@@ -44,6 +44,7 @@ crc32c.workspace = true
 zstd.workspace = true
 tokio = { workspace = true }
 thiserror.workspace = true
+flate2 = "1"
 
 [dev-dependencies]
 tokio = { workspace = true }

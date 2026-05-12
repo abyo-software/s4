@@ -32,6 +32,8 @@ enum CodecChoice {
     Passthrough,
     /// CPU zstd (GPU 不要、test bed)
     CpuZstd,
+    /// CPU gzip (RFC 1952; wire-compatible with stock gunzip / browsers)
+    CpuGzip,
     /// nvCOMP zstd-GPU (要 nvcomp-gpu feature)
     #[cfg(feature = "nvcomp-gpu")]
     NvcompZstd,
@@ -48,6 +50,7 @@ impl CodecChoice {
         match self {
             Self::Passthrough => CodecKind::Passthrough,
             Self::CpuZstd => CodecKind::CpuZstd,
+            Self::CpuGzip => CodecKind::CpuGzip,
             #[cfg(feature = "nvcomp-gpu")]
             Self::NvcompZstd => CodecKind::NvcompZstd,
             #[cfg(feature = "nvcomp-gpu")]
@@ -243,7 +246,8 @@ fn setup_tracing(
 fn build_registry(default: CodecKind, zstd_level: i32) -> Arc<CodecRegistry> {
     let reg = CodecRegistry::new(default)
         .with(Arc::new(Passthrough))
-        .with(Arc::new(CpuZstd::new(zstd_level)));
+        .with(Arc::new(CpuZstd::new(zstd_level)))
+        .with(Arc::new(s4_codec::cpu_gzip::CpuGzip::default()));
     #[cfg(feature = "nvcomp-gpu")]
     let reg = {
         use s4_codec::nvcomp::{

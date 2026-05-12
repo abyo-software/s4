@@ -12,6 +12,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod cpu_gzip;
 pub mod cpu_zstd;
 pub mod dietgpu;
 pub mod dispatcher;
@@ -40,6 +41,11 @@ pub enum CodecKind {
     /// algorithm-level format aligns with stock DEFLATE/zlib decoders given
     /// the right wrapper.
     NvcompGDeflate,
+    /// CPU gzip via `flate2` (v0.4 #26). Produces RFC 1952 gzip output that
+    /// any standard `gunzip`-aware client can decode without knowing about
+    /// S4. Pair with the `Content-Encoding: gzip` header to serve to a
+    /// browser / curl that's never heard of S4.
+    CpuGzip,
 }
 
 impl CodecKind {
@@ -52,6 +58,7 @@ impl CodecKind {
             Self::DietGpuAns => "dietgpu-ans",
             Self::CpuZstd => "cpu-zstd",
             Self::NvcompGDeflate => "nvcomp-gdeflate",
+            Self::CpuGzip => "cpu-gzip",
         }
     }
 
@@ -66,6 +73,7 @@ impl CodecKind {
             Self::NvcompGans => 4,
             Self::DietGpuAns => 5,
             Self::NvcompGDeflate => 6,
+            Self::CpuGzip => 7,
         }
     }
 
@@ -78,6 +86,7 @@ impl CodecKind {
             4 => Self::NvcompGans,
             5 => Self::DietGpuAns,
             6 => Self::NvcompGDeflate,
+            7 => Self::CpuGzip,
             _ => return None,
         })
     }
@@ -98,6 +107,7 @@ impl FromStr for CodecKind {
             "dietgpu-ans" => Self::DietGpuAns,
             "cpu-zstd" => Self::CpuZstd,
             "nvcomp-gdeflate" => Self::NvcompGDeflate,
+            "cpu-gzip" => Self::CpuGzip,
             other => return Err(ParseCodecKindError(other.into())),
         })
     }
