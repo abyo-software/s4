@@ -13,7 +13,10 @@ use s3s::S3;
 use s3s::auth::SimpleAuth;
 use s3s::host::SingleDomain;
 use s3s::service::S3ServiceBuilder;
-use s4_codec::{cpu_zstd::CpuZstd, passthrough::Passthrough};
+use s4_codec::cpu_zstd::CpuZstd;
+use s4_codec::dispatcher::AlwaysDispatcher;
+use s4_codec::passthrough::Passthrough;
+use s4_codec::{CodecKind, CodecRegistry};
 use s4_server::S4Service;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -25,6 +28,15 @@ enum CodecChoice {
     /// CPU zstd (GPU 不要、test bed)
     CpuZstd,
     // TODO Phase 1 後半: NvcompBitcomp / NvcompZstd / NvcompGans / DietGpuAns
+}
+
+impl CodecChoice {
+    fn as_kind(self) -> CodecKind {
+        match self {
+            Self::Passthrough => CodecKind::Passthrough,
+            Self::CpuZstd => CodecKind::CpuZstd,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -47,7 +59,7 @@ struct Opt {
     #[clap(long)]
     endpoint_url: String,
 
-    /// 圧縮 codec
+    /// 既定の圧縮 codec (PUT 時に dispatcher が選ぶ)
     #[clap(long, value_enum, default_value = "cpu-zstd")]
     codec: CodecChoice,
 
@@ -66,6 +78,14 @@ fn setup_tracing() {
         .init();
 }
 
+fn build_registry(zstd_level: i32) -> Arc<CodecRegistry> {
+    Arc::new(
+        CodecRegistry::new(CodecKind::CpuZstd)
+            .with(Arc::new(Passthrough))
+            .with(Arc::new(CpuZstd::new(zstd_level))),
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     setup_tracing();
@@ -82,18 +102,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     );
     let proxy = s3s_aws::Proxy::from(client);
 
-    info!(codec = ?opt.codec, "S4 codec activated");
+    let registry = build_registry(opt.zstd_level);
+    let dispatcher = Arc::new(AlwaysDispatcher(opt.codec.as_kind()));
+    info!(
+        codec = ?opt.codec,
+        registered = ?registry.kinds().collect::<Vec<_>>(),
+        "S4 codec registry built"
+    );
 
-    match opt.codec {
-        CodecChoice::Passthrough => {
-            let s4 = S4Service::new(proxy, Arc::new(Passthrough));
-            run_server(s4, &sdk_conf, &opt).await
-        }
-        CodecChoice::CpuZstd => {
-            let s4 = S4Service::new(proxy, Arc::new(CpuZstd::new(opt.zstd_level)));
-            run_server(s4, &sdk_conf, &opt).await
-        }
-    }
+    let s4 = S4Service::new(proxy, registry, dispatcher);
+    run_server(s4, &sdk_conf, &opt).await
 }
 
 async fn run_server<S>(

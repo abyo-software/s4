@@ -1,7 +1,7 @@
 //! `s3s::S3` 実装 — `s3s_aws::Proxy` への delegation を default にしつつ、
-//! `put_object` / `get_object` 経路で `s4_codec::Codec` を呼ぶ。
+//! `put_object` / `get_object` 経路で `s4_codec::CodecRegistry` を呼ぶ。
 //!
-//! ## カバー範囲 (Phase 1 月 2 想定)
+//! ## カバー範囲 (Phase 1 月 2)
 //!
 //! - 圧縮 hook あり: `put_object`, `get_object`
 //! - 純 delegation (圧縮なし): `head_bucket`, `list_buckets`, `create_bucket`, `delete_bucket`,
@@ -11,51 +11,68 @@
 //!   `list_parts`
 //! - 未対応 (デフォルトで NotImplemented): その他 80+ ops (Tagging / ACL / Lifecycle 等は Phase 2)
 //!
-//! ## 重要な制限事項
+//! ## アーキテクチャ
 //!
-//! - **Multipart Upload は per-part 圧縮が未実装**: 現状は upload_part を素通し
-//!   している。Phase 1 月 2 後半で per-part 圧縮 + complete_multipart_upload で
-//!   manifest を集約する設計を入れる。
-//! - **codec mismatch**: GET 時に object metadata の codec が S4Service に設定された
-//!   codec と異なる場合エラー。Phase 1 後半で `CodecRegistry` を導入し manifest 別に
-//!   dispatch するまでの暫定挙動。
-//! - **PUT body は memory に collect**: max_body_bytes 上限あり (default 5 GB = S3 単発 PUT 上限)。
+//! - `S4Service<B>` は backend (B: S3) と `Arc<CodecRegistry>` と `Arc<dyn CodecDispatcher>`
+//!   を保持する。`CodecRegistry` 経由で複数 codec を抱えられるので、ひとつの S4 インスタンスが
+//!   複数 codec で書かれた object を透過的に GET できる
+//! - PUT: dispatcher が body の先頭 sample から codec を選び、registry で compress、
+//!   manifest を S3 metadata に書いて backend に forward
+//! - GET: backend から取得 → metadata から manifest を復元 → registry.decompress で
+//!   manifest 指定の codec で解凍 → 元の bytes を return
+//!
+//! ## 既知の制限事項
+//!
+//! - **Multipart Upload は per-part 圧縮が未実装**: 現状は upload_part を素通し。
+//!   Phase 1 月 2 後半で per-part compress + complete_multipart_upload で manifest 集約。
+//! - **PUT body は memory に collect**: max_body_bytes 上限あり (default 5 GiB = S3 単発 PUT 上限)。
 //!   Streaming-aware 圧縮は Phase 2。
 
 use std::sync::Arc;
 
 use s3s::dto::*;
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
-use s4_codec::{ChunkManifest, Codec, CodecKind};
-use tracing::{debug, warn};
+use s4_codec::{ChunkManifest, CodecDispatcher, CodecKind, CodecRegistry};
+use tracing::debug;
 
 use crate::blob::{bytes_to_blob, collect_blob};
 
-/// S4 のメインサービス。任意の `S3` backend と `Codec` を組み合わせる。
-///
-/// production: `B = s3s_aws::Proxy` (AWS S3 への forward)
-/// tests: `B = s3s_fs::FileSystem` (ローカル FS backend で in-process roundtrip)
-pub struct S4Service<B: S3, C: Codec + 'static> {
+/// PUT body の先頭 sampling で渡す最大 byte 数。
+const SAMPLE_BYTES: usize = 4096;
+
+pub struct S4Service<B: S3> {
     backend: B,
-    codec: Arc<C>,
+    registry: Arc<CodecRegistry>,
+    dispatcher: Arc<dyn CodecDispatcher>,
     max_body_bytes: usize,
 }
 
-impl<B: S3, C: Codec + 'static> S4Service<B, C> {
+impl<B: S3> S4Service<B> {
     /// AWS S3 単発 PUT の API 上限 (5 GiB)
     pub const DEFAULT_MAX_BODY_BYTES: usize = 5 * 1024 * 1024 * 1024;
 
-    pub fn new(backend: B, codec: Arc<C>) -> Self {
+    pub fn new(
+        backend: B,
+        registry: Arc<CodecRegistry>,
+        dispatcher: Arc<dyn CodecDispatcher>,
+    ) -> Self {
         Self {
             backend,
-            codec,
+            registry,
+            dispatcher,
             max_body_bytes: Self::DEFAULT_MAX_BODY_BYTES,
         }
     }
 
+    #[must_use]
     pub fn with_max_body_bytes(mut self, n: usize) -> Self {
         self.max_body_bytes = n;
         self
+    }
+
+    /// テスト用: backend を取り戻す (test helper、production では使わない)
+    pub fn into_backend(self) -> B {
+        self.backend
     }
 }
 
@@ -64,8 +81,6 @@ const META_ORIGINAL_SIZE: &str = "s4-original-size";
 const META_COMPRESSED_SIZE: &str = "s4-compressed-size";
 const META_CRC32C: &str = "s4-crc32c";
 
-/// metadata から ChunkManifest を再構築。S4 が書いていないオブジェクト (= S4 経由前から
-/// 既に bucket にあったもの) は None。
 fn extract_manifest(metadata: &Option<Metadata>) -> Option<ChunkManifest> {
     let m = metadata.as_ref()?;
     let codec = m
@@ -101,7 +116,7 @@ fn internal<E: std::fmt::Display>(prefix: &'static str) -> impl FnOnce(E) -> S3E
 }
 
 #[async_trait::async_trait]
-impl<B: S3, C: Codec + 'static> S3 for S4Service<B, C> {
+impl<B: S3> S3 for S4Service<B> {
     // === 圧縮を挟む path (PUT) ===
     async fn put_object(
         &self,
@@ -111,18 +126,20 @@ impl<B: S3, C: Codec + 'static> S3 for S4Service<B, C> {
             let bytes = collect_blob(blob, self.max_body_bytes)
                 .await
                 .map_err(internal("collect put body"))?;
+            let sample_len = bytes.len().min(SAMPLE_BYTES);
+            let kind = self.dispatcher.pick(&bytes[..sample_len]).await;
             debug!(
                 bucket = ?req.input.bucket,
                 key = ?req.input.key,
                 bytes = bytes.len(),
-                codec = self.codec.kind().as_str(),
+                codec = kind.as_str(),
                 "S4 put_object: compressing"
             );
             let (compressed, manifest) = self
-                .codec
-                .compress(bytes)
+                .registry
+                .compress(bytes, kind)
                 .await
-                .map_err(internal("codec compress"))?;
+                .map_err(internal("registry compress"))?;
             write_manifest(&mut req.input.metadata, &manifest);
             req.input.body = Some(bytes_to_blob(compressed));
         }
@@ -136,53 +153,25 @@ impl<B: S3, C: Codec + 'static> S3 for S4Service<B, C> {
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let mut resp = self.backend.get_object(req).await?;
         let Some(manifest) = extract_manifest(&resp.output.metadata) else {
-            // S4 が書いていないオブジェクト (passthrough)。bucket に S4 経由前から
-            // あった可能性、または PUT-without-S4 で書かれたもの。そのまま返す。
+            // S4 が書いていないオブジェクトは透過 (raw bucket pre-existing object 等)
             debug!("S4 get_object: object lacks s4-codec metadata, returning as-is");
             return Ok(resp);
         };
-        if manifest.codec != self.codec.kind() && manifest.codec != CodecKind::Passthrough {
-            warn!(
-                want = self.codec.kind().as_str(),
-                got = manifest.codec.as_str(),
-                "S4 get_object: codec mismatch (Phase 1 limitation: single-codec service)"
-            );
-            return Err(S3Error::with_message(
-                S3ErrorCode::InternalError,
-                format!(
-                    "object compressed with {} but this S4 instance is configured with {}; \
-                     multi-codec dispatch is Phase 2",
-                    manifest.codec.as_str(),
-                    self.codec.kind().as_str()
-                ),
-            ));
-        }
         if let Some(blob) = resp.output.body.take() {
             let bytes = collect_blob(blob, self.max_body_bytes)
                 .await
                 .map_err(internal("collect get body"))?;
-            // codec mismatch を上で弾いているので、Passthrough manifest を current codec で
-            // 解凍するケースが残るが、Passthrough の manifest を非Passthrough codec が
-            // decompress すると codec.decompress() 側で CodecMismatch が返る。
-            // そのため Passthrough manifest かつ current codec が非Passthrough のときは
-            // Passthrough codec で処理する分岐を別に用意する。
-            let decompressed = if manifest.codec == CodecKind::Passthrough {
-                let pt = s4_codec::passthrough::Passthrough;
-                pt.decompress(bytes, &manifest)
-                    .await
-                    .map_err(internal("passthrough decompress"))?
-            } else {
-                self.codec
-                    .decompress(bytes, &manifest)
-                    .await
-                    .map_err(internal("codec decompress"))?
-            };
+            let decompressed = self
+                .registry
+                .decompress(bytes, &manifest)
+                .await
+                .map_err(internal("registry decompress"))?;
             resp.output.body = Some(bytes_to_blob(decompressed));
         }
         Ok(resp)
     }
 
-    // === passthrough delegations (1 op = 3 行) ===
+    // === passthrough delegations ===
     async fn head_bucket(
         &self,
         req: S3Request<HeadBucketInput>,
@@ -285,7 +274,6 @@ impl<B: S3, C: Codec + 'static> S3 for S4Service<B, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use s4_codec::passthrough::Passthrough;
 
     #[test]
     fn manifest_roundtrip_via_metadata() {
@@ -314,16 +302,7 @@ mod tests {
     fn partial_metadata_yields_none() {
         let mut meta = Metadata::new();
         meta.insert(META_CODEC.into(), "cpu-zstd".into());
-        // 残りのキーが欠落している
         let opt = Some(meta);
         assert!(extract_manifest(&opt).is_none());
-    }
-
-    // Passthrough codec が S4Service に組み込めることを type 上で確認 (compile-time check)。
-    #[allow(dead_code)]
-    fn _assert_compiles_with_passthrough(
-        p: s3s_aws::Proxy,
-    ) -> S4Service<s3s_aws::Proxy, Passthrough> {
-        S4Service::new(p, Arc::new(Passthrough))
     }
 }

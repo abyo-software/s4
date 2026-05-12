@@ -13,9 +13,23 @@ use bytes::Bytes;
 use s3s::dto::*;
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use s4_codec::cpu_zstd::CpuZstd;
+use s4_codec::dispatcher::AlwaysDispatcher;
 use s4_codec::passthrough::Passthrough;
+use s4_codec::{CodecKind, CodecRegistry};
 use s4_server::S4Service;
 use s4_server::blob::{bytes_to_blob, collect_blob};
+
+fn make_registry(default: CodecKind) -> Arc<CodecRegistry> {
+    Arc::new(
+        CodecRegistry::new(default)
+            .with(Arc::new(Passthrough))
+            .with(Arc::new(CpuZstd::default())),
+    )
+}
+
+fn make_dispatcher(kind: CodecKind) -> Arc<AlwaysDispatcher> {
+    Arc::new(AlwaysDispatcher(kind))
+}
 
 /// In-memory な (bucket, key) → (body, metadata) ストア。
 /// 実装するのは S4 が呼ぶ最小集合: `put_object`, `get_object`, `head_object`。
@@ -151,7 +165,11 @@ async fn read_back(resp: S3Response<GetObjectOutput>) -> Bytes {
 #[tokio::test]
 async fn cpu_zstd_roundtrip_through_s4service() {
     let backend = MemoryBackend::new();
-    let s4 = S4Service::new(backend, Arc::new(CpuZstd::default()));
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    );
 
     let payload = Bytes::from(vec![b'x'; 100_000]); // highly compressible
     s4.put_object(put_request("bucket", "key1", payload.clone()))
@@ -169,7 +187,11 @@ async fn cpu_zstd_roundtrip_through_s4service() {
 #[tokio::test]
 async fn passthrough_roundtrip_through_s4service() {
     let backend = MemoryBackend::new();
-    let s4 = S4Service::new(backend, Arc::new(Passthrough));
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::Passthrough),
+        make_dispatcher(CodecKind::Passthrough),
+    );
 
     let payload = Bytes::from_static(b"hello squished s3");
     s4.put_object(put_request("bucket", "key2", payload.clone()))
@@ -190,7 +212,11 @@ async fn cpu_zstd_actually_compresses_in_backend_storage() {
     // 検証は S4Service の HEAD で `s4-compressed-size` metadata を読み、
     // 圧縮率が想定通り出ていることを確認する。
     let backend = MemoryBackend::new();
-    let s4 = S4Service::new(backend, Arc::new(CpuZstd::default()));
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    );
 
     let payload = Bytes::from(vec![b'x'; 1024 * 1024]);
     s4.put_object(put_request("bucket", "compressible", payload.clone()))
@@ -244,7 +270,11 @@ async fn get_object_without_s4_metadata_passes_through() {
         },
     );
 
-    let s4 = S4Service::new(backend, Arc::new(CpuZstd::default()));
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    );
     let resp = s4
         .get_object(get_request("bucket", "raw"))
         .await
@@ -254,4 +284,50 @@ async fn get_object_without_s4_metadata_passes_through() {
         got, raw,
         "raw object lacking s4 metadata must pass through unchanged"
     );
+}
+
+#[tokio::test]
+async fn registry_dispatches_decompress_across_codecs() {
+    // 同じ bucket に passthrough と cpu-zstd 両方で書いた object を、
+    // **同じ S4 インスタンス** から GET して両方読めることを確認 (multi-codec dispatch)。
+    let backend = MemoryBackend::new();
+
+    // 1) passthrough で 1 個書く
+    let s4_pt = S4Service::new(
+        backend,
+        make_registry(CodecKind::Passthrough),
+        make_dispatcher(CodecKind::Passthrough),
+    );
+    let raw_payload = Bytes::from_static(b"unsquished bytes");
+    s4_pt
+        .put_object(put_request("bucket", "k_passthrough", raw_payload.clone()))
+        .await
+        .expect("put pt");
+
+    // backend を取り出し、新しい S4 (cpu-zstd default + 全 codec 登録) で再 wrap
+    let backend = s4_pt.into_backend();
+    let s4_zstd = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    );
+
+    // 2) cpu-zstd で 1 個書く (こちらは新インスタンス経由)
+    let zpayload = Bytes::from(vec![b'q'; 50_000]);
+    s4_zstd
+        .put_object(put_request("bucket", "k_zstd", zpayload.clone()))
+        .await
+        .expect("put zstd");
+
+    // 3) 同じ s4_zstd で両方読めることを確認 (registry が manifest.codec で dispatch)
+    let resp_pt = s4_zstd
+        .get_object(get_request("bucket", "k_passthrough"))
+        .await
+        .expect("get pt");
+    assert_eq!(read_back(resp_pt).await, raw_payload);
+    let resp_zstd = s4_zstd
+        .get_object(get_request("bucket", "k_zstd"))
+        .await
+        .expect("get zstd");
+    assert_eq!(read_back(resp_zstd).await, zpayload);
 }

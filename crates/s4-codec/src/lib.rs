@@ -14,8 +14,12 @@ use thiserror::Error;
 
 pub mod cpu_zstd;
 pub mod dietgpu;
+pub mod dispatcher;
 pub mod nvcomp;
 pub mod passthrough;
+pub mod registry;
+
+pub use registry::CodecRegistry;
 
 /// 圧縮 codec の種類 (manifest に記録、後段の decompress で codec を確定するために使う)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -91,6 +95,9 @@ pub enum CodecError {
 
     #[error("blocking-task join error: {0}")]
     Join(#[from] tokio::task::JoinError),
+
+    #[error("codec {0:?} is not registered in this CodecRegistry")]
+    UnregisteredCodec(CodecKind),
 }
 
 /// pluggable な圧縮 backend trait。
@@ -110,10 +117,4 @@ pub trait Codec: Send + Sync {
     -> Result<Bytes, CodecError>;
 }
 
-/// データ種別から最適 codec を選ぶ dispatcher (Phase 1 後半で実装)。
-///
-/// 入力先頭の sampling で integer 主体 / text 主体 / binary 既圧縮を判定する。
-#[async_trait::async_trait]
-pub trait CodecDispatcher: Send + Sync {
-    async fn pick(&self, sample: &[u8]) -> CodecKind;
-}
+pub use dispatcher::CodecDispatcher;
