@@ -30,8 +30,13 @@
 
 use std::sync::Arc;
 
+use bytes::BytesMut;
 use s3s::dto::*;
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use s4_codec::multipart::{
+    FRAME_HEADER_BYTES, FrameHeader, FrameIter, S3_MULTIPART_MIN_PART_BYTES, pad_to_minimum,
+    write_frame,
+};
 use s4_codec::{ChunkManifest, CodecDispatcher, CodecKind, CodecRegistry};
 use tracing::debug;
 
@@ -74,12 +79,67 @@ impl<B: S3> S4Service<B> {
     pub fn into_backend(self) -> B {
         self.backend
     }
+
+    /// Multipart object (frame 列) を解凍 → 元 bytes を再構築。
+    ///
+    /// 各 frame の codec は object metadata の `s4-codec` で全 part 共通という前提。
+    /// (Phase 2 で per-frame codec ID を入れる可能性あり、その時はここを拡張)
+    async fn decompress_multipart(
+        &self,
+        bytes: bytes::Bytes,
+        metadata: &Option<Metadata>,
+    ) -> S3Result<bytes::Bytes> {
+        let codec_kind = metadata
+            .as_ref()
+            .and_then(|m| m.get(META_CODEC))
+            .and_then(|s| s.parse::<CodecKind>().ok())
+            .ok_or_else(|| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    "multipart object missing s4-codec metadata",
+                )
+            })?;
+
+        let mut out = BytesMut::new();
+        for frame in FrameIter::new(bytes) {
+            let (header, payload) = frame.map_err(|e| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("multipart frame parse: {e}"),
+                )
+            })?;
+            let chunk_manifest = ChunkManifest {
+                codec: codec_kind,
+                original_size: header.original_size,
+                compressed_size: header.compressed_size,
+                crc32c: header.crc32c,
+            };
+            let decompressed = self
+                .registry
+                .decompress(payload, &chunk_manifest)
+                .await
+                .map_err(internal("multipart frame decompress"))?;
+            out.extend_from_slice(&decompressed);
+        }
+        Ok(out.freeze())
+    }
+}
+
+fn is_multipart_object(metadata: &Option<Metadata>) -> bool {
+    metadata
+        .as_ref()
+        .and_then(|m| m.get(META_MULTIPART))
+        .map(|v| v == "true")
+        .unwrap_or(false)
 }
 
 const META_CODEC: &str = "s4-codec";
 const META_ORIGINAL_SIZE: &str = "s4-original-size";
 const META_COMPRESSED_SIZE: &str = "s4-compressed-size";
 const META_CRC32C: &str = "s4-crc32c";
+/// Multipart upload で per-part frame format を使ったオブジェクトであることを示す。
+/// GET 時にこの flag を見て frame parser を起動する。
+const META_MULTIPART: &str = "s4-multipart";
 
 fn extract_manifest(metadata: &Option<Metadata>) -> Option<ChunkManifest> {
     let m = metadata.as_ref()?;
@@ -166,28 +226,71 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
+        // Range GET は currently 非対応 (multipart frame parser が full-object 前提で
+        // 動くため)。Range が指定されていたら head_object で codec metadata を見て、
+        // S4-managed object なら 416 で reject (silent corruption より明確な拒否)。
+        // 通常 (S4 が触っていない) object なら range を素通しさせる。
+        if req.input.range.is_some() {
+            let head_input = HeadObjectInput {
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                ..Default::default()
+            };
+            let head_req = S3Request {
+                input: head_input,
+                method: req.method.clone(),
+                uri: req.uri.clone(),
+                headers: req.headers.clone(),
+                extensions: http::Extensions::new(),
+                credentials: req.credentials.clone(),
+                region: req.region.clone(),
+                service: req.service.clone(),
+                trailing_headers: None,
+            };
+            if let Ok(head) = self.backend.head_object(head_req).await
+                && (is_multipart_object(&head.output.metadata)
+                    || extract_manifest(&head.output.metadata).is_some())
+            {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRange,
+                    "Range GET on S4-compressed objects is not supported in Phase 1; \
+                     issue full-object GET (omit Range header)",
+                ));
+            }
+        }
         let mut resp = self.backend.get_object(req).await?;
-        let Some(manifest) = extract_manifest(&resp.output.metadata) else {
+        let is_multipart = is_multipart_object(&resp.output.metadata);
+        let manifest_opt = extract_manifest(&resp.output.metadata);
+
+        if !is_multipart && manifest_opt.is_none() {
             // S4 が書いていないオブジェクトは透過 (raw bucket pre-existing object 等)
             debug!("S4 get_object: object lacks s4-codec metadata, returning as-is");
             return Ok(resp);
-        };
+        }
+
         if let Some(blob) = resp.output.body.take() {
             let bytes = collect_blob(blob, self.max_body_bytes)
                 .await
                 .map_err(internal("collect get body"))?;
-            let decompressed = self
-                .registry
-                .decompress(bytes, &manifest)
-                .await
-                .map_err(internal("registry decompress"))?;
+
+            let decompressed = if is_multipart {
+                self.decompress_multipart(bytes, &resp.output.metadata)
+                    .await?
+            } else {
+                let manifest = manifest_opt.expect("non-multipart guarded above");
+                self.registry
+                    .decompress(bytes, &manifest)
+                    .await
+                    .map_err(internal("registry decompress"))?
+            };
+
             // 解凍後の真のサイズを返す (S3 client は content_length を信頼するので
             // 圧縮 size のままだと downstream が body を途中で切ってしまう)
             resp.output.content_length = Some(decompressed.len() as i64);
             // 圧縮済 bytes の checksum を返すと AWS SDK 側で StreamingError
             // (ChecksumMismatch) になる。ETag も backend が返した「圧縮済 bytes の
             // MD5/checksum」なので意味的にズレる — クリアして S4 自身の crc32c
-            // (manifest 内) で integrity を保証する設計にする。
+            // (manifest 内 / frame 内) で integrity を保証する設計にする。
             resp.output.checksum_crc32 = None;
             resp.output.checksum_crc32c = None;
             resp.output.checksum_crc64nvme = None;
@@ -275,15 +378,77 @@ impl<B: S3> S3 for S4Service<B> {
     }
     async fn create_multipart_upload(
         &self,
-        req: S3Request<CreateMultipartUploadInput>,
+        mut req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        // Multipart object は per-part 圧縮 + frame 形式で書く。GET 時に
+        // frame parse を起動するため、object metadata に flag を立てる。
+        // codec は dispatcher の default kind を採用 (per-part 別 codec は Phase 2)。
+        let codec_kind = self.registry.default_kind();
+        let meta = req.input.metadata.get_or_insert_with(Default::default);
+        meta.insert(META_MULTIPART.into(), "true".into());
+        meta.insert(META_CODEC.into(), codec_kind.as_str().into());
+        debug!(
+            bucket = ?req.input.bucket,
+            key = ?req.input.key,
+            codec = codec_kind.as_str(),
+            "S4 create_multipart_upload: marking object for per-part compression"
+        );
         self.backend.create_multipart_upload(req).await
     }
+
     async fn upload_part(
         &self,
-        req: S3Request<UploadPartInput>,
+        mut req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
-        // TODO Phase 1 後半: per-part 圧縮を入れる (現状は素通し)
+        // 各 part を圧縮して frame header 付きで forward。GET 時に
+        // `decompress_multipart` が frame iter で順に解凍する。
+        if let Some(blob) = req.input.body.take() {
+            let bytes = collect_blob(blob, self.max_body_bytes)
+                .await
+                .map_err(internal("collect upload_part body"))?;
+            // codec は registry の default を使う (multipart は uniform codec)。
+            // create_multipart_upload で metadata に書いた codec と整合する
+            // 必要があるが、現状は同じ S4Service インスタンス前提なので一致する
+            let codec_kind = self.registry.default_kind();
+            let original_size = bytes.len() as u64;
+            let (compressed, manifest) = self
+                .registry
+                .compress(bytes, codec_kind)
+                .await
+                .map_err(internal("registry compress part"))?;
+            let header = FrameHeader {
+                original_size,
+                compressed_size: compressed.len() as u64,
+                crc32c: manifest.crc32c,
+            };
+            let mut framed = BytesMut::with_capacity(FRAME_HEADER_BYTES + compressed.len());
+            write_frame(&mut framed, header, &compressed);
+            // S3 multipart の non-final part 最小サイズ (5 MiB) を満たすため
+            // padding frame を追加。FrameIter が S4P1 padding を skip する。
+            // 注: 最終 part も常に pad してしまっているが、最終 part だけ pad しない
+            // 最適化は S4Service が「最終 part か」を upload_part 時点で知れない
+            // ため Phase 2 (CompleteMultipartUpload で trim) で対応。
+            pad_to_minimum(&mut framed, S3_MULTIPART_MIN_PART_BYTES);
+            let framed_bytes = framed.freeze();
+            let new_len = framed_bytes.len() as i64;
+            // 同じ wire 互換問題が multipart にもある (content-length / checksum)
+            req.input.content_length = Some(new_len);
+            req.input.checksum_algorithm = None;
+            req.input.checksum_crc32 = None;
+            req.input.checksum_crc32c = None;
+            req.input.checksum_crc64nvme = None;
+            req.input.checksum_sha1 = None;
+            req.input.checksum_sha256 = None;
+            req.input.content_md5 = None;
+            req.input.body = Some(bytes_to_blob(framed_bytes));
+            debug!(
+                part_number = ?req.input.part_number,
+                upload_id = ?req.input.upload_id,
+                original_size,
+                framed_size = new_len,
+                "S4 upload_part: framed compressed payload"
+            );
+        }
         self.backend.upload_part(req).await
     }
     async fn complete_multipart_upload(

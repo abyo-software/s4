@@ -37,6 +37,7 @@ anyhow.workspace = true
 bytes.workspace = true
 futures.workspace = true
 thiserror.workspace = true
+http = "1"
 
 s4-codec = { path = "../s4-codec" }
 s4-config = { path = "../s4-config" }

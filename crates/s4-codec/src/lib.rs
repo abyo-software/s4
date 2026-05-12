@@ -15,6 +15,7 @@ use thiserror::Error;
 pub mod cpu_zstd;
 pub mod dietgpu;
 pub mod dispatcher;
+pub mod multipart;
 pub mod nvcomp;
 pub mod passthrough;
 pub mod registry;
