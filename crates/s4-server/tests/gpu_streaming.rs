@@ -104,3 +104,35 @@ async fn streaming_compress_nvcomp_zstd_roundtrip_100mib() {
 async fn streaming_compress_nvcomp_zstd_roundtrip_1gib() {
     assert_roundtrip(1024 * 1024 * 1024).await;
 }
+
+/// v0.2 #9: nvCOMP GDeflate roundtrip via the bytes-API codec wrapper.
+/// Validates that the GDeflate FFI bindings link correctly and the
+/// compress/decompress round-trip is byte-equal on a typical text-like
+/// workload (highly compressible repeated bytes).
+#[tokio::test]
+#[ignore = "requires CUDA-capable GPU + NVCOMP_HOME at build time"]
+async fn nvcomp_gdeflate_codec_roundtrip() {
+    use s4_codec::Codec;
+    use s4_codec::nvcomp::NvcompGDeflateCodec;
+
+    let codec = NvcompGDeflateCodec::new().expect("nvcomp gdeflate init");
+    let original = synthetic_input(1024 * 1024); // 1 MiB mixed compressible
+    let (compressed, manifest) = codec
+        .compress(original.clone())
+        .await
+        .expect("gdeflate compress");
+    assert_eq!(manifest.codec, s4_codec::CodecKind::NvcompGDeflate);
+    assert_eq!(manifest.original_size, original.len() as u64);
+    assert!(
+        compressed.len() < original.len(),
+        "expected gdeflate to reduce {} -> < {}, got {}",
+        original.len(),
+        original.len(),
+        compressed.len()
+    );
+    let decompressed = codec
+        .decompress(compressed, &manifest)
+        .await
+        .expect("gdeflate decompress");
+    assert_eq!(decompressed, original);
+}

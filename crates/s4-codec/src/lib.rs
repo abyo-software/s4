@@ -35,6 +35,11 @@ pub enum CodecKind {
     NvcompZstd,
     DietGpuAns,
     CpuZstd,
+    /// nvCOMP GDeflate (v0.2 #9). DEFLATE-family GPU codec; output bytes are
+    /// NOT gzip-compatible at the wire level (different framing) but the
+    /// algorithm-level format aligns with stock DEFLATE/zlib decoders given
+    /// the right wrapper.
+    NvcompGDeflate,
 }
 
 impl CodecKind {
@@ -46,6 +51,7 @@ impl CodecKind {
             Self::NvcompZstd => "nvcomp-zstd",
             Self::DietGpuAns => "dietgpu-ans",
             Self::CpuZstd => "cpu-zstd",
+            Self::NvcompGDeflate => "nvcomp-gdeflate",
         }
     }
 
@@ -59,6 +65,7 @@ impl CodecKind {
             Self::NvcompBitcomp => 3,
             Self::NvcompGans => 4,
             Self::DietGpuAns => 5,
+            Self::NvcompGDeflate => 6,
         }
     }
 
@@ -70,6 +77,7 @@ impl CodecKind {
             3 => Self::NvcompBitcomp,
             4 => Self::NvcompGans,
             5 => Self::DietGpuAns,
+            6 => Self::NvcompGDeflate,
             _ => return None,
         })
     }
@@ -89,6 +97,7 @@ impl FromStr for CodecKind {
             "nvcomp-zstd" => Self::NvcompZstd,
             "dietgpu-ans" => Self::DietGpuAns,
             "cpu-zstd" => Self::CpuZstd,
+            "nvcomp-gdeflate" => Self::NvcompGDeflate,
             other => return Err(ParseCodecKindError(other.into())),
         })
     }

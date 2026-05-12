@@ -203,6 +203,91 @@ mod imp {
         }
     }
 
+    /// nvCOMP GDeflate を S4 の `Codec` trait に bridge (v0.2 #9)。
+    /// DEFLATE-family GPU codec。汎用 binary、log、JSON 等に zstd と並ぶ
+    /// 候補。zstd よりは圧縮率劣るが、algorithm-level format が DEFLATE
+    /// 互換なので将来 wrapper を被せれば stock gunzip でも復号可能 (Phase 2)。
+    pub struct NvcompGDeflateCodec {
+        inner: Arc<NvcompCodec>,
+    }
+
+    impl NvcompGDeflateCodec {
+        pub fn new() -> Result<Self, CodecError> {
+            let inner = NvcompCodec::new(Algo::GDeflate)
+                .map_err(|e| CodecError::Backend(anyhow::anyhow!("nvcomp gdeflate init: {e}")))?;
+            Ok(Self {
+                inner: Arc::new(inner),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Codec for NvcompGDeflateCodec {
+        fn kind(&self) -> CodecKind {
+            CodecKind::NvcompGDeflate
+        }
+
+        async fn compress(&self, input: Bytes) -> Result<(Bytes, ChunkManifest), CodecError> {
+            let original_size = input.len() as u64;
+            let original_crc = crc32c::crc32c(&input);
+            let codec = Arc::clone(&self.inner);
+            let compressed = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, CodecError> {
+                let mut out = Vec::with_capacity(codec.max_compressed_len(input.len()));
+                codec.compress(input.as_ref(), &mut out).map_err(|e| {
+                    CodecError::Backend(anyhow::anyhow!("nvcomp gdeflate compress: {e}"))
+                })?;
+                Ok(out)
+            })
+            .await??;
+            let manifest = ChunkManifest {
+                codec: CodecKind::NvcompGDeflate,
+                original_size,
+                compressed_size: compressed.len() as u64,
+                crc32c: original_crc,
+            };
+            Ok((Bytes::from(compressed), manifest))
+        }
+
+        async fn decompress(
+            &self,
+            input: Bytes,
+            manifest: &ChunkManifest,
+        ) -> Result<Bytes, CodecError> {
+            if manifest.codec != CodecKind::NvcompGDeflate {
+                return Err(CodecError::CodecMismatch {
+                    expected: CodecKind::NvcompGDeflate,
+                    got: manifest.codec,
+                });
+            }
+            let expected_crc = manifest.crc32c;
+            let expected_orig_size = manifest.original_size as usize;
+            let codec = Arc::clone(&self.inner);
+            let decompressed =
+                tokio::task::spawn_blocking(move || -> Result<Vec<u8>, CodecError> {
+                    let mut out = Vec::with_capacity(expected_orig_size);
+                    codec.decompress(input.as_ref(), &mut out).map_err(|e| {
+                        CodecError::Backend(anyhow::anyhow!("nvcomp gdeflate decompress: {e}"))
+                    })?;
+                    Ok(out)
+                })
+                .await??;
+            if decompressed.len() != expected_orig_size {
+                return Err(CodecError::SizeMismatch {
+                    expected: manifest.original_size,
+                    got: decompressed.len() as u64,
+                });
+            }
+            let actual_crc = crc32c::crc32c(&decompressed);
+            if actual_crc != expected_crc {
+                return Err(CodecError::CrcMismatch {
+                    expected: expected_crc,
+                    got: actual_crc,
+                });
+            }
+            Ok(Bytes::from(decompressed))
+        }
+    }
+
     /// CUDA-capable な GPU が runtime に存在するか
     pub fn is_gpu_available() -> bool {
         NvcompCodec::is_available()
@@ -210,7 +295,7 @@ mod imp {
 }
 
 #[cfg(feature = "nvcomp-gpu")]
-pub use imp::{NvcompBitcompCodec, NvcompZstdCodec, is_gpu_available};
+pub use imp::{NvcompBitcompCodec, NvcompGDeflateCodec, NvcompZstdCodec, is_gpu_available};
 
 #[cfg(not(feature = "nvcomp-gpu"))]
 pub fn is_gpu_available() -> bool {

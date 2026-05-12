@@ -155,6 +155,10 @@ impl Codec for NvcompCodec {
             Algo::Snappy => 32 + self.chunk_size + self.chunk_size / 6,
             Algo::Lz4 => self.chunk_size + self.chunk_size / 255 + 16,
             Algo::Zstd => self.chunk_size + self.chunk_size / 200 + 64,
+            // GDeflate (DEFLATE-family GPU codec). DEFLATE worst-case is
+            // input-size + ~5 bytes per 16 KiB block (zlib RFC 1951 §3.2.4).
+            // We give it the same generous margin as zstd.
+            Algo::GDeflate => self.chunk_size + self.chunk_size / 200 + 64,
             // Bitcomp is highly data-dependent — Phase 0 saw 2.79× to
             // 3.59× on numeric columns. Worst-case the codec falls back
             // to pass-through with a small frame header (~16 B/chunk).
@@ -427,6 +431,11 @@ fn compress_get_max_output_chunk_size(algo: Algo, max_chunk: usize) -> Result<us
                 Default::default(),
                 &mut out,
             ),
+            Algo::GDeflate => nvcompBatchedGdeflateCompressGetMaxOutputChunkSize(
+                max_chunk,
+                Default::default(),
+                &mut out,
+            ),
             Algo::Bitcomp { data_type } => nvcompBatchedBitcompCompressGetMaxOutputChunkSize(
                 max_chunk,
                 bitcomp_format_opts(data_type),
@@ -474,6 +483,13 @@ fn compress_get_temp_size(
                 total_uncomp,
             ),
             Algo::Zstd => nvcompBatchedZstdCompressGetTempSizeAsync(
+                num_chunks,
+                max_chunk,
+                Default::default(),
+                &mut out,
+                total_uncomp,
+            ),
+            Algo::GDeflate => nvcompBatchedGdeflateCompressGetTempSizeAsync(
                 num_chunks,
                 max_chunk,
                 Default::default(),
@@ -552,6 +568,19 @@ fn dispatch_compress(
                 d_statuses,
                 stream,
             ),
+            Algo::GDeflate => nvcompBatchedGdeflateCompressAsync(
+                d_uncomp_ptrs,
+                d_uncomp_sizes,
+                max_chunk,
+                num_chunks,
+                d_temp,
+                temp_bytes,
+                d_comp_ptrs,
+                d_comp_sizes,
+                Default::default(),
+                d_statuses,
+                stream,
+            ),
             Algo::Bitcomp { data_type } => nvcompBatchedBitcompCompressAsync(
                 d_uncomp_ptrs,
                 d_uncomp_sizes,
@@ -595,6 +624,13 @@ fn decompress_get_temp_size(
                 total_uncomp,
             ),
             Algo::Zstd => nvcompBatchedZstdDecompressGetTempSizeAsync(
+                num_chunks,
+                chunk_size,
+                Default::default(),
+                &mut out,
+                total_uncomp,
+            ),
+            Algo::GDeflate => nvcompBatchedGdeflateDecompressGetTempSizeAsync(
                 num_chunks,
                 chunk_size,
                 Default::default(),
@@ -658,6 +694,19 @@ fn dispatch_decompress(
                 stream,
             ),
             Algo::Zstd => nvcompBatchedZstdDecompressAsync(
+                d_comp_ptrs,
+                d_comp_sizes,
+                d_uncomp_buf_sizes,
+                d_uncomp_actual_sizes,
+                num_chunks,
+                d_temp,
+                temp_bytes,
+                d_uncomp_ptrs,
+                Default::default(),
+                d_statuses,
+                stream,
+            ),
+            Algo::GDeflate => nvcompBatchedGdeflateDecompressAsync(
                 d_comp_ptrs,
                 d_comp_sizes,
                 d_uncomp_buf_sizes,

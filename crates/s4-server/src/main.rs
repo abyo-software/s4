@@ -38,6 +38,9 @@ enum CodecChoice {
     /// nvCOMP Bitcomp (整数列向け、要 nvcomp-gpu feature)
     #[cfg(feature = "nvcomp-gpu")]
     NvcompBitcomp,
+    /// nvCOMP GDeflate (DEFLATE-family GPU codec、要 nvcomp-gpu feature)
+    #[cfg(feature = "nvcomp-gpu")]
+    NvcompGdeflate,
 }
 
 impl CodecChoice {
@@ -49,6 +52,8 @@ impl CodecChoice {
             Self::NvcompZstd => CodecKind::NvcompZstd,
             #[cfg(feature = "nvcomp-gpu")]
             Self::NvcompBitcomp => CodecKind::NvcompBitcomp,
+            #[cfg(feature = "nvcomp-gpu")]
+            Self::NvcompGdeflate => CodecKind::NvcompGDeflate,
         }
     }
 }
@@ -216,7 +221,9 @@ fn build_registry(default: CodecKind, zstd_level: i32) -> Arc<CodecRegistry> {
         .with(Arc::new(CpuZstd::new(zstd_level)));
     #[cfg(feature = "nvcomp-gpu")]
     let reg = {
-        use s4_codec::nvcomp::{NvcompBitcompCodec, NvcompZstdCodec, is_gpu_available};
+        use s4_codec::nvcomp::{
+            NvcompBitcompCodec, NvcompGDeflateCodec, NvcompZstdCodec, is_gpu_available,
+        };
         if is_gpu_available() {
             let mut r = reg;
             match NvcompZstdCodec::new() {
@@ -226,6 +233,10 @@ fn build_registry(default: CodecKind, zstd_level: i32) -> Arc<CodecRegistry> {
             match NvcompBitcompCodec::default_general() {
                 Ok(c) => r = r.with(Arc::new(c)),
                 Err(e) => tracing::warn!("nvcomp-bitcomp init failed: {e}"),
+            }
+            match NvcompGDeflateCodec::new() {
+                Ok(c) => r = r.with(Arc::new(c)),
+                Err(e) => tracing::warn!("nvcomp-gdeflate init failed: {e}"),
             }
             r
         } else {

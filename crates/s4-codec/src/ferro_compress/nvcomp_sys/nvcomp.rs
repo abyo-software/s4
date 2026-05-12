@@ -465,6 +465,88 @@ unsafe extern "C" {
     ) -> nvcompStatus_t;
 }
 
+// ---------- GDeflate (v0.2 #9) ----------
+//
+// nvCOMP GDeflate is a GPU-parallelizable variant of DEFLATE. The batched
+// API surface mirrors zstd exactly — same parameter shapes, just renamed
+// symbols and a separate Opts struct (which carries an algorithm-id field).
+// Layout taken from `nvcomp/gdeflate.h` in nvCOMP 4.x; the 64-byte raw
+// padding pattern matches the other Opts types vendored above.
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct nvcompBatchedGdeflateCompressOpts_t {
+    pub raw: [u8; 64],
+}
+impl Default for nvcompBatchedGdeflateCompressOpts_t {
+    fn default() -> Self {
+        Self { raw: [0; 64] }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct nvcompBatchedGdeflateDecompressOpts_t {
+    pub raw: [u8; 64],
+}
+impl Default for nvcompBatchedGdeflateDecompressOpts_t {
+    fn default() -> Self {
+        Self { raw: [0; 64] }
+    }
+}
+
+unsafe extern "C" {
+    pub fn nvcompBatchedGdeflateCompressGetTempSizeAsync(
+        num_chunks: usize,
+        max_uncompressed_chunk_bytes: usize,
+        compress_opts: nvcompBatchedGdeflateCompressOpts_t,
+        temp_bytes: *mut usize,
+        max_total_uncompressed_bytes: usize,
+    ) -> nvcompStatus_t;
+
+    pub fn nvcompBatchedGdeflateCompressGetMaxOutputChunkSize(
+        max_uncompressed_chunk_bytes: usize,
+        compress_opts: nvcompBatchedGdeflateCompressOpts_t,
+        max_compressed_chunk_bytes: *mut usize,
+    ) -> nvcompStatus_t;
+
+    pub fn nvcompBatchedGdeflateCompressAsync(
+        device_uncompressed_chunk_ptrs: *const *const c_void,
+        device_uncompressed_chunk_bytes: *const usize,
+        max_uncompressed_chunk_bytes: usize,
+        num_chunks: usize,
+        device_temp_ptr: *mut c_void,
+        temp_bytes: usize,
+        device_compressed_chunk_ptrs: *const *mut c_void,
+        device_compressed_chunk_bytes: *mut usize,
+        compress_opts: nvcompBatchedGdeflateCompressOpts_t,
+        device_statuses: *mut nvcompStatus_t,
+        stream: cudaStream_t,
+    ) -> nvcompStatus_t;
+
+    pub fn nvcompBatchedGdeflateDecompressGetTempSizeAsync(
+        num_chunks: usize,
+        max_uncompressed_chunk_bytes: usize,
+        decompress_opts: nvcompBatchedGdeflateDecompressOpts_t,
+        temp_bytes: *mut usize,
+        max_total_uncompressed_bytes: usize,
+    ) -> nvcompStatus_t;
+
+    pub fn nvcompBatchedGdeflateDecompressAsync(
+        device_compressed_chunk_ptrs: *const *const c_void,
+        device_compressed_chunk_bytes: *const usize,
+        device_uncompressed_buffer_bytes: *const usize,
+        device_uncompressed_chunk_bytes: *mut usize,
+        num_chunks: usize,
+        device_temp_ptr: *mut c_void,
+        temp_bytes: usize,
+        device_uncompressed_chunk_ptrs: *const *mut c_void,
+        decompress_opts: nvcompBatchedGdeflateDecompressOpts_t,
+        device_statuses: *mut nvcompStatus_t,
+        stream: cudaStream_t,
+    ) -> nvcompStatus_t;
+}
+
 // nvCOMP returns a single status from each batched API. This helper turns a
 // non-zero status into a printable string via the inline error names above.
 pub fn status_str(status: nvcompStatus_t) -> &'static str {

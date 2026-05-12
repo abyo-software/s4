@@ -59,7 +59,10 @@ impl StringOrVec {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum PrincipalSet {
-    Wildcard(String),
+    /// `"Principal": "*"` — JSON string form. The string content is
+    /// untyped (only the string variant matters), so we accept any but
+    /// don't read the value.
+    Wildcard(#[allow(dead_code)] String),
     Map {
         #[serde(rename = "AWS", default)]
         aws: Option<StringOrVec>,
