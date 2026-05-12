@@ -46,6 +46,10 @@ tokio-util = { version = "0.7", features = ["io"] }
 pin-project-lite = "0.2"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "grpc-tonic"] }
+tracing-opentelemetry = "0.32"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

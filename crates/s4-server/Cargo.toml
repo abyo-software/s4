@@ -45,6 +45,10 @@ pin-project-lite.workspace = true
 http-body-util = "0.1"
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+tracing-opentelemetry.workspace = true
 
 s4-codec = { path = "../s4-codec" }
 s4-config = { path = "../s4-config" }

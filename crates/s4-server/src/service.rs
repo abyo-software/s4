@@ -368,6 +368,11 @@ fn resolve_range(range: &s3s::dto::Range, total: u64) -> Result<(u64, u64), Stri
 #[async_trait::async_trait]
 impl<B: S3> S3 for S4Service<B> {
     // === 圧縮を挟む path (PUT) ===
+    #[tracing::instrument(
+        name = "s4.put_object",
+        skip(self, req),
+        fields(bucket = %req.input.bucket, key = %req.input.key, codec, bytes_in, bytes_out, latency_ms)
+    )]
     async fn put_object(
         &self,
         mut req: S3Request<PutObjectInput>,
@@ -480,6 +485,11 @@ impl<B: S3> S3 for S4Service<B> {
     }
 
     // === 圧縮を解く path (GET) ===
+    #[tracing::instrument(
+        name = "s4.get_object",
+        skip(self, req),
+        fields(bucket = %req.input.bucket, key = %req.input.key, codec, bytes_out, range, path)
+    )]
     async fn get_object(
         &self,
         mut req: S3Request<GetObjectInput>,

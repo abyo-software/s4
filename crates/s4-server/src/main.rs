@@ -1,6 +1,10 @@
 //! S4 server binary。`s4-server::S4Service` で `s3s_aws::Proxy` を圧縮 hook 付きに
 //! ラップし、hyper-util 経由で公開する。
 
+// tracing-subscriber + OpenTelemetry の Layered<...> 型が深くなり trait
+// resolver の default depth (128) を超えるため、解決上限を 512 に上げる。
+#![recursion_limit = "512"]
+
 use std::error::Error;
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -100,28 +104,92 @@ struct Opt {
     /// ログ出力形式 (pretty / json)。production では json 推奨
     #[clap(long, value_enum, default_value = "pretty")]
     log_format: LogFormat,
+
+    /// OpenTelemetry OTLP gRPC endpoint (例: http://otel-collector:4317)。
+    /// 指定すると各 PUT/GET request が trace span として export される
+    #[clap(long)]
+    otlp_endpoint: Option<String>,
+
+    /// OTel resource service.name (default: "s4")
+    #[clap(long, default_value = "s4")]
+    service_name: String,
 }
 
-fn setup_tracing(format: LogFormat) {
+fn setup_tracing(
+    format: LogFormat,
+    otlp_endpoint: Option<&str>,
+    service_name: &str,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    match format {
-        LogFormat::Pretty => {
-            let enable_color = std::io::stdout().is_terminal();
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .with_ansi(enable_color)
+
+    // OTel layer を共通で構築 (Option)
+    let otel_layer = if let Some(endpoint) = otlp_endpoint {
+        use opentelemetry::trace::TracerProvider;
+        use opentelemetry_otlp::WithExportConfig;
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .build()?;
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_resource(
+                opentelemetry_sdk::Resource::builder()
+                    .with_service_name(service_name.to_owned())
+                    .build(),
+            )
+            .with_batch_exporter(exporter)
+            .build();
+        let tracer = provider.tracer(service_name.to_owned());
+        opentelemetry::global::set_tracer_provider(provider);
+        Some(tracing_opentelemetry::layer().with_tracer(tracer))
+    } else {
+        None
+    };
+
+    // OTel layer は Registry (LookupSpan を提供) の直上に置く必要がある。
+    // EnvFilter は fmt 層に per-layer filter として適用する形にして trait
+    // resolution の干渉を避ける。
+    use tracing_subscriber::Layer;
+    match (format, otel_layer) {
+        (LogFormat::Pretty, Some(otel)) => {
+            let fmt_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(std::io::stdout().is_terminal())
+                .with_filter(env_filter);
+            tracing_subscriber::registry()
+                .with(otel)
+                .with(fmt_layer)
                 .init();
         }
-        LogFormat::Json => {
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
+        (LogFormat::Pretty, None) => {
+            let fmt_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(std::io::stdout().is_terminal())
+                .with_filter(env_filter);
+            tracing_subscriber::registry().with(fmt_layer).init();
+        }
+        (LogFormat::Json, Some(otel)) => {
+            let fmt_layer = tracing_subscriber::fmt::layer()
                 .json()
                 .with_current_span(true)
                 .with_span_list(false)
+                .with_filter(env_filter);
+            tracing_subscriber::registry()
+                .with(otel)
+                .with(fmt_layer)
                 .init();
         }
+        (LogFormat::Json, None) => {
+            let fmt_layer = tracing_subscriber::fmt::layer()
+                .json()
+                .with_current_span(true)
+                .with_span_list(false)
+                .with_filter(env_filter);
+            tracing_subscriber::registry().with(fmt_layer).init();
+        }
     }
+    Ok(())
 }
 
 fn build_registry(default: CodecKind, zstd_level: i32) -> Arc<CodecRegistry> {
@@ -162,7 +230,11 @@ fn build_dispatcher(choice: DispatcherChoice, default: CodecKind) -> Arc<dyn Cod
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     let opt = Opt::parse();
-    setup_tracing(opt.log_format);
+    setup_tracing(
+        opt.log_format,
+        opt.otlp_endpoint.as_deref(),
+        &opt.service_name,
+    )?;
 
     let sdk_conf = aws_config::from_env()
         .endpoint_url(&opt.endpoint_url)
