@@ -50,6 +50,7 @@ opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "grpc-tonic"] }
 tracing-opentelemetry = "0.32"
+proptest = "1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

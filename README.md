@@ -167,7 +167,46 @@ export LD_LIBRARY_PATH=$NVCOMP_HOME/lib:$LD_LIBRARY_PATH
 cargo test --workspace --features s4-server/nvcomp-gpu -- --ignored
 ```
 
-主要な E2E カバレッジ:
+### Fuzz testing (proptest, stable Rust)
+
+```bash
+cargo test --test fuzz_parsers              # 各 property 256-512 cases
+PROPTEST_CASES=10000 cargo test --test fuzz_parsers   # 拡張 fuzz run
+```
+
+`tests/fuzz_parsers.rs` で以下の不変式を property-based に検証:
+
+- `read_frame(random_bytes)` / `decode_index(random_bytes)` は **panic せず Result**
+- `FrameIter` over random bytes は **必ず terminate** (1 byte 入力で無限 Err
+  ループ する初期実装バグを fuzz が発見、修正済)
+- `write_frame ↔ read_frame` / `encode_index ↔ decode_index` の roundtrip
+- `pad_to_minimum` の output サイズ ≥ min_total 不変式
+- `lookup_range` の返す `RangePlan` の slice index が in-bounds
+
+### Soak / load testing
+
+`scripts/soak/run.sh` で 24h+ 持続負荷を投げて memory leak / FD leak / connection
+pool 枯渇を検出する harness。Marketplace AMI 出品前の最終 production
+validation 用:
+
+```bash
+# default 24h, concurrency 16
+./scripts/soak/run.sh
+
+# 短い smoke run
+DURATION=300 CONCURRENCY=4 ./scripts/soak/run.sh
+
+# カスタム endpoint / bucket
+S4_ENDPOINT=http://localhost:8014 BUCKET=my-soak ./scripts/soak/run.sh
+```
+
+`/tmp/s4-soak/{date}/` に下記を出力:
+
+- `monitor.csv` — 1 分ごとの RSS / FD count / open conn / VmSize
+- `load.log` — PUT/GET 結果ログ
+- `summary.txt` — 最終サマリ + leak verdict (`final_rss < 2 × initial_rss` で pass)
+
+### E2E カバレッジ詳細
 - `tests/roundtrip.rs`: in-process trait roundtrip (4 tests、CpuZstd + Passthrough
   + multi-codec dispatch + raw object passthrough)
 - `tests/minio_e2e.rs`: MinIO container 経由 wire roundtrip (5 tests、CpuZstd +

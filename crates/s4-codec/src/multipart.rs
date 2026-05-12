@@ -155,24 +155,36 @@ pub fn read_frame(mut input: Bytes) -> Result<(FrameHeader, Bytes, Bytes), Frame
 ///
 /// `S4P1` (padding) を見つけたら header の length 分だけ skip して次に進む
 /// (= caller には見せない)。
+///
+/// **エラー時の振る舞い**: parse 失敗を 1 度返したら、それ以降 next() は `None`
+/// を返す (= iterator 終了)。これにより corrupt 入力に対する **無限ループ防止**
+/// (proptest fuzz で発覚)。
 pub struct FrameIter {
     rest: Bytes,
+    fused: bool,
 }
 
 impl FrameIter {
     pub fn new(input: Bytes) -> Self {
-        Self { rest: input }
+        Self {
+            rest: input,
+            fused: false,
+        }
     }
 }
 
 impl Iterator for FrameIter {
     type Item = Result<(FrameHeader, Bytes), FrameError>;
     fn next(&mut self) -> Option<Self::Item> {
+        if self.fused {
+            return None;
+        }
         loop {
             if self.rest.is_empty() {
                 return None;
             }
             if self.rest.len() < 4 {
+                self.fused = true;
                 return Some(Err(FrameError::TooShort(self.rest.len())));
             }
             let mut magic = [0u8; 4];
@@ -180,11 +192,13 @@ impl Iterator for FrameIter {
             if &magic == PADDING_MAGIC {
                 // skip padding frame: 4 magic + 8 len + len bytes
                 if self.rest.len() < PADDING_HEADER_BYTES {
+                    self.fused = true;
                     return Some(Err(FrameError::TooShort(self.rest.len())));
                 }
                 self.rest.advance(4);
                 let pad_len = self.rest.get_u64_le();
                 if (pad_len as usize) > self.rest.len() {
+                    self.fused = true;
                     return Some(Err(FrameError::PayloadTruncated {
                         compressed_size: pad_len,
                         remaining: self.rest.len(),
@@ -199,7 +213,10 @@ impl Iterator for FrameIter {
                     self.rest = remainder;
                     Some(Ok((hdr, payload)))
                 }
-                Err(e) => Some(Err(e)),
+                Err(e) => {
+                    self.fused = true;
+                    Some(Err(e))
+                }
             };
         }
     }
