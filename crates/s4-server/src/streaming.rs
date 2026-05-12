@@ -182,6 +182,26 @@ pub async fn streaming_compress_cpu_zstd(
 /// - CPU/GPU codec の per-call overhead が amortized
 pub const DEFAULT_S4F2_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
+/// v0.4 #16: pick a chunk size for `streaming_compress_to_frames` based on
+/// the request's `Content-Length` (when known). Smaller objects get smaller
+/// chunks (avoids carrying multi-MiB framing infrastructure on a 64 KiB
+/// upload); large objects get larger chunks (amortises GPU launch overhead
+/// and keeps the sidecar small).
+///
+/// Thresholds:
+/// - `None` (chunked transfer-encoding, size unknown): default 4 MiB
+/// - `<= 1 MiB`:           1 MiB (single chunk for small uploads)
+/// - `1 MiB ..= 100 MiB`:  4 MiB (the v0.2 #4 default; balanced)
+/// - `> 100 MiB`:          16 MiB (fewer frames → less sidecar / GPU overhead)
+pub fn pick_chunk_size(content_length: Option<u64>) -> usize {
+    match content_length {
+        None => DEFAULT_S4F2_CHUNK_SIZE,
+        Some(len) if len <= 1024 * 1024 => 1024 * 1024,
+        Some(len) if len <= 100 * 1024 * 1024 => DEFAULT_S4F2_CHUNK_SIZE,
+        Some(_) => 16 * 1024 * 1024,
+    }
+}
+
 /// `streaming_compress_to_frames` の default in-flight depth (v0.3 #12)。
 ///
 /// 同時に走らせる per-chunk compress task の数。chunk K-1 の compress 中に
@@ -360,6 +380,39 @@ mod tests {
     use bytes::BytesMut;
     use futures::stream;
     use futures::stream::StreamExt;
+
+    /// v0.4 #16: pick_chunk_size threshold table.
+    #[test]
+    fn pick_chunk_size_thresholds() {
+        // None (chunked transfer-encoding) → default 4 MiB
+        assert_eq!(pick_chunk_size(None), DEFAULT_S4F2_CHUNK_SIZE);
+        // <= 1 MiB → 1 MiB
+        assert_eq!(pick_chunk_size(Some(0)), 1024 * 1024);
+        assert_eq!(pick_chunk_size(Some(64 * 1024)), 1024 * 1024);
+        assert_eq!(pick_chunk_size(Some(1024 * 1024)), 1024 * 1024);
+        // 1 MiB ..= 100 MiB → 4 MiB (default)
+        assert_eq!(
+            pick_chunk_size(Some(1024 * 1024 + 1)),
+            DEFAULT_S4F2_CHUNK_SIZE
+        );
+        assert_eq!(
+            pick_chunk_size(Some(50 * 1024 * 1024)),
+            DEFAULT_S4F2_CHUNK_SIZE
+        );
+        assert_eq!(
+            pick_chunk_size(Some(100 * 1024 * 1024)),
+            DEFAULT_S4F2_CHUNK_SIZE
+        );
+        // > 100 MiB → 16 MiB
+        assert_eq!(
+            pick_chunk_size(Some(100 * 1024 * 1024 + 1)),
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            pick_chunk_size(Some(10 * 1024 * 1024 * 1024)),
+            16 * 1024 * 1024
+        );
+    }
 
     async fn collect(blob: StreamingBlob) -> Bytes {
         let mut buf = BytesMut::new();

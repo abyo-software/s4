@@ -46,7 +46,7 @@ use crate::blob::{
     bytes_to_blob, chain_sample_with_rest, collect_blob, collect_with_sample, peek_sample,
 };
 use crate::streaming::{
-    DEFAULT_S4F2_CHUNK_SIZE, cpu_zstd_decompress_stream, streaming_compress_to_frames,
+    cpu_zstd_decompress_stream, pick_chunk_size, streaming_compress_to_frames,
     supports_streaming_compress, supports_streaming_decompress,
 };
 
@@ -546,11 +546,15 @@ impl<B: S3> S3 for S4Service<B> {
                     path = "streaming-framed",
                     "S4 put_object: compressing (streaming, S4F2 multi-frame)"
                 );
+                // v0.4 #16: pick the chunk size based on the request's
+                // Content-Length when known, falling back to the 4 MiB
+                // default for chunked transfers.
+                let chunk_size = pick_chunk_size(req.input.content_length.map(|n| n as u64));
                 let (body, manifest) = streaming_compress_to_frames(
                     chained,
                     Arc::clone(&self.registry),
                     kind,
-                    DEFAULT_S4F2_CHUNK_SIZE,
+                    chunk_size,
                 )
                 .await
                 .map_err(internal("streaming framed compress"))?;
