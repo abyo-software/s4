@@ -45,6 +45,8 @@ use tracing::{debug, info};
 use crate::blob::{
     bytes_to_blob, chain_sample_with_rest, collect_blob, collect_with_sample, peek_sample,
 };
+#[cfg(feature = "nvcomp-gpu")]
+use crate::streaming::{DEFAULT_NVCOMP_STREAM_CHUNK_SIZE, streaming_compress_nvcomp_zstd};
 use crate::streaming::{
     cpu_zstd_decompress_stream, streaming_compress_cpu_zstd, streaming_passthrough,
     supports_streaming_compress, supports_streaming_decompress,
@@ -408,6 +410,11 @@ impl<B: S3> S3 for S4Service<B> {
                         streaming_compress_cpu_zstd(chained, 3).await
                     }
                     CodecKind::Passthrough => streaming_passthrough(chained).await,
+                    #[cfg(feature = "nvcomp-gpu")]
+                    CodecKind::NvcompZstd => {
+                        streaming_compress_nvcomp_zstd(chained, DEFAULT_NVCOMP_STREAM_CHUNK_SIZE)
+                            .await
+                    }
                     other => unreachable!("supports_streaming_compress lied: {other:?}"),
                 }
                 .map_err(internal("streaming compress"))?
