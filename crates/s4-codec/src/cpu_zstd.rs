@@ -79,8 +79,28 @@ impl Codec for CpuZstd {
         let expected_crc = manifest.crc32c;
         let expected_orig_size = manifest.original_size;
 
+        // **Zstd decompression bomb hardening**: 信頼できない入力 (改ざんされた
+        // sidecar / S3 上で bit flip / 攻撃者操作) で `decode_all` が無制限に
+        // 出力を伸ばすと OOM するので、`expected_orig_size + small margin` で
+        // 上限を hard-cap する。Decoder + Read::take パターンで実装。
         let decompressed = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
-            zstd::stream::decode_all(input.as_ref())
+            use std::io::Read;
+            // 1 KiB margin: zstd の internal buffer flush で多少 overshoot しても
+            // 検出できる余地を残す。expected_orig_size + margin を超えたら
+            // bomb 認定して error にする
+            let limit = expected_orig_size.saturating_add(1024);
+            let mut decoder = zstd::stream::Decoder::new(input.as_ref())?;
+            let mut buf = Vec::with_capacity(expected_orig_size as usize);
+            (&mut decoder).take(limit).read_to_end(&mut buf)?;
+            // limit 以上を消費したかチェック (= bomb)
+            if (buf.len() as u64) > expected_orig_size {
+                return Err(std::io::Error::other(format!(
+                    "zstd decompression bomb detected: produced {} bytes, manifest claimed {}",
+                    buf.len(),
+                    expected_orig_size
+                )));
+            }
+            Ok(buf)
         })
         .await??;
 

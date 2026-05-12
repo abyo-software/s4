@@ -170,18 +170,37 @@ cargo test --workspace --features s4-server/nvcomp-gpu -- --ignored
 ### Fuzz testing (proptest, stable Rust)
 
 ```bash
-cargo test --test fuzz_parsers              # 各 property 256-512 cases
-PROPTEST_CASES=10000 cargo test --test fuzz_parsers   # 拡張 fuzz run
+cargo test --test fuzz_parsers --test fuzz_server   # 29 properties × 256+ cases
+PROPTEST_CASES=10000 cargo test --test fuzz_parsers --test fuzz_server  # stress
 ```
 
-`tests/fuzz_parsers.rs` で以下の不変式を property-based に検証:
+`crates/s4-codec/tests/fuzz_parsers.rs` (低層 19 property):
 
-- `read_frame(random_bytes)` / `decode_index(random_bytes)` は **panic せず Result**
+- `read_frame(random)` / `decode_index(random)` は **panic せず Result**
 - `FrameIter` over random bytes は **必ず terminate** (1 byte 入力で無限 Err
-  ループ する初期実装バグを fuzz が発見、修正済)
+  ループする初期実装バグを fuzz が発見、修正済)
+- 巨大 `compressed_size` を主張する frame / 巨大 `length` を主張する padding
+  → memory 確保せず安全に error
 - `write_frame ↔ read_frame` / `encode_index ↔ decode_index` の roundtrip
-- `pad_to_minimum` の output サイズ ≥ min_total 不変式
+- `pad_to_minimum` の output サイズ ≥ min_total
 - `lookup_range` の返す `RangePlan` の slice index が in-bounds
+- **CpuZstd compress ↔ decompress roundtrip** (random input)
+- **CpuZstd 解凍 bomb 防御**: 1 KB payload + 10 GB 主張 manifest
+  → bounded memory で SizeMismatch (zstd `Decoder + take(limit)` で実装)
+- **CodecKind**: 全 variant の id ↔ from_id, as_str ↔ from_str roundtrip
+  + 未知 id は None (新 codec 追加時の漏れ検出)
+
+`crates/s4-server/tests/fuzz_server.rs` (server 層 10 property):
+
+- `resolve_range(Range::Int / Suffix, total)` は **u64 全範囲で panic / overflow
+  なし**、成功時は start ≤ end ≤ total、total=0 は必ず Err
+- `collect_blob` chunk 列順序保存 + max_bytes 超過は必ず Oversized
+- `peek_sample(blob, N)`: sample.len() ≤ N、sample + rest = 元 body
+- `SamplingDispatcher.pick(random)` は閉じた CodecKind enum 内の値しか返さない
+- `AlwaysDispatcher` は任意 input 不変
+
+stress run 結果: **29 properties × 10000 cases = 290,000 fuzz cases pass in 34 sec、
+zero failures** (`PROPTEST_CASES=10000` で実行確認済)。
 
 ### Soak / load testing
 

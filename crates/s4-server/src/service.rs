@@ -339,7 +339,7 @@ fn internal<E: std::fmt::Display>(prefix: &'static str) -> impl FnOnce(E) -> S3E
 /// `Range` request を decompressed object サイズ `total` に適用して `(start, end_exclusive)`
 /// を返す。`Range::Int { first, last }` は `bytes=first-last` (last は inclusive)、
 /// `Range::Suffix { length }` は末尾 `length` byte。S3 仕様に準拠。
-fn resolve_range(range: &s3s::dto::Range, total: u64) -> Result<(u64, u64), String> {
+pub fn resolve_range(range: &s3s::dto::Range, total: u64) -> Result<(u64, u64), String> {
     if total == 0 {
         return Err("cannot range-get zero-length object".into());
     }

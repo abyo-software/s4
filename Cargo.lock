@@ -3152,6 +3152,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "pin-project-lite",
+ "proptest",
  "reqwest",
  "s3s",
  "s3s-aws",

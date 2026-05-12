@@ -15,14 +15,16 @@
 
 use proptest::prelude::*;
 
-use s4_codec::CodecKind;
+use s4_codec::cpu_zstd::CpuZstd;
 use s4_codec::index::{FrameIndex, FrameIndexEntry, decode_index, encode_index};
 use s4_codec::multipart::{
-    FRAME_HEADER_BYTES, FrameHeader, FrameIter, S3_MULTIPART_MIN_PART_BYTES, pad_to_minimum,
-    read_frame, write_frame,
+    FRAME_HEADER_BYTES, FrameHeader, FrameIter, PADDING_HEADER_BYTES, PADDING_MAGIC,
+    S3_MULTIPART_MIN_PART_BYTES, pad_to_minimum, read_frame, write_frame,
 };
+use s4_codec::passthrough::Passthrough;
+use s4_codec::{ChunkManifest, Codec, CodecKind};
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 // ====== read_frame: 任意 bytes に対して panic せず Result を返す ======
 proptest! {
@@ -183,6 +185,180 @@ fn arb_frame_index(max_entries: usize) -> impl Strategy<Value = FrameIndex> {
                 entries,
             }
         })
+}
+
+// ====== Adversarial frame: 巨大 compressed_size 主張 → OOM 防止 ======
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 256, .. ProptestConfig::default()
+    })]
+
+    /// frame header に絶対あり得ない巨大 compressed_size を書き込んで read_frame
+    /// に投げる → 必ず PayloadTruncated を返す (memory 確保しない)
+    #[test]
+    fn adversarial_huge_compressed_size_doesnt_oom(
+        codec_id in 0u32..6,
+        original_size in any::<u64>(),
+        crc32c in any::<u32>(),
+        actual_payload_len in 0usize..256,
+        liar_factor in 1u64..u64::MAX,
+    ) {
+        let mut buf = BytesMut::with_capacity(FRAME_HEADER_BYTES + actual_payload_len);
+        buf.extend_from_slice(b"S4F2");
+        buf.put_u32_le(codec_id);
+        buf.put_u64_le(original_size);
+        // compressed_size を実際の payload_len より絶対大きく書く
+        buf.put_u64_le(actual_payload_len as u64 + liar_factor);
+        buf.put_u32_le(crc32c);
+        buf.resize(FRAME_HEADER_BYTES + actual_payload_len, 0);
+        let result = read_frame(buf.freeze());
+        // 巨大 size 主張 + 短い payload → 必ず PayloadTruncated か UnknownCodec
+        prop_assert!(result.is_err(), "huge compressed_size must fail, not allocate");
+    }
+
+    /// padding frame に巨大 length を書き込んで FrameIter に投げる → 必ず error
+    #[test]
+    fn adversarial_huge_padding_length_doesnt_oom(
+        liar_factor in 1u64..u64::MAX,
+        actual_pad_payload in 0usize..64,
+    ) {
+        let mut buf = BytesMut::with_capacity(PADDING_HEADER_BYTES + actual_pad_payload);
+        buf.extend_from_slice(PADDING_MAGIC);
+        buf.put_u64_le(actual_pad_payload as u64 + liar_factor);
+        buf.resize(PADDING_HEADER_BYTES + actual_pad_payload, 0);
+        let mut iter = FrameIter::new(buf.freeze());
+        let r = iter.next();
+        prop_assert!(matches!(r, Some(Err(_))), "huge padding length must fail safely");
+        // fused: 次は None
+        prop_assert!(iter.next().is_none(), "FrameIter must be fused after error");
+    }
+}
+
+// ====== Codec roundtrip + decompress robustness ======
+
+fn rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 64, .. ProptestConfig::default()
+    })]
+
+    /// CPU zstd: input bytes → compress → decompress = original bytes
+    #[test]
+    fn cpu_zstd_compress_decompress_roundtrips(
+        payload in proptest::collection::vec(any::<u8>(), 0..16384),
+        level in 1i32..=10,
+    ) {
+        let codec = CpuZstd::new(level);
+        let input = Bytes::from(payload);
+        let rt = rt();
+        rt.block_on(async {
+            let (compressed, manifest) = codec.compress(input.clone()).await.unwrap();
+            let decompressed = codec.decompress(compressed, &manifest).await.unwrap();
+            assert_eq!(decompressed, input);
+        });
+    }
+
+    /// Passthrough: input → compress → decompress = original (CRC 検証含む)
+    #[test]
+    fn passthrough_compress_decompress_roundtrips(
+        payload in proptest::collection::vec(any::<u8>(), 0..4096),
+    ) {
+        let codec = Passthrough;
+        let input = Bytes::from(payload);
+        let rt = rt();
+        rt.block_on(async {
+            let (compressed, manifest) = codec.compress(input.clone()).await.unwrap();
+            let decompressed = codec.decompress(compressed, &manifest).await.unwrap();
+            assert_eq!(decompressed, input);
+        });
+    }
+
+    /// adversarial: random bytes を CpuZstd.decompress に投げる → 必ず Err、決して panic / OOM しない
+    #[test]
+    fn cpu_zstd_decompress_random_input_no_panic(
+        random_payload in proptest::collection::vec(any::<u8>(), 0..2048),
+        manifest_orig_size in 0u64..1_000_000,
+    ) {
+        let codec = CpuZstd::default();
+        let payload_len = random_payload.len() as u64;
+        let manifest = ChunkManifest {
+            codec: CodecKind::CpuZstd,
+            original_size: manifest_orig_size,
+            compressed_size: payload_len,
+            crc32c: 0,
+        };
+        let rt = rt();
+        rt.block_on(async {
+            // 意図的に random input、ほぼすべて Err になる前提
+            let _ = codec.decompress(Bytes::from(random_payload), &manifest).await;
+            // 重要なのは panic しないこと、OOM しないこと (ここまで来れば OK)
+        });
+    }
+
+    /// 🔥 Zstd bomb: 小さい payload が巨大 manifest を主張する → bounded memory で error
+    #[test]
+    fn cpu_zstd_bomb_caps_at_manifest_size(
+        bomb_seed in 0u8..255,
+        big_claim in 1_000u64..10_000_000_000u64,  // up to 10 GB claim
+    ) {
+        // 1 KB のデータを作って圧縮 (実際の decompressed size は 1 KB)
+        let real_data = vec![bomb_seed; 1024];
+        let compressed = zstd::stream::encode_all(real_data.as_slice(), 3).unwrap();
+        // manifest を改ざん: original_size を巨大に主張 (= 攻撃者の sidecar 改ざん想定)
+        let bomb_manifest = ChunkManifest {
+            codec: CodecKind::CpuZstd,
+            original_size: big_claim,  // 嘘
+            compressed_size: compressed.len() as u64,
+            crc32c: 0,
+        };
+        let codec = CpuZstd::default();
+        let rt = rt();
+        rt.block_on(async {
+            // hardening 前: codec が big_claim 分のメモリを確保しようとして OOM
+            // hardening 後: take(big_claim + 1024) で読むが、実際の decompressed は
+            //               1 KB なので buf には 1 KB しか入らない、
+            //               次のサイズチェックで SizeMismatch を返す
+            let result = codec.decompress(Bytes::from(compressed), &bomb_manifest).await;
+            assert!(result.is_err(), "decompress must error on size mismatch (claim too big)");
+            // OOM しない = ここまで到達することが正解
+        });
+    }
+}
+
+// ====== CodecKind enum 完全性 ======
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 100, ..ProptestConfig::default() })]
+
+    /// 全 CodecKind variant の id ↔ from_id roundtrip (新 codec 追加時の漏れ検出)
+    #[test]
+    fn codec_kind_id_roundtrip(kind in arb_codec_kind()) {
+        let id = kind.id();
+        prop_assert_eq!(CodecKind::from_id(id), Some(kind));
+    }
+
+    /// 全 CodecKind variant の as_str ↔ parse roundtrip
+    #[test]
+    fn codec_kind_str_roundtrip(kind in arb_codec_kind()) {
+        let s = kind.as_str();
+        let parsed: CodecKind = s.parse().unwrap_or_else(|_| {
+            panic!("CodecKind::{:?}.as_str() = {:?} but parse failed", kind, s)
+        });
+        prop_assert_eq!(parsed, kind);
+    }
+
+    /// 未知 id は None を返す (panic しない)
+    #[test]
+    fn codec_kind_unknown_id_returns_none(unknown_id in 100u32..u32::MAX) {
+        prop_assert!(CodecKind::from_id(unknown_id).is_none());
+    }
 }
 
 proptest! {

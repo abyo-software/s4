@@ -60,3 +60,4 @@ testcontainers-modules = { version = "0.14", features = ["minio"] }
 zstd = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 metrics-exporter-prometheus.workspace = true
+proptest.workspace = true
