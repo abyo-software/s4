@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-05-12
+
+Five v0.3 milestone issues delivered (#10 #11 #12 #13 #14). Theme:
+operational polish for the v0.2 surface — TLS cert hot-reload + ACME
+auto-cert eliminate the "manage your own PEM" pain, IAM Conditions
+unlock real-world AWS bucket policies, GPU streaming pipelining
+gives 2.55× CPU compress + 1.4× GPU compress speedup, and the new
+benches/comparison/ stack lets anyone reproduce the head-to-head
+numbers vs Garage / MinIO.
+
+### Added
+
+- **TLS cert hot-reload on SIGHUP** (#10) — `kill -HUP <pid>` swaps
+  the cert/key without dropping in-flight connections; bad reloads
+  log WARN and keep the previous config so a deploy mistake never
+  causes a listener outage. New `s4_tls_cert_reload_total{result}`
+  Prometheus counter.
+- **ACME / Let's Encrypt auto-cert** (#11) — `--acme <domain>` plus
+  `--acme-contact` / `--acme-cache-dir` / `--acme-staging`. Uses
+  TLS-ALPN-01 challenge handled inline on the listening port (no
+  separate port-80 listener). Background renewal at the standard
+  ~60-day interval; new `s4_acme_renewal_total{result}` +
+  `s4_acme_cert_expiry_seconds` metrics.
+- **GPU streaming pipelining** (#12) — `streaming_compress_to_frames`
+  keeps `DEFAULT_S4F2_INFLIGHT = 3` chunks in flight via
+  `futures::stream::FuturesOrdered`, ordering preserved. Bench
+  (`bench_pipeline.rs` example): cpu-zstd 0.56 → 1.43 GB/s (**2.55×**),
+  nvcomp-zstd 0.56 → 0.78 GB/s (**1.4×**). Memory peak still bounded
+  (3 × chunk_size = 12 MiB input buffering vs sequential 4 MiB).
+- **IAM Condition support in bucket policy** (#13) —
+  `IpAddress` / `NotIpAddress` (CIDR), `StringEquals` / `StringLike` /
+  `StringNotEquals` / `StringNotLike`, `DateGreaterThan` /
+  `DateLessThan`, `Bool`. Well-known context keys: `aws:SourceIp`
+  (from `X-Forwarded-For`), `aws:UserAgent`, `aws:CurrentTime`,
+  `aws:SecureTransport`. New `Policy::evaluate_with(...)` API
+  taking a `RequestContext`; old `Policy::evaluate(...)` kept for
+  back-compat.
+- **Compression-ratio comparison bench scaffold** (#14) — new
+  `benches/comparison/` with `docker-compose.yml` + `garage.toml` +
+  `run.sh` driver. Brings up Garage (zstd L6) + MinIO (server-side
+  text compression) + S4 (cpu-zstd) + S4 (nvcomp-zstd) and writes
+  `bench-result.csv` with (workload, system, ratio, put/get secs).
+  Three workloads (nginx-log, parquet-like, random-bytes); Silesia
+  / real Parquet / peak RSS deferred to follow-up issues.
+- **Bench example** `bench_codecs.rs` extended with three typed-
+  numeric workloads (postings u32, timestamps i64, doc_values i64)
+  + `BitcompDataType` made public so callers can target the right
+  column shape — full 22-row codec × dataset × ratio table now in
+  the README.
+- **README cost-savings self-diagnostic** — five-row table from
+  $500/mo to $50,000/mo S3 bill plus an honest "if your bill is
+  under $1,000/mo, don't bother" note as a counterweight to the
+  headline 50–80% pitch.
+
+### Fixed
+
+- `MutexGuard` held across `await` (clippy `await_holding_lock`) in
+  two roundtrip tests after the v0.2 #4 framed-format refactor.
+- `aws_e2e` cred detection now also accepts a present
+  `~/.aws/credentials` or `~/.aws/config` (the `aws configure` /
+  `aws sso login` happy path), not just env vars.
+- `aws_s3_multipart_roundtrip_compresses_and_unframes` assertion
+  now honours the S3 multipart 5 MiB-per-part minimum (was claiming
+  >10× compression for what's mathematically capped at 2× on a
+  2-part upload).
+
 ## [0.2.0] — 2026-05-12
 
 Eight v0.2 milestone issues delivered (#1, #2, #3, #4, #5, #6, #7, #9 —
