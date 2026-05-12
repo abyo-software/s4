@@ -647,6 +647,121 @@ async fn policy_with_no_matching_statement_implicit_denies() {
     assert!(dbg.contains("AccessDenied"), "got {dbg}");
 }
 
+/// v0.4 #21: SSE-S4 (AES-256-GCM) compress→encrypt→PUT round-trip
+/// matches GET→decrypt→decompress. Backend bytes start with the S4E1
+/// magic; flipping any byte after the header makes GET fail with a
+/// hard auth-tag error (ciphertext tampering or wrong key).
+#[tokio::test]
+async fn sse_s4_roundtrip_and_tamper_detection() {
+    use s4_server::sse::SseKey;
+
+    let backend = MemoryBackend::new();
+    let backend_view = backend.shared();
+    let key = Arc::new(SseKey::from_bytes(&[42u8; 32]).unwrap());
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    )
+    .with_sse_key(Arc::clone(&key));
+
+    let payload =
+        Bytes::from(b"top secret payload that needs to be encrypted on the wire".repeat(50));
+    s4.put_object(put_request("bucket", "encrypted", payload.clone()))
+        .await
+        .expect("put");
+
+    // Snapshot the on-disk body and metadata before any GET so we can
+    // (a) confirm encryption shape and (b) tamper for the second test.
+    let (stored_body, stored_meta) = {
+        let inner = backend_view.lock().unwrap();
+        let s = inner
+            .get(&("bucket".into(), "encrypted".into()))
+            .unwrap()
+            .clone();
+        (s.body, s.metadata)
+    };
+    assert_eq!(
+        &stored_body[..4],
+        b"S4E1",
+        "encrypted body must start with S4E1 magic"
+    );
+    let meta = stored_meta.as_ref().expect("must have metadata");
+    assert_eq!(
+        meta.get("s4-encrypted").map(String::as_str),
+        Some("aes-256-gcm")
+    );
+
+    // Round-trip with the same gateway → original bytes.
+    let resp = s4
+        .get_object(get_request("bucket", "encrypted"))
+        .await
+        .expect("get");
+    assert_eq!(read_back(resp).await, payload);
+
+    // Tamper: flip a byte in the ciphertext, then GET fails with
+    // InternalError (we surface the AES-GCM auth-tag failure as such).
+    {
+        let mut inner = backend_view.lock().unwrap();
+        let stored = inner
+            .get_mut(&("bucket".into(), "encrypted".into()))
+            .unwrap();
+        let mut bytes = stored.body.to_vec();
+        let idx = bytes.len() - 1;
+        bytes[idx] ^= 0xff;
+        stored.body = Bytes::from(bytes);
+    }
+    let err = s4
+        .get_object(get_request("bucket", "encrypted"))
+        .await
+        .expect_err("tampered ciphertext must fail");
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("SSE-S4 decrypt failed"),
+        "expected SSE-S4 decrypt error, got {dbg}"
+    );
+}
+
+/// v0.4 #21: an object marked `s4-encrypted` but the gateway has no key
+/// configured returns InvalidRequest (= operator misconfig).
+#[tokio::test]
+async fn sse_s4_get_without_key_errors() {
+    use s4_server::sse::SseKey;
+
+    let backend = MemoryBackend::new();
+    let backend_view = backend.shared();
+    let key = Arc::new(SseKey::from_bytes(&[42u8; 32]).unwrap());
+    // PUT with a key
+    let s4_with_key = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    )
+    .with_sse_key(Arc::clone(&key));
+    s4_with_key
+        .put_object(put_request("bucket", "k", Bytes::from_static(b"data")))
+        .await
+        .expect("put");
+    let backend = s4_with_key.into_backend();
+
+    // GET via a fresh service that has NO key configured
+    let s4_no_key = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    );
+    let err = s4_no_key
+        .get_object(get_request("bucket", "k"))
+        .await
+        .expect_err("must require key");
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("no --sse-s4-key"),
+        "expected key-missing error, got {dbg}"
+    );
+    let _ = backend_view;
+}
+
 /// v0.2 #4 back-compat: a v0.1 object stored as raw compressed bytes (no
 /// `s4-framed` flag) must still GET correctly through v0.2.
 #[tokio::test]

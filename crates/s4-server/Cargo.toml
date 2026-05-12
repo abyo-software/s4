@@ -70,6 +70,9 @@ arc-swap = "1"
 rustls-acme = { version = "0.15", default-features = false, features = ["ring", "webpki-roots"] }
 governor = "0.10"
 dashmap = "6"
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
 
 s4-codec = { path = "../s4-codec", version = "0.3.0" }
 s4-config = { path = "../s4-config", version = "0.3.0" }

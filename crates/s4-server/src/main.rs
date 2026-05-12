@@ -173,6 +173,15 @@ struct Opt {
     #[clap(long)]
     rate_limit: Option<std::path::PathBuf>,
 
+    /// Optional server-side encryption key for SSE-S4 (AES-256-GCM).
+    /// Path to a 32-byte key file (raw bytes, 64-char hex, or 44-char
+    /// base64). When set, every PUT body gets wrapped with S4E1 after
+    /// compression + framing; every GET that's flagged `s4-encrypted`
+    /// gets decrypted before frame parse. The compress-then-encrypt
+    /// order preserves the codec's compression ratio.
+    #[clap(long)]
+    sse_s4_key: Option<std::path::PathBuf>,
+
     /// Optional S3-style access-log destination directory. When set,
     /// every completed PUT / GET / DELETE / List request is buffered
     /// and flushed to hourly-rotated `.log` files under the directory.
@@ -341,6 +350,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // (--acme) qualifies.
     let listener_secure = opt.tls_cert.is_some() || opt.acme.is_some();
     s4 = s4.with_secure_transport(listener_secure);
+    if let Some(ref key_path) = opt.sse_s4_key {
+        let key = s4_server::sse::SseKey::from_path(key_path)
+            .map_err(|e| format!("--sse-s4-key {}: {e}", key_path.display()))?;
+        info!(path = %key_path.display(), "S4 SSE-S4 key loaded (AES-256-GCM)");
+        s4 = s4.with_sse_key(std::sync::Arc::new(key));
+    }
     if let Some(ref dir) = opt.access_log {
         let dest = s4_server::access_log::AccessLogDest { dir: dir.clone() };
         let log = std::sync::Arc::new(s4_server::access_log::AccessLog::new(dest));

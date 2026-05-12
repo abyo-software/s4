@@ -78,6 +78,11 @@ pub struct S4Service<B: S3> {
     rate_limits: Option<crate::rate_limit::SharedRateLimits>,
     /// v0.4 #20: optional S3-style access log emitter.
     access_log: Option<crate::access_log::SharedAccessLog>,
+    /// v0.4 #21: optional server-side encryption key (AES-256-GCM).
+    /// When set, every PUT body gets wrapped in S4E1 after the compress
+    /// and framing steps; every GET that smells like S4E1 gets
+    /// decrypted before frame parsing.
+    sse_key: Option<crate::sse::SharedSseKey>,
 }
 
 impl<B: S3> S4Service<B> {
@@ -98,7 +103,19 @@ impl<B: S3> S4Service<B> {
             secure_transport: false,
             rate_limits: None,
             access_log: None,
+            sse_key: None,
         }
+    }
+
+    /// v0.4 #21: attach a server-side encryption key. When set, S4 wraps
+    /// every PUT body with AES-256-GCM (S4E1 wire format) AFTER
+    /// compression + framing, and unwraps it on GET before frame parse.
+    /// Encrypt-after-compress preserves the codec ratio (encrypted bytes
+    /// don't compress).
+    #[must_use]
+    pub fn with_sse_key(mut self, key: crate::sse::SharedSseKey) -> Self {
+        self.sse_key = Some(key);
+        self
     }
 
     /// v0.4 #20: attach an S3-style access-log emitter. Each completed
@@ -558,6 +575,15 @@ fn is_framed_v2_object(metadata: &Option<Metadata>) -> bool {
         .unwrap_or(false)
 }
 
+/// v0.4 #21: detect SSE-S4 by the metadata flag we set on PUT.
+fn is_sse_encrypted(metadata: &Option<Metadata>) -> bool {
+    metadata
+        .as_ref()
+        .and_then(|m| m.get("s4-encrypted"))
+        .map(|v| v == "aes-256-gcm")
+        .unwrap_or(false)
+}
+
 fn extract_manifest(metadata: &Option<Metadata>) -> Option<ChunkManifest> {
     let m = metadata.as_ref()?;
     let codec = m
@@ -732,7 +758,20 @@ impl<B: S3> S3 for S4Service<B> {
             } else {
                 None
             };
-            req.input.body = Some(bytes_to_blob(compressed));
+            // v0.4 #21: encrypt-after-compress. Wraps the post-framing
+            // body with AES-256-GCM (S4E1) when --sse-s4-key is set.
+            // Sidecar is built from the *unencrypted* framed body so the
+            // S4F2 frame iterator can still parse it post-decrypt on GET.
+            let body_to_send = if let Some(key) = self.sse_key.as_ref() {
+                req.input
+                    .metadata
+                    .get_or_insert_with(Default::default)
+                    .insert("s4-encrypted".into(), "aes-256-gcm".into());
+                crate::sse::encrypt(key, &compressed)
+            } else {
+                compressed.clone()
+            };
+            req.input.body = Some(bytes_to_blob(body_to_send));
             let backend_resp = self.backend.put_object(req).await;
             if let Some(idx) = sidecar_index
                 && backend_resp.is_ok()
@@ -836,6 +875,31 @@ impl<B: S3> S3 for S4Service<B> {
         }
 
         if let Some(blob) = resp.output.body.take() {
+            // v0.4 #21: if the object was stored under SSE-S4 (metadata
+            // flag `s4-encrypted: aes-256-gcm`), we MUST decrypt before
+            // any frame parse / streaming decompress. Encrypted bodies
+            // are opaque to the codec; this also forces the buffered
+            // path because AES-GCM needs the full body for tag verify.
+            let blob = if is_sse_encrypted(&resp.output.metadata) {
+                let key = self.sse_key.as_ref().ok_or_else(|| {
+                    S3Error::with_message(
+                        S3ErrorCode::InvalidRequest,
+                        "object is SSE-S4 encrypted but no --sse-s4-key is configured on this gateway",
+                    )
+                })?;
+                let body = collect_blob(blob, self.max_body_bytes)
+                    .await
+                    .map_err(internal("collect SSE-encrypted body"))?;
+                let plain = crate::sse::decrypt(key, &body).map_err(|e| {
+                    S3Error::with_message(
+                        S3ErrorCode::InternalError,
+                        format!("SSE-S4 decrypt failed: {e}"),
+                    )
+                })?;
+                bytes_to_blob(plain)
+            } else {
+                blob
+            };
             // ====== Streaming fast path (CpuZstd, non-multipart, codec supports it) ======
             // 大規模 object (e.g. 5 GB) を memory に collect すると OOM するので、
             // codec が streaming-aware なら body を chunk-by-chunk で decompress して

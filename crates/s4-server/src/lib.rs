@@ -8,6 +8,7 @@ pub mod policy;
 pub mod rate_limit;
 pub mod routing;
 pub mod service;
+pub mod sse;
 pub mod streaming;
 pub mod tls;
 
