@@ -37,8 +37,13 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
-/// Frame magic = ASCII "S4F1" (S4 Frame, version 1).
-pub const FRAME_MAGIC: &[u8; 4] = b"S4F1";
+use crate::CodecKind;
+
+/// Frame magic = ASCII "S4F2" (S4 Frame, version 2)。
+/// v1 (S4F1) との違い: 4 byte の codec_id field を header に追加し、per-frame
+/// codec dispatch を可能にした。`s4-codec` v0.0.x は v1 を読まない (released 前
+/// なので backward compat 不要)。
+pub const FRAME_MAGIC: &[u8; 4] = b"S4F2";
 /// Padding frame magic = ASCII "S4P1" (S4 Padding, version 1)。
 ///
 /// AWS S3 は multipart の non-final part に min 5 MB 制約を課すが、S4 が圧縮すると
@@ -47,7 +52,8 @@ pub const FRAME_MAGIC: &[u8; 4] = b"S4F1";
 /// [len bytes of zeros]` を書き込んで全体を S3 の最小サイズまで膨らませる。
 /// `FrameIter` は padding を skip するので decode 側は意識不要。
 pub const PADDING_MAGIC: &[u8; 4] = b"S4P1";
-pub const FRAME_HEADER_BYTES: usize = 4 + 8 + 8 + 4; // = 24
+/// 4 (magic) + 4 (codec_id) + 8 (orig_size) + 8 (compressed_size) + 4 (crc32c) = 28
+pub const FRAME_HEADER_BYTES: usize = 4 + 4 + 8 + 8 + 4;
 pub const PADDING_HEADER_BYTES: usize = 4 + 8; // = 12
 
 /// AWS S3 の non-final multipart part の最小サイズ (5 MiB)。
@@ -55,6 +61,7 @@ pub const S3_MULTIPART_MIN_PART_BYTES: usize = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
+    pub codec: CodecKind,
     pub original_size: u64,
     pub compressed_size: u64,
     pub crc32c: u32,
@@ -71,6 +78,8 @@ pub enum FrameError {
         compressed_size: u64,
         remaining: usize,
     },
+    #[error("unknown codec id {0} in frame header (decoder out of date?)")]
+    UnknownCodec(u32),
 }
 
 /// 1 フレーム分を直列化: header + payload を `dst` に追記。
@@ -78,6 +87,7 @@ pub fn write_frame(dst: &mut BytesMut, header: FrameHeader, payload: &[u8]) {
     debug_assert_eq!(payload.len() as u64, header.compressed_size);
     dst.reserve(FRAME_HEADER_BYTES + payload.len());
     dst.put_slice(FRAME_MAGIC);
+    dst.put_u32_le(header.codec.id());
     dst.put_u64_le(header.original_size);
     dst.put_u64_le(header.compressed_size);
     dst.put_u32_le(header.crc32c);
@@ -117,6 +127,8 @@ pub fn read_frame(mut input: Bytes) -> Result<(FrameHeader, Bytes, Bytes), Frame
         });
     }
     input.advance(4);
+    let codec_id = input.get_u32_le();
+    let codec = CodecKind::from_id(codec_id).ok_or(FrameError::UnknownCodec(codec_id))?;
     let original_size = input.get_u64_le();
     let compressed_size = input.get_u64_le();
     let crc32c = input.get_u32_le();
@@ -129,6 +141,7 @@ pub fn read_frame(mut input: Bytes) -> Result<(FrameHeader, Bytes, Bytes), Frame
     let payload = input.split_to(compressed_size as usize);
     Ok((
         FrameHeader {
+            codec,
             original_size,
             compressed_size,
             crc32c,
@@ -200,6 +213,7 @@ mod tests {
     fn frame_roundtrip_single() {
         let payload = Bytes::from_static(b"hello frame payload");
         let header = FrameHeader {
+            codec: CodecKind::CpuZstd,
             original_size: 999,
             compressed_size: payload.len() as u64,
             crc32c: 0xdead_beef,
@@ -215,14 +229,23 @@ mod tests {
     }
 
     #[test]
-    fn frame_iter_walks_all_frames() {
+    fn frame_iter_walks_all_frames_with_mixed_codecs() {
+        // 異なる codec で 5 frame を交互に書く → reader が per-frame codec を返すこと
+        let codecs = [
+            CodecKind::Passthrough,
+            CodecKind::CpuZstd,
+            CodecKind::NvcompZstd,
+            CodecKind::NvcompBitcomp,
+            CodecKind::DietGpuAns,
+        ];
         let mut buf = BytesMut::new();
-        for i in 0..5u32 {
-            let payload = vec![i as u8; (i as usize + 1) * 4];
+        for (i, codec) in codecs.iter().enumerate() {
+            let payload = vec![i as u8; (i + 1) * 4];
             let h = FrameHeader {
+                codec: *codec,
                 original_size: 100 + i as u64,
                 compressed_size: payload.len() as u64,
-                crc32c: i,
+                crc32c: i as u32,
             };
             write_frame(&mut buf, h, &payload);
         }
@@ -231,6 +254,7 @@ mod tests {
             .unwrap();
         assert_eq!(total.len(), 5);
         for (i, (h, payload)) in total.iter().enumerate() {
+            assert_eq!(h.codec, codecs[i], "codec must be preserved per frame");
             assert_eq!(h.original_size, 100 + i as u64);
             assert_eq!(h.crc32c, i as u32);
             assert_eq!(payload.len(), (i + 1) * 4);
@@ -241,6 +265,7 @@ mod tests {
     fn frame_bad_magic_rejected() {
         let mut buf = BytesMut::with_capacity(FRAME_HEADER_BYTES);
         buf.put_slice(b"BAD!");
+        buf.put_u32_le(0); // codec_id
         buf.put_u64_le(0);
         buf.put_u64_le(0);
         buf.put_u32_le(0);
@@ -253,11 +278,24 @@ mod tests {
         // header says 100 bytes payload, but we provide 0
         let mut buf = BytesMut::with_capacity(FRAME_HEADER_BYTES);
         buf.put_slice(FRAME_MAGIC);
+        buf.put_u32_le(CodecKind::CpuZstd.id());
         buf.put_u64_le(100);
         buf.put_u64_le(100);
         buf.put_u32_le(0);
         let err = read_frame(buf.freeze()).unwrap_err();
         assert!(matches!(err, FrameError::PayloadTruncated { .. }));
+    }
+
+    #[test]
+    fn frame_unknown_codec_rejected() {
+        let mut buf = BytesMut::with_capacity(FRAME_HEADER_BYTES);
+        buf.put_slice(FRAME_MAGIC);
+        buf.put_u32_le(99); // unknown codec id
+        buf.put_u64_le(0);
+        buf.put_u64_le(0);
+        buf.put_u32_le(0);
+        let err = read_frame(buf.freeze()).unwrap_err();
+        assert!(matches!(err, FrameError::UnknownCodec(99)));
     }
 
     #[test]
@@ -275,6 +313,7 @@ mod tests {
         write_frame(
             &mut buf,
             FrameHeader {
+                codec: CodecKind::CpuZstd,
                 original_size: 11,
                 compressed_size: p1.len() as u64,
                 crc32c: 0,
@@ -289,6 +328,7 @@ mod tests {
         write_frame(
             &mut buf,
             FrameHeader {
+                codec: CodecKind::CpuZstd,
                 original_size: 12,
                 compressed_size: p2.len() as u64,
                 crc32c: 0,
@@ -322,6 +362,7 @@ mod tests {
         write_frame(
             &mut buf,
             FrameHeader {
+                codec: CodecKind::Passthrough,
                 original_size: 0,
                 compressed_size: 0,
                 crc32c: 0,

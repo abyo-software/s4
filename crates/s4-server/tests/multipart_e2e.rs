@@ -222,11 +222,12 @@ async fn multipart_upload_through_s4_with_per_part_compression() {
         full_payload.len(),
         raw_bytes.len()
     );
-    // 最低 1 つの S4F1 magic が入っているはず
-    let needle = b"S4F1";
+    // 最低 1 つの S4F2 magic が入っているはず (per-part codec dispatch 対応で
+    // frame format を v1 → v2 に bump、24 → 28 byte header)
+    let needle = b"S4F2";
     assert!(
         raw_bytes.windows(4).any(|w| w == needle),
-        "MinIO object should contain S4F1 frame magic"
+        "MinIO object should contain S4F2 frame magic"
     );
 
     let _ = shutdown.send(());

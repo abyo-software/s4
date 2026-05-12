@@ -89,24 +89,10 @@ impl<B: S3> S4Service<B> {
 
     /// Multipart object (frame 列) を解凍 → 元 bytes を再構築。
     ///
-    /// 各 frame の codec は object metadata の `s4-codec` で全 part 共通という前提。
-    /// (Phase 2 で per-frame codec ID を入れる可能性あり、その時はここを拡張)
-    async fn decompress_multipart(
-        &self,
-        bytes: bytes::Bytes,
-        metadata: &Option<Metadata>,
-    ) -> S3Result<bytes::Bytes> {
-        let codec_kind = metadata
-            .as_ref()
-            .and_then(|m| m.get(META_CODEC))
-            .and_then(|s| s.parse::<CodecKind>().ok())
-            .ok_or_else(|| {
-                S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    "multipart object missing s4-codec metadata",
-                )
-            })?;
-
+    /// **per-frame codec dispatch**: 各 frame header に codec_id が入っているので、
+    /// frame ごとに registry が違う codec を呼ぶことができる。同一 object 内で
+    /// 異なる codec が混在していても透過的に解凍可能 (parquet 風 mixed columns 等)。
+    async fn decompress_multipart(&self, bytes: bytes::Bytes) -> S3Result<bytes::Bytes> {
         let mut out = BytesMut::new();
         for frame in FrameIter::new(bytes) {
             let (header, payload) = frame.map_err(|e| {
@@ -116,7 +102,7 @@ impl<B: S3> S4Service<B> {
                 )
             })?;
             let chunk_manifest = ChunkManifest {
-                codec: codec_kind,
+                codec: header.codec,
                 original_size: header.original_size,
                 compressed_size: header.compressed_size,
                 crc32c: header.crc32c,
@@ -411,8 +397,7 @@ impl<B: S3> S3 for S4Service<B> {
                 .map_err(internal("collect get body"))?;
 
             let decompressed = if is_multipart {
-                self.decompress_multipart(bytes, &resp.output.metadata)
-                    .await?
+                self.decompress_multipart(bytes).await?
             } else {
                 let manifest = manifest_opt.as_ref().expect("non-multipart guarded above");
                 self.registry
@@ -633,14 +618,15 @@ impl<B: S3> S3 for S4Service<B> {
     ) -> S3Result<S3Response<UploadPartOutput>> {
         // 各 part を圧縮して frame header 付きで forward。GET 時に
         // `decompress_multipart` が frame iter で順に解凍する。
+        // **per-part codec dispatch**: dispatcher が body 先頭 sample から
+        // codec を選ぶので、parquet 風の mixed-content multipart で part ごとに
+        // 最適 codec を使える (整数列 part → Bitcomp、text 列 part → zstd 等)。
         if let Some(blob) = req.input.body.take() {
             let bytes = collect_blob(blob, self.max_body_bytes)
                 .await
                 .map_err(internal("collect upload_part body"))?;
-            // codec は registry の default を使う (multipart は uniform codec)。
-            // create_multipart_upload で metadata に書いた codec と整合する
-            // 必要があるが、現状は同じ S4Service インスタンス前提なので一致する
-            let codec_kind = self.registry.default_kind();
+            let sample_len = bytes.len().min(SAMPLE_BYTES);
+            let codec_kind = self.dispatcher.pick(&bytes[..sample_len]).await;
             let original_size = bytes.len() as u64;
             let (compressed, manifest) = self
                 .registry
@@ -648,6 +634,7 @@ impl<B: S3> S3 for S4Service<B> {
                 .await
                 .map_err(internal("registry compress part"))?;
             let header = FrameHeader {
+                codec: codec_kind,
                 original_size,
                 compressed_size: compressed.len() as u64,
                 crc32c: manifest.crc32c,

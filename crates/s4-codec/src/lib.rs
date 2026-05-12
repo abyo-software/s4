@@ -45,6 +45,31 @@ impl CodecKind {
             Self::CpuZstd => "cpu-zstd",
         }
     }
+
+    /// 安定 numeric ID。`s4-codec/multipart.rs` の frame header に書き込む際に使う。
+    /// ⚠️ **この値は wire format の一部** — 既存値の変更禁止 (新 codec は新 ID を割当)。
+    pub fn id(self) -> u32 {
+        match self {
+            Self::Passthrough => 0,
+            Self::CpuZstd => 1,
+            Self::NvcompZstd => 2,
+            Self::NvcompBitcomp => 3,
+            Self::NvcompGans => 4,
+            Self::DietGpuAns => 5,
+        }
+    }
+
+    pub fn from_id(id: u32) -> Option<Self> {
+        Some(match id {
+            0 => Self::Passthrough,
+            1 => Self::CpuZstd,
+            2 => Self::NvcompZstd,
+            3 => Self::NvcompBitcomp,
+            4 => Self::NvcompGans,
+            5 => Self::DietGpuAns,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
