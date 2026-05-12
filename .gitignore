@@ -1,0 +1,38 @@
+# 企画書(社内ドキュメント、git 管理対象外)
+S4_PROPOSAL.md
+
+# Rust build artifacts
+target/
+Cargo.lock.bak
+**/*.rs.bk
+
+# 環境設定・秘密情報
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials
+.aws/
+
+# IDE / エディタ
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Node (将来 docs / web で使う場合)
+node_modules/
+
+# ログ・一時ファイル
+*.log
+tmp/
+.cache/
+
+# Python (検証スクリプト用)
+__pycache__/
+*.pyc
+.venv/
+venv/
