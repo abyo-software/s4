@@ -211,6 +211,72 @@ async fn http_roundtrip_through_full_s4_stack() {
 
 #[tokio::test]
 #[ignore = "requires Docker for MinIO container"]
+async fn http_range_get_on_s4_compressed_object_returns_partial_bytes() {
+    // S4 で圧縮された object に Range request を送って、part 抜き出しが
+    // 正しく返ることを wire-level で検証 (parquet/ORC reader 互換の核機能)
+    let minio = start_minio().await;
+    let (s4_endpoint, shutdown) = spawn_s4_server(&minio.endpoint_url).await;
+    let backend = build_aws_client(&minio.endpoint_url);
+    let _ = backend.create_bucket().bucket("range-e2e").send().await;
+
+    let s4_client = build_aws_client(&s4_endpoint);
+
+    // PUT 100 KB (zstd で大幅圧縮されるが decompress 後 100 KB)
+    let payload: Vec<u8> = (0..100_000u32).map(|i| (i & 0xff) as u8).collect();
+    let payload_bytes = Bytes::from(payload.clone());
+    s4_client
+        .put_object()
+        .bucket("range-e2e")
+        .key("ramp.bin")
+        .body(payload_bytes.clone().into())
+        .send()
+        .await
+        .expect("put");
+
+    // Case 1: 中間 1000 byte を取得 (bytes=50000-50999)
+    let resp = s4_client
+        .get_object()
+        .bucket("range-e2e")
+        .key("ramp.bin")
+        .range("bytes=50000-50999")
+        .send()
+        .await
+        .expect("range get mid");
+    let body = resp.body.collect().await.expect("body").into_bytes();
+    assert_eq!(body.len(), 1000);
+    assert_eq!(body.as_ref(), &payload[50000..51000]);
+
+    // Case 2: 末尾 256 byte を取得 (bytes=-256, suffix range)
+    let resp = s4_client
+        .get_object()
+        .bucket("range-e2e")
+        .key("ramp.bin")
+        .range("bytes=-256")
+        .send()
+        .await
+        .expect("range get suffix");
+    let body = resp.body.collect().await.expect("body").into_bytes();
+    assert_eq!(body.len(), 256);
+    assert_eq!(body.as_ref(), &payload[100_000 - 256..]);
+
+    // Case 3: 先頭から (bytes=0-99)
+    let resp = s4_client
+        .get_object()
+        .bucket("range-e2e")
+        .key("ramp.bin")
+        .range("bytes=0-99")
+        .send()
+        .await
+        .expect("range get prefix");
+    let body = resp.body.collect().await.expect("body").into_bytes();
+    assert_eq!(body.len(), 100);
+    assert_eq!(body.as_ref(), &payload[..100]);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
 async fn http_metrics_endpoint_exposes_prometheus_text() {
     let minio = start_minio().await;
     let (s4_endpoint, shutdown) = spawn_s4_server(&minio.endpoint_url).await;

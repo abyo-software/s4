@@ -182,6 +182,35 @@ fn internal<E: std::fmt::Display>(prefix: &'static str) -> impl FnOnce(E) -> S3E
     move |e| S3Error::with_message(S3ErrorCode::InternalError, format!("{prefix}: {e}"))
 }
 
+/// `Range` request を decompressed object サイズ `total` に適用して `(start, end_exclusive)`
+/// を返す。`Range::Int { first, last }` は `bytes=first-last` (last は inclusive)、
+/// `Range::Suffix { length }` は末尾 `length` byte。S3 仕様に準拠。
+fn resolve_range(range: &s3s::dto::Range, total: u64) -> Result<(u64, u64), String> {
+    if total == 0 {
+        return Err("cannot range-get zero-length object".into());
+    }
+    match range {
+        s3s::dto::Range::Int { first, last } => {
+            let start = *first;
+            let end_inclusive = match last {
+                Some(l) => (*l).min(total - 1),
+                None => total - 1,
+            };
+            if start > end_inclusive || start >= total {
+                return Err(format!(
+                    "range bytes={start}-{:?} out of object size {total}",
+                    last
+                ));
+            }
+            Ok((start, end_inclusive + 1))
+        }
+        s3s::dto::Range::Suffix { length } => {
+            let len = (*length).min(total);
+            Ok((total - len, total))
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl<B: S3> S3 for S4Service<B> {
     // === 圧縮を挟む path (PUT) ===
@@ -294,43 +323,16 @@ impl<B: S3> S3 for S4Service<B> {
     // === 圧縮を解く path (GET) ===
     async fn get_object(
         &self,
-        req: S3Request<GetObjectInput>,
+        mut req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let get_start = Instant::now();
         let get_bucket = req.input.bucket.clone();
         let get_key = req.input.key.clone();
-        // Range GET は currently 非対応 (multipart frame parser が full-object 前提で
-        // 動くため)。Range が指定されていたら head_object で codec metadata を見て、
-        // S4-managed object なら 416 で reject (silent corruption より明確な拒否)。
-        // 通常 (S4 が触っていない) object なら range を素通しさせる。
-        if req.input.range.is_some() {
-            let head_input = HeadObjectInput {
-                bucket: req.input.bucket.clone(),
-                key: req.input.key.clone(),
-                ..Default::default()
-            };
-            let head_req = S3Request {
-                input: head_input,
-                method: req.method.clone(),
-                uri: req.uri.clone(),
-                headers: req.headers.clone(),
-                extensions: http::Extensions::new(),
-                credentials: req.credentials.clone(),
-                region: req.region.clone(),
-                service: req.service.clone(),
-                trailing_headers: None,
-            };
-            if let Ok(head) = self.backend.head_object(head_req).await
-                && (is_multipart_object(&head.output.metadata)
-                    || extract_manifest(&head.output.metadata).is_some())
-            {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InvalidRange,
-                    "Range GET on S4-compressed objects is not supported in Phase 1; \
-                     issue full-object GET (omit Range header)",
-                ));
-            }
-        }
+        // Range request の事前検出 (decompress 後 slice する path に使う)。
+        // S4-managed object に対する Range は full-object decompress + slice で
+        // 実装する (= 帯域節約はないが意味的に正しい)。Phase 2.1 で frame index
+        // sidecar を経由した部分 fetch + decompress に最適化予定。
+        let range_request = req.input.range.take();
         let mut resp = self.backend.get_object(req).await?;
         let is_multipart = is_multipart_object(&resp.output.metadata);
         let manifest_opt = extract_manifest(&resp.output.metadata);
@@ -346,7 +348,11 @@ impl<B: S3> S3 for S4Service<B> {
             // 大規模 object (e.g. 5 GB) を memory に collect すると OOM するので、
             // codec が streaming-aware なら body を chunk-by-chunk で decompress して
             // 即座に client に流す。
-            if !is_multipart
+            //
+            // ただし Range request 時は streaming できない (slice するため total bytes
+            // が必要) → buffered path に fall through。
+            if range_request.is_none()
+                && !is_multipart
                 && let Some(ref m) = manifest_opt
                 && supports_streaming_decompress(m.codec)
                 && m.codec == CodecKind::CpuZstd
@@ -381,8 +387,9 @@ impl<B: S3> S3 for S4Service<B> {
                 );
                 return Ok(resp);
             }
-            // Passthrough: そのまま流す
-            if !is_multipart
+            // Passthrough: そのまま流す (Range なしの場合のみ streaming)
+            if range_request.is_none()
+                && !is_multipart
                 && let Some(ref m) = manifest_opt
                 && m.codec == CodecKind::Passthrough
             {
@@ -414,9 +421,23 @@ impl<B: S3> S3 for S4Service<B> {
                     .map_err(internal("registry decompress"))?
             };
 
+            // Range request があれば slice。なければ full body を返す。
+            let total_size = decompressed.len() as u64;
+            let (final_bytes, status_override) = if let Some(r) = range_request.as_ref() {
+                let (start, end) = resolve_range(r, total_size)
+                    .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, e))?;
+                let sliced = decompressed.slice(start as usize..end as usize);
+                resp.output.content_range = Some(format!(
+                    "bytes {start}-{}/{total_size}",
+                    end.saturating_sub(1)
+                ));
+                (sliced, Some(http::StatusCode::PARTIAL_CONTENT))
+            } else {
+                (decompressed, None)
+            };
             // 解凍後の真のサイズを返す (S3 client は content_length を信頼するので
             // 圧縮 size のままだと downstream が body を途中で切ってしまう)
-            resp.output.content_length = Some(decompressed.len() as i64);
+            resp.output.content_length = Some(final_bytes.len() as i64);
             // 圧縮済 bytes の checksum を返すと AWS SDK 側で StreamingError
             // (ChecksumMismatch) になる。ETag も backend が返した「圧縮済 bytes の
             // MD5/checksum」なので意味的にズレる — クリアして S4 自身の crc32c
@@ -427,20 +448,25 @@ impl<B: S3> S3 for S4Service<B> {
             resp.output.checksum_sha1 = None;
             resp.output.checksum_sha256 = None;
             resp.output.e_tag = None;
-            let original_size = decompressed.len() as u64;
+            let returned_size = final_bytes.len() as u64;
             let codec_label = manifest_opt
                 .as_ref()
                 .map(|m| m.codec.as_str())
                 .unwrap_or("multipart");
-            resp.output.body = Some(bytes_to_blob(decompressed));
+            resp.output.body = Some(bytes_to_blob(final_bytes));
+            if let Some(status) = status_override {
+                resp.status = Some(status);
+            }
             let elapsed = get_start.elapsed();
-            crate::metrics::record_get(codec_label, 0, original_size, elapsed.as_secs_f64(), true);
+            crate::metrics::record_get(codec_label, 0, returned_size, elapsed.as_secs_f64(), true);
             info!(
                 op = "get_object",
                 bucket = %get_bucket,
                 key = %get_key,
                 codec = codec_label,
-                bytes_out = original_size,
+                bytes_out = returned_size,
+                total_object_size = total_size,
+                range = range_request.is_some(),
                 path = "buffered",
                 latency_ms = elapsed.as_millis() as u64,
                 "S4 get completed (buffered)"
