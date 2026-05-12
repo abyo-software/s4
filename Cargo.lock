@@ -3286,6 +3286,8 @@ dependencies = [
  "s3s-aws",
  "s4-codec",
  "s4-config",
+ "serde",
+ "serde_json",
  "tempfile",
  "testcontainers-modules",
  "thiserror",

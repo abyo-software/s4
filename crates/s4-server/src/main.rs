@@ -123,6 +123,14 @@ struct Opt {
     /// TLS server private key (PEM file, PKCS#8 or RSA). See --tls-cert.
     #[clap(long, requires = "tls_cert")]
     tls_key: Option<std::path::PathBuf>,
+
+    /// Optional AWS-style bucket policy JSON file. When set, every PUT /
+    /// GET / DELETE / List request is evaluated against the policy before
+    /// being forwarded to the backend; explicit Deny or implicit deny
+    /// returns AccessDenied. See `s4_server::policy` docs for the supported
+    /// subset.
+    #[clap(long)]
+    policy: Option<std::path::PathBuf>,
 }
 
 fn setup_tracing(
@@ -269,7 +277,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         "S4 codec registry built"
     );
 
-    let s4 = S4Service::new(proxy, registry, dispatcher);
+    let mut s4 = S4Service::new(proxy, registry, dispatcher);
+    if let Some(ref policy_path) = opt.policy {
+        let policy = s4_server::policy::Policy::from_path(policy_path)
+            .map_err(|e| format!("--policy {}: {e}", policy_path.display()))?;
+        info!(path = %policy_path.display(), "S4 bucket policy loaded");
+        s4 = s4.with_policy(std::sync::Arc::new(policy));
+    }
     run_server(s4, &sdk_conf, &opt, ready_client).await
 }
 

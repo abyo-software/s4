@@ -31,6 +31,19 @@ pub mod names {
     pub const BYTES_IN_TOTAL: &str = "s4_bytes_in_total";
     pub const BYTES_OUT_TOTAL: &str = "s4_bytes_out_total";
     pub const REQUEST_LATENCY_SECONDS: &str = "s4_request_latency_seconds";
+    pub const POLICY_DENIALS_TOTAL: &str = "s4_policy_denials_total";
+}
+
+/// v0.2 #7: bumped each time the gateway's bucket policy denies a request.
+/// Labels: action (e.g. "s3:GetObject"), bucket. Cardinality is bounded by
+/// the supported S3 action set × number of buckets actually accessed.
+pub fn record_policy_denial(action: &'static str, bucket: &str) {
+    metrics::counter!(
+        names::POLICY_DENIALS_TOTAL,
+        "action" => action,
+        "bucket" => bucket.to_owned(),
+    )
+    .increment(1);
 }
 
 /// 1 PUT request 完了時に呼ぶ

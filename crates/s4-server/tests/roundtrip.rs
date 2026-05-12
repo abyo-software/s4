@@ -429,6 +429,113 @@ async fn single_put_framed_range_get_via_sidecar() {
     assert_eq!(got, payload.slice(4_000_000..4_500_001));
 }
 
+/// v0.2 #7: a Deny on s3:DeleteObject blocks delete from reaching the
+/// backend, while other actions still pass.
+#[tokio::test]
+async fn policy_denies_delete_but_allows_get_and_put() {
+    use s4_server::policy::Policy;
+
+    let backend = MemoryBackend::new();
+    let backend_view = backend.shared();
+    let policy = Policy::from_json_str(
+        r#"{
+            "Version": "2012-10-17",
+            "Statement": [
+              {"Sid": "AllowAll", "Effect": "Allow", "Action": "s3:*",
+               "Resource": "arn:aws:s3:::bucket/*"},
+              {"Sid": "DenyDelete", "Effect": "Deny", "Action": "s3:DeleteObject",
+               "Resource": "arn:aws:s3:::bucket/*"}
+            ]
+        }"#,
+    )
+    .expect("policy parse");
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    )
+    .with_policy(Arc::new(policy));
+
+    // PUT allowed
+    let payload = Bytes::from_static(b"data");
+    s4.put_object(put_request("bucket", "k", payload.clone()))
+        .await
+        .expect("put should be allowed by policy");
+    assert!(
+        backend_view
+            .lock()
+            .unwrap()
+            .contains_key(&("bucket".into(), "k".into()))
+    );
+
+    // GET allowed
+    let resp = s4
+        .get_object(get_request("bucket", "k"))
+        .await
+        .expect("get should be allowed");
+    assert_eq!(read_back(resp).await, payload);
+
+    // DELETE denied — should return AccessDenied without reaching backend
+    let del_input = DeleteObjectInput {
+        bucket: "bucket".into(),
+        key: "k".into(),
+        ..Default::default()
+    };
+    let del_req = S3Request {
+        input: del_input,
+        method: http::Method::DELETE,
+        uri: "/bucket/k".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let err = s4.delete_object(del_req).await.expect_err("should deny");
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("AccessDenied"),
+        "expected AccessDenied, got {dbg}"
+    );
+    // Object must still be in backend (delete didn't reach it)
+    assert!(
+        backend_view
+            .lock()
+            .unwrap()
+            .contains_key(&("bucket".into(), "k".into()))
+    );
+}
+
+/// v0.2 #7: a policy that allows nothing → implicit deny on every request.
+#[tokio::test]
+async fn policy_with_no_matching_statement_implicit_denies() {
+    use s4_server::policy::Policy;
+
+    let backend = MemoryBackend::new();
+    // Policy allows ops on a different bucket → no statement matches "bucket"
+    let policy = Policy::from_json_str(
+        r#"{"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "s3:*", "Resource": "arn:aws:s3:::other/*"}
+        ]}"#,
+    )
+    .unwrap();
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    )
+    .with_policy(Arc::new(policy));
+
+    let payload = Bytes::from_static(b"data");
+    let err = s4
+        .put_object(put_request("bucket", "k", payload))
+        .await
+        .expect_err("implicit deny");
+    let dbg = format!("{err:?}");
+    assert!(dbg.contains("AccessDenied"), "got {dbg}");
+}
+
 /// v0.2 #4 back-compat: a v0.1 object stored as raw compressed bytes (no
 /// `s4-framed` flag) must still GET correctly through v0.2.
 #[tokio::test]

@@ -58,6 +58,7 @@ pub struct S4Service<B: S3> {
     registry: Arc<CodecRegistry>,
     dispatcher: Arc<dyn CodecDispatcher>,
     max_body_bytes: usize,
+    policy: Option<crate::policy::SharedPolicy>,
 }
 
 impl<B: S3> S4Service<B> {
@@ -74,6 +75,7 @@ impl<B: S3> S4Service<B> {
             registry,
             dispatcher,
             max_body_bytes: Self::DEFAULT_MAX_BODY_BYTES,
+            policy: None,
         }
     }
 
@@ -81,6 +83,57 @@ impl<B: S3> S4Service<B> {
     pub fn with_max_body_bytes(mut self, n: usize) -> Self {
         self.max_body_bytes = n;
         self
+    }
+
+    /// Attach an optional bucket policy (v0.2 #7). When `Some(...)`, every
+    /// PUT / GET / DELETE / List handler runs `policy.evaluate(...)` before
+    /// delegating to the backend; failures return `S3ErrorCode::AccessDenied`.
+    /// When `None` (the default), no policy enforcement happens.
+    #[must_use]
+    pub fn with_policy(mut self, policy: crate::policy::SharedPolicy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Pull the SigV4 access key id off the request's credentials, if any.
+    /// Used as the `principal_id` for policy evaluation.
+    fn principal_of<I>(req: &S3Request<I>) -> Option<&str> {
+        req.credentials.as_ref().map(|c| c.access_key.as_str())
+    }
+
+    /// Helper used by request handlers to enforce the optional policy.
+    /// Returns `Ok(())` when allowed (or no policy is configured), or an
+    /// `AccessDenied` S3Error otherwise. Bumps the policy denial Prometheus
+    /// counter on deny.
+    fn enforce_policy(
+        &self,
+        action: &'static str,
+        bucket: &str,
+        key: Option<&str>,
+        principal_id: Option<&str>,
+    ) -> S3Result<()> {
+        let Some(policy) = self.policy.as_ref() else {
+            return Ok(());
+        };
+        let decision = policy.evaluate(action, bucket, key, principal_id);
+        if decision.allow {
+            Ok(())
+        } else {
+            crate::metrics::record_policy_denial(action, bucket);
+            tracing::info!(
+                action,
+                bucket,
+                key = ?key,
+                principal = ?principal_id,
+                matched_sid = ?decision.matched_sid,
+                effect = ?decision.matched_effect,
+                "S4 policy denied request"
+            );
+            Err(S3Error::with_message(
+                S3ErrorCode::AccessDenied,
+                format!("denied by S4 policy: {action} on bucket={bucket}"),
+            ))
+        }
     }
 
     /// テスト用: backend を取り戻す (test helper、production では使わない)
@@ -418,6 +471,12 @@ impl<B: S3> S3 for S4Service<B> {
         let put_start = Instant::now();
         let put_bucket = req.input.bucket.clone();
         let put_key = req.input.key.clone();
+        self.enforce_policy(
+            "s3:PutObject",
+            &put_bucket,
+            Some(&put_key),
+            Self::principal_of(&req),
+        )?;
         if let Some(blob) = req.input.body.take() {
             // Sample 4 KiB から codec を決定。streaming-aware codec なら streaming
             // compress fast path、そうでなければ従来の collect-then-compress。
@@ -553,6 +612,12 @@ impl<B: S3> S3 for S4Service<B> {
         let get_start = Instant::now();
         let get_bucket = req.input.bucket.clone();
         let get_key = req.input.key.clone();
+        self.enforce_policy(
+            "s3:GetObject",
+            &get_bucket,
+            Some(&get_key),
+            Self::principal_of(&req),
+        )?;
         // Range request の事前検出 (decompress 後 slice する path に使う)。
         let range_request = req.input.range.take();
 
@@ -770,9 +835,15 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        // sidecar も best-effort で削除 (失敗は無視 — 存在しない場合や IAM 制限を許容)
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
+        self.enforce_policy(
+            "s3:DeleteObject",
+            &bucket,
+            Some(&key),
+            Self::principal_of(&req),
+        )?;
+        // sidecar も best-effort で削除 (失敗は無視 — 存在しない場合や IAM 制限を許容)
         let resp = self.backend.delete_object(req).await?;
         let sidecar_input = DeleteObjectInput {
             bucket: bucket.clone(),
@@ -803,6 +874,23 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         mut req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
+        // copy is conceptually "GetObject src + PutObject dst" — enforce both.
+        let dst_bucket = req.input.bucket.clone();
+        let dst_key = req.input.key.clone();
+        self.enforce_policy(
+            "s3:PutObject",
+            &dst_bucket,
+            Some(&dst_key),
+            Self::principal_of(&req),
+        )?;
+        if let CopySource::Bucket { bucket, key, .. } = &req.input.copy_source {
+            self.enforce_policy(
+                "s3:GetObject",
+                &bucket.to_string(),
+                Some(&key.to_string()),
+                Self::principal_of(&req),
+            )?;
+        }
         // S4-aware copy: source object に s4-* metadata がある場合、それを
         // destination に確実に preserve する。
         //
@@ -867,6 +955,12 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<ListObjectsInput>,
     ) -> S3Result<S3Response<ListObjectsOutput>> {
+        self.enforce_policy(
+            "s3:ListBucket",
+            &req.input.bucket,
+            None,
+            Self::principal_of(&req),
+        )?;
         let mut resp = self.backend.list_objects(req).await?;
         // S4 内部 object (`*.s4index` sidecar 等) を顧客から隠す
         if let Some(contents) = resp.output.contents.as_mut() {
@@ -883,6 +977,12 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        self.enforce_policy(
+            "s3:ListBucket",
+            &req.input.bucket,
+            None,
+            Self::principal_of(&req),
+        )?;
         let mut resp = self.backend.list_objects_v2(req).await?;
         if let Some(contents) = resp.output.contents.as_mut() {
             let before = contents.len();

@@ -48,6 +48,7 @@ tracing-subscriber.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
+serde.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 http = "1"
@@ -64,6 +65,7 @@ opentelemetry-otlp.workspace = true
 tracing-opentelemetry.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-pemfile = "2"
+serde_json = "1"
 
 s4-codec = { path = "../s4-codec", version = "0.1.0" }
 s4-config = { path = "../s4-config", version = "0.1.0" }

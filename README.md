@@ -209,6 +209,7 @@ NVCOMP_HOME=... cargo test --workspace --features s4-server/nvcomp-gpu -- --igno
 | `--service-name` | `s4` | OTel resource `service.name` |
 | `--tls-cert` | (none) | TLS server certificate (PEM). Together with `--tls-key`, terminates HTTPS on the listener |
 | `--tls-key` | (none) | TLS server private key (PEM, PKCS#8 or RSA) |
+| `--policy` | (none) | AWS-style bucket policy JSON. When set, every PUT/GET/DELETE/List request is evaluated before backend dispatch |
 
 AWS credentials are read from the standard AWS chain (`AWS_ACCESS_KEY_ID` /
 `AWS_SECRET_ACCESS_KEY` / `AWS_PROFILE` / IAM role on EC2).
@@ -227,6 +228,32 @@ aws --endpoint-url https://localhost:8443 s3 ls
 Backed by `tokio-rustls` + `ring`. ALPN advertises `h2` then `http/1.1`, so
 HTTP/2 is negotiated automatically with capable clients. Without these
 flags, S4 serves plain HTTP (the default).
+
+### Bucket policy enforcement
+
+Pass an AWS-style bucket policy JSON to `--policy` to gate requests at the
+gateway:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Sid": "ReadOnly",  "Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket"],
+     "Resource": ["arn:aws:s3:::my-bucket", "arn:aws:s3:::my-bucket/*"]},
+    {"Sid": "DenyDelete", "Effect": "Deny",  "Action": "s3:DeleteObject",
+     "Resource": "arn:aws:s3:::my-bucket/*"}
+  ]
+}
+```
+
+Supported subset (v0.2): `Effect`, `Action`, `Resource`, `Principal`
+(SigV4 access-key match). Decision order is the standard AWS one:
+**explicit Deny > explicit Allow > implicit Deny**. Denials are exposed as
+the `s4_policy_denials_total{action,bucket}` Prometheus counter.
+
+For more advanced needs (full IAM Conditions, STS / AssumeRole), front
+S4 with an IAM-aware proxy and use this flag for in-gateway last-mile
+checks.
 
 ## On-the-wire Format
 

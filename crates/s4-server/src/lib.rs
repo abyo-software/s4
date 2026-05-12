@@ -2,6 +2,7 @@
 
 pub mod blob;
 pub mod metrics;
+pub mod policy;
 pub mod routing;
 pub mod service;
 pub mod streaming;
