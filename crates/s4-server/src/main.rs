@@ -357,19 +357,45 @@ where
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
     let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
 
-    let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = match (&opt.tls_cert, &opt.tls_key) {
+    let tls_state: Option<Arc<s4_server::tls::TlsState>> = match (&opt.tls_cert, &opt.tls_key) {
         (Some(cert), Some(key)) => {
             s4_server::tls::install_default_crypto_provider();
-            let cfg = s4_server::tls::load_tls_config(cert, key)?;
-            Some(tokio_rustls::TlsAcceptor::from(cfg))
+            let state = Arc::new(s4_server::tls::TlsState::load(cert, key)?);
+            // SIGHUP handler — operators rotate cert + key files and
+            // `kill -HUP <pid>` to atomically swap the active config.
+            // Re-read failures (missing file / bad PEM / key mismatch) are
+            // logged at WARN; the previous config stays in effect, so a
+            // bad reload never causes a listener outage.
+            let reload_state = Arc::clone(&state);
+            tokio::spawn(async move {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut hup = match signal(SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("could not install SIGHUP handler: {e}");
+                        return;
+                    }
+                };
+                while hup.recv().await.is_some() {
+                    match reload_state.reload() {
+                        Ok(()) => {
+                            tracing::info!("S4 TLS cert hot-reload succeeded");
+                            s4_server::metrics::record_tls_cert_reload(true);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "S4 TLS cert hot-reload failed (keeping previous config): {e}"
+                            );
+                            s4_server::metrics::record_tls_cert_reload(false);
+                        }
+                    }
+                }
+            });
+            Some(state)
         }
         _ => None,
     };
-    let scheme = if tls_acceptor.is_some() {
-        "https"
-    } else {
-        "http"
-    };
+    let scheme = if tls_state.is_some() { "https" } else { "http" };
 
     info!(
         host = %opt.host,
@@ -393,7 +419,11 @@ where
         let svc = routed_service.clone();
         let server = http_server.clone();
         let watch_handle = graceful.watcher();
-        if let Some(acceptor) = tls_acceptor.clone() {
+        if let Some(state) = tls_state.as_ref() {
+            // Per-connection acceptor — picks up the latest swapped config
+            // on every accept, so a SIGHUP reload starts taking effect from
+            // the very next connection without dropping anything in flight.
+            let acceptor = state.acceptor();
             tokio::spawn(async move {
                 let tls_stream = match acceptor.accept(socket).await {
                     Ok(s) => s,

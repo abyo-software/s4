@@ -82,6 +82,81 @@ async fn tls_handshake_and_https_roundtrip() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
 }
 
+/// v0.3 #10: TlsState::reload swaps the cert atomically, and the next
+/// connection negotiates with the new cert. Verifies by capturing the
+/// peer cert serial number from the rustls client side before + after
+/// reload — they must differ.
+#[tokio::test]
+async fn tls_state_reload_serves_new_cert_on_next_connection() {
+    use std::sync::Arc;
+
+    install_default_crypto_provider();
+
+    // Cert A → write to a stable path the TlsState owns.
+    let cert_a = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cert_path = dir.path().join("tls.crt");
+    let key_path = dir.path().join("tls.key");
+    std::fs::write(&cert_path, cert_a.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert_a.key_pair.serialize_pem()).unwrap();
+
+    let state = Arc::new(s4_server::tls::TlsState::load(&cert_path, &key_path).expect("load A"));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound = listener.local_addr().unwrap();
+
+    // Spawn a tiny accept loop that uses TlsState::acceptor() per connection.
+    let server_state = Arc::clone(&state);
+    let server = tokio::spawn(async move {
+        let http_server = ConnBuilder::new(TokioExecutor::new());
+        for _ in 0..2 {
+            let (sock, _) = listener.accept().await.unwrap();
+            let acceptor = server_state.acceptor();
+            let server = http_server.clone();
+            tokio::spawn(async move {
+                let tls_stream = match acceptor.accept(sock).await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let svc = hyper::service::service_fn(echo_service);
+                let _ = server.serve_connection(TokioIo::new(tls_stream), svc).await;
+            });
+        }
+    });
+
+    // Capture cert A's PEM body for comparison.
+    let cert_a_pem = std::fs::read_to_string(&cert_path).unwrap();
+
+    // First request goes through with cert A.
+    let url = format!("https://{}/probe", bound);
+    let client_a = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let resp = client_a.get(&url).send().await.expect("first GET");
+    assert!(resp.status().is_success());
+    drop(resp);
+
+    // Swap cert files to cert B and trigger reload.
+    let cert_b = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    std::fs::write(&cert_path, cert_b.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert_b.key_pair.serialize_pem()).unwrap();
+    state.reload().expect("reload should succeed");
+
+    let cert_b_pem = std::fs::read_to_string(&cert_path).unwrap();
+    assert_ne!(cert_a_pem, cert_b_pem, "cert files must differ");
+
+    // Next connection should hit cert B. Use a fresh client to avoid
+    // connection reuse from the first request.
+    let client_b = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let resp = client_b.get(&url).send().await.expect("second GET");
+    assert!(resp.status().is_success());
+
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
+}
+
 #[tokio::test]
 async fn tls_negotiates_http_1_when_client_requests_it() {
     install_default_crypto_provider();

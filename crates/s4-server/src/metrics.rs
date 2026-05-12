@@ -32,6 +32,14 @@ pub mod names {
     pub const BYTES_OUT_TOTAL: &str = "s4_bytes_out_total";
     pub const REQUEST_LATENCY_SECONDS: &str = "s4_request_latency_seconds";
     pub const POLICY_DENIALS_TOTAL: &str = "s4_policy_denials_total";
+    pub const TLS_CERT_RELOAD_TOTAL: &str = "s4_tls_cert_reload_total";
+}
+
+/// v0.3 #10: bumped each time the operator triggers a SIGHUP-driven TLS
+/// cert hot-reload. Labels: `result` (= "ok" | "err").
+pub fn record_tls_cert_reload(ok: bool) {
+    let result = if ok { "ok" } else { "err" };
+    metrics::counter!(names::TLS_CERT_RELOAD_TOTAL, "result" => result).increment(1);
 }
 
 /// v0.2 #7: bumped each time the gateway's bucket policy denies a request.

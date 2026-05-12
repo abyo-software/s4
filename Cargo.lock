@@ -3259,6 +3259,7 @@ name = "s4-server"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-compression",
  "async-trait",
  "aws-config",
