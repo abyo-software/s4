@@ -15,10 +15,15 @@ Third-party components
 This product bundles or links to the following third-party components.
 Each component remains under its own license:
 
-1. ferro-compress (vendored at crates/s4-codec/vendor/ferro-compress/)
+1. ferro-compress (integrated at crates/s4-codec/src/ferro_compress/)
    - Origin: abyo software 合同会社 / FerroSearch project
-   - License: Apache-2.0 OR MIT (see vendor/ferro-compress/LICENSE and NOTICE)
+   - License: Apache-2.0 OR MIT (dual-licensed)
    - Purpose: NVIDIA nvCOMP Rust binding for GPU compression backend
+   - Status: Source physically integrated into s4-codec for crates.io
+     distribution. Subset includes algo / error / nvcomp_sys (FFI) /
+     nvcomp / nvcomp_hlif / bitcomp_device / slab_alloc and the
+     nvcomp_hlif_shim.cpp C-ABI shim. Tantivy bitmap-op kernels and CPU
+     codec features from upstream are NOT included.
 
 2. s3s (https://github.com/Nugine/s3s)
    - License: Apache-2.0

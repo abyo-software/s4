@@ -56,18 +56,18 @@
 //! 12-term cohort drops from ~36 µs/cohort (per-term loop) to ~4 µs
 //! (one launch + one sync) on RTX 4070 Ti SUPER.
 
-#![cfg(feature = "nvcomp")]
+#![cfg(feature = "nvcomp-gpu")]
 
 use std::ffi::c_void;
 use std::ptr::null_mut;
 
-use crate::algo::BitcompDataType;
-use crate::error::{Error, Result};
-use crate::nvcomp_sys::cuda::{
+use super::algo::BitcompDataType;
+use super::error::{Error, Result};
+use super::nvcomp_sys::cuda::{
     cudaError_t, cudaFree, cudaGetErrorString, cudaMalloc, cudaMemcpy, cudaMemcpyKind,
     cudaStreamSynchronize, cudaStream_t, CUDA_SUCCESS,
 };
-use crate::nvcomp_sys::nvcomp::{
+use super::nvcomp_sys::nvcomp::{
     nvcompBatchedBitcompCompressAsync, nvcompBatchedBitcompCompressGetMaxOutputChunkSize,
     nvcompBatchedBitcompCompressGetTempSizeSync, nvcompBatchedBitcompDecompressAsync,
     nvcompBatchedBitcompDecompressGetTempSizeAsync, nvcompBatchedBitcompDecompressOpts_t,
@@ -76,7 +76,7 @@ use crate::nvcomp_sys::nvcomp::{
     NVCOMP_TYPE_FLOAT, NVCOMP_TYPE_INT, NVCOMP_TYPE_LONGLONG, NVCOMP_TYPE_SHORT, NVCOMP_TYPE_UCHAR,
     NVCOMP_TYPE_UINT, NVCOMP_TYPE_ULONGLONG, NVCOMP_TYPE_USHORT,
 };
-use crate::slab_alloc::SlabAllocator;
+use super::slab_alloc::SlabAllocator;
 
 /// Device-direct Bitcomp codec for v3 VRAM-resident cache.
 ///
@@ -193,7 +193,7 @@ impl BitcompDeviceCodec {
         let mut stream: cudaStream_t = null_mut();
         // SAFETY: cudaStreamCreate writes a valid stream handle on
         // success; left untouched on failure.
-        let rc = unsafe { crate::nvcomp_sys::cuda::cudaStreamCreate(&mut stream) };
+        let rc = unsafe { super::nvcomp_sys::cuda::cudaStreamCreate(&mut stream) };
         check_cuda(rc, "cudaStreamCreate(BitcompDeviceCodec)")?;
         match Self::with_stream_internal(data_type, stream, /*owns_stream=*/ true, with_slab) {
             Ok(c) => Ok(c),
@@ -202,7 +202,7 @@ impl BitcompDeviceCodec {
                 // exclusively owned by this failed-construction path;
                 // safe to destroy.
                 unsafe {
-                    let _ = crate::nvcomp_sys::cuda::cudaStreamDestroy(stream);
+                    let _ = super::nvcomp_sys::cuda::cudaStreamDestroy(stream);
                 }
                 Err(e)
             }
@@ -696,7 +696,7 @@ impl BitcompDeviceCodec {
                 return Err(Error::Decompress(format!(
                     "Bitcomp decompress_batch: chunk {i} status={} ({})",
                     *status_h,
-                    crate::nvcomp_sys::nvcomp::status_str(*status_h),
+                    super::nvcomp_sys::nvcomp::status_str(*status_h),
                 )));
             }
             let expected = entries[i].2;
@@ -1131,7 +1131,7 @@ impl Drop for BitcompDeviceCodec {
             // SAFETY: stream was created in `new` and is exclusively
             // owned by this codec (owns_stream = true).
             unsafe {
-                let _ = crate::nvcomp_sys::cuda::cudaStreamDestroy(self.stream);
+                let _ = super::nvcomp_sys::cuda::cudaStreamDestroy(self.stream);
             }
             self.stream = null_mut();
         }
@@ -1202,7 +1202,7 @@ fn bitcomp_format_opts(dt: BitcompDataType) -> nvcompBatchedBitcompFormatOpts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nvcomp_sys::cuda::cudaMemcpy;
+    use super::nvcomp_sys::cuda::cudaMemcpy;
 
     /// Helper: try to construct the codec; returns `None` on a
     /// driver-missing host so tests skip cleanly.

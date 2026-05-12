@@ -24,7 +24,7 @@ pub const cudaHostAllocPortable: c_uint = 0x01;
 pub const cudaHostAllocMapped: c_uint = 0x02;
 pub const cudaHostAllocWriteCombined: c_uint = 0x04;
 
-extern "C" {
+unsafe extern "C" {
     pub fn cudaMalloc(devPtr: *mut *mut c_void, size: usize) -> cudaError_t;
     pub fn cudaFree(devPtr: *mut c_void) -> cudaError_t;
 
@@ -88,7 +88,7 @@ pub type CUmodule = *mut c_void;
 pub type CUfunction = *mut c_void;
 pub type CUstream = cudaStream_t;
 
-extern "C" {
+unsafe extern "C" {
     pub fn cuInit(flags: c_uint) -> CUresult;
     pub fn cuDeviceGet(device: *mut CUdevice, ordinal: c_int) -> CUresult;
     pub fn cuDevicePrimaryCtxRetain(pctx: *mut CUcontext, dev: CUdevice) -> CUresult;

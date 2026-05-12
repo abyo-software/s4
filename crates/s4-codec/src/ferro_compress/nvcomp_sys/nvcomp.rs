@@ -183,7 +183,7 @@ impl Default for nvcompBatchedBitcompDecompressOpts_t {
     }
 }
 
-extern "C" {
+unsafe extern "C" {
     pub fn nvcompBatchedBitcompCompressGetTempSizeSync(
         device_uncompressed_chunk_ptrs: *const *const c_void,
         device_uncompressed_chunk_bytes: *const usize,
@@ -248,7 +248,7 @@ extern "C" {
 
 // ---------- Snappy ----------
 
-extern "C" {
+unsafe extern "C" {
     pub fn nvcompBatchedSnappyCompressGetTempSizeAsync(
         num_chunks: usize,
         max_uncompressed_chunk_bytes: usize,
@@ -321,7 +321,7 @@ extern "C" {
 
 // ---------- LZ4 ----------
 
-extern "C" {
+unsafe extern "C" {
     pub fn nvcompBatchedLZ4CompressGetTempSizeAsync(
         num_chunks: usize,
         max_uncompressed_chunk_bytes: usize,
@@ -394,7 +394,7 @@ extern "C" {
 
 // ---------- zstd ----------
 
-extern "C" {
+unsafe extern "C" {
     pub fn nvcompBatchedZstdCompressGetTempSizeAsync(
         num_chunks: usize,
         max_uncompressed_chunk_bytes: usize,

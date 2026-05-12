@@ -6,7 +6,7 @@ pub enum Error {
     UnknownAlgo(String),
 
     #[error("algorithm {0} is not supported by this backend")]
-    UnsupportedAlgo(crate::Algo),
+    UnsupportedAlgo(super::Algo),
 
     #[error("batch length mismatch: inputs={inputs}, outputs={outputs}")]
     BatchLenMismatch { inputs: usize, outputs: usize },

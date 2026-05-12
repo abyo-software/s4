@@ -5,7 +5,23 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "S4 codec layer — pluggable GPU/CPU compression backends (nvCOMP, DietGPU, CPU zstd)"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+description = "S4 (Squished S3) — pluggable GPU/CPU compression codec layer (nvCOMP zstd / Bitcomp, CPU zstd)."
+build = "build.rs"
+include = [
+    "src/**/*.rs",
+    "src/cuda_kernels/*.cpp",
+    "build.rs",
+    "Cargo.toml",
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+]
 
 [lints]
 workspace = true
@@ -16,7 +32,7 @@ default = []
 # NVCOMP_HOME env var pointing to an extracted nvCOMP redist tarball at build
 # time, plus a CUDA-capable GPU at runtime. Without this feature, S4 runs
 # CPU-only (cpu_zstd / passthrough).
-nvcomp-gpu = ["dep:ferro-compress-vendored"]
+nvcomp-gpu = []
 
 [dependencies]
 async-trait.workspace = true
@@ -28,8 +44,6 @@ crc32c.workspace = true
 zstd.workspace = true
 tokio = { workspace = true }
 thiserror.workspace = true
-
-ferro-compress-vendored = { path = "vendor/ferro-compress", features = ["nvcomp"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

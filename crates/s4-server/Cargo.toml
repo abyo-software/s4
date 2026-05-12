@@ -5,7 +5,20 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "S4 — Squished S3 — GPU 透過圧縮 S3 互換ストレージゲートウェイ (server binary)"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+description = "S4 — Squished S3 — GPU-accelerated transparent compression S3-compatible storage gateway (cargo install s4-server installs the `s4` binary)."
+include = [
+    "src/**/*.rs",
+    "Cargo.toml",
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+]
 
 [lints]
 workspace = true
@@ -50,8 +63,8 @@ opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 tracing-opentelemetry.workspace = true
 
-s4-codec = { path = "../s4-codec" }
-s4-config = { path = "../s4-config" }
+s4-codec = { path = "../s4-codec", version = "0.1.0" }
+s4-config = { path = "../s4-config", version = "0.1.0" }
 
 [dev-dependencies]
 tempfile = "3"

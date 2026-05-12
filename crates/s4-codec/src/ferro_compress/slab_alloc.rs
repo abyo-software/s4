@@ -43,14 +43,14 @@
 //! - The allocator is not internally synchronised; callers wrap in a
 //!   `Mutex` if shared between threads.
 
-#![cfg(feature = "nvcomp")]
+#![cfg(feature = "nvcomp-gpu")]
 
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::null_mut;
 
-use crate::error::{Error, Result};
-use crate::nvcomp_sys::cuda::{cudaFree, cudaMalloc, CUDA_SUCCESS};
+use super::error::{Error, Result};
+use super::nvcomp_sys::cuda::{cudaFree, cudaMalloc, CUDA_SUCCESS};
 
 /// Power-of-two floor for size-class buckets. Smaller requests round up
 /// to this bucket so the very smallest cohort metadata slots (1-2 KiB)

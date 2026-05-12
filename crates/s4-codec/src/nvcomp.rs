@@ -2,9 +2,9 @@
 //!
 //! ## 設計方針 (2026-05-12 確定)
 //!
-//! - **vendored ferro-compress 経由**: `crates/s4-codec/vendor/ferro-compress` (Apache-2.0
-//!   OR MIT) に nvCOMP の Rust binding を vendoring 済。本 module はそれを async な
-//!   [`crate::Codec`] trait に bridge する薄い adapter。
+//! - **integrated ferro-compress 経由**: nvCOMP の Rust binding を s4-codec の内部
+//!   module `crate::ferro_compress` (Apache-2.0 OR MIT) として物理統合済。本 module は
+//!   それを async な [`crate::Codec`] trait に bridge する薄い adapter。
 //! - **feature gate**: `nvcomp-gpu` feature を opt-in にすることで、CUDA toolchain と
 //!   NVCOMP_HOME が無い環境でも default build (cargo check / test) が green に保たれる。
 //! - **配布形態**: nvCOMP redist は NVIDIA SLA 制約あり。Phase 1 は **BYO 方式**
@@ -28,7 +28,7 @@ mod imp {
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use ferro_compress_vendored::{Algo, BitcompDataType, Codec as FerroCodec, NvcompCodec};
+    use crate::ferro_compress::{Algo, BitcompDataType, Codec as FerroCodec, NvcompCodec};
 
     use crate::{ChunkManifest, Codec, CodecError, CodecKind};
 

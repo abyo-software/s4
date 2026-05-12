@@ -15,6 +15,8 @@ use thiserror::Error;
 pub mod cpu_zstd;
 pub mod dietgpu;
 pub mod dispatcher;
+#[cfg(feature = "nvcomp-gpu")]
+mod ferro_compress;
 pub mod index;
 pub mod multipart;
 pub mod nvcomp;

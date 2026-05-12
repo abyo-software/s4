@@ -39,9 +39,9 @@ use std::ffi::{c_void, CStr};
 use std::ptr::null_mut;
 use std::sync::Mutex;
 
-use crate::nvcomp_sys::cuda::*;
-use crate::nvcomp_sys::nvcomp::*;
-use crate::{Algo, BitcompDataType, Codec, Error, Result};
+use super::nvcomp_sys::cuda::*;
+use super::nvcomp_sys::nvcomp::*;
+use super::{Algo, BitcompDataType, Codec, Error, Result};
 
 const FRAME_MAGIC: [u8; 4] = *b"FCG1";
 const HEADER_FIXED_BYTES: usize = 4 + 1 + 3 + 8 + 4 + 4;
