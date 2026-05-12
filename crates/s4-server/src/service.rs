@@ -53,6 +53,16 @@ use crate::streaming::{
 /// PUT body の先頭 sampling で渡す最大 byte 数。
 const SAMPLE_BYTES: usize = 4096;
 
+/// v0.4 #20: captured at the start of a handler, before the request is
+/// consumed by the backend call, so the matching `record_access` at
+/// end-of-request can fill in the structured access log entry.
+struct AccessLogPreamble {
+    remote_ip: Option<String>,
+    requester: Option<String>,
+    request_uri: String,
+    user_agent: Option<String>,
+}
+
 pub struct S4Service<B: S3> {
     backend: B,
     registry: Arc<CodecRegistry>,
@@ -66,6 +76,8 @@ pub struct S4Service<B: S3> {
     secure_transport: bool,
     /// v0.4 #19: optional per-(principal, bucket) token-bucket limiter.
     rate_limits: Option<crate::rate_limit::SharedRateLimits>,
+    /// v0.4 #20: optional S3-style access log emitter.
+    access_log: Option<crate::access_log::SharedAccessLog>,
 }
 
 impl<B: S3> S4Service<B> {
@@ -85,7 +97,79 @@ impl<B: S3> S4Service<B> {
             policy: None,
             secure_transport: false,
             rate_limits: None,
+            access_log: None,
         }
+    }
+
+    /// v0.4 #20: attach an S3-style access-log emitter. Each completed
+    /// PUT / GET / DELETE / List handler emits one entry into the
+    /// emitter's buffer; a background flusher (started separately, see
+    /// [`crate::access_log::AccessLog::spawn_flusher`]) writes hourly
+    /// rotated `.log` files into the configured directory.
+    #[must_use]
+    pub fn with_access_log(mut self, log: crate::access_log::SharedAccessLog) -> Self {
+        self.access_log = Some(log);
+        self
+    }
+
+    /// Capture the per-request access-log preamble before the request is
+    /// consumed by the backend call. Returns `None` if no access logger
+    /// is configured (cheap early-out so the handler doesn't pay the
+    /// header-clone cost when access logging is off).
+    fn access_log_preamble<I>(&self, req: &S3Request<I>) -> Option<AccessLogPreamble> {
+        self.access_log.as_ref()?;
+        Some(AccessLogPreamble {
+            remote_ip: req
+                .headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|raw| raw.split(',').next())
+                .map(|s| s.trim().to_owned()),
+            requester: Self::principal_of(req).map(str::to_owned),
+            request_uri: format!("{} {}", req.method, req.uri.path()),
+            user_agent: req
+                .headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+        })
+    }
+
+    /// Internal — called by handlers at end-of-request with a captured
+    /// preamble. Best-effort: swallows the await fast (clones Arc +
+    /// pushes), no error propagation back to the request path.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_access(
+        &self,
+        preamble: Option<AccessLogPreamble>,
+        operation: &'static str,
+        bucket: &str,
+        key: Option<&str>,
+        http_status: u16,
+        bytes_sent: u64,
+        object_size: u64,
+        total_time_ms: u64,
+        error_code: Option<&str>,
+    ) {
+        let (Some(log), Some(p)) = (self.access_log.as_ref(), preamble) else {
+            return;
+        };
+        log.record(crate::access_log::AccessLogEntry {
+            time: std::time::SystemTime::now(),
+            bucket: bucket.to_owned(),
+            remote_ip: p.remote_ip,
+            requester: p.requester,
+            operation,
+            key: key.map(str::to_owned),
+            request_uri: p.request_uri,
+            http_status,
+            error_code: error_code.map(str::to_owned),
+            bytes_sent,
+            object_size,
+            total_time_ms,
+            user_agent: p.user_agent,
+        })
+        .await;
     }
 
     /// v0.4 #19: attach a per-(principal, bucket) token-bucket rate limiter.
@@ -552,6 +636,7 @@ impl<B: S3> S3 for S4Service<B> {
         let put_start = Instant::now();
         let put_bucket = req.input.bucket.clone();
         let put_key = req.input.key.clone();
+        let access_preamble = self.access_log_preamble(&req);
         self.enforce_rate_limit(&req, &put_bucket)?;
         self.enforce_policy(&req, "s3:PutObject", &put_bucket, Some(&put_key))?;
         if let Some(blob) = req.input.body.take() {
@@ -666,6 +751,19 @@ impl<B: S3> S3 for S4Service<B> {
                 elapsed.as_secs_f64(),
                 backend_resp.is_ok(),
             );
+            // v0.4 #20: structured access-log entry (best-effort).
+            self.record_access(
+                access_preamble,
+                "REST.PUT.OBJECT",
+                &put_bucket,
+                Some(&put_key),
+                if backend_resp.is_ok() { 200 } else { 500 },
+                compressed_size,
+                original_size,
+                elapsed.as_millis() as u64,
+                backend_resp.as_ref().err().map(|e| e.code().as_str()),
+            )
+            .await;
             info!(
                 op = "put_object",
                 bucket = %put_bucket,

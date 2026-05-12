@@ -172,6 +172,15 @@ struct Opt {
     /// `s4_rate_limit_throttled_total{principal,bucket}`.
     #[clap(long)]
     rate_limit: Option<std::path::PathBuf>,
+
+    /// Optional S3-style access-log destination directory. When set,
+    /// every completed PUT / GET / DELETE / List request is buffered
+    /// and flushed to hourly-rotated `.log` files under the directory.
+    /// v0.4 ships local-directory only; pipe via filebeat / vector / etc
+    /// to ship to S3 if needed (a follow-up issue tracks native s3://
+    /// destination).
+    #[clap(long)]
+    access_log: Option<std::path::PathBuf>,
 }
 
 fn setup_tracing(
@@ -332,6 +341,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // (--acme) qualifies.
     let listener_secure = opt.tls_cert.is_some() || opt.acme.is_some();
     s4 = s4.with_secure_transport(listener_secure);
+    if let Some(ref dir) = opt.access_log {
+        let dest = s4_server::access_log::AccessLogDest { dir: dir.clone() };
+        let log = std::sync::Arc::new(s4_server::access_log::AccessLog::new(dest));
+        let _flusher = log.spawn_flusher();
+        info!(dir = %dir.display(), "S4 access log emitter started");
+        s4 = s4.with_access_log(log);
+    }
     if let Some(ref rl_path) = opt.rate_limit {
         let rl = s4_server::rate_limit::RateLimits::from_path(rl_path)
             .map_err(|e| format!("--rate-limit {}: {e}", rl_path.display()))?;
