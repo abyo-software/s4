@@ -1,0 +1,119 @@
+# Compression-ratio comparison stack for v0.3 #14.
+#
+# Brings up the three S3-compatible backends we benchmark against:
+#   - garage:    Garage with zstd compression (level 6)
+#   - minio:     MinIO with compression enabled (best-effort — see note below)
+#   - s4-cpu:    S4 with cpu-zstd codec
+#   - s4-gpu:    S4 with nvcomp-zstd codec (requires --gpus on host)
+#
+# All four expose a port in the 9100-9103 range. The bench driver
+# (`run.sh`) talks to each via aws-cli + a shared test bucket.
+#
+# Notes on MinIO compression:
+#   MinIO supports server-side compression via `MINIO_COMPRESSION_ENABLE=on`
+#   plus extension/MIME allowlists. We turn it on for `text/*` + `application/json`
+#   so the nginx-log workload exercises it. Random-binary workloads still
+#   bypass per MinIO's heuristics.
+#
+# Usage:
+#   docker compose -f benches/comparison/docker-compose.yml up -d
+#   ./benches/comparison/run.sh
+#   docker compose -f benches/comparison/docker-compose.yml down -v
+
+services:
+  # --- Garage with zstd ---
+  garage:
+    image: dxflrs/garage:v1.0.1
+    ports:
+      - "9100:3900"   # S3 API
+      - "9180:3902"   # admin
+    environment:
+      RUST_LOG: garage=info
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-data:/var/lib/garage/data
+      - garage-meta:/var/lib/garage/meta
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3902/health"]
+      interval: 5s
+      retries: 30
+
+  # --- MinIO with built-in compression on text + json ---
+  minio:
+    image: minio/minio:RELEASE.2024-09-13T20-26-02Z
+    command: server /data --address ":9000"
+    ports:
+      - "9101:9000"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_COMPRESSION_ENABLE: "on"
+      MINIO_COMPRESSION_MIME_TYPES: "text/*,application/json,application/octet-stream"
+      MINIO_COMPRESSION_EXTENSIONS: ".log,.txt,.json,.csv,.bin"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      retries: 30
+
+  # --- S4 CPU codec — points at MinIO as its backend, but stores in a
+  #     different prefix so the two systems don't collide. ---
+  s4-cpu:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    ports:
+      - "9102:8014"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      RUST_LOG: warn
+    command:
+      - --endpoint-url=http://minio:9000
+      - --host=0.0.0.0
+      - --port=8014
+      - --codec=cpu-zstd
+      - --dispatcher=always
+      - --log-format=json
+
+  # --- S4 GPU codec — same but nvcomp-zstd, needs Docker --gpus all ---
+  s4-gpu:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.gpu
+    ports:
+      - "9103:8014"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      RUST_LOG: warn
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    command:
+      - --endpoint-url=http://minio:9000
+      - --host=0.0.0.0
+      - --port=8014
+      - --codec=nvcomp-zstd
+      - --dispatcher=always
+      - --log-format=json
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  garage-data:
+  garage-meta:
+  minio-data:
