@@ -31,7 +31,9 @@ use futures::{Stream, StreamExt};
 use s3s::StdError;
 use s3s::dto::StreamingBlob;
 use s3s::stream::{ByteStream, RemainingLength};
-use s4_codec::{ChunkManifest, CodecError, CodecKind};
+use s4_codec::multipart::{FrameHeader, write_frame};
+use s4_codec::{ChunkManifest, CodecError, CodecKind, CodecRegistry};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_util::io::{ReaderStream, StreamReader};
 
@@ -255,6 +257,90 @@ pub async fn streaming_compress_nvcomp_zstd(
 /// - nvCOMP HLIF default (64 KiB) より大きいが、batched API は chunk 内で更に細分化されるため OK
 #[cfg(feature = "nvcomp-gpu")]
 pub const DEFAULT_NVCOMP_STREAM_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+/// `streaming_compress_to_frames` の default chunk size。
+///
+/// 4 MiB を選んだ根拠:
+/// - Range GET 1 件の最小帯域 ~= compressed_size_per_chunk (~数百 KB-1 MB)
+/// - chunk 数が現実的 (1 GiB object → 256 frames、sidecar < 10 KB)
+/// - CPU/GPU codec の per-call overhead が amortized
+pub const DEFAULT_S4F2_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+/// 入力 `body` を **chunked + framed** に圧縮した output を返す (v0.2 #4)。
+///
+/// 各 chunk を `registry.compress(chunk_kind)` に通し、結果を `S4F2` frame として
+/// 順次連結する。outer `ChunkManifest` は input 全体に対する rolling crc + total
+/// original/compressed size を返す。
+///
+/// **wire format**: `[S4F2 frame][S4F2 frame]...[S4F2 frame]` の連結。
+/// 各 frame は self-describing なので reader 側は `multipart::FrameIter` で
+/// そのまま parse 可能 (= 既存 multipart decompress 経路と同じ機構)。
+///
+/// **why chunked single-PUT**:
+/// - Range GET partial-fetch を sidecar で活用可能 (issue #4)
+/// - per-frame CRC で局所 corruption を検出可能
+/// - per-frame codec dispatch (将来 mixed-codec 対応)
+///
+/// **memory peak**: `chunk_size` (input) + `compressed_size` (output buffer accumulating)。
+/// 入力 5 GB を 200 MB に圧縮する case で peak ≈ 4 MiB + 200 MB = ~204 MB。
+pub async fn streaming_compress_to_frames(
+    body: StreamingBlob,
+    registry: Arc<CodecRegistry>,
+    codec_kind: CodecKind,
+    chunk_size: usize,
+) -> Result<(Bytes, ChunkManifest), CodecError> {
+    use bytes::BytesMut;
+    let mut read = blob_to_async_read(body);
+    let mut framed = BytesMut::with_capacity(chunk_size);
+    let mut rolling_crc: u32 = 0;
+    let mut total_in: u64 = 0;
+    let mut chunk_buf = vec![0u8; chunk_size];
+
+    loop {
+        let mut filled = 0;
+        while filled < chunk_size {
+            let n = read
+                .read(&mut chunk_buf[filled..])
+                .await
+                .map_err(CodecError::Io)?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        if filled == 0 {
+            break;
+        }
+
+        let chunk_slice = &chunk_buf[..filled];
+        let chunk_crc = crc32c::crc32c(chunk_slice);
+        rolling_crc = crc32c::crc32c_append(rolling_crc, chunk_slice);
+        total_in += filled as u64;
+
+        let original_chunk = Bytes::copy_from_slice(chunk_slice);
+        let (compressed_chunk, _per_chunk_manifest) =
+            registry.compress(original_chunk, codec_kind).await?;
+
+        let header = FrameHeader {
+            codec: codec_kind,
+            original_size: filled as u64,
+            compressed_size: compressed_chunk.len() as u64,
+            crc32c: chunk_crc,
+        };
+        write_frame(&mut framed, header, &compressed_chunk);
+    }
+
+    let total_framed = framed.len() as u64;
+    Ok((
+        framed.freeze(),
+        ChunkManifest {
+            codec: codec_kind,
+            original_size: total_in,
+            compressed_size: total_framed,
+            crc32c: rolling_crc,
+        },
+    ))
+}
 
 /// `body` を passthrough で集めるだけ。CRC32C も計算する。
 pub async fn streaming_passthrough(

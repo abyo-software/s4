@@ -34,8 +34,11 @@ fn make_dispatcher(kind: CodecKind) -> Arc<AlwaysDispatcher> {
 /// In-memory な (bucket, key) → (body, metadata) ストア。
 /// 実装するのは S4 が呼ぶ最小集合: `put_object`, `get_object`, `head_object`。
 /// それ以外は trait default (NotImplemented) のまま。
+///
+/// `inner` を `Arc<Mutex<...>>` で持つことで test が S4Service を消費せずに
+/// backend storage を覗ける (single-PUT framed body / sidecar 検証で使用)。
 struct MemoryBackend {
-    inner: Mutex<HashMap<(String, String), StoredObject>>,
+    inner: Arc<Mutex<HashMap<(String, String), StoredObject>>>,
 }
 
 #[derive(Clone)]
@@ -48,8 +51,12 @@ struct StoredObject {
 impl MemoryBackend {
     fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn shared(&self) -> Arc<Mutex<HashMap<(String, String), StoredObject>>> {
+        Arc::clone(&self.inner)
     }
 }
 
@@ -283,6 +290,184 @@ async fn get_object_without_s4_metadata_passes_through() {
     assert_eq!(
         got, raw,
         "raw object lacking s4 metadata must pass through unchanged"
+    );
+}
+
+/// v0.2 #4: large single-PUT object becomes multi-frame S4F2 + sidecar.
+///
+/// Validates:
+/// - Body bytes start with the S4F2 magic (= framed format)
+/// - `s4-framed` metadata flag is set
+/// - `<key>.s4index` sidecar is written (for multi-frame objects)
+/// - Roundtrip GET reconstructs the original bytes exactly
+#[tokio::test]
+async fn single_put_above_chunk_size_is_framed_with_sidecar() {
+    let backend = MemoryBackend::new();
+    let backend_view = backend.shared();
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    );
+
+    // > DEFAULT_S4F2_CHUNK_SIZE (4 MiB) → must produce >= 2 frames
+    let payload = Bytes::from(vec![b'z'; 5 * 1024 * 1024]);
+    s4.put_object(put_request("bucket", "framed_object", payload.clone()))
+        .await
+        .expect("put");
+
+    // peek the backend to verify framed format
+    let inner = backend_view.lock().unwrap();
+    let stored = inner
+        .get(&("bucket".into(), "framed_object".into()))
+        .unwrap();
+    assert_eq!(
+        &stored.body[0..4],
+        b"S4F2",
+        "framed body must start with S4F2 magic"
+    );
+    let meta = stored.metadata.as_ref().expect("must have s4 metadata");
+    assert_eq!(
+        meta.get("s4-framed").map(String::as_str),
+        Some("true"),
+        "s4-framed flag must be set on framed objects"
+    );
+    // sidecar must exist
+    assert!(
+        inner.contains_key(&("bucket".into(), "framed_object.s4index".into())),
+        "sidecar object must be written for multi-frame body"
+    );
+    drop(inner);
+
+    let resp = s4
+        .get_object(get_request("bucket", "framed_object"))
+        .await
+        .expect("get");
+    let got = read_back(resp).await;
+    assert_eq!(
+        got, payload,
+        "framed roundtrip must reconstruct original bytes"
+    );
+}
+
+/// v0.2 #4: small single-PUT object is still framed but no sidecar
+/// (single frame = sidecar offers no benefit).
+#[tokio::test]
+async fn single_put_small_object_is_framed_without_sidecar() {
+    let backend = MemoryBackend::new();
+    let backend_view = backend.shared();
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    );
+
+    let payload = Bytes::from(b"small payload, well under the chunk size".to_vec());
+    s4.put_object(put_request("bucket", "tiny", payload.clone()))
+        .await
+        .expect("put");
+
+    let inner = backend_view.lock().unwrap();
+    assert!(
+        !inner.contains_key(&("bucket".into(), "tiny.s4index".into())),
+        "no sidecar should be written for single-frame objects"
+    );
+    drop(inner);
+
+    let resp = s4
+        .get_object(get_request("bucket", "tiny"))
+        .await
+        .expect("get");
+    assert_eq!(read_back(resp).await, payload);
+}
+
+/// v0.2 #4: Range GET on a framed object follows the sidecar partial-fetch
+/// path. With per-chunk frames + sidecar, the GET handler should serve the
+/// requested range correctly (byte-equal to the original slice).
+#[tokio::test]
+async fn single_put_framed_range_get_via_sidecar() {
+    let backend = MemoryBackend::new();
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    );
+
+    // Multi-chunk payload: 6 MiB → 2 frames at 4 MiB chunk size
+    let payload: Bytes = (0u32..(6 * 1024 * 1024 / 4))
+        .flat_map(|n| n.to_le_bytes())
+        .collect::<Vec<u8>>()
+        .into();
+    s4.put_object(put_request("bucket", "rangeable", payload.clone()))
+        .await
+        .expect("put");
+
+    // Range GET: bytes 1_500_000-1_500_999 (1000 bytes inside the first frame)
+    let mut req = get_request("bucket", "rangeable");
+    req.input.range = Some(s3s::dto::Range::Int {
+        first: 1_500_000,
+        last: Some(1_500_999),
+    });
+    let resp = s4.get_object(req).await.expect("range get");
+    let got = read_back(resp).await;
+    assert_eq!(got.len(), 1000, "should return exactly the requested range");
+    assert_eq!(
+        got,
+        payload.slice(1_500_000..1_501_000),
+        "ranged bytes must match original slice"
+    );
+
+    // Range GET that crosses a frame boundary
+    let mut req = get_request("bucket", "rangeable");
+    req.input.range = Some(s3s::dto::Range::Int {
+        first: 4_000_000,
+        last: Some(4_500_000),
+    });
+    let resp = s4.get_object(req).await.expect("cross-frame range get");
+    let got = read_back(resp).await;
+    assert_eq!(got.len(), 4_500_001 - 4_000_000);
+    assert_eq!(got, payload.slice(4_000_000..4_500_001));
+}
+
+/// v0.2 #4 back-compat: a v0.1 object stored as raw compressed bytes (no
+/// `s4-framed` flag) must still GET correctly through v0.2.
+#[tokio::test]
+async fn legacy_v01_raw_blob_still_decompresses_on_get() {
+    let backend = MemoryBackend::new();
+    // Manually inject a v0.1-style stored object: raw zstd-compressed body +
+    // legacy manifest metadata, no `s4-framed` flag.
+    let original = Bytes::from(b"legacy v0.1 payload that v0.2 must still read".to_vec());
+    let raw_compressed = zstd::stream::encode_all(original.as_ref(), 3).unwrap();
+    let mut meta = Metadata::default();
+    meta.insert("s4-codec".into(), "cpu-zstd".into());
+    meta.insert("s4-original-size".into(), original.len().to_string());
+    meta.insert(
+        "s4-compressed-size".into(),
+        raw_compressed.len().to_string(),
+    );
+    meta.insert("s4-crc32c".into(), crc32c::crc32c(&original).to_string());
+    backend.inner.lock().unwrap().insert(
+        ("bucket".into(), "legacy_obj".into()),
+        StoredObject {
+            body: Bytes::from(raw_compressed),
+            metadata: Some(meta),
+            content_type: None,
+        },
+    );
+
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    );
+    let resp = s4
+        .get_object(get_request("bucket", "legacy_obj"))
+        .await
+        .expect("get");
+    assert_eq!(
+        read_back(resp).await,
+        original,
+        "legacy v0.1 raw blob must decompress correctly under v0.2"
     );
 }
 

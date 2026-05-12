@@ -45,10 +45,8 @@ use tracing::{debug, info};
 use crate::blob::{
     bytes_to_blob, chain_sample_with_rest, collect_blob, collect_with_sample, peek_sample,
 };
-#[cfg(feature = "nvcomp-gpu")]
-use crate::streaming::{DEFAULT_NVCOMP_STREAM_CHUNK_SIZE, streaming_compress_nvcomp_zstd};
 use crate::streaming::{
-    cpu_zstd_decompress_stream, streaming_compress_cpu_zstd, streaming_passthrough,
+    DEFAULT_S4F2_CHUNK_SIZE, cpu_zstd_decompress_stream, streaming_compress_to_frames,
     supports_streaming_compress, supports_streaming_decompress,
 };
 
@@ -303,6 +301,18 @@ const META_CRC32C: &str = "s4-crc32c";
 /// Multipart upload で per-part frame format を使ったオブジェクトであることを示す。
 /// GET 時にこの flag を見て frame parser を起動する。
 const META_MULTIPART: &str = "s4-multipart";
+/// v0.2 #4: single-PUT でも S4F2 framed format で書かれていることを示す。
+/// 旧 v0.1 single-PUT は raw 圧縮 bytes (この flag なし)。GET 時にこの flag を
+/// 見て framed 経路 (= multipart と同じ FrameIter parse) に流す。
+const META_FRAMED: &str = "s4-framed";
+
+fn is_framed_v2_object(metadata: &Option<Metadata>) -> bool {
+    metadata
+        .as_ref()
+        .and_then(|m| m.get(META_FRAMED))
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
 
 fn extract_manifest(metadata: &Option<Metadata>) -> Option<ChunkManifest> {
     let m = metadata.as_ref()?;
@@ -391,53 +401,55 @@ impl<B: S3> S3 for S4Service<B> {
             let sample_len = sample.len().min(SAMPLE_BYTES);
             let kind = self.dispatcher.pick(&sample[..sample_len]).await;
 
-            let (compressed, manifest) = if supports_streaming_compress(kind) {
+            let (compressed, manifest, is_framed) = if supports_streaming_compress(kind) {
                 // streaming fast path: input は memory に collect しない
                 let chained = chain_sample_with_rest(sample, rest_stream);
                 debug!(
                     bucket = ?req.input.bucket,
                     key = ?req.input.key,
                     codec = kind.as_str(),
-                    path = "streaming",
-                    "S4 put_object: compressing (streaming)"
+                    path = "streaming-framed",
+                    "S4 put_object: compressing (streaming, S4F2 multi-frame)"
                 );
-                match kind {
-                    CodecKind::CpuZstd => {
-                        // dispatcher の default zstd level (3) を使う。CLI で
-                        // `--zstd-level` を変えても registry 内の codec を
-                        // 経由せず streaming に分岐するため反映されない。
-                        // Phase 2.1 で `streaming_compress` への level 注入を検討
-                        streaming_compress_cpu_zstd(chained, 3).await
-                    }
-                    CodecKind::Passthrough => streaming_passthrough(chained).await,
-                    #[cfg(feature = "nvcomp-gpu")]
-                    CodecKind::NvcompZstd => {
-                        streaming_compress_nvcomp_zstd(chained, DEFAULT_NVCOMP_STREAM_CHUNK_SIZE)
-                            .await
-                    }
-                    other => unreachable!("supports_streaming_compress lied: {other:?}"),
-                }
-                .map_err(internal("streaming compress"))?
+                let (body, manifest) = streaming_compress_to_frames(
+                    chained,
+                    Arc::clone(&self.registry),
+                    kind,
+                    DEFAULT_S4F2_CHUNK_SIZE,
+                )
+                .await
+                .map_err(internal("streaming framed compress"))?;
+                (body, manifest, true)
             } else {
-                // GPU codec 等は batch API なので bytes-buffered path
+                // GPU codec 等で streaming-aware でないものは bytes-buffered path
+                // (raw 圧縮 bytes、framed なし — back-compat 互換 path)
                 let bytes = collect_with_sample(sample, rest_stream, self.max_body_bytes)
                     .await
-                    .map_err(internal("collect put body (gpu path)"))?;
+                    .map_err(internal("collect put body (buffered path)"))?;
                 debug!(
                     bucket = ?req.input.bucket,
                     key = ?req.input.key,
                     bytes = bytes.len(),
                     codec = kind.as_str(),
                     path = "buffered",
-                    "S4 put_object: compressing (buffered)"
+                    "S4 put_object: compressing (buffered, raw blob)"
                 );
-                self.registry
+                let (body, m) = self
+                    .registry
                     .compress(bytes, kind)
                     .await
-                    .map_err(internal("registry compress"))?
+                    .map_err(internal("registry compress"))?;
+                (body, m, false)
             };
 
             write_manifest(&mut req.input.metadata, &manifest);
+            if is_framed {
+                // v0.2 #4: framed body であることを GET 側に伝える meta flag。
+                req.input
+                    .metadata
+                    .get_or_insert_with(Default::default)
+                    .insert(META_FRAMED.into(), "true".into());
+            }
             // 重要: content_length を圧縮後サイズで更新する。
             // これを忘れると下流 (aws-sdk-s3 → S3) が宣言サイズ分の bytes を
             // 待ち続けて RequestTimeout で失敗する (S3 仕様)。
@@ -456,12 +468,23 @@ impl<B: S3> S3 for S4Service<B> {
             let original_size = manifest.original_size;
             let compressed_size = manifest.compressed_size;
             let codec_label = manifest.codec.as_str();
+            // framed body は GET 側で sidecar partial-fetch を効かせるため
+            // build_index_from_body で sidecar を組み立てて backend に PUT する。
+            let sidecar_index = if is_framed {
+                s4_codec::index::build_index_from_body(&compressed).ok()
+            } else {
+                None
+            };
             req.input.body = Some(bytes_to_blob(compressed));
             let backend_resp = self.backend.put_object(req).await;
-            // 単発 PUT は frame 化していない (raw 圧縮 bytes をそのまま流す) ので
-            // sidecar は書かない。書いても partial-range fast path で
-            // S4F2 magic が見つからず failure する。Phase 2.2 で non-multipart も
-            // 全て frame 化に統一すれば sidecar を書ける (今は multipart 限定)
+            if let Some(idx) = sidecar_index
+                && backend_resp.is_ok()
+                && idx.entries.len() > 1
+            {
+                // 1 chunk しかない (small object) なら sidecar は意味がない (=
+                // partial fetch しても full body と同じ範囲) ので省略。
+                self.write_sidecar(&put_bucket, &put_key, &idx).await;
+            }
             let _ = (original_size, compressed_size); // mute unused warnings
             let elapsed = put_start.elapsed();
             crate::metrics::record_put(
@@ -528,9 +551,13 @@ impl<B: S3> S3 for S4Service<B> {
         }
         let mut resp = self.backend.get_object(req).await?;
         let is_multipart = is_multipart_object(&resp.output.metadata);
+        let is_framed_v2 = is_framed_v2_object(&resp.output.metadata);
+        // v0.2 #4: framed-v2 single-PUT は多 frame parse が必要なので
+        // multipart と同じ path に流す。
+        let needs_frame_parse = is_multipart || is_framed_v2;
         let manifest_opt = extract_manifest(&resp.output.metadata);
 
-        if !is_multipart && manifest_opt.is_none() {
+        if !needs_frame_parse && manifest_opt.is_none() {
             // S4 が書いていないオブジェクトは透過 (raw bucket pre-existing object 等)
             debug!("S4 get_object: object lacks s4-codec metadata, returning as-is");
             return Ok(resp);
@@ -545,7 +572,7 @@ impl<B: S3> S3 for S4Service<B> {
             // ただし Range request 時は streaming できない (slice するため total bytes
             // が必要) → buffered path に fall through。
             if range_request.is_none()
-                && !is_multipart
+                && !needs_frame_parse
                 && let Some(ref m) = manifest_opt
                 && supports_streaming_decompress(m.codec)
                 && m.codec == CodecKind::CpuZstd
@@ -582,7 +609,7 @@ impl<B: S3> S3 for S4Service<B> {
             }
             // Passthrough: そのまま流す (Range なしの場合のみ streaming)
             if range_request.is_none()
-                && !is_multipart
+                && !needs_frame_parse
                 && let Some(ref m) = manifest_opt
                 && m.codec == CodecKind::Passthrough
             {
@@ -603,7 +630,9 @@ impl<B: S3> S3 for S4Service<B> {
                 .await
                 .map_err(internal("collect get body"))?;
 
-            let decompressed = if is_multipart {
+            let decompressed = if needs_frame_parse {
+                // multipart objects と framed-v2 single-PUT objects は同じ
+                // S4F2 frame 列なので decompress_multipart で統一処理
                 self.decompress_multipart(bytes).await?
             } else {
                 let manifest = manifest_opt.as_ref().expect("non-multipart guarded above");
