@@ -38,3 +38,4 @@ s4-config = { path = "../s4-config" }
 [dev-dependencies]
 tempfile = "3"
 http = "1"
+testcontainers-modules = { version = "0.14", features = ["minio"] }

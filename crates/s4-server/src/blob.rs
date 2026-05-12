@@ -4,10 +4,14 @@
 //! chunk 圧縮 (Phase 2 で取り組む) に比べると memory cost が高いが、roundtrip 検証と
 //! manifest 生成の単純さを優先。max_bytes で受け取れる最大サイズを上限化する。
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use bytes::{Bytes, BytesMut};
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
+use s3s::StdError;
 use s3s::dto::StreamingBlob;
-use s3s::stream::ByteStream;
+use s3s::stream::{ByteStream, RemainingLength};
 
 /// `StreamingBlob` を Bytes に collect。`max_bytes` を超えたら早期に Err。
 pub async fn collect_blob(blob: StreamingBlob, max_bytes: usize) -> Result<Bytes, BlobError> {
@@ -28,9 +32,40 @@ pub async fn collect_blob(blob: StreamingBlob, max_bytes: usize) -> Result<Bytes
 }
 
 /// `Bytes` を 1 chunk の `StreamingBlob` に包む。
+///
+/// content-length を **既知** として返す ByteStream impl にすることが重要。
+/// `StreamingBlob::wrap` (futures::Stream 越し) だと remaining_length が unknown
+/// になり、aws-sdk-s3 が `AwsChunkedContentEncodingInterceptor` で
+/// `UnsizedRequestBody` エラーを返す。
 pub fn bytes_to_blob(bytes: Bytes) -> StreamingBlob {
-    let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(bytes) });
-    StreamingBlob::wrap(stream)
+    StreamingBlob::new(SingleChunkBlob(Some(bytes)))
+}
+
+/// 単一の `Bytes` を 1 度だけ yield して終わる `ByteStream`。
+/// `remaining_length` を正確な byte 数として返すので、aws-sdk-s3 の chunked
+/// signing path がそのまま動く。
+struct SingleChunkBlob(Option<Bytes>);
+
+impl Stream for SingleChunkBlob {
+    type Item = Result<Bytes, StdError>;
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.get_mut().0.take().map(Ok))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match &self.0 {
+            Some(_) => (1, Some(1)),
+            None => (0, Some(0)),
+        }
+    }
+}
+
+impl ByteStream for SingleChunkBlob {
+    fn remaining_length(&self) -> RemainingLength {
+        match &self.0 {
+            Some(b) => RemainingLength::new_exact(b.len()),
+            None => RemainingLength::new_exact(0),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
