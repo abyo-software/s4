@@ -50,7 +50,7 @@ use std::ffi::c_void;
 use std::ptr::null_mut;
 
 use super::error::{Error, Result};
-use super::nvcomp_sys::cuda::{cudaFree, cudaMalloc, CUDA_SUCCESS};
+use super::nvcomp_sys::cuda::{CUDA_SUCCESS, cudaFree, cudaMalloc};
 
 /// Power-of-two floor for size-class buckets. Smaller requests round up
 /// to this bucket so the very smallest cohort metadata slots (1-2 KiB)

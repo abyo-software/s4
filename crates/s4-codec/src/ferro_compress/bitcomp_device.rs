@@ -64,17 +64,17 @@ use std::ptr::null_mut;
 use super::algo::BitcompDataType;
 use super::error::{Error, Result};
 use super::nvcomp_sys::cuda::{
-    cudaError_t, cudaFree, cudaGetErrorString, cudaMalloc, cudaMemcpy, cudaMemcpyKind,
-    cudaStreamSynchronize, cudaStream_t, CUDA_SUCCESS,
+    CUDA_SUCCESS, cudaError_t, cudaFree, cudaGetErrorString, cudaMalloc, cudaMemcpy,
+    cudaMemcpyKind, cudaStream_t, cudaStreamSynchronize,
 };
 use super::nvcomp_sys::nvcomp::{
-    nvcompBatchedBitcompCompressAsync, nvcompBatchedBitcompCompressGetMaxOutputChunkSize,
-    nvcompBatchedBitcompCompressGetTempSizeSync, nvcompBatchedBitcompDecompressAsync,
-    nvcompBatchedBitcompDecompressGetTempSizeAsync, nvcompBatchedBitcompDecompressOpts_t,
-    nvcompBatchedBitcompFormatOpts, nvcompStatus_t, nvcompSuccess, nvcompType_t,
     NVCOMP_BITCOMP_FORMAT_DEFAULT, NVCOMP_TYPE_BFLOAT16, NVCOMP_TYPE_CHAR, NVCOMP_TYPE_DOUBLE,
     NVCOMP_TYPE_FLOAT, NVCOMP_TYPE_INT, NVCOMP_TYPE_LONGLONG, NVCOMP_TYPE_SHORT, NVCOMP_TYPE_UCHAR,
-    NVCOMP_TYPE_UINT, NVCOMP_TYPE_ULONGLONG, NVCOMP_TYPE_USHORT,
+    NVCOMP_TYPE_UINT, NVCOMP_TYPE_ULONGLONG, NVCOMP_TYPE_USHORT, nvcompBatchedBitcompCompressAsync,
+    nvcompBatchedBitcompCompressGetMaxOutputChunkSize, nvcompBatchedBitcompCompressGetTempSizeSync,
+    nvcompBatchedBitcompDecompressAsync, nvcompBatchedBitcompDecompressGetTempSizeAsync,
+    nvcompBatchedBitcompDecompressOpts_t, nvcompBatchedBitcompFormatOpts, nvcompStatus_t,
+    nvcompSuccess, nvcompType_t,
 };
 use super::slab_alloc::SlabAllocator;
 
@@ -1201,8 +1201,8 @@ fn bitcomp_format_opts(dt: BitcompDataType) -> nvcompBatchedBitcompFormatOpts {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::nvcomp_sys::cuda::cudaMemcpy;
+    use super::*;
 
     /// Helper: try to construct the codec; returns `None` on a
     /// driver-missing host so tests skip cleanly.

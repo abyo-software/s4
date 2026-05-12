@@ -27,8 +27,8 @@
 mod imp {
     use std::sync::Arc;
 
-    use bytes::Bytes;
     use crate::ferro_compress::{Algo, BitcompDataType, Codec as FerroCodec, NvcompCodec};
+    use bytes::Bytes;
 
     use crate::{ChunkManifest, Codec, CodecError, CodecKind};
 

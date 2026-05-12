@@ -48,14 +48,14 @@ pub use nvcomp::NvcompCodec;
 
 #[cfg(feature = "nvcomp-gpu")]
 pub use nvcomp_hlif::{
-    cuda_available, BitcompHlifBackend, ZstdHlifBackend, DEFAULT_HLIF_CHUNK_SIZE,
+    BitcompHlifBackend, DEFAULT_HLIF_CHUNK_SIZE, ZstdHlifBackend, cuda_available,
 };
 
 #[cfg(feature = "nvcomp-gpu")]
 pub use bitcomp_device::BitcompDeviceCodec;
 
 #[cfg(feature = "nvcomp-gpu")]
-pub use slab_alloc::{SlabAllocator, SLAB_MAX_BUCKET_BYTES, SLAB_MIN_BUCKET_BYTES};
+pub use slab_alloc::{SLAB_MAX_BUCKET_BYTES, SLAB_MIN_BUCKET_BYTES, SlabAllocator};
 
 /// Compression / decompression interface (verbatim from upstream
 /// `ferro_compress::Codec`).

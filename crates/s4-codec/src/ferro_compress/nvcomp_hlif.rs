@@ -68,14 +68,14 @@ use std::sync::Mutex;
 use super::algo::BitcompDataType;
 use super::error::{Error, Result};
 use super::nvcomp_sys::cuda::{
-    cudaError_t, cudaFree, cudaGetDeviceCount, cudaGetErrorString, cudaMalloc, cudaMemcpyAsync,
-    cudaMemcpyKind, cudaStreamCreate, cudaStreamDestroy, cudaStreamSynchronize, cudaStream_t,
-    CUDA_SUCCESS,
+    CUDA_SUCCESS, cudaError_t, cudaFree, cudaGetDeviceCount, cudaGetErrorString, cudaMalloc,
+    cudaMemcpyAsync, cudaMemcpyKind, cudaStream_t, cudaStreamCreate, cudaStreamDestroy,
+    cudaStreamSynchronize,
 };
 use super::nvcomp_sys::nvcomp::{
-    nvcompType_t, NVCOMP_TYPE_BFLOAT16, NVCOMP_TYPE_CHAR, NVCOMP_TYPE_DOUBLE, NVCOMP_TYPE_FLOAT,
-    NVCOMP_TYPE_INT, NVCOMP_TYPE_LONGLONG, NVCOMP_TYPE_SHORT, NVCOMP_TYPE_UCHAR, NVCOMP_TYPE_UINT,
-    NVCOMP_TYPE_ULONGLONG, NVCOMP_TYPE_USHORT,
+    NVCOMP_TYPE_BFLOAT16, NVCOMP_TYPE_CHAR, NVCOMP_TYPE_DOUBLE, NVCOMP_TYPE_FLOAT, NVCOMP_TYPE_INT,
+    NVCOMP_TYPE_LONGLONG, NVCOMP_TYPE_SHORT, NVCOMP_TYPE_UCHAR, NVCOMP_TYPE_UINT,
+    NVCOMP_TYPE_ULONGLONG, NVCOMP_TYPE_USHORT, nvcompType_t,
 };
 use super::{Algo, Codec};
 

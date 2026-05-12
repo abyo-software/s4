@@ -35,7 +35,7 @@
 //! `NvcompCodec` (or by a CPU re-implementation of the framing on top of the
 //! per-chunk Snappy/LZ4/zstd block format).
 
-use std::ffi::{c_void, CStr};
+use std::ffi::{CStr, c_void};
 use std::ptr::null_mut;
 use std::sync::Mutex;
 
