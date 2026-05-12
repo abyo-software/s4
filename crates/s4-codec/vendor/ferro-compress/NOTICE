@@ -1,0 +1,41 @@
+S4 vendored subset of ferro-compress
+====================================
+
+This directory contains a vendored subset of the `ferro-compress` Rust crate,
+originally developed as part of the FerroSearch project by:
+
+    abyo software (masumi-ryugo) <abyo.software@gmail.com>
+
+Upstream repository (private):
+    https://github.com/abyo-software/ferrosearch-gpu-compress
+    crates/ferro-compress/  (Apache-2.0 OR MIT, publish=false)
+
+The files in this directory are dual-licensed under Apache License, Version 2.0
+(see LICENSE in this directory) OR the MIT License at the recipient's option.
+
+Files vendored verbatim from upstream `crates/ferro-compress/src/`:
+    algo.rs
+    error.rs
+    nvcomp.rs
+    nvcomp_hlif.rs
+    bitcomp_device.rs
+    slab_alloc.rs
+    nvcomp_sys/cuda.rs
+    nvcomp_sys/nvcomp.rs
+    nvcomp_sys/mod.rs
+    cuda_kernels/nvcomp_hlif_shim.cpp
+    build.rs
+
+Files modified or rewritten for S4:
+    src/lib.rs       — module list trimmed to the nvCOMP-only subset; Tantivy
+                       bitmap-op kernel, posting-list stats kernel, CPU codec,
+                       and Backend dispatcher are NOT vendored.
+    Cargo.toml       — package renamed to `ferro-compress-vendored`,
+                       feature surface trimmed to `nvcomp` only, CPU
+                       compression dependencies removed.
+
+Third-party dependencies referenced through the vendored FFI bindings:
+- NVIDIA nvCOMP — proprietary, distributed under the NVIDIA Software License
+  Agreement. Not vendored. Users must obtain libnvcomp.so from NGC and supply
+  NVCOMP_HOME at build time. See https://developer.nvidia.com/nvcomp.
+- NVIDIA CUDA Toolkit — proprietary. Not vendored. Required at build/runtime.

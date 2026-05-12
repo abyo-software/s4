@@ -1,24 +1,38 @@
-//! S4 server binary (spike 版、2026-05-12)。
-//!
-//! 現時点では `s3s_aws::Proxy` をそのまま使い、AWS S3 への素通しが動くことを確認する。
-//! Phase 1 で `s3s::S3` trait を独自実装した `S4Service` でラップし、PUT/GET 経路に
-//! `s4_codec::Codec` の hook を差し込む。
+//! S4 server binary。`s4-server::S4Service` で `s3s_aws::Proxy` を圧縮 hook 付きに
+//! ラップし、hyper-util 経由で公開する。
 
 use std::error::Error;
 use std::io::IsTerminal;
+use std::sync::Arc;
 
 use aws_credential_types::provider::ProvideCredentials;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
+use s3s::S3;
 use s3s::auth::SimpleAuth;
 use s3s::host::SingleDomain;
 use s3s::service::S3ServiceBuilder;
+use s4_codec::{cpu_zstd::CpuZstd, passthrough::Passthrough};
+use s4_server::S4Service;
 use tokio::net::TcpListener;
 use tracing::info;
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CodecChoice {
+    /// 無圧縮 (開発・比較用)
+    Passthrough,
+    /// CPU zstd (GPU 不要、test bed)
+    CpuZstd,
+    // TODO Phase 1 後半: NvcompBitcomp / NvcompZstd / NvcompGans / DietGpuAns
+}
+
 #[derive(Debug, Parser)]
-#[command(name = "s4", version, about = "S4 — Squished S3 (GPU 透過圧縮 S3 互換ゲートウェイ)")]
+#[command(
+    name = "s4",
+    version,
+    about = "S4 — Squished S3 (GPU 透過圧縮 S3 互換ゲートウェイ)"
+)]
 struct Opt {
     #[clap(long, default_value = "127.0.0.1")]
     host: String,
@@ -32,6 +46,14 @@ struct Opt {
     /// バックエンド S3 endpoint (例: https://s3.us-east-1.amazonaws.com)
     #[clap(long)]
     endpoint_url: String,
+
+    /// 圧縮 codec
+    #[clap(long, value_enum, default_value = "cpu-zstd")]
+    codec: CodecChoice,
+
+    /// CPU zstd の compression level (1-22)
+    #[clap(long, default_value_t = CpuZstd::DEFAULT_LEVEL)]
+    zstd_level: i32,
 }
 
 fn setup_tracing() {
@@ -49,7 +71,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     setup_tracing();
     let opt = Opt::parse();
 
-    let sdk_conf = aws_config::from_env().endpoint_url(&opt.endpoint_url).load().await;
+    let sdk_conf = aws_config::from_env()
+        .endpoint_url(&opt.endpoint_url)
+        .load()
+        .await;
     let client = aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::config::Builder::from(&sdk_conf)
             .force_path_style(true)
@@ -57,8 +82,30 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     );
     let proxy = s3s_aws::Proxy::from(client);
 
+    info!(codec = ?opt.codec, "S4 codec activated");
+
+    match opt.codec {
+        CodecChoice::Passthrough => {
+            let s4 = S4Service::new(proxy, Arc::new(Passthrough));
+            run_server(s4, &sdk_conf, &opt).await
+        }
+        CodecChoice::CpuZstd => {
+            let s4 = S4Service::new(proxy, Arc::new(CpuZstd::new(opt.zstd_level)));
+            run_server(s4, &sdk_conf, &opt).await
+        }
+    }
+}
+
+async fn run_server<S>(
+    s4: S,
+    sdk_conf: &aws_config::SdkConfig,
+    opt: &Opt,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>>
+where
+    S: S3 + Send + Sync + 'static,
+{
     let service = {
-        let mut b = S3ServiceBuilder::new(proxy);
+        let mut b = S3ServiceBuilder::new(s4);
         if let Some(cred_provider) = sdk_conf.credentials_provider() {
             let cred = cred_provider.provide_credentials().await?;
             b.set_auth(SimpleAuth::from_single(
@@ -66,8 +113,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
                 cred.secret_access_key(),
             ));
         }
-        if let Some(domain) = opt.domain {
-            b.set_host(SingleDomain::new(&domain)?);
+        if let Some(domain) = &opt.domain {
+            b.set_host(SingleDomain::new(domain)?);
         }
         b.build()
     };

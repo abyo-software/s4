@@ -36,6 +36,10 @@ async-trait = "0.1"
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
+crc32c = "0.6"
+zstd = "0.13"
+futures = "0.3"
+thiserror = "2"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

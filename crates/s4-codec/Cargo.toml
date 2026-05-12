@@ -16,6 +16,10 @@ bytes.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 serde.workspace = true
+crc32c.workspace = true
+zstd.workspace = true
+tokio = { workspace = true }
+thiserror.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }

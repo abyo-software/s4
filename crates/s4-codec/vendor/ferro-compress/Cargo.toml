@@ -1,0 +1,37 @@
+# Vendored subset of ferro-compress (Apache-2.0 OR MIT). See src/lib.rs for
+# scope, modifications, and provenance.
+#
+# This is NOT wired into the s4 workspace by default — it lives as a sibling
+# directory under crates/s4-codec/vendor/ as a footprint for the Phase 1
+# implementor. To activate:
+#
+#   1. Add this crate to the workspace members in /home/y1/git/s4/Cargo.toml
+#      (or list it as `path = "vendor/ferro-compress"` from s4-codec/Cargo.toml).
+#   2. Enable the `nvcomp` feature on a host with CUDA + NVCOMP_HOME set.
+#   3. Wire s4-codec/src/nvcomp.rs to call into `ferro_compress_vendored::NvcompCodec`.
+
+[package]
+name = "ferro-compress-vendored"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0 OR MIT"
+publish = false
+description = "Vendored ferro-compress subset for S4 (nvCOMP backend only)"
+
+[lib]
+name = "ferro_compress_vendored"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Opt-in GPU backend. Requires NVCOMP_HOME (path to extracted nvCOMP redist
+# tarball) and CUDA runtime libs at link time. Without this feature the crate
+# exports only the algo / error / Codec trait surface and has zero CUDA deps.
+nvcomp = []
+
+[dependencies]
+thiserror = "2"
+
+[build-dependencies]
+# (none — build.rs only emits cargo metadata when the nvcomp feature is on)

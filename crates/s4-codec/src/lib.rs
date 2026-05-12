@@ -4,10 +4,13 @@
 //!
 //! - **nvCOMP** (NVIDIA proprietary、要 license 確認): Bitcomp / gANS / zstd-GPU
 //! - **DietGPU** (Meta, MIT): ANS-only、license clean な fallback
-//! - **CPU zstd**: GPU 無し環境向け究極の fallback
+//! - **CPU zstd**: GPU 無し環境向け究極の fallback / test bed
+
+use std::str::FromStr;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 pub mod cpu_zstd;
 pub mod dietgpu;
@@ -39,6 +42,25 @@ impl CodecKind {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("unknown codec kind: {0}")]
+pub struct ParseCodecKindError(String);
+
+impl FromStr for CodecKind {
+    type Err = ParseCodecKindError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "passthrough" => Self::Passthrough,
+            "nvcomp-bitcomp" => Self::NvcompBitcomp,
+            "nvcomp-gans" => Self::NvcompGans,
+            "nvcomp-zstd" => Self::NvcompZstd,
+            "dietgpu-ans" => Self::DietGpuAns,
+            "cpu-zstd" => Self::CpuZstd,
+            other => return Err(ParseCodecKindError(other.into())),
+        })
+    }
+}
+
 /// 圧縮済 chunk のメタ情報。S3 オブジェクトの metadata に格納される。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkManifest {
@@ -48,19 +70,44 @@ pub struct ChunkManifest {
     pub crc32c: u32,
 }
 
+/// codec 操作のエラー型。`anyhow::Error` ではなく専用型にすることで、上位 (S4Service) が
+/// HTTP エラーコードを意味的に出し分けやすくする。
+#[derive(Debug, Error)]
+pub enum CodecError {
+    #[error("codec mismatch: expected {expected:?}, got {got:?}")]
+    CodecMismatch { expected: CodecKind, got: CodecKind },
+
+    #[error("crc32c mismatch (chunk corruption?): expected {expected:#010x}, got {got:#010x}")]
+    CrcMismatch { expected: u32, got: u32 },
+
+    #[error("compressed size mismatch: manifest says {expected} bytes, payload is {got} bytes")]
+    SizeMismatch { expected: u64, got: u64 },
+
+    #[error("compression backend error: {0}")]
+    Backend(#[from] anyhow::Error),
+
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("blocking-task join error: {0}")]
+    Join(#[from] tokio::task::JoinError),
+}
+
 /// pluggable な圧縮 backend trait。
 ///
-/// すべて async — GPU codec は CUDA stream に await できる。
+/// すべて async — GPU codec は CUDA stream に await でき、CPU codec は
+/// `spawn_blocking` で別スレッドへ逃がす。
 #[async_trait::async_trait]
 pub trait Codec: Send + Sync {
     /// この実装が提供する codec の種類
     fn kind(&self) -> CodecKind;
 
     /// 圧縮: 入力 bytes → 圧縮済 bytes + manifest
-    async fn compress(&self, input: Bytes) -> anyhow::Result<(Bytes, ChunkManifest)>;
+    async fn compress(&self, input: Bytes) -> Result<(Bytes, ChunkManifest), CodecError>;
 
     /// 解凍: 圧縮済 bytes + manifest → 元の bytes
-    async fn decompress(&self, input: Bytes, manifest: &ChunkManifest) -> anyhow::Result<Bytes>;
+    async fn decompress(&self, input: Bytes, manifest: &ChunkManifest)
+    -> Result<Bytes, CodecError>;
 }
 
 /// データ種別から最適 codec を選ぶ dispatcher (Phase 1 後半で実装)。
