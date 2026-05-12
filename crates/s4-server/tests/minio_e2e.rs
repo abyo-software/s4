@@ -311,6 +311,92 @@ async fn minio_roundtrip_through_s4_with_nvcomp_bitcomp() {
 
 #[tokio::test]
 #[ignore = "requires Docker for MinIO container"]
+async fn minio_copy_object_preserves_s4_metadata_on_replace_directive() {
+    // 顧客が MetadataDirective::REPLACE で copy しても S4 が s4-* metadata を強制
+    // preserve することを wire-level で確認 (silent corruption 防止)
+
+    let fixture = start_minio().await;
+    let aws_client = build_aws_client(&fixture.endpoint_url).await;
+    ensure_bucket(&aws_client, "s4-copy-test").await;
+
+    let proxy = s3s_aws::Proxy::from(aws_client.clone());
+    let s4 = S4Service::new(
+        proxy,
+        make_registry(),
+        Arc::new(AlwaysDispatcher(CodecKind::CpuZstd)),
+    );
+
+    // 1) 普通に PUT (S4 が s4-codec metadata を書く)
+    let payload = Bytes::from("compressed data ".repeat(2000));
+    s4.put_object(put_request("s4-copy-test", "src.log", payload.clone()))
+        .await
+        .expect("put");
+
+    // 2) S4 経由で copy_object with MetadataDirective::REPLACE + 客カスタム metadata。
+    //    S4 が source の s4-* metadata を merge back することを検証
+    use s3s::dto::*;
+    let mut user_meta = Metadata::new();
+    user_meta.insert("user-tag".into(), "audit-2026".into());
+    let mut b = CopyObjectInput::builder();
+    b.set_bucket("s4-copy-test".into());
+    b.set_key("dst.log".into());
+    b.set_copy_source(CopySource::Bucket {
+        bucket: "s4-copy-test".into(),
+        key: "src.log".into(),
+        version_id: None,
+    });
+    b.set_metadata_directive(Some(MetadataDirective::from_static(
+        MetadataDirective::REPLACE,
+    )));
+    b.set_metadata(Some(user_meta));
+    let copy_input = b.build().expect("CopyObjectInput build");
+    let copy_req = S3Request {
+        input: copy_input,
+        method: http::Method::PUT,
+        uri: "/s4-copy-test/dst.log".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    s4.copy_object(copy_req).await.expect("copy_object");
+
+    // 3) raw GET で MinIO 上の dst.log を確認
+    let raw = aws_client
+        .get_object()
+        .bucket("s4-copy-test")
+        .key("dst.log")
+        .send()
+        .await
+        .expect("raw get");
+    let raw_meta = raw.metadata().cloned().unwrap_or_default();
+    assert_eq!(
+        raw_meta.get("s4-codec").map(String::as_str),
+        Some("cpu-zstd"),
+        "S4 must preserve s4-codec across REPLACE directive"
+    );
+    assert_eq!(
+        raw_meta.get("user-tag").map(String::as_str),
+        Some("audit-2026"),
+        "user-supplied custom metadata must be preserved"
+    );
+
+    // 4) S4 経由で dst.log を GET → 元バイト列が完全に復元 (silent corruption なし)
+    let resp = s4
+        .get_object(get_request("s4-copy-test", "dst.log"))
+        .await
+        .expect("get dst");
+    let got = read_back(resp).await;
+    assert_eq!(
+        got, payload,
+        "destination after REPLACE-copy must roundtrip identically"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
 async fn minio_sampling_dispatcher_skips_already_compressed() {
     let fixture = start_minio().await;
     let aws_client = build_aws_client(&fixture.endpoint_url).await;

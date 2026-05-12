@@ -260,20 +260,29 @@ impl<B: S3> S3 for S4Service<B> {
             req.input.content_md5 = None;
             let original_size = manifest.original_size;
             let compressed_size = manifest.compressed_size;
+            let codec_label = manifest.codec.as_str();
             req.input.body = Some(bytes_to_blob(compressed));
             let backend_resp = self.backend.put_object(req).await;
+            let elapsed = put_start.elapsed();
+            crate::metrics::record_put(
+                codec_label,
+                original_size,
+                compressed_size,
+                elapsed.as_secs_f64(),
+                backend_resp.is_ok(),
+            );
             info!(
                 op = "put_object",
                 bucket = %put_bucket,
                 key = %put_key,
-                codec = manifest.codec.as_str(),
+                codec = codec_label,
                 bytes_in = original_size,
                 bytes_out = compressed_size,
                 ratio = format!(
                     "{:.3}",
                     if original_size == 0 { 1.0 } else { compressed_size as f64 / original_size as f64 }
                 ),
-                latency_ms = put_start.elapsed().as_millis() as u64,
+                latency_ms = elapsed.as_millis() as u64,
                 ok = backend_resp.is_ok(),
                 "S4 put completed"
             );
@@ -351,6 +360,14 @@ impl<B: S3> S3 for S4Service<B> {
                 resp.output.checksum_sha256 = None;
                 resp.output.e_tag = None;
                 resp.output.body = Some(decompressed_blob);
+                let elapsed = get_start.elapsed();
+                crate::metrics::record_get(
+                    m.codec.as_str(),
+                    m.compressed_size,
+                    m.original_size,
+                    elapsed.as_secs_f64(),
+                    true,
+                );
                 info!(
                     op = "get_object",
                     bucket = %get_bucket,
@@ -359,7 +376,7 @@ impl<B: S3> S3 for S4Service<B> {
                     bytes_in = m.compressed_size,
                     bytes_out = m.original_size,
                     path = "streaming",
-                    setup_latency_ms = get_start.elapsed().as_millis() as u64,
+                    setup_latency_ms = elapsed.as_millis() as u64,
                     "S4 get started (streaming)"
                 );
                 return Ok(resp);
@@ -411,15 +428,21 @@ impl<B: S3> S3 for S4Service<B> {
             resp.output.checksum_sha256 = None;
             resp.output.e_tag = None;
             let original_size = decompressed.len() as u64;
+            let codec_label = manifest_opt
+                .as_ref()
+                .map(|m| m.codec.as_str())
+                .unwrap_or("multipart");
             resp.output.body = Some(bytes_to_blob(decompressed));
+            let elapsed = get_start.elapsed();
+            crate::metrics::record_get(codec_label, 0, original_size, elapsed.as_secs_f64(), true);
             info!(
                 op = "get_object",
                 bucket = %get_bucket,
                 key = %get_key,
-                codec = manifest_opt.as_ref().map(|m| m.codec.as_str()).unwrap_or("multipart"),
+                codec = codec_label,
                 bytes_out = original_size,
                 path = "buffered",
-                latency_ms = get_start.elapsed().as_millis() as u64,
+                latency_ms = elapsed.as_millis() as u64,
                 "S4 get completed (buffered)"
             );
         }
@@ -484,8 +507,66 @@ impl<B: S3> S3 for S4Service<B> {
     }
     async fn copy_object(
         &self,
-        req: S3Request<CopyObjectInput>,
+        mut req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
+        // S4-aware copy: source object に s4-* metadata がある場合、それを
+        // destination に確実に preserve する。
+        //
+        // - MetadataDirective::COPY (default): backend が source metadata を
+        //   そのまま copy するので S4 metadata も自動で渡る。介入不要
+        // - MetadataDirective::REPLACE: 客が指定した metadata で source を
+        //   上書き → s4-* metadata が消えると destination は decompress 不能に
+        //   なる (silent corruption)。S4 が source metadata を HEAD で取得し、
+        //   s4-* fields を input.metadata に強制 merge する
+        let needs_merge = req
+            .input
+            .metadata_directive
+            .as_ref()
+            .map(|d| d.as_str() == MetadataDirective::REPLACE)
+            .unwrap_or(false);
+        if needs_merge && let CopySource::Bucket { bucket, key, .. } = &req.input.copy_source {
+            let head_input = HeadObjectInput {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                ..Default::default()
+            };
+            let head_req = S3Request {
+                input: head_input,
+                method: req.method.clone(),
+                uri: req.uri.clone(),
+                headers: req.headers.clone(),
+                extensions: http::Extensions::new(),
+                credentials: req.credentials.clone(),
+                region: req.region.clone(),
+                service: req.service.clone(),
+                trailing_headers: None,
+            };
+            if let Ok(head) = self.backend.head_object(head_req).await
+                && let Some(src_meta) = head.output.metadata.as_ref()
+            {
+                let dest_meta = req.input.metadata.get_or_insert_with(Default::default);
+                for key in [
+                    META_CODEC,
+                    META_ORIGINAL_SIZE,
+                    META_COMPRESSED_SIZE,
+                    META_CRC32C,
+                    META_MULTIPART,
+                ] {
+                    if let Some(v) = src_meta.get(key) {
+                        // 客が同じ key を指定していたら preserve しない (= 上書き許可)
+                        // していたら何もしない。指定していなければ insert
+                        dest_meta
+                            .entry(key.to_string())
+                            .or_insert_with(|| v.clone());
+                    }
+                }
+                debug!(
+                    src_bucket = %bucket,
+                    src_key = %key,
+                    "S4 copy_object: preserved s4-* metadata across REPLACE directive"
+                );
+            }
+        }
         self.backend.copy_object(req).await
     }
     async fn list_objects(

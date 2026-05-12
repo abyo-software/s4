@@ -43,6 +43,8 @@ tokio-util.workspace = true
 crc32c.workspace = true
 pin-project-lite.workspace = true
 http-body-util = "0.1"
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
 
 s4-codec = { path = "../s4-codec" }
 s4-config = { path = "../s4-config" }
@@ -53,3 +55,4 @@ http = "1"
 testcontainers-modules = { version = "0.14", features = ["minio"] }
 zstd = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+metrics-exporter-prometheus.workspace = true

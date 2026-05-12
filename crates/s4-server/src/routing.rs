@@ -18,21 +18,33 @@ use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::service::Service;
 use hyper::{Request, Response, StatusCode};
+use metrics_exporter_prometheus::PrometheusHandle;
 
 /// readiness check 関数。bound is `Send + Sync` for cross-task use.
 pub type ReadyCheck =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync>;
 
-/// inner service と health/ready handler を合成する hyper Service。
+/// inner service と health/ready/metrics handler を合成する hyper Service。
 #[derive(Clone)]
 pub struct HealthRouter<S> {
     pub inner: S,
     pub ready_check: Option<ReadyCheck>,
+    pub metrics_handle: Option<PrometheusHandle>,
 }
 
 impl<S> HealthRouter<S> {
     pub fn new(inner: S, ready_check: Option<ReadyCheck>) -> Self {
-        Self { inner, ready_check }
+        Self {
+            inner,
+            ready_check,
+            metrics_handle: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_metrics(mut self, handle: PrometheusHandle) -> Self {
+        self.metrics_handle = Some(handle);
+        self
     }
 }
 
@@ -53,6 +65,22 @@ fn make_text_response(status: StatusCode, body: &'static str) -> Response<RespBo
         .expect("static response")
 }
 
+fn make_owned_text_response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: String,
+) -> Response<RespBody> {
+    let bytes = Bytes::from(body.into_bytes());
+    Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        .header("content-length", bytes.len().to_string())
+        .body(s3s::Body::http_body(
+            Full::new(bytes).map_err(|never| match never {}),
+        ))
+        .expect("owned response")
+}
+
 impl<S> Service<Request<Incoming>> for HealthRouter<S>
 where
     S: Service<Request<Incoming>, Response = Response<s3s::Body>, Error = s3s::HttpError>
@@ -70,6 +98,25 @@ where
         match (req.method(), path) {
             (&hyper::Method::GET, "/health") | (&hyper::Method::HEAD, "/health") => {
                 Box::pin(async { Ok(make_text_response(StatusCode::OK, "ok\n")) })
+            }
+            (&hyper::Method::GET, "/metrics") | (&hyper::Method::HEAD, "/metrics") => {
+                let handle = self.metrics_handle.clone();
+                Box::pin(async move {
+                    match handle {
+                        Some(h) => {
+                            let body = h.render();
+                            Ok(make_owned_text_response(
+                                StatusCode::OK,
+                                "text/plain; version=0.0.4; charset=utf-8",
+                                body,
+                            ))
+                        }
+                        None => Ok(make_text_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "metrics not configured\n",
+                        )),
+                    }
+                })
             }
             (&hyper::Method::GET, "/ready") | (&hyper::Method::HEAD, "/ready") => {
                 let check = self.ready_check.clone();

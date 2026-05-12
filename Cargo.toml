@@ -44,6 +44,8 @@ thiserror = "2"
 async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 tokio-util = { version = "0.7", features = ["io"] }
 pin-project-lite = "0.2"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

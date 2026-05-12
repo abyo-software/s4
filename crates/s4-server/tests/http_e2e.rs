@@ -26,11 +26,14 @@ use s4_codec::passthrough::Passthrough;
 use s4_codec::{CodecKind, CodecRegistry};
 use s4_server::S4Service;
 use s4_server::routing::HealthRouter;
+use std::sync::OnceLock;
 use testcontainers_modules::minio::MinIO;
 use testcontainers_modules::testcontainers::ContainerAsync;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+
+static METRICS_HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
 
 const MINIO_USER: &str = "minioadmin";
 const MINIO_PASS: &str = "minioadmin";
@@ -90,7 +93,12 @@ async fn spawn_s4_server(backend_endpoint: &str) -> (String, oneshot::Sender<()>
                 .map_err(|e| format!("{e}"))
         })
     });
-    let service = HealthRouter::new(service, Some(ready_check));
+    // Prometheus metrics は同 process で 1 回しか install できないので、
+    // 既に install 済なら再利用、未 install なら install。OnceCell で gate
+    let metrics_handle = METRICS_HANDLE
+        .get_or_init(s4_server::metrics::install)
+        .clone();
+    let service = HealthRouter::new(service, Some(ready_check)).with_metrics(metrics_handle);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let local = listener.local_addr().expect("local addr");
@@ -196,6 +204,56 @@ async fn http_roundtrip_through_full_s4_stack() {
         "MinIO 上の object は圧縮されているべき: {} -> {} bytes",
         payload.len(),
         raw_bytes.len()
+    );
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn http_metrics_endpoint_exposes_prometheus_text() {
+    let minio = start_minio().await;
+    let (s4_endpoint, shutdown) = spawn_s4_server(&minio.endpoint_url).await;
+    let backend = build_aws_client(&minio.endpoint_url);
+    let _ = backend.create_bucket().bucket("metrics-e2e").send().await;
+
+    let s4_client = build_aws_client(&s4_endpoint);
+
+    // 1 PUT で counter を発火
+    let payload = Bytes::from("metrics test ".repeat(2000));
+    s4_client
+        .put_object()
+        .bucket("metrics-e2e")
+        .key("hit.log")
+        .body(payload.into())
+        .send()
+        .await
+        .expect("put");
+
+    // /metrics を取得
+    let resp = reqwest::get(format!("{s4_endpoint}/metrics"))
+        .await
+        .expect("/metrics");
+    assert_eq!(resp.status(), 200);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.contains("text/plain"),
+        "content-type should be Prometheus text format, got {ct}"
+    );
+    let body = resp.text().await.expect("metrics body");
+    assert!(
+        body.contains("s4_requests_total"),
+        "missing s4_requests_total in metrics: {body}"
+    );
+    assert!(body.contains("op=\"put\""), "missing put op label: {body}");
+    assert!(
+        body.contains("s4_bytes_in_total"),
+        "missing bytes_in counter: {body}"
     );
 
     let _ = shutdown.send(());

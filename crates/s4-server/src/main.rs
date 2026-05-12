@@ -241,7 +241,9 @@ where
     };
 
     let ready_check = build_ready_check(ready_client);
-    let routed_service = HealthRouter::new(service, Some(ready_check));
+    // Prometheus metrics exporter を install。/metrics endpoint で render される
+    let metrics_handle = s4_server::metrics::install();
+    let routed_service = HealthRouter::new(service, Some(ready_check)).with_metrics(metrics_handle);
 
     let listener = TcpListener::bind((opt.host.as_str(), opt.port)).await?;
     let http_server = ConnBuilder::new(TokioExecutor::new());
