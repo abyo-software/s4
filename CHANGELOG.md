@@ -7,8 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-S4 is pre-1.0; all 0.0.x changes are tracked here. The first tagged release
-will be `0.1.0` once the public API stabilizes.
+## [0.1.0] — 2026-05-12
+
+First public release. Published to crates.io as `s4-server` (binary `s4`),
+`s4-codec`, and `s4-config`. Apache-2.0.
+
+### Added (since pre-release)
+- ferro-compress source physically integrated into `s4-codec` so
+  `cargo install s4-server --features nvcomp-gpu` works without an upstream
+  crates.io release of ferro-compress.
+- Per-crate metadata (description, keywords, categories, README/LICENSE/NOTICE
+  symlinks) so the crates render properly on crates.io and docs.rs.
+- Public Docker images (`Dockerfile` CPU + `Dockerfile.gpu`) and
+  `docker-compose.yml` / `docker-compose.gpu.yml` quick-start.
+- Bilingual README (English + Japanese), CONTRIBUTING, SECURITY,
+  CODE_OF_CONDUCT, Issue + PR templates.
 
 ### Phase 2.1 (2026-05-12)
 
