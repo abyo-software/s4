@@ -1201,7 +1201,8 @@ fn bitcomp_format_opts(dt: BitcompDataType) -> nvcompBatchedBitcompFormatOpts {
 
 #[cfg(test)]
 mod tests {
-    use super::nvcomp_sys::cuda::cudaMemcpy;
+    use crate::ferro_compress::nvcomp_sys::cuda::cudaMemcpy;
+
     use super::*;
 
     /// Helper: try to construct the codec; returns `None` on a
