@@ -25,6 +25,7 @@ use s4_codec::dispatcher::AlwaysDispatcher;
 use s4_codec::passthrough::Passthrough;
 use s4_codec::{CodecKind, CodecRegistry};
 use s4_server::S4Service;
+use s4_server::routing::HealthRouter;
 use testcontainers_modules::minio::MinIO;
 use testcontainers_modules::testcontainers::ContainerAsync;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -77,6 +78,19 @@ async fn spawn_s4_server(backend_endpoint: &str) -> (String, oneshot::Sender<()>
     let mut svc = S3ServiceBuilder::new(s4);
     svc.set_auth(SimpleAuth::from_single(MINIO_USER, MINIO_PASS));
     let service = svc.build();
+    // /health は無条件 200、/ready は backend (MinIO) ListBuckets の成否で判定
+    let backend_for_ready = build_aws_client(backend_endpoint);
+    let ready_check: s4_server::routing::ReadyCheck = Arc::new(move || {
+        let c = backend_for_ready.clone();
+        Box::pin(async move {
+            c.list_buckets()
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("{e}"))
+        })
+    });
+    let service = HealthRouter::new(service, Some(ready_check));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let local = listener.local_addr().expect("local addr");
@@ -183,6 +197,29 @@ async fn http_roundtrip_through_full_s4_stack() {
         payload.len(),
         raw_bytes.len()
     );
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn http_health_and_ready_endpoints_respond_correctly() {
+    let minio = start_minio().await;
+    let (s4_endpoint, shutdown) = spawn_s4_server(&minio.endpoint_url).await;
+
+    // /health は無条件 200
+    let h_resp = reqwest::get(format!("{s4_endpoint}/health"))
+        .await
+        .expect("/health request");
+    assert_eq!(h_resp.status(), 200);
+    let h_body = h_resp.text().await.expect("/health body");
+    assert!(h_body.contains("ok"));
+
+    // /ready は backend が動いているので 200
+    let r_resp = reqwest::get(format!("{s4_endpoint}/ready"))
+        .await
+        .expect("/ready request");
+    assert_eq!(r_resp.status(), 200);
 
     let _ = shutdown.send(());
 }

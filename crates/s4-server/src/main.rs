@@ -18,6 +18,7 @@ use s4_codec::dispatcher::{AlwaysDispatcher, SamplingDispatcher};
 use s4_codec::passthrough::Passthrough;
 use s4_codec::{CodecDispatcher, CodecKind, CodecRegistry};
 use s4_server::S4Service;
+use s4_server::routing::{HealthRouter, ReadyCheck};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -56,6 +57,14 @@ enum DispatcherChoice {
     Sampling,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LogFormat {
+    /// 人間向け (terminal でカラー化、tracing-subscriber default)
+    Pretty,
+    /// JSON 1 行 = 1 event (CloudWatch Logs Insights / fluent-bit と統合しやすい)
+    Json,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "s4",
@@ -87,16 +96,32 @@ struct Opt {
     /// codec dispatcher: always (CLI 指定固定) / sampling (auto 選択)
     #[clap(long, value_enum, default_value = "sampling")]
     dispatcher: DispatcherChoice,
+
+    /// ログ出力形式 (pretty / json)。production では json 推奨
+    #[clap(long, value_enum, default_value = "pretty")]
+    log_format: LogFormat,
 }
 
-fn setup_tracing() {
+fn setup_tracing(format: LogFormat) {
     use tracing_subscriber::EnvFilter;
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let enable_color = std::io::stdout().is_terminal();
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_ansi(enable_color)
-        .init();
+    match format {
+        LogFormat::Pretty => {
+            let enable_color = std::io::stdout().is_terminal();
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_ansi(enable_color)
+                .init();
+        }
+        LogFormat::Json => {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .json()
+                .with_current_span(true)
+                .with_span_list(false)
+                .init();
+        }
+    }
 }
 
 fn build_registry(default: CodecKind, zstd_level: i32) -> Arc<CodecRegistry> {
@@ -136,8 +161,8 @@ fn build_dispatcher(choice: DispatcherChoice, default: CodecKind) -> Arc<dyn Cod
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-    setup_tracing();
     let opt = Opt::parse();
+    setup_tracing(opt.log_format);
 
     let sdk_conf = aws_config::from_env()
         .endpoint_url(&opt.endpoint_url)
@@ -148,6 +173,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             .force_path_style(true)
             .build(),
     );
+    // ready_check 用に client を 1 つ複製して保持
+    let ready_client = client.clone();
     let proxy = s3s_aws::Proxy::from(client);
 
     let default_kind = opt.codec.as_kind();
@@ -161,13 +188,39 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     );
 
     let s4 = S4Service::new(proxy, registry, dispatcher);
-    run_server(s4, &sdk_conf, &opt).await
+    run_server(s4, &sdk_conf, &opt, ready_client).await
+}
+
+fn build_ready_check(client: aws_sdk_s3::Client) -> ReadyCheck {
+    Arc::new(move || {
+        let c = client.clone();
+        Box::pin(async move {
+            // ListBuckets で backend が応答するか確認 (権限不足でも 4xx は届くので "ready"
+            // と判定する。connection 失敗 / 5xx だけが not-ready)。
+            match c.list_buckets().send().await {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    let dbg = format!("{e:?}");
+                    // 認証や権限の問題は backend は生きているので ready 判定
+                    if dbg.contains("AccessDenied")
+                        || dbg.contains("InvalidAccessKeyId")
+                        || dbg.contains("SignatureDoesNotMatch")
+                    {
+                        Ok(())
+                    } else {
+                        Err(format!("backend list_buckets failed: {e}"))
+                    }
+                }
+            }
+        })
+    })
 }
 
 async fn run_server<S>(
     s4: S,
     sdk_conf: &aws_config::SdkConfig,
     opt: &Opt,
+    ready_client: aws_sdk_s3::Client,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>>
 where
     S: S3 + Send + Sync + 'static,
@@ -187,13 +240,20 @@ where
         b.build()
     };
 
+    let ready_check = build_ready_check(ready_client);
+    let routed_service = HealthRouter::new(service, Some(ready_check));
+
     let listener = TcpListener::bind((opt.host.as_str(), opt.port)).await?;
     let http_server = ConnBuilder::new(TokioExecutor::new());
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
     let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
 
-    info!("S4 listening at http://{}:{}/", opt.host, opt.port);
-    info!("forwarding to {}", opt.endpoint_url);
+    info!(
+        host = %opt.host,
+        port = opt.port,
+        endpoint_url = %opt.endpoint_url,
+        "S4 listening (paths /health and /ready served alongside S3 traffic)"
+    );
 
     loop {
         let (socket, _) = tokio::select! {
@@ -206,7 +266,7 @@ where
             },
             _ = ctrl_c.as_mut() => break,
         };
-        let conn = http_server.serve_connection(TokioIo::new(socket), service.clone());
+        let conn = http_server.serve_connection(TokioIo::new(socket), routed_service.clone());
         let conn = graceful.watch(conn.into_owned());
         tokio::spawn(async move {
             let _ = conn.await;

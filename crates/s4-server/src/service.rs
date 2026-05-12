@@ -41,6 +41,7 @@ use s4_codec::{ChunkManifest, CodecDispatcher, CodecKind, CodecRegistry};
 use tracing::debug;
 
 use crate::blob::{bytes_to_blob, collect_blob};
+use crate::streaming::{cpu_zstd_decompress_stream, supports_streaming_decompress};
 
 /// PUT body の先頭 sampling で渡す最大 byte 数。
 const SAMPLE_BYTES: usize = 4096;
@@ -269,6 +270,49 @@ impl<B: S3> S3 for S4Service<B> {
         }
 
         if let Some(blob) = resp.output.body.take() {
+            // ====== Streaming fast path (CpuZstd, non-multipart, codec supports it) ======
+            // 大規模 object (e.g. 5 GB) を memory に collect すると OOM するので、
+            // codec が streaming-aware なら body を chunk-by-chunk で decompress して
+            // 即座に client に流す。
+            if !is_multipart
+                && let Some(ref m) = manifest_opt
+                && supports_streaming_decompress(m.codec)
+                && m.codec == CodecKind::CpuZstd
+            {
+                let decompressed_blob = cpu_zstd_decompress_stream(blob);
+                resp.output.content_length = Some(m.original_size as i64);
+                resp.output.checksum_crc32 = None;
+                resp.output.checksum_crc32c = None;
+                resp.output.checksum_crc64nvme = None;
+                resp.output.checksum_sha1 = None;
+                resp.output.checksum_sha256 = None;
+                resp.output.e_tag = None;
+                resp.output.body = Some(decompressed_blob);
+                debug!(
+                    codec = "cpu-zstd",
+                    original_size = m.original_size,
+                    "S4 get_object: streaming fast path"
+                );
+                return Ok(resp);
+            }
+            // Passthrough: そのまま流す
+            if !is_multipart
+                && let Some(ref m) = manifest_opt
+                && m.codec == CodecKind::Passthrough
+            {
+                resp.output.content_length = Some(m.original_size as i64);
+                resp.output.checksum_crc32 = None;
+                resp.output.checksum_crc32c = None;
+                resp.output.checksum_crc64nvme = None;
+                resp.output.checksum_sha1 = None;
+                resp.output.checksum_sha256 = None;
+                resp.output.e_tag = None;
+                resp.output.body = Some(blob);
+                debug!("S4 get_object: passthrough streaming");
+                return Ok(resp);
+            }
+
+            // ====== Buffered slow path (multipart frame parser, GPU codecs) ======
             let bytes = collect_blob(blob, self.max_body_bytes)
                 .await
                 .map_err(internal("collect get body"))?;
