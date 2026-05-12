@@ -50,7 +50,7 @@ fn synth(size: usize) -> Bytes {
     let mut counter: u64 = 0;
     while buf.len() < size {
         let run = (size - buf.len()).min(4096);
-        buf.extend(std::iter::repeat(b'x').take(run / 2));
+        buf.extend(std::iter::repeat_n(b'x', run / 2));
         for _ in 0..(run / 16) {
             buf.extend_from_slice(&counter.to_le_bytes());
             counter += 1;
