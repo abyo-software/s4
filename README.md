@@ -47,6 +47,13 @@ zstd before storing it.
 
 ## Quick Start
 
+### Install via cargo (Rust devs)
+
+```bash
+cargo install s4-server                                  # CPU build
+s4 --endpoint-url https://s3.us-east-1.amazonaws.com     # binary is `s4`
+```
+
 ### 60-second local trial (Docker, CPU-only)
 
 ```bash
@@ -88,11 +95,13 @@ target/release/s4 --endpoint-url https://s3.us-east-1.amazonaws.com \
 | Feature | S4 | MinIO (built-in S2) | Garage | Wasabi / B2 | AWS S3 |
 |---|---|---|---|---|---|
 | S3 API compatibility | ✅ Full | ✅ Full | ⚠️ Subset | ✅ Full | ✅ Native |
-| **GPU compression** | ✅ nvCOMP zstd / Bitcomp / gANS | ❌ | ❌ | ❌ | ❌ |
+| **GPU compression** | ✅ nvCOMP zstd / Bitcomp / GDeflate | ❌ | ❌ | ❌ | ❌ |
 | **CPU compression** | ✅ zstd 1–22 | ⚠️ S2 only | ✅ zstd 1–22 | ❌ | ❌ |
 | **Auto codec selection** | ✅ entropy + magic-byte sampling | ❌ | ❌ | — | — |
-| **Range GET on compressed** | ✅ via sidecar frame index | n/a | n/a | ✅ | ✅ |
-| **Streaming I/O** | ✅ TTFB ms-class, ~10 MiB peak | ✅ | ✅ | ✅ | ✅ |
+| **Range GET on compressed** | ✅ via sidecar frame index (single-PUT + multipart) | n/a | n/a | ✅ | ✅ |
+| **Streaming I/O** | ✅ TTFB ms-class, ~10 MiB peak; GPU per-chunk pipelined | ✅ | ✅ | ✅ | ✅ |
+| **Native HTTPS / TLS** | ✅ rustls + ring, ALPN h2 | ⚠️ via reverse proxy | ⚠️ via reverse proxy | ✅ | ✅ |
+| **Bucket-policy enforcement at gateway** | ✅ AWS-style JSON, Allow / Deny | n/a | n/a | ✅ | ✅ |
 | **Acts as gateway to existing S3** | ✅ | ❌ (gateway mode removed) | ❌ | ❌ | n/a |
 | **License** | Apache-2.0 | AGPLv3 / commercial | AGPLv3 | proprietary | proprietary |
 
@@ -110,8 +119,9 @@ target/release/s4 --endpoint-url https://s3.us-east-1.amazonaws.com \
 │  │ s4-codec::CodecRegistry  (multi-codec dispatch by id)   │     │
 │  │   ├─ Passthrough          (no compression)              │     │
 │  │   ├─ CpuZstd              (zstd-rs, streaming)          │     │
-│  │   ├─ NvcompZstd           (nvCOMP, GPU, batch)          │     │
-│  │   └─ NvcompBitcomp        (nvCOMP, integer columns)     │     │
+│  │   ├─ NvcompZstd           (nvCOMP, GPU, per-chunk)      │     │
+│  │   ├─ NvcompBitcomp        (nvCOMP, integer columns)     │     │
+│  │   └─ NvcompGDeflate       (nvCOMP, DEFLATE-family GPU)  │     │
 │  └─────────────────────────────────────────────────────────┘     │
 │  ┌─────────────────────────────────────────────────────────┐     │
 │  │ s4-codec::CodecDispatcher                               │     │
@@ -132,23 +142,48 @@ target/release/s4 --endpoint-url https://s3.us-east-1.amazonaws.com \
   TTFB ms-class, memory ≈ zstd window + 64 KiB buffer
 - **Streaming PUT** for the same codecs: input never fully buffered, peak memory
   ≈ compressed size (5 GB → ~50 MB at 100× ratio)
+- **GPU streaming compress** (v0.2): nvCOMP `zstd` / `gdeflate` PUTs run a
+  per-chunk pipeline so a 10 GB highly-compressible upload peaks at ~210 MB
+  host RAM instead of buffering the full input
+- **Single-PUT framed format unification** (v0.2): every compressed PUT now
+  uses the same `S4F2` multi-frame format multipart uploads use, with an
+  optional `<key>.s4index` sidecar. Range GET partial-fetch optimisation
+  applies to single-PUT objects too, not just multipart
 - **Multipart per-part compression**: each part compressed and frame-encoded
   (`S4F2` magic), per-frame codec dispatch (mixed codecs in one object)
+- **Multipart final-part padding trim** (v0.2): the final part of a multipart
+  with a tiny highly-compressible tail skips `S4P1` padding (saves up to
+  ~5 MiB per object on highly compressible workloads)
 - **Range GET via sidecar `<key>.s4index`**: only the needed compressed bytes
   are fetched from backend, decoded, and sliced. Falls back to full read when
-  sidecar is absent.
+  sidecar is absent
+- **Byte-range aware `upload_part_copy`** (v0.2): when the source is S4-framed,
+  the user-visible byte range is what gets copied (decompressed and re-framed),
+  not raw compressed bytes
 
 ### Observability
 - **`/health`** — liveness probe, always 200 OK
 - **`/ready`** — readiness probe, runs `ListBuckets` against the backend
 - **`/metrics`** — Prometheus text format
   (`s4_requests_total{op,codec,result}`, `s4_bytes_in_total`, `s4_bytes_out_total`,
-  `s4_request_latency_seconds`)
+  `s4_request_latency_seconds`, `s4_policy_denials_total{action,bucket}`)
 - **Structured JSON logs** (`--log-format json`) with per-request fields:
   `op`, `bucket`, `key`, `codec`, `bytes_in`, `bytes_out`, `ratio`, `latency_ms`, `ok`
 - **OpenTelemetry traces** (`--otlp-endpoint http://collector:4317`) — each
   PUT/GET emitted as `s4.put_object` / `s4.get_object` span with semantic
   attributes; export to Jaeger / Tempo / Grafana / AWS X-Ray.
+
+### Security
+- **Native HTTPS / TLS** (v0.2) — `--tls-cert` / `--tls-key` for direct
+  termination via `tokio-rustls + ring`, ALPN advertises `h2` then
+  `http/1.1`. No reverse-proxy required for HTTPS deployments.
+- **Bucket policy enforcement at the gateway** (v0.2) — `--policy <path>`
+  accepts an AWS-style bucket policy JSON; every PUT / GET / DELETE / List /
+  Copy / UploadPartCopy is evaluated with explicit Deny > explicit Allow >
+  implicit Deny semantics (matches AWS). Subset: `Effect`, `Action` (e.g.
+  `s3:GetObject` / `s3:*`), `Resource` with glob, `Principal` (SigV4
+  access-key match). Denials are bumped on
+  `s4_policy_denials_total{action,bucket}`.
 
 ### Data Integrity
 - **CRC32C** stored per-object (single PUT) or per-frame (multipart), verified on GET
@@ -168,16 +203,18 @@ target/release/s4 --endpoint-url https://s3.us-east-1.amazonaws.com \
 
 | Tier | What runs | Where | Pass count |
 |---|---|---|---|
-| **Unit + integration** | parsers, registry, blob helpers, S3 trait | every push (CI) | 51 |
+| **Unit + integration** | parsers, registry, blob helpers, S3 trait, policy, TLS | every push (CI) | 70+ |
 | **proptest fuzz** | 38 properties × 256–10K cases (push), × 1M (nightly) | every push + nightly | 38 |
 | **bolero coverage-guided** | 7 targets, libfuzzer engine | nightly (matrix, 30 min × 5) | 7 |
 | **fuzz canary** | proves fuzz framework is alive | every push | 3 |
-| **Docker MinIO E2E** | full HTTP wire + SigV4 against real MinIO | nightly | 10 |
-| **GPU codec E2E** | real CUDA, nvCOMP zstd/Bitcomp roundtrip | manual (`--features nvcomp-gpu`) | 4 |
+| **Docker MinIO E2E** | full HTTP wire + SigV4 against real MinIO + multipart + upload_part_copy | every push (CI) | 8 |
+| **In-process TLS E2E** | rcgen self-signed cert + tokio-rustls + reqwest h2/h11 | every push | 2 |
+| **GPU codec E2E** | real CUDA, nvCOMP zstd / Bitcomp / GDeflate, streaming + bytes API | manual (`--features nvcomp-gpu`) | 5 |
+| **Real AWS S3 E2E** | OIDC role + actual S3, single-PUT / multipart / Range GET | nightly (`aws-e2e.yml`, opt-in) | 3 |
 | **Soak / load** | 24h sustained load, RSS / FD / connection leak detection | manual (`scripts/soak/run.sh`) | continuous |
 
-**99 default tests + 10 ignored E2E + 4 GPU + canary = 116+ tests**, plus
-PROPTEST_CASES=10000 stress run on every push (~73 sec, 380K fuzz cases),
+**125 default tests + 15 ignored (Docker / GPU / AWS env required) = 140 tests**,
+plus PROPTEST_CASES=10000 stress run on every push (~73 sec, 380K fuzz cases),
 1M cases × 38 properties nightly (~6 h, 38M+ fuzz cases).
 
 Two real bugs already caught by fuzz infrastructure:
@@ -296,16 +333,20 @@ needed bytes from S3.
 
 ## Project Status
 
-- **Phase 1 + 2.0 + 2.1 complete** (24 commits, 116+ tests, fuzz / soak / OTel /
-  Prometheus all wired)
+- **v0.2.0 released** (2026-05-12) — 8 milestone issues delivered: GPU
+  streaming, HTTPS / TLS, single-PUT framed unification, multipart padding
+  trim, byte-range `upload_part_copy`, bucket policy enforcement, AWS-E2E CI
+  scaffold, GDeflate codec
+- **Phase 1 + 2.0 + 2.1 + 2.2 (= v0.2) complete** (~40 commits, 140 tests,
+  fuzz / soak / OTel / Prometheus / TLS / policy / GPU streaming all wired)
 - **Production-ready** for log archival, data lake, parquet/ORC analytics
-- **Known limitations / Phase 2.2 plans**:
-  - GPU streaming compress (currently bytes-buffered, batch-API): per-chunk
-    pipeline + framed-everywhere unification
-  - Multipart final-part padding trim (typical workloads not affected; up to
-    5 MiB overhead per object on highly-compressible last parts)
-  - `upload_part_copy` byte-range awareness (currently passes through)
-  - Single-PUT sidecar (currently multipart-only)
+- **Real-GPU validation** done on RTX 4070 Ti SUPER + nvCOMP 5.x: streaming
+  zstd 1 GiB roundtrip + GDeflate roundtrip both green
+- **Open roadmap for v0.3 and beyond**: ACME / Let's Encrypt opt-in, TLS cert
+  hot-reload on SIGHUP, in-flight pipelining (chunk K-1 compress overlapped
+  with chunk K PCIe transfer), full IAM Conditions, additional codec backends
+  (DietGPU re-evaluated if user demand surfaces). File issues at
+  https://github.com/abyo-software/s4/issues to influence the roadmap.
 
 ## Contributing
 

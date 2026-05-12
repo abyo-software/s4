@@ -89,12 +89,24 @@ One concise sentence summarizing the *why*; longer body for context if useful.
 - Features that lock S4 to a single backend (we want AWS S3 and S3-compatible
   alternatives to keep working interchangeably).
 
-## Phase 2.2 / open opportunities
+## Open opportunities (v0.3 and beyond)
 
-- GPU streaming compress (nvCOMP batched per-chunk pipeline)
-- `upload_part_copy` with byte-range awareness via the frame index
-- Single-PUT framed format (currently multipart-only) for unified Range GET
-- More CodecKind backends (DietGPU ANS, GDeflate, etc.)
-- Additional integration tests against AWS S3 (currently MinIO-only in CI)
+The big v0.2 items (GPU streaming, single-PUT framed unification,
+`upload_part_copy` byte-range, GDeflate codec, AWS-E2E CI) all shipped in
+v0.2.0 — see [CHANGELOG.md](CHANGELOG.md). Currently open:
+
+- **TLS cert hot-reload on SIGHUP** — operationally nice for cert rotation
+  without a server restart
+- **ACME / Let's Encrypt opt-in flag** — `--acme` to skip the manual
+  cert-management for public deployments
+- **In-flight pipelining for the GPU streaming path** — overlap chunk K-1
+  compress with chunk K PCIe transfer (currently sequential per chunk)
+- **Full IAM Conditions** in the bucket-policy evaluator (`IpAddress`,
+  `StringEquals`, `aws:SourceVpc`, etc.) — v0.2 ships only the core 4
+  actions + Resource glob + Principal-by-access-key
+- **DietGPU codec backend** — closed in v0.2 ([#8](https://github.com/abyo-software/s4/issues/8));
+  reopen if a concrete user need surfaces
+- **More streaming GPU codecs** — Bitcomp streaming (currently bytes-API
+  only because the FCG1 framing isn't concatenable like zstd)
 
 If any of these interest you, please open an issue first to coordinate scope.
