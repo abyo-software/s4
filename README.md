@@ -206,9 +206,26 @@ NVCOMP_HOME=... cargo test --workspace --features s4-server/nvcomp-gpu -- --igno
 | `--log-format` | `pretty` | `pretty` (terminal) or `json` (CloudWatch / fluent-bit) |
 | `--otlp-endpoint` | (none) | OpenTelemetry OTLP gRPC endpoint |
 | `--service-name` | `s4` | OTel resource `service.name` |
+| `--tls-cert` | (none) | TLS server certificate (PEM). Together with `--tls-key`, terminates HTTPS on the listener |
+| `--tls-key` | (none) | TLS server private key (PEM, PKCS#8 or RSA) |
 
 AWS credentials are read from the standard AWS chain (`AWS_ACCESS_KEY_ID` /
 `AWS_SECRET_ACCESS_KEY` / `AWS_PROFILE` / IAM role on EC2).
+
+### HTTPS
+
+S4 can terminate TLS itself — no fronting reverse proxy required:
+
+```bash
+s4 --endpoint-url https://s3.us-east-1.amazonaws.com \
+   --host 0.0.0.0 --port 8443 \
+   --tls-cert /etc/ssl/s4.crt --tls-key /etc/ssl/s4.key
+aws --endpoint-url https://localhost:8443 s3 ls
+```
+
+Backed by `tokio-rustls` + `ring`. ALPN advertises `h2` then `http/1.1`, so
+HTTP/2 is negotiated automatically with capable clients. Without these
+flags, S4 serves plain HTTP (the default).
 
 ## On-the-wire Format
 

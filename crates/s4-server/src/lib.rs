@@ -5,6 +5,7 @@ pub mod metrics;
 pub mod routing;
 pub mod service;
 pub mod streaming;
+pub mod tls;
 
 pub use s4_codec as codec;
 pub use s4_config as config;

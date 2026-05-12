@@ -62,6 +62,8 @@ opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 tracing-opentelemetry.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
 
 s4-codec = { path = "../s4-codec", version = "0.1.0" }
 s4-config = { path = "../s4-config", version = "0.1.0" }
@@ -71,6 +73,7 @@ tempfile = "3"
 http = "1"
 testcontainers-modules = { version = "0.14", features = ["minio"] }
 zstd = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 metrics-exporter-prometheus.workspace = true
 proptest.workspace = true
+rcgen = "0.13"

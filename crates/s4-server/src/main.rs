@@ -113,6 +113,16 @@ struct Opt {
     /// OTel resource service.name (default: "s4")
     #[clap(long, default_value = "s4")]
     service_name: String,
+
+    /// TLS server certificate (PEM file). Together with --tls-key enables
+    /// HTTPS termination on the listener. Without these flags, S4 serves
+    /// plain HTTP.
+    #[clap(long, requires = "tls_key")]
+    tls_cert: Option<std::path::PathBuf>,
+
+    /// TLS server private key (PEM file, PKCS#8 or RSA). See --tls-cert.
+    #[clap(long, requires = "tls_cert")]
+    tls_key: Option<std::path::PathBuf>,
 }
 
 fn setup_tracing(
@@ -322,9 +332,24 @@ where
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
     let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
 
+    let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = match (&opt.tls_cert, &opt.tls_key) {
+        (Some(cert), Some(key)) => {
+            s4_server::tls::install_default_crypto_provider();
+            let cfg = s4_server::tls::load_tls_config(cert, key)?;
+            Some(tokio_rustls::TlsAcceptor::from(cfg))
+        }
+        _ => None,
+    };
+    let scheme = if tls_acceptor.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+
     info!(
         host = %opt.host,
         port = opt.port,
+        scheme,
         endpoint_url = %opt.endpoint_url,
         "S4 listening (paths /health and /ready served alongside S3 traffic)"
     );
@@ -340,11 +365,29 @@ where
             },
             _ = ctrl_c.as_mut() => break,
         };
-        let conn = http_server.serve_connection(TokioIo::new(socket), routed_service.clone());
-        let conn = graceful.watch(conn.into_owned());
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
+        let svc = routed_service.clone();
+        let server = http_server.clone();
+        let watch_handle = graceful.watcher();
+        if let Some(acceptor) = tls_acceptor.clone() {
+            tokio::spawn(async move {
+                let tls_stream = match acceptor.accept(socket).await {
+                    Ok(s) => s,
+                    Err(err) => {
+                        tracing::warn!("tls handshake failed: {err}");
+                        return;
+                    }
+                };
+                let conn = server.serve_connection(TokioIo::new(tls_stream), svc);
+                let conn = watch_handle.watch(conn.into_owned());
+                let _ = conn.await;
+            });
+        } else {
+            let conn = server.serve_connection(TokioIo::new(socket), svc);
+            let conn = watch_handle.watch(conn.into_owned());
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+        }
     }
 
     tokio::select! {
