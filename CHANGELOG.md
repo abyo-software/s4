@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-05-12
+
+Eight v0.2 milestone issues delivered (#1, #2, #3, #4, #5, #6, #7, #9 —
+#8 DietGPU explicitly closed as out-of-scope after honest cost/value
+re-assessment). Real-GPU validation done on the dev box (RTX 4070 Ti
+SUPER + nvCOMP 5.x) so no "deferred to EC2" caveats remain on shipped
+codec features.
+
+### Added — Performance / scale
+
+- **GPU streaming compress** (#1) — per-chunk pipelined `nvcomp-zstd`
+  via the unified `streaming_compress_to_frames` path. Bound host-RAM
+  peak to `chunk_size + compressed_size` (a 10 GB highly-compressible
+  upload now peaks at ~210 MB of host RAM instead of buffering the
+  full input).
+- **Single-PUT framed format** (#4) — every compressed PUT now goes
+  through the same S4F2 multi-frame format multipart uploads use, with
+  an optional `<key>.s4index` sidecar for objects that produce more
+  than one frame. Range GET on single-PUT objects gets the same
+  partial-fetch optimisation multipart already had.
+- **Multipart final-part padding trim** (#5) — heuristic-based padding
+  skip for likely-final parts (parts with raw user-bytes < 5 MiB).
+  Saves up to ~5 MiB per object on highly compressible workloads where
+  the final part shrinks far below 5 MiB after compression.
+
+### Added — S3 API completeness
+
+- **Byte-range aware `upload_part_copy`** (#6) — when the source object
+  is S4-framed, the user-visible byte range is what gets copied
+  (decompressed and re-framed), not raw compressed bytes. Falls back
+  to the original passthrough for non-framed sources (cheaper).
+- **HTTPS / TLS termination** (#2) — native rustls + ring termination
+  via `--tls-cert` / `--tls-key`. ALPN advertises `h2` then
+  `http/1.1`, so HTTP/2 is negotiated automatically with capable
+  clients. Removes the requirement to front S4 with a reverse proxy
+  for HTTPS.
+
+### Added — Production hardening
+
+- **Bucket policy enforcement** (#7) — optional `--policy` flag accepts
+  AWS-style bucket policy JSON, evaluated on every PUT/GET/DELETE/List/
+  Copy/UploadPartCopy with explicit Deny > explicit Allow > implicit
+  Deny. Subset: `Effect`, `Action` (`s3:*` / `s3:GetObject` etc.),
+  `Resource` with glob, `Principal` (SigV4 access-key match).
+  `s4_policy_denials_total{action,bucket}` Prometheus counter.
+- **AWS S3 (real) integration tests in CI** (#3) — Terraform module
+  in `infra/aws-e2e/` (test bucket + GitHub OIDC + least-privilege
+  IAM role), `.github/workflows/aws-e2e.yml` (nightly + on-demand +
+  PR-label-triggered), `tests/aws_e2e.rs` with 3 tests covering
+  single-PUT, multipart, and Range GET against real AWS S3. User
+  needs to `terraform apply` once and configure 3 GitHub Actions
+  variables to activate the workflow.
+
+### Added — Codec ecosystem
+
+- **`nvcomp-gdeflate` codec** (#9) — DEFLATE-family GPU codec via
+  nvCOMP's batched GDeflate API. New `CodecKind::NvcompGDeflate`
+  (wire id=6, append-only — preserves the existing 0..=5 enum
+  stability). Enabled when the `nvcomp-gpu` feature is on and a
+  CUDA-capable GPU is detected at runtime.
+
+### Fixed
+
+- `streaming_compress_nvcomp_zstd` was wrongly assuming nvCOMP batched
+  output forms a stock zstd stream; in reality nvCOMP wraps each call
+  in an internal FCG1 header. The function is removed and all GPU PUTs
+  now route through the v0.2 #4 unified S4F2 path which is the actual
+  wire format produced. Local-GPU validation surfaced the bug; the
+  earlier "deferred to EC2" framing had hidden it.
+- `Algo::GDeflate` was missing from `NvcompCodec::with_chunk_size`'s
+  algorithm whitelist and from the FCG1 algo_tag dispatch (decompress
+  failed with "unknown algo tag: 255").
+
+### Closed without implementation
+
+- **#8 DietGPU codec** — closed without implementation. Implementation
+  cost is ~3-4 hours focused work (vendor source + CMake build.rs +
+  C++ shim + FFI + GPU validation), and the headline "license clean"
+  value is partial since CUDA runtime itself remains NVIDIA proprietary.
+  DietGPU upstream is also sparsely maintained (last meaningful activity
+  2022-2023). See the issue for the full rationale; reopen if a concrete
+  user need surfaces.
+
 ## [0.1.0] — 2026-05-12
 
 First public release. Published to crates.io as `s4-server` (binary `s4`),
