@@ -24,8 +24,23 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets
-      - name: cargo test
+      - name: cargo test (default cases)
         run: cargo test --workspace --release
+      - name: proptest medium-stress (10K cases / property、~2 min)
+        # push / PR で早期に fuzz failure を検出する。1M cases は nightly
+        # job の責務。10K でも default の 256-2048 より遥かに広く branch を踏む。
+        env:
+          PROPTEST_CASES: "10000"
+        run: |
+          cargo test --workspace --release \
+            --test fuzz_parsers --test fuzz_server --test fuzz_advanced
+      - name: Upload proptest-regressions artifact (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proptest-regressions-${{ github.run_id }}
+          path: "**/*.proptest-regressions"
+          if-no-files-found: ignore
       - name: cargo test --features nvcomp-gpu (build-only, no GPU on CI)
         run: cargo build --workspace --features s4-server/nvcomp-gpu
         env:

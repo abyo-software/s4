@@ -227,6 +227,50 @@ cargo bolero test --engine libfuzzer frame_parser_bolero -- corpus/<crash-input>
 - `cpu_zstd::decompress` で **解凍 bomb で OOM** 可能 → `Decoder + take(limit)`
   で hardening、SizeMismatch で安全に reject
 
+#### 「fuzz failure → CI red」の動作保証
+
+| いつ | 何 cases | Failure 時の挙動 |
+|---|---|---|
+| push / PR (`ci.yml`) | default + **10K cases stress** (~1.3 min) | `cargo test` 非0 exit → CI 赤 → PR merge block + `proptest-regressions` を artifact 保存 |
+| nightly 03:00 UTC (`fuzz-nightly.yml`) | **1M cases × 38 properties + bolero libfuzzer 30min × 5 target** | artifact 保存 + `fuzz-failure` ラベル付き **GitHub Issue 自動 open** |
+
+**Regression 永続化**: proptest が見つけた crash input は `*.proptest-regressions`
+ファイルに自動保存される。これは `.gitignore` で whitelist (`!**/*.proptest-regressions`)
+されているので **commit すれば将来の test run で必ず replay** される (= 一度
+塞いだ穴は二度と空けない設計)。
+
+**CI 動作の自己検証** (`fuzz_canary.rs` の 3 test):
+
+- `canary_proptest_does_run`: proptest framework が確実に最低 100 cases 実行した
+  ことを `AtomicUsize` で count + assert (silently skipped を防ぐ)
+- `canary_known_invariant_holds`: `write_frame` の出力長 = `header + payload`
+  という単純不変式を 1024 cases × proptest で検証 (誰かが header size を変えると
+  fail = canary 機能)
+- `canary_zstd_bomb_protection_active`: cpu_zstd の bomb hardening が有効
+  であることを直接検証 (誰かが `Decoder + take(limit)` を revert すると fail)
+
+**Local で「fuzz が本当に CI を落とすか」を verify する手順**:
+
+```bash
+# 1. 既知の不変式を意図的に破壊 (例: write_frame で header size を変える、または
+#    cpu_zstd の bomb hardening を revert)
+# 2. 実行
+cargo test --workspace --release --test fuzz_canary
+# → assert 失敗、exit code 1
+# 3. 修正を revert
+git stash pop
+```
+
+**GitHub Actions workflow の事前 validation**: GitHub remote 接続後、
+manual trigger で軽量 run を実施:
+
+```bash
+gh workflow run fuzz-nightly.yml -f cases=1000 -f bolero_minutes=2
+```
+
+(`workflow_dispatch` 経由で 5 分以内の smoke run を回せる、permissions 動作
+確認用)。
+
 ### Soak / load testing
 
 ### Soak / load testing

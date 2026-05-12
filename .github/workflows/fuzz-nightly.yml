@@ -21,6 +21,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Issue 自動 open + artifact upload に必要な権限を明示
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   proptest-stress:
     name: proptest stress (1M cases / property)

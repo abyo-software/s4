@@ -31,6 +31,14 @@ node_modules/
 tmp/
 .cache/
 
+# ⚠️ 以下の fuzz artifact は **意図的に commit する** (= ignore しない):
+# - proptest が見つけた regression input は、commit して将来の test run で
+#   replay されないと regression 防御にならない
+# - bolero corpus / crashes も同じ理由で repo 配下に残す
+# Whitelist で ignore を打ち消す:
+!**/*.proptest-regressions
+!crates/*/tests/__fuzz__/
+
 # Python (検証スクリプト用)
 __pycache__/
 *.pyc
