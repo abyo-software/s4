@@ -1,0 +1,96 @@
+name: AWS E2E
+
+# Real AWS S3 integration tests (issue #3). Runs against the test bucket
+# provisioned by infra/aws-e2e/main.tf. Uses GitHub OIDC to assume an IAM
+# role — no long-lived access keys committed.
+#
+# Triggers:
+#   - nightly at 04:00 UTC (cron)
+#   - manual via workflow_dispatch
+#   - on PRs with the `aws-e2e` label (so reviewers can opt-in per PR)
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize]
+
+jobs:
+  aws-e2e:
+    name: AWS S3 E2E (real bucket)
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'aws-e2e'))
+    permissions:
+      id-token: write
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pre-flight — verify GitHub Actions variables are configured
+        run: |
+          set -eu
+          missing=""
+          [ -n "${{ vars.AWS_E2E_BUCKET }}" ]   || missing="$missing AWS_E2E_BUCKET"
+          [ -n "${{ vars.AWS_E2E_ROLE_ARN }}" ] || missing="$missing AWS_E2E_ROLE_ARN"
+          [ -n "${{ vars.AWS_E2E_REGION }}" ]   || missing="$missing AWS_E2E_REGION"
+          if [ -n "$missing" ]; then
+            echo "::error::Required repository variables not set:$missing"
+            echo "Set them in Settings → Secrets and variables → Actions → Variables tab."
+            echo "See infra/aws-e2e/README.md for setup instructions."
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_E2E_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_E2E_REGION }}
+          role-session-name: s4-aws-e2e-${{ github.run_id }}
+
+      - name: Build s4 (CPU)
+        run: cargo build --release -p s4-server --bin s4
+
+      - name: Run AWS E2E tests
+        env:
+          AWS_E2E_BUCKET: ${{ vars.AWS_E2E_BUCKET }}
+          AWS_E2E_REGION: ${{ vars.AWS_E2E_REGION }}
+          # Object key prefix unique to this run so concurrent runs don't collide
+          AWS_E2E_PREFIX: "ci/run-${{ github.run_id }}-${{ github.run_attempt }}"
+          RUST_LOG: info,aws_smithy_runtime=warn,aws_config=warn
+        run: |
+          cargo test --release -p s4-server --test aws_e2e \
+            -- --ignored --test-threads=1 --nocapture
+
+      - name: Open issue on failure
+        if: failure() && github.event_name == 'schedule'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `AWS E2E nightly failure — ${new Date().toISOString().slice(0,10)}`;
+            const body = [
+              `Nightly aws-e2e workflow failed.`,
+              ``,
+              `**Run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              `**Commit:** ${context.sha}`,
+              ``,
+              `Likely causes: AWS API change, S3 SDK regression, or s4 wire-format break against real S3.`,
+              `Re-run via workflow_dispatch first (transient AWS errors are not unheard of).`,
+              ``,
+              `🤖 auto-opened by .github/workflows/aws-e2e.yml`,
+            ].join("\n");
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title, body,
+              labels: ["aws-e2e", "ci-failure"],
+            });
