@@ -486,7 +486,13 @@ impl<B: S3> S3 for S4Service<B> {
             let sample_len = sample.len().min(SAMPLE_BYTES);
             let kind = self.dispatcher.pick(&sample[..sample_len]).await;
 
-            let (compressed, manifest, is_framed) = if supports_streaming_compress(kind) {
+            // Passthrough buys nothing from S4F2 wrapping (no compression =
+            // no per-chunk frame to skip past) and the +28-byte header
+            // overhead breaks size-sensitive callers that expect a true
+            // pass-through. So passthrough always uses the legacy raw-blob
+            // path; only compressing codecs go through the framed path.
+            let use_framed = supports_streaming_compress(kind) && kind != CodecKind::Passthrough;
+            let (compressed, manifest, is_framed) = if use_framed {
                 // streaming fast path: input は memory に collect しない
                 let chained = chain_sample_with_rest(sample, rest_stream);
                 debug!(
@@ -928,6 +934,7 @@ impl<B: S3> S3 for S4Service<B> {
                     META_COMPRESSED_SIZE,
                     META_CRC32C,
                     META_MULTIPART,
+                    META_FRAMED,
                 ] {
                     if let Some(v) = src_meta.get(key) {
                         // 客が同じ key を指定していたら preserve しない (= 上書き許可)
