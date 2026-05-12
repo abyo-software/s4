@@ -109,6 +109,20 @@ nvCOMP), inline or cert-manager TLS, and bucket-policy ConfigMap. See
 on building the image locally (the `abyosoftware/s4` image is not yet on
 Docker Hub).
 
+### Python (pip)
+
+For ML / ETL pipelines that just want the codec without the gateway:
+
+```python
+from s4_codec import CpuZstd, CpuGzip, gpu_available
+codec = CpuZstd(level=3)
+compressed, original_size, crc = codec.compress(data_bytes)
+roundtrip = codec.decompress(compressed, original_size, crc)
+```
+
+PyO3 bindings live in [`crates/s4-codec-py/`](crates/s4-codec-py/) — build
+with `maturin build --release` (and `--features nvcomp-gpu` for GPU).
+
 ### Build from source
 
 ```bash
