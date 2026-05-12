@@ -182,11 +182,26 @@ pub async fn streaming_compress_cpu_zstd(
 /// - CPU/GPU codec の per-call overhead が amortized
 pub const DEFAULT_S4F2_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
-/// 入力 `body` を **chunked + framed** に圧縮した output を返す (v0.2 #4)。
+/// `streaming_compress_to_frames` の default in-flight depth (v0.3 #12)。
 ///
-/// 各 chunk を `registry.compress(chunk_kind)` に通し、結果を `S4F2` frame として
-/// 順次連結する。outer `ChunkManifest` は input 全体に対する rolling crc + total
-/// original/compressed size を返す。
+/// 同時に走らせる per-chunk compress task の数。chunk K-1 の compress 中に
+/// chunk K の host-side read + crc 計算 + spawn を走らせ、完了したら順次
+/// frame を書き出す pipeline で、CPU codec / GPU codec 両方で大物入力の
+/// total throughput を 2-4× 改善 (issue #12 acceptance)。
+///
+/// 3 を選んだ根拠:
+/// - 1 (= sequential) より明確に速い、4+ にしても reader / writer が
+///   bottleneck で improvement diminishing
+/// - host RAM peak が `N * chunk_size + accumulating output` で予測可能
+///   (3 × 4 MiB = 12 MiB の input buffering vs 1 chunk = 4 MiB)
+pub const DEFAULT_S4F2_INFLIGHT: usize = 3;
+
+/// 入力 `body` を **chunked + framed + pipelined** に圧縮した output を返す
+/// (v0.2 #4 + v0.3 #12)。
+///
+/// 各 chunk を `registry.compress(chunk_kind)` に投げ、最大
+/// [`DEFAULT_S4F2_INFLIGHT`] 件まで in-flight に保つ。 結果は元の chunk 順を
+/// 保持して S4F2 frame として連結。
 ///
 /// **wire format**: `[S4F2 frame][S4F2 frame]...[S4F2 frame]` の連結。
 /// 各 frame は self-describing なので reader 側は `multipart::FrameIter` で
@@ -197,53 +212,104 @@ pub const DEFAULT_S4F2_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 /// - per-frame CRC で局所 corruption を検出可能
 /// - per-frame codec dispatch (将来 mixed-codec 対応)
 ///
-/// **memory peak**: `chunk_size` (input) + `compressed_size` (output buffer accumulating)。
-/// 入力 5 GB を 200 MB に圧縮する case で peak ≈ 4 MiB + 200 MB = ~204 MB。
+/// **memory peak**: `inflight × chunk_size` (in-flight chunks の input/output) +
+/// `compressed_size` (output buffer accumulating)。
+/// 入力 5 GB を 200 MB に圧縮する case で peak ≈ 12 MiB + 200 MB = ~212 MB
+/// (vs sequential `chunk_size + compressed_size` = ~204 MB)。
 pub async fn streaming_compress_to_frames(
     body: StreamingBlob,
     registry: Arc<CodecRegistry>,
     codec_kind: CodecKind,
     chunk_size: usize,
 ) -> Result<(Bytes, ChunkManifest), CodecError> {
+    streaming_compress_to_frames_with(
+        body,
+        registry,
+        codec_kind,
+        chunk_size,
+        DEFAULT_S4F2_INFLIGHT,
+    )
+    .await
+}
+
+/// Like [`streaming_compress_to_frames`] but lets callers tune the in-flight
+/// depth — useful in the bench harness, and as the building block any
+/// `streaming_compress_to_frames` callers extend if their workload needs a
+/// non-default pipelining depth.
+pub async fn streaming_compress_to_frames_with(
+    body: StreamingBlob,
+    registry: Arc<CodecRegistry>,
+    codec_kind: CodecKind,
+    chunk_size: usize,
+    inflight: usize,
+) -> Result<(Bytes, ChunkManifest), CodecError> {
     use bytes::BytesMut;
+    use futures::StreamExt as _;
+    use futures::stream::FuturesOrdered;
+
+    let inflight = inflight.max(1);
     let mut read = blob_to_async_read(body);
     let mut framed = BytesMut::with_capacity(chunk_size);
     let mut rolling_crc: u32 = 0;
     let mut total_in: u64 = 0;
     let mut chunk_buf = vec![0u8; chunk_size];
 
+    // Each in-flight task carries the per-chunk frame header (computed
+    // synchronously when the chunk was read) and a JoinHandle that resolves
+    // to the codec output. Ordering is preserved by FuturesOrdered.
+    type InFlight = futures::future::BoxFuture<'static, Result<(FrameHeader, Bytes), CodecError>>;
+    let mut queue: FuturesOrdered<InFlight> = FuturesOrdered::new();
+    let mut eof = false;
+
     loop {
-        let mut filled = 0;
-        while filled < chunk_size {
-            let n = read
-                .read(&mut chunk_buf[filled..])
-                .await
-                .map_err(CodecError::Io)?;
-            if n == 0 {
+        // Refill the in-flight queue.
+        while !eof && queue.len() < inflight {
+            let mut filled = 0;
+            while filled < chunk_size {
+                let n = read
+                    .read(&mut chunk_buf[filled..])
+                    .await
+                    .map_err(CodecError::Io)?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            if filled == 0 {
+                eof = true;
                 break;
             }
-            filled += n;
+
+            let chunk_slice = &chunk_buf[..filled];
+            let chunk_crc = crc32c::crc32c(chunk_slice);
+            rolling_crc = crc32c::crc32c_append(rolling_crc, chunk_slice);
+            total_in += filled as u64;
+
+            let header = FrameHeader {
+                codec: codec_kind,
+                original_size: filled as u64,
+                compressed_size: 0, // patched after compress completes
+                crc32c: chunk_crc,
+            };
+            let original_chunk = Bytes::copy_from_slice(chunk_slice);
+            let registry = Arc::clone(&registry);
+            queue.push_back(Box::pin(async move {
+                let (compressed_chunk, _per_chunk_manifest) =
+                    registry.compress(original_chunk, codec_kind).await?;
+                let mut header = header;
+                header.compressed_size = compressed_chunk.len() as u64;
+                Ok::<_, CodecError>((header, compressed_chunk))
+            }));
         }
-        if filled == 0 {
-            break;
+
+        // Drain the next ready frame in chunk order.
+        match queue.next().await {
+            Some(Ok((header, compressed_chunk))) => {
+                write_frame(&mut framed, header, &compressed_chunk);
+            }
+            Some(Err(e)) => return Err(e),
+            None => break,
         }
-
-        let chunk_slice = &chunk_buf[..filled];
-        let chunk_crc = crc32c::crc32c(chunk_slice);
-        rolling_crc = crc32c::crc32c_append(rolling_crc, chunk_slice);
-        total_in += filled as u64;
-
-        let original_chunk = Bytes::copy_from_slice(chunk_slice);
-        let (compressed_chunk, _per_chunk_manifest) =
-            registry.compress(original_chunk, codec_kind).await?;
-
-        let header = FrameHeader {
-            codec: codec_kind,
-            original_size: filled as u64,
-            compressed_size: compressed_chunk.len() as u64,
-            crc32c: chunk_crc,
-        };
-        write_frame(&mut framed, header, &compressed_chunk);
     }
 
     let total_framed = framed.len() as u64;
