@@ -64,6 +64,8 @@ pub struct S4Service<B: S3> {
     /// gating "deny if not over TLS" can do their job. Defaults to `false`
     /// (HTTP); set via [`S4Service::with_secure_transport`] at boot.
     secure_transport: bool,
+    /// v0.4 #19: optional per-(principal, bucket) token-bucket limiter.
+    rate_limits: Option<crate::rate_limit::SharedRateLimits>,
 }
 
 impl<B: S3> S4Service<B> {
@@ -82,7 +84,37 @@ impl<B: S3> S4Service<B> {
             max_body_bytes: Self::DEFAULT_MAX_BODY_BYTES,
             policy: None,
             secure_transport: false,
+            rate_limits: None,
         }
+    }
+
+    /// v0.4 #19: attach a per-(principal, bucket) token-bucket rate limiter.
+    /// When set, every PUT / GET / DELETE / List / Copy / multipart op is
+    /// throttle-checked before the policy gate; throttled requests return
+    /// `S3ErrorCode::SlowDown` (HTTP 503) and bump
+    /// `s4_rate_limit_throttled_total{principal,bucket}`.
+    #[must_use]
+    pub fn with_rate_limits(mut self, rl: crate::rate_limit::SharedRateLimits) -> Self {
+        self.rate_limits = Some(rl);
+        self
+    }
+
+    /// Helper used by request handlers to apply the rate limit. Returns
+    /// `Ok(())` when allowed (or no rate limiter is configured), or a
+    /// `SlowDown` S3Error otherwise.
+    fn enforce_rate_limit<I>(&self, req: &S3Request<I>, bucket: &str) -> S3Result<()> {
+        let Some(rl) = self.rate_limits.as_ref() else {
+            return Ok(());
+        };
+        let principal_id = Self::principal_of(req);
+        if !rl.check(principal_id, bucket) {
+            crate::metrics::record_rate_limit_throttle(principal_id.unwrap_or("-"), bucket);
+            return Err(S3Error::with_message(
+                S3ErrorCode::SlowDown,
+                format!("rate-limited: bucket={bucket}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Tell the policy evaluator that the listener is reached over TLS
@@ -520,6 +552,7 @@ impl<B: S3> S3 for S4Service<B> {
         let put_start = Instant::now();
         let put_bucket = req.input.bucket.clone();
         let put_key = req.input.key.clone();
+        self.enforce_rate_limit(&req, &put_bucket)?;
         self.enforce_policy(&req, "s3:PutObject", &put_bucket, Some(&put_key))?;
         if let Some(blob) = req.input.body.take() {
             // Sample 4 KiB から codec を決定。streaming-aware codec なら streaming
@@ -666,6 +699,7 @@ impl<B: S3> S3 for S4Service<B> {
         let get_start = Instant::now();
         let get_bucket = req.input.bucket.clone();
         let get_key = req.input.key.clone();
+        self.enforce_rate_limit(&req, &get_bucket)?;
         self.enforce_policy(&req, "s3:GetObject", &get_bucket, Some(&get_key))?;
         // Range request の事前検出 (decompress 後 slice する path に使う)。
         let range_request = req.input.range.take();
@@ -886,6 +920,7 @@ impl<B: S3> S3 for S4Service<B> {
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
+        self.enforce_rate_limit(&req, &bucket)?;
         self.enforce_policy(&req, "s3:DeleteObject", &bucket, Some(&key))?;
         // sidecar も best-effort で削除 (失敗は無視 — 存在しない場合や IAM 制限を許容)
         let resp = self.backend.delete_object(req).await?;
@@ -990,6 +1025,7 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<ListObjectsInput>,
     ) -> S3Result<S3Response<ListObjectsOutput>> {
+        self.enforce_rate_limit(&req, &req.input.bucket)?;
         self.enforce_policy(&req, "s3:ListBucket", &req.input.bucket, None)?;
         let mut resp = self.backend.list_objects(req).await?;
         // S4 内部 object (`*.s4index` sidecar 等) を顧客から隠す
@@ -1007,6 +1043,7 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        self.enforce_rate_limit(&req, &req.input.bucket)?;
         self.enforce_policy(&req, "s3:ListBucket", &req.input.bucket, None)?;
         let mut resp = self.backend.list_objects_v2(req).await?;
         if let Some(contents) = resp.output.contents.as_mut() {
@@ -1033,6 +1070,7 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        self.enforce_rate_limit(&req, &req.input.bucket)?;
         self.enforce_policy(&req, "s3:ListBucket", &req.input.bucket, None)?;
         let mut resp = self.backend.list_object_versions(req).await?;
         if let Some(versions) = resp.output.versions.as_mut() {

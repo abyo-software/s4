@@ -164,6 +164,14 @@ struct Opt {
     /// subset.
     #[clap(long)]
     policy: Option<std::path::PathBuf>,
+
+    /// Optional per-(principal, bucket) token-bucket rate-limit JSON file.
+    /// Format: `[{"principal": "AKIA...", "bucket": "*", "rps": 100,
+    /// "burst": 500}, ...]`. First-match-wins on the rule list. Throttled
+    /// requests return `SlowDown` (HTTP 503) and bump
+    /// `s4_rate_limit_throttled_total{principal,bucket}`.
+    #[clap(long)]
+    rate_limit: Option<std::path::PathBuf>,
 }
 
 fn setup_tracing(
@@ -324,6 +332,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // (--acme) qualifies.
     let listener_secure = opt.tls_cert.is_some() || opt.acme.is_some();
     s4 = s4.with_secure_transport(listener_secure);
+    if let Some(ref rl_path) = opt.rate_limit {
+        let rl = s4_server::rate_limit::RateLimits::from_path(rl_path)
+            .map_err(|e| format!("--rate-limit {}: {e}", rl_path.display()))?;
+        info!(path = %rl_path.display(), "S4 rate-limit config loaded");
+        s4 = s4.with_rate_limits(std::sync::Arc::new(rl));
+    }
     if let Some(ref policy_path) = opt.policy {
         let policy = s4_server::policy::Policy::from_path(policy_path)
             .map_err(|e| format!("--policy {}: {e}", policy_path.display()))?;

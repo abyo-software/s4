@@ -35,6 +35,18 @@ pub mod names {
     pub const TLS_CERT_RELOAD_TOTAL: &str = "s4_tls_cert_reload_total";
     pub const ACME_RENEWAL_TOTAL: &str = "s4_acme_renewal_total";
     pub const ACME_CERT_EXPIRY_SECONDS: &str = "s4_acme_cert_expiry_seconds";
+    pub const RATE_LIMIT_THROTTLED_TOTAL: &str = "s4_rate_limit_throttled_total";
+}
+
+/// v0.4 #19: bumped each time a request is rejected by the rate limiter.
+/// Labels: principal (= access key id or `"-"` for anonymous), bucket.
+pub fn record_rate_limit_throttle(principal: &str, bucket: &str) {
+    metrics::counter!(
+        names::RATE_LIMIT_THROTTLED_TOTAL,
+        "principal" => principal.to_owned(),
+        "bucket" => bucket.to_owned(),
+    )
+    .increment(1);
 }
 
 /// v0.3 #10: bumped each time the operator triggers a SIGHUP-driven TLS

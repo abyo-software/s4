@@ -4,6 +4,7 @@ pub mod acme;
 pub mod blob;
 pub mod metrics;
 pub mod policy;
+pub mod rate_limit;
 pub mod routing;
 pub mod service;
 pub mod streaming;
