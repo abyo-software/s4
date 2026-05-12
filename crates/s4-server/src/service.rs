@@ -59,6 +59,11 @@ pub struct S4Service<B: S3> {
     dispatcher: Arc<dyn CodecDispatcher>,
     max_body_bytes: usize,
     policy: Option<crate::policy::SharedPolicy>,
+    /// v0.3 #13: surfaced as the `aws:SecureTransport` Condition key. Set
+    /// to `true` when the listener is wrapped in TLS (or ACME), so policies
+    /// gating "deny if not over TLS" can do their job. Defaults to `false`
+    /// (HTTP); set via [`S4Service::with_secure_transport`] at boot.
+    secure_transport: bool,
 }
 
 impl<B: S3> S4Service<B> {
@@ -76,7 +81,17 @@ impl<B: S3> S4Service<B> {
             dispatcher,
             max_body_bytes: Self::DEFAULT_MAX_BODY_BYTES,
             policy: None,
+            secure_transport: false,
         }
+    }
+
+    /// Tell the policy evaluator that the listener is reached over TLS
+    /// (or ACME). When `true`, the `aws:SecureTransport` Condition key
+    /// resolves to `true`. Defaults to `false`.
+    #[must_use]
+    pub fn with_secure_transport(mut self, on: bool) -> Self {
+        self.secure_transport = on;
+        self
     }
 
     #[must_use]
@@ -101,21 +116,52 @@ impl<B: S3> S4Service<B> {
         req.credentials.as_ref().map(|c| c.access_key.as_str())
     }
 
+    /// v0.3 #13: build the per-request policy context from the incoming
+    /// `S3Request`. Pulls `aws:UserAgent` from the User-Agent header,
+    /// `aws:SourceIp` from the standard `X-Forwarded-For` header (most
+    /// production deployments are behind an LB / reverse proxy that sets
+    /// this), `aws:CurrentTime` from the system clock, and
+    /// `aws:SecureTransport` from the per-listener TLS flag.
+    fn request_context<I>(&self, req: &S3Request<I>) -> crate::policy::RequestContext {
+        let user_agent = req
+            .headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        // X-Forwarded-For is `client, proxy1, proxy2`; the leftmost entry
+        // is the original client. Trim and parse leniently.
+        let source_ip = req
+            .headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|raw| raw.split(',').next())
+            .and_then(|s| s.trim().parse().ok());
+        crate::policy::RequestContext {
+            source_ip,
+            user_agent,
+            request_time: Some(std::time::SystemTime::now()),
+            secure_transport: self.secure_transport,
+            extra: Default::default(),
+        }
+    }
+
     /// Helper used by request handlers to enforce the optional policy.
     /// Returns `Ok(())` when allowed (or no policy is configured), or an
     /// `AccessDenied` S3Error otherwise. Bumps the policy denial Prometheus
     /// counter on deny.
-    fn enforce_policy(
+    fn enforce_policy<I>(
         &self,
+        req: &S3Request<I>,
         action: &'static str,
         bucket: &str,
         key: Option<&str>,
-        principal_id: Option<&str>,
     ) -> S3Result<()> {
         let Some(policy) = self.policy.as_ref() else {
             return Ok(());
         };
-        let decision = policy.evaluate(action, bucket, key, principal_id);
+        let principal_id = Self::principal_of(req);
+        let ctx = self.request_context(req);
+        let decision = policy.evaluate_with(action, bucket, key, principal_id, &ctx);
         if decision.allow {
             Ok(())
         } else {
@@ -125,6 +171,9 @@ impl<B: S3> S4Service<B> {
                 bucket,
                 key = ?key,
                 principal = ?principal_id,
+                source_ip = ?ctx.source_ip,
+                user_agent = ?ctx.user_agent,
+                secure_transport = ctx.secure_transport,
                 matched_sid = ?decision.matched_sid,
                 effect = ?decision.matched_effect,
                 "S4 policy denied request"
@@ -471,12 +520,7 @@ impl<B: S3> S3 for S4Service<B> {
         let put_start = Instant::now();
         let put_bucket = req.input.bucket.clone();
         let put_key = req.input.key.clone();
-        self.enforce_policy(
-            "s3:PutObject",
-            &put_bucket,
-            Some(&put_key),
-            Self::principal_of(&req),
-        )?;
+        self.enforce_policy(&req, "s3:PutObject", &put_bucket, Some(&put_key))?;
         if let Some(blob) = req.input.body.take() {
             // Sample 4 KiB から codec を決定。streaming-aware codec なら streaming
             // compress fast path、そうでなければ従来の collect-then-compress。
@@ -618,12 +662,7 @@ impl<B: S3> S3 for S4Service<B> {
         let get_start = Instant::now();
         let get_bucket = req.input.bucket.clone();
         let get_key = req.input.key.clone();
-        self.enforce_policy(
-            "s3:GetObject",
-            &get_bucket,
-            Some(&get_key),
-            Self::principal_of(&req),
-        )?;
+        self.enforce_policy(&req, "s3:GetObject", &get_bucket, Some(&get_key))?;
         // Range request の事前検出 (decompress 後 slice する path に使う)。
         let range_request = req.input.range.take();
 
@@ -843,12 +882,7 @@ impl<B: S3> S3 for S4Service<B> {
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
-        self.enforce_policy(
-            "s3:DeleteObject",
-            &bucket,
-            Some(&key),
-            Self::principal_of(&req),
-        )?;
+        self.enforce_policy(&req, "s3:DeleteObject", &bucket, Some(&key))?;
         // sidecar も best-effort で削除 (失敗は無視 — 存在しない場合や IAM 制限を許容)
         let resp = self.backend.delete_object(req).await?;
         let sidecar_input = DeleteObjectInput {
@@ -883,14 +917,9 @@ impl<B: S3> S3 for S4Service<B> {
         // copy is conceptually "GetObject src + PutObject dst" — enforce both.
         let dst_bucket = req.input.bucket.clone();
         let dst_key = req.input.key.clone();
-        self.enforce_policy(
-            "s3:PutObject",
-            &dst_bucket,
-            Some(&dst_key),
-            Self::principal_of(&req),
-        )?;
+        self.enforce_policy(&req, "s3:PutObject", &dst_bucket, Some(&dst_key))?;
         if let CopySource::Bucket { bucket, key, .. } = &req.input.copy_source {
-            self.enforce_policy("s3:GetObject", bucket, Some(key), Self::principal_of(&req))?;
+            self.enforce_policy(&req, "s3:GetObject", bucket, Some(key))?;
         }
         // S4-aware copy: source object に s4-* metadata がある場合、それを
         // destination に確実に preserve する。
@@ -957,12 +986,7 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<ListObjectsInput>,
     ) -> S3Result<S3Response<ListObjectsOutput>> {
-        self.enforce_policy(
-            "s3:ListBucket",
-            &req.input.bucket,
-            None,
-            Self::principal_of(&req),
-        )?;
+        self.enforce_policy(&req, "s3:ListBucket", &req.input.bucket, None)?;
         let mut resp = self.backend.list_objects(req).await?;
         // S4 内部 object (`*.s4index` sidecar 等) を顧客から隠す
         if let Some(contents) = resp.output.contents.as_mut() {
@@ -979,12 +1003,7 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
-        self.enforce_policy(
-            "s3:ListBucket",
-            &req.input.bucket,
-            None,
-            Self::principal_of(&req),
-        )?;
+        self.enforce_policy(&req, "s3:ListBucket", &req.input.bucket, None)?;
         let mut resp = self.backend.list_objects_v2(req).await?;
         if let Some(contents) = resp.output.contents.as_mut() {
             let before = contents.len();

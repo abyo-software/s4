@@ -28,8 +28,11 @@
 //! Decision: **explicit Deny > explicit Allow > implicit Deny** — the
 //! standard AWS evaluation order.
 
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde::Deserialize;
 
@@ -81,6 +84,10 @@ struct StatementJson {
     resource: StringOrVec,
     #[serde(rename = "Principal", default)]
     principal: Option<PrincipalSet>,
+    /// Optional Condition map (v0.3 #13): operator → key → values.
+    /// `{"IpAddress": {"aws:SourceIp": ["10.0.0.0/8"]}, ...}`.
+    #[serde(rename = "Condition", default)]
+    condition: Option<HashMap<String, HashMap<String, StringOrVec>>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -110,6 +117,62 @@ struct Statement {
     /// `Some(vec!["AKIA..."])` = match those access key ids.
     /// An empty `principals` vector means "wildcard (any principal)".
     principals: Option<Vec<String>>,
+    /// Compiled Condition clauses; empty vec = no condition restriction
+    /// (statement always matches once Action / Resource / Principal pass).
+    conditions: Vec<Condition>,
+}
+
+/// Per-request context fed into the policy evaluator. Caller is expected to
+/// fill what's available; missing fields make any Condition that depends on
+/// them fail (= statement skipped, never silently allowed).
+#[derive(Debug, Clone, Default)]
+pub struct RequestContext {
+    pub source_ip: Option<IpAddr>,
+    pub user_agent: Option<String>,
+    pub request_time: Option<SystemTime>,
+    pub secure_transport: bool,
+    /// Generic key → value map for any aws:* or s3:* context key not
+    /// covered by the typed fields above (keeps the door open for things
+    /// like `aws:RequestTag/*`, `s3:RequestObjectTag/*` later).
+    pub extra: HashMap<String, String>,
+}
+
+/// One compiled Condition clause inside a Statement.
+#[derive(Debug, Clone)]
+struct Condition {
+    op: ConditionOp,
+    key: String,         // e.g. `aws:SourceIp`, `aws:UserAgent`, `aws:CurrentTime`
+    values: Vec<String>, // operator-specific (CIDR, glob, ISO-8601 timestamp, "true" / "false", ...)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionOp {
+    IpAddress,
+    NotIpAddress,
+    StringEquals,
+    StringNotEquals,
+    StringLike,
+    StringNotLike,
+    DateGreaterThan,
+    DateLessThan,
+    Bool,
+}
+
+impl ConditionOp {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "IpAddress" => Self::IpAddress,
+            "NotIpAddress" => Self::NotIpAddress,
+            "StringEquals" => Self::StringEquals,
+            "StringNotEquals" => Self::StringNotEquals,
+            "StringLike" => Self::StringLike,
+            "StringNotLike" => Self::StringNotLike,
+            "DateGreaterThan" => Self::DateGreaterThan,
+            "DateLessThan" => Self::DateLessThan,
+            "Bool" => Self::Bool,
+            _ => return None,
+        })
+    }
 }
 
 impl Policy {
@@ -118,6 +181,26 @@ impl Policy {
             serde_json::from_str(s).map_err(|e| format!("policy JSON parse error: {e}"))?;
         let mut statements = Vec::with_capacity(raw.statements.len());
         for s in raw.statements {
+            let mut conditions = Vec::new();
+            if let Some(cond_map) = s.condition {
+                for (op_name, key_map) in cond_map {
+                    let op = ConditionOp::parse(&op_name).ok_or_else(|| {
+                        format!(
+                            "unsupported policy Condition operator: {op_name:?}. \
+                             v0.3 supports IpAddress / NotIpAddress / StringEquals / \
+                             StringNotEquals / StringLike / StringNotLike / \
+                             DateGreaterThan / DateLessThan / Bool."
+                        )
+                    })?;
+                    for (key, values) in key_map {
+                        conditions.push(Condition {
+                            op,
+                            key,
+                            values: values.into_vec(),
+                        });
+                    }
+                }
+            }
             statements.push(Statement {
                 sid: s.sid,
                 effect: s.effect,
@@ -127,6 +210,7 @@ impl Policy {
                     PrincipalSet::Wildcard(_) => Vec::new(),
                     PrincipalSet::Map { aws } => aws.map(|v| v.into_vec()).unwrap_or_default(),
                 }),
+                conditions,
             });
         }
         Ok(Self { statements })
@@ -143,12 +227,35 @@ impl Policy {
     /// `principal_id` is typically the SigV4 access key id taken from the
     /// authenticated request. Pass `None` for anonymous (will only match
     /// statements with wildcard or absent Principal).
+    ///
+    /// Convenience for the common case with no Condition data; calls the
+    /// full [`Policy::evaluate_with`] with a default `RequestContext`.
     pub fn evaluate(
         &self,
         action: &str,
         bucket: &str,
         key: Option<&str>,
         principal_id: Option<&str>,
+    ) -> Decision {
+        self.evaluate_with(
+            action,
+            bucket,
+            key,
+            principal_id,
+            &RequestContext::default(),
+        )
+    }
+
+    /// Same as [`Policy::evaluate`] but lets the caller plumb a populated
+    /// [`RequestContext`] for v0.3 #13 IAM Conditions (IP allowlists,
+    /// user-agent restrictions, time windows, etc.).
+    pub fn evaluate_with(
+        &self,
+        action: &str,
+        bucket: &str,
+        key: Option<&str>,
+        principal_id: Option<&str>,
+        ctx: &RequestContext,
     ) -> Decision {
         let object_resource = match key {
             Some(k) => format!("arn:aws:s3:::{bucket}/{k}"),
@@ -170,6 +277,12 @@ impl Policy {
                 continue;
             }
             if !principal_matches(&st.principals, principal_id) {
+                continue;
+            }
+            // v0.3 #13: Conditions are ALL-AND — a statement applies only
+            // when every Condition clause matches the request context.
+            // A clause failing simply skips the statement (no error).
+            if !st.conditions.iter().all(|c| condition_matches(c, ctx)) {
                 continue;
             }
             match st.effect {
@@ -291,6 +404,145 @@ fn principal_matches(allowed: &Option<Vec<String>>, principal_id: Option<&str>) 
             Some(id) => list.iter().any(|p| p == "*" || p == id),
         },
     }
+}
+
+/// v0.3 #13: evaluate one Condition clause against the request context.
+/// Returns `true` when the clause matches (statement may apply), `false`
+/// when it doesn't (statement is skipped).
+fn condition_matches(c: &Condition, ctx: &RequestContext) -> bool {
+    match c.op {
+        ConditionOp::IpAddress => match ctx.source_ip {
+            Some(ip) => c.values.iter().any(|cidr| ip_in_cidr(ip, cidr)),
+            None => false,
+        },
+        ConditionOp::NotIpAddress => match ctx.source_ip {
+            Some(ip) => !c.values.iter().any(|cidr| ip_in_cidr(ip, cidr)),
+            None => false,
+        },
+        ConditionOp::StringEquals => match context_value(&c.key, ctx) {
+            Some(v) => c.values.iter().any(|x| x == &v),
+            None => false,
+        },
+        ConditionOp::StringNotEquals => match context_value(&c.key, ctx) {
+            Some(v) => !c.values.iter().any(|x| x == &v),
+            None => false,
+        },
+        ConditionOp::StringLike => match context_value(&c.key, ctx) {
+            Some(v) => c.values.iter().any(|pat| glob_match(pat, &v)),
+            None => false,
+        },
+        ConditionOp::StringNotLike => match context_value(&c.key, ctx) {
+            Some(v) => !c.values.iter().any(|pat| glob_match(pat, &v)),
+            None => false,
+        },
+        ConditionOp::DateGreaterThan | ConditionOp::DateLessThan => {
+            // aws:CurrentTime is the only date key we materialise today.
+            let now = ctx.request_time.unwrap_or_else(SystemTime::now);
+            let now_unix = match now.duration_since(SystemTime::UNIX_EPOCH) {
+                Ok(d) => d.as_secs() as i64,
+                Err(_) => 0,
+            };
+            c.values.iter().any(|s| match parse_iso8601(s) {
+                Some(t) => match c.op {
+                    ConditionOp::DateGreaterThan => now_unix > t,
+                    ConditionOp::DateLessThan => now_unix < t,
+                    _ => unreachable!(),
+                },
+                None => false,
+            })
+        }
+        ConditionOp::Bool => match context_value(&c.key, ctx) {
+            Some(v) => c.values.iter().any(|x| x.eq_ignore_ascii_case(&v)),
+            None => false,
+        },
+    }
+}
+
+/// Resolve a Condition key against the request context. Handles the
+/// well-known `aws:SourceIp` / `aws:UserAgent` / `aws:CurrentTime` /
+/// `aws:SecureTransport` keys, plus any free-form key the caller stuffed
+/// into `ctx.extra`.
+fn context_value(key: &str, ctx: &RequestContext) -> Option<String> {
+    match key {
+        "aws:UserAgent" | "aws:userAgent" => ctx.user_agent.clone(),
+        "aws:SourceIp" | "aws:sourceIp" => ctx.source_ip.map(|ip| ip.to_string()),
+        "aws:SecureTransport" => Some(ctx.secure_transport.to_string()),
+        other => ctx.extra.get(other).cloned(),
+    }
+}
+
+/// Minimal CIDR-or-bare-IP membership test for `IpAddress`. Supports both
+/// IPv4 and IPv6, with or without the `/N` mask.
+fn ip_in_cidr(ip: IpAddr, cidr: &str) -> bool {
+    match cidr.split_once('/') {
+        None => cidr.parse::<IpAddr>().is_ok_and(|c| c == ip),
+        Some((net_str, mask_str)) => {
+            let Ok(net) = net_str.parse::<IpAddr>() else {
+                return false;
+            };
+            let Ok(mask_bits) = mask_str.parse::<u8>() else {
+                return false;
+            };
+            match (ip, net) {
+                (IpAddr::V4(ip4), IpAddr::V4(net4)) => {
+                    if mask_bits > 32 {
+                        return false;
+                    }
+                    if mask_bits == 0 {
+                        return true;
+                    }
+                    let shift = 32 - mask_bits;
+                    (u32::from(ip4) >> shift) == (u32::from(net4) >> shift)
+                }
+                (IpAddr::V6(ip6), IpAddr::V6(net6)) => {
+                    if mask_bits > 128 {
+                        return false;
+                    }
+                    if mask_bits == 0 {
+                        return true;
+                    }
+                    let shift = 128 - mask_bits;
+                    (u128::from(ip6) >> shift) == (u128::from(net6) >> shift)
+                }
+                _ => false, // IPv4 vs IPv6 mismatch
+            }
+        }
+    }
+}
+
+/// Minimal ISO-8601 parser tailored to the AWS bucket-policy
+/// `aws:CurrentTime` format: `YYYY-MM-DDTHH:MM:SSZ` (UTC, second
+/// granularity). Returns unix epoch seconds. AWS also accepts the
+/// `+00:00` offset variants and millisecond fractions — out of scope
+/// for v0.3, can be relaxed later if a real policy needs them.
+fn parse_iso8601(s: &str) -> Option<i64> {
+    // Accept `YYYY-MM-DDTHH:MM:SSZ` only; reject anything else.
+    let s = s.strip_suffix('Z')?;
+    let (date, time) = s.split_once('T')?;
+    let date_parts: Vec<&str> = date.split('-').collect();
+    if date_parts.len() != 3 {
+        return None;
+    }
+    let year: i64 = date_parts[0].parse().ok()?;
+    let month: i64 = date_parts[1].parse().ok()?;
+    let day: i64 = date_parts[2].parse().ok()?;
+    let time_parts: Vec<&str> = time.split(':').collect();
+    if time_parts.len() != 3 {
+        return None;
+    }
+    let h: i64 = time_parts[0].parse().ok()?;
+    let m: i64 = time_parts[1].parse().ok()?;
+    let s: i64 = time_parts[2].parse().ok()?;
+    // Days from 1970-01-01 via a quick civil-from-date algorithm
+    // (Howard Hinnant — public domain). Good for AD years.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as u64;
+    let days_from_epoch = era * 146097 + doe as i64 - 719468;
+    Some(days_from_epoch * 86_400 + h * 3600 + m * 60 + s)
 }
 
 /// Wrap a Policy in an Arc so cloning the S4Service stays cheap.
@@ -449,5 +701,217 @@ mod tests {
         assert!(glob_match("a?c", "abc"));
         assert!(!glob_match("a?c", "abbc"));
         assert!(glob_match("a*b*c", "axxxbyyyc"));
+    }
+
+    // ===== v0.3 #13 IAM Condition tests =====
+
+    fn ctx_ip(ip: &str) -> RequestContext {
+        RequestContext {
+            source_ip: Some(ip.parse().unwrap()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn condition_ip_address_cidr_match() {
+        let pol = p(r#"{
+            "Statement": [{
+              "Effect": "Allow", "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::b/*",
+              "Condition": {"IpAddress": {"aws:SourceIp": ["10.0.0.0/8", "192.168.1.0/24"]}}
+            }]
+        }"#);
+        assert!(
+            pol.evaluate_with("s3:GetObject", "b", Some("k"), None, &ctx_ip("10.5.6.7"))
+                .allow
+        );
+        assert!(
+            pol.evaluate_with(
+                "s3:GetObject",
+                "b",
+                Some("k"),
+                None,
+                &ctx_ip("192.168.1.50")
+            )
+            .allow
+        );
+        assert!(
+            !pol.evaluate_with("s3:GetObject", "b", Some("k"), None, &ctx_ip("203.0.113.1"))
+                .allow
+        );
+        // No source IP in context → condition fails → statement skipped
+        assert!(
+            !pol.evaluate_with(
+                "s3:GetObject",
+                "b",
+                Some("k"),
+                None,
+                &RequestContext::default()
+            )
+            .allow
+        );
+    }
+
+    #[test]
+    fn condition_not_ip_address_negates() {
+        let pol = p(r#"{
+            "Statement": [{
+              "Effect": "Deny", "Action": "s3:DeleteObject",
+              "Resource": "arn:aws:s3:::b/*",
+              "Condition": {"NotIpAddress": {"aws:SourceIp": ["10.0.0.0/8"]}}
+            },
+            {"Effect": "Allow", "Action": "s3:*", "Resource": "arn:aws:s3:::b/*"}]
+        }"#);
+        // Outside the trusted CIDR → Deny applies (NotIpAddress = true) → AccessDenied
+        assert!(
+            !pol.evaluate_with(
+                "s3:DeleteObject",
+                "b",
+                Some("k"),
+                None,
+                &ctx_ip("203.0.113.1")
+            )
+            .allow
+        );
+        // Inside the trusted CIDR → Deny condition fails → Allow remains
+        assert!(
+            pol.evaluate_with("s3:DeleteObject", "b", Some("k"), None, &ctx_ip("10.0.0.7"))
+                .allow
+        );
+    }
+
+    #[test]
+    fn condition_string_equals_user_agent() {
+        let pol = p(r#"{
+            "Statement": [{
+              "Effect": "Allow", "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::b/*",
+              "Condition": {"StringEquals": {"aws:UserAgent": ["MyApp/1.0", "MyApp/2.0"]}}
+            }]
+        }"#);
+        let ua = |s: &str| RequestContext {
+            user_agent: Some(s.into()),
+            ..Default::default()
+        };
+        assert!(
+            pol.evaluate_with("s3:GetObject", "b", Some("k"), None, &ua("MyApp/1.0"))
+                .allow
+        );
+        assert!(
+            !pol.evaluate_with("s3:GetObject", "b", Some("k"), None, &ua("OtherApp/1.0"))
+                .allow
+        );
+    }
+
+    #[test]
+    fn condition_string_like_glob() {
+        let pol = p(r#"{
+            "Statement": [{
+              "Effect": "Allow", "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::b/*",
+              "Condition": {"StringLike": {"aws:UserAgent": ["MyApp/*", "boto3/*"]}}
+            }]
+        }"#);
+        let ua = |s: &str| RequestContext {
+            user_agent: Some(s.into()),
+            ..Default::default()
+        };
+        assert!(
+            pol.evaluate_with("s3:GetObject", "b", Some("k"), None, &ua("MyApp/3.14"))
+                .allow
+        );
+        assert!(
+            pol.evaluate_with("s3:GetObject", "b", Some("k"), None, &ua("boto3/1.34.5"))
+                .allow
+        );
+        assert!(
+            !pol.evaluate_with("s3:GetObject", "b", Some("k"), None, &ua("curl/8"))
+                .allow
+        );
+    }
+
+    #[test]
+    fn condition_date_window() {
+        // Allow only requests between two dates.
+        let pol = p(r#"{
+            "Statement": [{
+              "Effect": "Allow", "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::b/*",
+              "Condition": {
+                "DateGreaterThan": {"aws:CurrentTime": ["2026-01-01T00:00:00Z"]},
+                "DateLessThan":    {"aws:CurrentTime": ["2026-12-31T23:59:59Z"]}
+              }
+            }]
+        }"#);
+        let mid_year = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_780_000_000); // ~mid-2026
+        let after = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000); // ~early-2027
+        let ctx_at = |t: SystemTime| RequestContext {
+            request_time: Some(t),
+            ..Default::default()
+        };
+        assert!(
+            pol.evaluate_with("s3:GetObject", "b", Some("k"), None, &ctx_at(mid_year))
+                .allow
+        );
+        assert!(
+            !pol.evaluate_with("s3:GetObject", "b", Some("k"), None, &ctx_at(after))
+                .allow
+        );
+    }
+
+    #[test]
+    fn condition_bool_secure_transport() {
+        let pol = p(r#"{
+            "Statement": [{
+              "Effect": "Deny", "Action": "s3:*",
+              "Resource": "arn:aws:s3:::b/*",
+              "Condition": {"Bool": {"aws:SecureTransport": ["false"]}}
+            },
+            {"Effect": "Allow", "Action": "s3:*", "Resource": "arn:aws:s3:::b/*"}]
+        }"#);
+        let plain = RequestContext {
+            secure_transport: false,
+            ..Default::default()
+        };
+        let tls = RequestContext {
+            secure_transport: true,
+            ..Default::default()
+        };
+        // Plain HTTP → SecureTransport=false → Deny matches
+        assert!(
+            !pol.evaluate_with("s3:GetObject", "b", Some("k"), None, &plain)
+                .allow
+        );
+        // TLS → SecureTransport=true → Deny condition fails → Allow remains
+        assert!(
+            pol.evaluate_with("s3:GetObject", "b", Some("k"), None, &tls)
+                .allow
+        );
+    }
+
+    #[test]
+    fn condition_unknown_operator_rejected() {
+        let err = Policy::from_json_str(
+            r#"{
+            "Statement": [{"Effect": "Allow", "Action": "s3:*",
+              "Resource": "arn:aws:s3:::b/*",
+              "Condition": {"NumericGreaterThan": {"k": ["1"]}}
+            }]
+        }"#,
+        )
+        .expect_err("should reject unsupported operator");
+        assert!(err.contains("unsupported policy Condition operator"));
+        assert!(err.contains("NumericGreaterThan"));
+    }
+
+    #[test]
+    fn condition_legacy_evaluate_unchanged() {
+        // Old `evaluate` (no context) still works: a policy without
+        // Condition clauses is unaffected by the v0.3 changes.
+        let pol = p(r#"{
+            "Statement": [{"Effect": "Allow", "Action": "s3:*",
+              "Resource": "arn:aws:s3:::b/*"}]
+        }"#);
+        assert!(pol.evaluate("s3:GetObject", "b", Some("k"), None).allow);
     }
 }

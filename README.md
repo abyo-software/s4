@@ -414,14 +414,26 @@ gateway:
 }
 ```
 
-Supported subset (v0.2): `Effect`, `Action`, `Resource`, `Principal`
-(SigV4 access-key match). Decision order is the standard AWS one:
-**explicit Deny > explicit Allow > implicit Deny**. Denials are exposed as
-the `s4_policy_denials_total{action,bucket}` Prometheus counter.
+Supported subset (v0.3):
 
-For more advanced needs (full IAM Conditions, STS / AssumeRole), front
-S4 with an IAM-aware proxy and use this flag for in-gateway last-mile
-checks.
+- **`Effect` / `Action` / `Resource` / `Principal`** (v0.2 baseline): SigV4
+  access-key match for Principal, glob matching for Resource.
+- **`Condition` clauses** (v0.3 #13): `IpAddress` / `NotIpAddress` (CIDR),
+  `StringEquals` / `StringNotEquals` / `StringLike` / `StringNotLike`,
+  `DateGreaterThan` / `DateLessThan`, `Bool`. Supports the well-known
+  AWS context keys `aws:SourceIp` (taken from the `X-Forwarded-For`
+  header — set this at your reverse proxy / load balancer),
+  `aws:UserAgent`, `aws:CurrentTime`, `aws:SecureTransport` (true when
+  the listener is `--tls-cert` or `--acme`).
+
+Decision order is the standard AWS one: **explicit Deny > explicit Allow >
+implicit Deny**. Conditions are AND-combined within a Statement. Denials
+are exposed as the `s4_policy_denials_total{action,bucket}` Prometheus
+counter.
+
+For STS / AssumeRole chains and cross-account delegation (still out of
+scope), front S4 with an IAM-aware proxy and use this flag for the
+in-gateway last-mile checks.
 
 ## On-the-wire Format
 

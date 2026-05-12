@@ -314,6 +314,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     );
 
     let mut s4 = S4Service::new(proxy, registry, dispatcher);
+    // v0.3 #13: tell the policy evaluator whether traffic is reaching us
+    // over TLS so the `aws:SecureTransport` Condition key resolves
+    // correctly. Either an operator-provided cert (--tls-cert) or ACME
+    // (--acme) qualifies.
+    let listener_secure = opt.tls_cert.is_some() || opt.acme.is_some();
+    s4 = s4.with_secure_transport(listener_secure);
     if let Some(ref policy_path) = opt.policy {
         let policy = s4_server::policy::Policy::from_path(policy_path)
             .map_err(|e| format!("--policy {}: {e}", policy_path.display()))?;

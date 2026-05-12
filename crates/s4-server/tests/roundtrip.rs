@@ -516,6 +516,108 @@ async fn policy_denies_delete_but_allows_get_and_put() {
     );
 }
 
+/// v0.3 #13: a policy with an IpAddress Condition denies a request whose
+/// X-Forwarded-For header puts it outside the trusted CIDR. Validates the
+/// full hot path: header → request_context → policy.evaluate_with → deny.
+#[tokio::test]
+async fn policy_iam_condition_ip_address_denies_outside_cidr() {
+    use s4_server::policy::Policy;
+
+    let backend = MemoryBackend::new();
+    let policy = Policy::from_json_str(
+        r#"{
+            "Version": "2012-10-17",
+            "Statement": [
+              {"Sid": "AllowFromCorpVpn",
+               "Effect": "Allow",
+               "Action": "s3:GetObject",
+               "Resource": "arn:aws:s3:::bucket/*",
+               "Condition": {"IpAddress": {"aws:SourceIp": ["10.0.0.0/8"]}}}
+            ]
+        }"#,
+    )
+    .expect("policy parse");
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    )
+    .with_policy(Arc::new(policy));
+
+    // Manually craft a GET with X-Forwarded-For populated. Use the
+    // existing helper but override headers.
+    let make_get = |xff: Option<&str>| {
+        let mut req = get_request("bucket", "k");
+        if let Some(ip) = xff {
+            req.headers.insert("x-forwarded-for", ip.parse().unwrap());
+        }
+        req
+    };
+
+    // PUT first so the object exists (PUT itself is denied because no
+    // s3:PutObject in the Allow list — implicit deny — so we go around
+    // S4 and inject the object directly via the in-memory backend).
+    let payload = Bytes::from_static(b"data");
+    let raw_compressed = zstd::stream::encode_all(payload.as_ref(), 3).unwrap();
+    let mut meta = Metadata::default();
+    meta.insert("s4-codec".into(), "cpu-zstd".into());
+    meta.insert("s4-original-size".into(), payload.len().to_string());
+    meta.insert(
+        "s4-compressed-size".into(),
+        raw_compressed.len().to_string(),
+    );
+    meta.insert("s4-crc32c".into(), crc32c::crc32c(&payload).to_string());
+    {
+        let backend_ref = s4.into_backend();
+        backend_ref.inner.lock().unwrap().insert(
+            ("bucket".into(), "k".into()),
+            StoredObject {
+                body: Bytes::from(raw_compressed),
+                metadata: Some(meta),
+                content_type: None,
+            },
+        );
+
+        // Re-wrap the backend in S4Service for the GET tests.
+        let policy = Policy::from_json_str(
+            r#"{"Statement": [{"Effect": "Allow", "Action": "s3:GetObject",
+                  "Resource": "arn:aws:s3:::bucket/*",
+                  "Condition": {"IpAddress": {"aws:SourceIp": ["10.0.0.0/8"]}}}]}"#,
+        )
+        .unwrap();
+        let s4 = S4Service::new(
+            backend_ref,
+            make_registry(CodecKind::CpuZstd),
+            make_dispatcher(CodecKind::CpuZstd),
+        )
+        .with_policy(Arc::new(policy));
+
+        // Inside the trusted CIDR → allow.
+        let resp = s4
+            .get_object(make_get(Some("10.5.6.7")))
+            .await
+            .expect("ip in cidr should allow");
+        assert_eq!(read_back(resp).await, payload);
+
+        // Outside the trusted CIDR → AccessDenied.
+        let err = s4
+            .get_object(make_get(Some("203.0.113.1")))
+            .await
+            .expect_err("ip outside cidr should deny");
+        let dbg = format!("{err:?}");
+        assert!(dbg.contains("AccessDenied"), "got {dbg}");
+
+        // No X-Forwarded-For at all → context has no source_ip → IpAddress
+        // condition fails → statement skipped → implicit deny.
+        let err = s4
+            .get_object(make_get(None))
+            .await
+            .expect_err("missing source ip should deny via implicit deny");
+        let dbg = format!("{err:?}");
+        assert!(dbg.contains("AccessDenied"), "got {dbg}");
+    }
+}
+
 /// v0.2 #7: a policy that allows nothing → implicit deny on every request.
 #[tokio::test]
 async fn policy_with_no_matching_statement_implicit_denies() {
