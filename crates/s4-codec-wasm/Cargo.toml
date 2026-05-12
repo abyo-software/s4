@@ -1,0 +1,42 @@
+# `s4-codec-wasm` — browser-side decoder for S4F2-framed objects (v0.4 #24).
+#
+# Why a separate crate (instead of a `wasm` feature on `s4-codec`):
+#   - the workspace `tokio = "full"` and `s3s` / `aws-sdk-s3` deps don't
+#     compile to `wasm32-unknown-unknown`;
+#   - the browser only ever decodes (read path), so no need to drag the GPU
+#     codecs (nvCOMP / DietGPU) or the async runtime through `wasm-bindgen`.
+#
+# Build: `cargo build --release --target wasm32-unknown-unknown -p s4-codec-wasm`
+# or, with `wasm-pack` installed: `wasm-pack build --release --target web`.
+
+[package]
+name = "s4-codec-wasm"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "README.md"
+description = "Browser-side WASM decoder for S4F2-framed objects (CPU codecs only — zstd / gzip / passthrough)."
+publish = false  # npm publish is the distribution channel; crates.io publish disabled
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# `s4-codec` is the source of truth for `CodecKind`, the S4F2 frame format
+# (`multipart::FrameIter`), and the `*_blocking` decode helpers added in this
+# same change. Pinning by path keeps in-repo changes aligned; pinning by
+# version protects against accidental dep skew when published.
+s4-codec = { path = "../s4-codec", version = "0.3.0" }
+bytes = { workspace = true }
+crc32c = { workspace = true }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }

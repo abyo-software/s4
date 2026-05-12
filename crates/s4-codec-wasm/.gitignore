@@ -1,0 +1,13 @@
+# wasm-pack output (rebuilt per release; not vendored in the repo).
+pkg/
+pkg-node/
+pkg-bundler/
+
+# Cargo / npm build artefacts.
+target/
+node_modules/
+
+# Lock files for the JS side — npm publish will produce its own.
+package-lock.json
+yarn.lock
+pnpm-lock.yaml

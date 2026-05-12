@@ -1,0 +1,47 @@
+{
+  "name": "@abyo-software/s4-codec-wasm",
+  "version": "0.1.0",
+  "description": "Browser/Node WASM decoder for S4F2-framed S4 (Squished S3) objects. CPU codecs only — passthrough, cpu-zstd, cpu-gzip.",
+  "type": "module",
+  "main": "pkg/s4_codec_wasm.js",
+  "types": "pkg/s4_codec_wasm.d.ts",
+  "files": [
+    "pkg/s4_codec_wasm_bg.wasm",
+    "pkg/s4_codec_wasm.js",
+    "pkg/s4_codec_wasm.d.ts",
+    "pkg/package.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "s4",
+    "s3",
+    "compression",
+    "wasm",
+    "zstd",
+    "gzip",
+    "browser",
+    "decoder"
+  ],
+  "author": "abyo software 合同会社",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/abyo-software/s4",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/abyo-software/s4.git",
+    "directory": "crates/s4-codec-wasm"
+  },
+  "bugs": {
+    "url": "https://github.com/abyo-software/s4/issues"
+  },
+  "scripts": {
+    "build": "wasm-pack build --release --target web --out-dir pkg",
+    "build:node": "wasm-pack build --release --target nodejs --out-dir pkg-node",
+    "build:bundler": "wasm-pack build --release --target bundler --out-dir pkg-bundler",
+    "test:node": "wasm-pack test --node",
+    "clean": "rm -rf pkg pkg-node pkg-bundler target"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

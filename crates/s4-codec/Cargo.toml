@@ -42,11 +42,18 @@ tracing.workspace = true
 serde.workspace = true
 crc32c.workspace = true
 zstd.workspace = true
-tokio = { workspace = true }
+# tokio: only `rt` is needed at runtime (spawn_blocking + JoinError). The
+# workspace dep is `features = ["full"]` which drags in mio / sockets / signal
+# and prevents `s4-codec-wasm` (a path-dep on this crate) from building for
+# `wasm32-unknown-unknown`. Pin a slim feature set here while still using the
+# workspace version. Server / nvcomp consumers compose their own full set in
+# their own Cargo.toml so this doesn't disable anything they need.
+tokio = { version = "1", default-features = false, features = ["rt"] }
 thiserror.workspace = true
 flate2 = "1"
 
 [dev-dependencies]
-tokio = { workspace = true }
+# Tests use `#[tokio::test]` (= `macros` + `rt`).
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread"] }
 proptest.workspace = true
 bolero.workspace = true

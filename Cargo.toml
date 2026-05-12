@@ -5,6 +5,7 @@ members = [
     "crates/s4-codec",
     "crates/s4-config",
     "crates/s4-codec-py",
+    "crates/s4-codec-wasm",
 ]
 
 [workspace.package]

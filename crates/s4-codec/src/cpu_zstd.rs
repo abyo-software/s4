@@ -32,6 +32,76 @@ impl Default for CpuZstd {
     }
 }
 
+/// Sync, runtime-free decompress used by `s4-codec-wasm` (browser / WASM has
+/// no tokio runtime and no `spawn_blocking`). Same checks as the trait
+/// implementation: codec/size match, decompression-bomb cap at
+/// `manifest.original_size + 1024`, crc32c verify after.
+///
+/// Kept in this module (and not duplicated in the wasm crate) so the bomb
+/// limit + size + crc rules stay defined exactly once.
+pub fn decompress_blocking(input: &[u8], manifest: &ChunkManifest) -> Result<Vec<u8>, CodecError> {
+    if manifest.codec != CodecKind::CpuZstd {
+        return Err(CodecError::CodecMismatch {
+            expected: CodecKind::CpuZstd,
+            got: manifest.codec,
+        });
+    }
+    if input.len() as u64 != manifest.compressed_size {
+        return Err(CodecError::SizeMismatch {
+            expected: manifest.compressed_size,
+            got: input.len() as u64,
+        });
+    }
+    use std::io::Read;
+    let limit = manifest.original_size.saturating_add(1024);
+    let mut decoder = zstd::stream::Decoder::new(input).map_err(CodecError::Io)?;
+    let mut buf = Vec::with_capacity(manifest.original_size as usize);
+    (&mut decoder)
+        .take(limit)
+        .read_to_end(&mut buf)
+        .map_err(CodecError::Io)?;
+    if (buf.len() as u64) > manifest.original_size {
+        return Err(CodecError::Io(std::io::Error::other(format!(
+            "zstd decompression bomb detected: produced {} bytes, manifest claimed {}",
+            buf.len(),
+            manifest.original_size
+        ))));
+    }
+    if buf.len() as u64 != manifest.original_size {
+        return Err(CodecError::SizeMismatch {
+            expected: manifest.original_size,
+            got: buf.len() as u64,
+        });
+    }
+    let actual_crc = crc32c::crc32c(&buf);
+    if actual_crc != manifest.crc32c {
+        return Err(CodecError::CrcMismatch {
+            expected: manifest.crc32c,
+            got: actual_crc,
+        });
+    }
+    Ok(buf)
+}
+
+/// Sync compress sibling of `decompress_blocking`. Provided for symmetry — the
+/// browser side rarely compresses (it's read-only), but having both halves
+/// keeps the API explainable and useful for offline tooling.
+pub fn compress_blocking(input: &[u8], level: i32) -> Result<(Vec<u8>, ChunkManifest), CodecError> {
+    let level = level.clamp(1, 22);
+    let original_size = input.len() as u64;
+    let original_crc = crc32c::crc32c(input);
+    let compressed = zstd::stream::encode_all(input, level).map_err(CodecError::Io)?;
+    Ok((
+        compressed.clone(),
+        ChunkManifest {
+            codec: CodecKind::CpuZstd,
+            original_size,
+            compressed_size: compressed.len() as u64,
+            crc32c: original_crc,
+        },
+    ))
+}
+
 #[async_trait::async_trait]
 impl Codec for CpuZstd {
     fn kind(&self) -> CodecKind {
@@ -185,5 +255,16 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, CodecError::CodecMismatch { .. }));
+    }
+
+    /// `decompress_blocking` (used by `s4-codec-wasm`) round-trips through
+    /// `compress_blocking` with the same checks the async path applies.
+    #[test]
+    fn blocking_roundtrip() {
+        let input = b"hello squished s3 hello squished s3 hello squished s3";
+        let (compressed, manifest) = compress_blocking(input, CpuZstd::DEFAULT_LEVEL).unwrap();
+        assert_eq!(manifest.codec, CodecKind::CpuZstd);
+        let decompressed = decompress_blocking(&compressed, &manifest).unwrap();
+        assert_eq!(decompressed, input);
     }
 }

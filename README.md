@@ -123,6 +123,21 @@ roundtrip = codec.decompress(compressed, original_size, crc)
 PyO3 bindings live in [`crates/s4-codec-py/`](crates/s4-codec-py/) — build
 with `maturin build --release` (and `--features nvcomp-gpu` for GPU).
 
+### Browser (WASM)
+
+For frontend apps that read S4-compressed objects directly from S3 over a
+presigned URL, no S4 server in the read path:
+
+```bash
+rustup target add wasm32-unknown-unknown
+wasm-pack build --release --target web crates/s4-codec-wasm  # → pkg/
+```
+
+The bundle exports `decompressFramed` / `decompressSingle` for the CPU
+codec subset (`passthrough`, `cpu-zstd`, `cpu-gzip`). See
+[`crates/s4-codec-wasm/README.md`](crates/s4-codec-wasm/README.md) for
+the API and a 10-line example.
+
 ### Build from source
 
 ```bash
