@@ -180,6 +180,135 @@ async fn minio_roundtrip_through_s4_with_cpu_zstd() {
     );
 }
 
+#[cfg(feature = "nvcomp-gpu")]
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container + CUDA-capable GPU + NVCOMP_HOME"]
+async fn minio_roundtrip_through_s4_with_nvcomp_zstd() {
+    use s4_codec::nvcomp::{NvcompZstdCodec, is_gpu_available};
+    if !is_gpu_available() {
+        eprintln!("skipping: no CUDA GPU detected at runtime");
+        return;
+    }
+
+    let fixture = start_minio().await;
+    let aws_client = build_aws_client(&fixture.endpoint_url).await;
+    ensure_bucket(&aws_client, "s4-gpu-test").await;
+
+    let proxy = s3s_aws::Proxy::from(aws_client.clone());
+    let registry = Arc::new(
+        CodecRegistry::new(CodecKind::NvcompZstd)
+            .with(Arc::new(Passthrough))
+            .with(Arc::new(NvcompZstdCodec::new().expect("nvcomp init"))),
+    );
+    let s4 = S4Service::new(
+        proxy,
+        registry,
+        Arc::new(AlwaysDispatcher(CodecKind::NvcompZstd)),
+    );
+
+    // 1 MB の repeated text — GPU zstd で大きく縮むはず
+    let payload = Bytes::from("the quick brown fox ".repeat(50_000));
+    let original_size = payload.len();
+
+    s4.put_object(put_request(
+        "s4-gpu-test",
+        "log/2026-05-12.log",
+        payload.clone(),
+    ))
+    .await
+    .expect("put");
+
+    // S4 経由 GET → 元バイト列が返る
+    let resp = s4
+        .get_object(get_request("s4-gpu-test", "log/2026-05-12.log"))
+        .await
+        .expect("get");
+    let roundtripped = read_back(resp).await;
+    assert_eq!(roundtripped, payload, "GPU compress + decompress roundtrip");
+
+    // raw aws-sdk-s3 で MinIO 上の実 object を直接読み、GPU zstd で大きく縮んでいることを確認
+    let raw = aws_client
+        .get_object()
+        .bucket("s4-gpu-test")
+        .key("log/2026-05-12.log")
+        .send()
+        .await
+        .expect("raw get");
+    let raw_meta = raw.metadata().cloned().unwrap_or_default();
+    assert_eq!(
+        raw_meta.get("s4-codec").map(String::as_str),
+        Some("nvcomp-zstd"),
+        "MinIO 上の object には s4-codec=nvcomp-zstd が書かれているべき"
+    );
+    let raw_bytes = raw.body.collect().await.expect("body collect").into_bytes();
+    assert!(
+        raw_bytes.len() < original_size / 20,
+        "expected GPU zstd to compress repeated text by 20x+, got {} -> {} bytes",
+        original_size,
+        raw_bytes.len()
+    );
+}
+
+#[cfg(feature = "nvcomp-gpu")]
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container + CUDA-capable GPU + NVCOMP_HOME"]
+async fn minio_roundtrip_through_s4_with_nvcomp_bitcomp() {
+    use s4_codec::nvcomp::{NvcompBitcompCodec, is_gpu_available};
+    if !is_gpu_available() {
+        eprintln!("skipping: no CUDA GPU detected at runtime");
+        return;
+    }
+
+    let fixture = start_minio().await;
+    let aws_client = build_aws_client(&fixture.endpoint_url).await;
+    ensure_bucket(&aws_client, "s4-gpu-test").await;
+
+    let proxy = s3s_aws::Proxy::from(aws_client.clone());
+    let registry = Arc::new(
+        CodecRegistry::new(CodecKind::NvcompBitcomp)
+            .with(Arc::new(Passthrough))
+            .with(Arc::new(
+                NvcompBitcompCodec::default_general().expect("init"),
+            )),
+    );
+    let s4 = S4Service::new(
+        proxy,
+        registry,
+        Arc::new(AlwaysDispatcher(CodecKind::NvcompBitcomp)),
+    );
+
+    // Parquet 風 = 単調 i64 column 16 KB 分
+    let mut payload: Vec<u8> = Vec::with_capacity(16384);
+    for i in 0i64..2048 {
+        payload.extend_from_slice(&i.to_le_bytes());
+    }
+    let payload = Bytes::from(payload);
+
+    s4.put_object(put_request("s4-gpu-test", "col/i64.bin", payload.clone()))
+        .await
+        .expect("put");
+
+    let resp = s4
+        .get_object(get_request("s4-gpu-test", "col/i64.bin"))
+        .await
+        .expect("get");
+    let roundtripped = read_back(resp).await;
+    assert_eq!(roundtripped, payload);
+
+    let raw = aws_client
+        .get_object()
+        .bucket("s4-gpu-test")
+        .key("col/i64.bin")
+        .send()
+        .await
+        .expect("raw get");
+    let raw_meta = raw.metadata().cloned().unwrap_or_default();
+    assert_eq!(
+        raw_meta.get("s4-codec").map(String::as_str),
+        Some("nvcomp-bitcomp")
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires Docker for MinIO container"]
 async fn minio_sampling_dispatcher_skips_already_compressed() {

@@ -269,6 +269,399 @@ impl<B: S3> S3 for S4Service<B> {
     ) -> S3Result<S3Response<ListPartsOutput>> {
         self.backend.list_parts(req).await
     }
+
+    // =========================================================================
+    // Phase 2 — pure passthrough delegations。S4 はこれらに対して圧縮 hook を
+    // 持たないので、backend (= AWS S3) の動作と完全に同一。
+    //
+    // 既知の制限事項:
+    // - copy_object / upload_part_copy: source object が S4-compressed の場合、
+    //   backend が bytes を copy するだけなので metadata (s4-codec etc) も一緒に
+    //   coppied される (AWS S3 default = MetadataDirective COPY)。GET は manifest
+    //   経由で正しく decompress できる。MetadataDirective REPLACE で上書き
+    //   されると圧縮 metadata が消えて壊れる — 顧客側の運用で注意
+    // - list_object_versions: versioning enabled bucket では各 version も S4
+    //   metadata を維持する。古い version も S4 経由で正しく GET できる。
+    // =========================================================================
+
+    // ---- Object ACL / tagging / attributes ----
+    async fn get_object_acl(
+        &self,
+        req: S3Request<GetObjectAclInput>,
+    ) -> S3Result<S3Response<GetObjectAclOutput>> {
+        self.backend.get_object_acl(req).await
+    }
+    async fn put_object_acl(
+        &self,
+        req: S3Request<PutObjectAclInput>,
+    ) -> S3Result<S3Response<PutObjectAclOutput>> {
+        self.backend.put_object_acl(req).await
+    }
+    async fn get_object_tagging(
+        &self,
+        req: S3Request<GetObjectTaggingInput>,
+    ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        self.backend.get_object_tagging(req).await
+    }
+    async fn put_object_tagging(
+        &self,
+        req: S3Request<PutObjectTaggingInput>,
+    ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        self.backend.put_object_tagging(req).await
+    }
+    async fn delete_object_tagging(
+        &self,
+        req: S3Request<DeleteObjectTaggingInput>,
+    ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        self.backend.delete_object_tagging(req).await
+    }
+    async fn get_object_attributes(
+        &self,
+        req: S3Request<GetObjectAttributesInput>,
+    ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
+        self.backend.get_object_attributes(req).await
+    }
+    async fn restore_object(
+        &self,
+        req: S3Request<RestoreObjectInput>,
+    ) -> S3Result<S3Response<RestoreObjectOutput>> {
+        self.backend.restore_object(req).await
+    }
+    async fn upload_part_copy(
+        &self,
+        req: S3Request<UploadPartCopyInput>,
+    ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        // 注: source が S4-compressed の場合、bytes の partial copy は壊れる。
+        //     S3 spec の仕様上 byte-range で copy できるが、S4 の compress block
+        //     boundary とは無関係。Phase 2 で per-part 圧縮を入れた後に再考。
+        self.backend.upload_part_copy(req).await
+    }
+
+    // ---- Object lock / retention / legal hold ----
+    async fn get_object_lock_configuration(
+        &self,
+        req: S3Request<GetObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
+        self.backend.get_object_lock_configuration(req).await
+    }
+    async fn put_object_lock_configuration(
+        &self,
+        req: S3Request<PutObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
+        self.backend.put_object_lock_configuration(req).await
+    }
+    async fn get_object_legal_hold(
+        &self,
+        req: S3Request<GetObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<GetObjectLegalHoldOutput>> {
+        self.backend.get_object_legal_hold(req).await
+    }
+    async fn put_object_legal_hold(
+        &self,
+        req: S3Request<PutObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<PutObjectLegalHoldOutput>> {
+        self.backend.put_object_legal_hold(req).await
+    }
+    async fn get_object_retention(
+        &self,
+        req: S3Request<GetObjectRetentionInput>,
+    ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
+        self.backend.get_object_retention(req).await
+    }
+    async fn put_object_retention(
+        &self,
+        req: S3Request<PutObjectRetentionInput>,
+    ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
+        self.backend.put_object_retention(req).await
+    }
+
+    // ---- Versioning ----
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        self.backend.list_object_versions(req).await
+    }
+    async fn get_bucket_versioning(
+        &self,
+        req: S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        self.backend.get_bucket_versioning(req).await
+    }
+    async fn put_bucket_versioning(
+        &self,
+        req: S3Request<PutBucketVersioningInput>,
+    ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        self.backend.put_bucket_versioning(req).await
+    }
+
+    // ---- Bucket location ----
+    async fn get_bucket_location(
+        &self,
+        req: S3Request<GetBucketLocationInput>,
+    ) -> S3Result<S3Response<GetBucketLocationOutput>> {
+        self.backend.get_bucket_location(req).await
+    }
+
+    // ---- Bucket policy ----
+    async fn get_bucket_policy(
+        &self,
+        req: S3Request<GetBucketPolicyInput>,
+    ) -> S3Result<S3Response<GetBucketPolicyOutput>> {
+        self.backend.get_bucket_policy(req).await
+    }
+    async fn put_bucket_policy(
+        &self,
+        req: S3Request<PutBucketPolicyInput>,
+    ) -> S3Result<S3Response<PutBucketPolicyOutput>> {
+        self.backend.put_bucket_policy(req).await
+    }
+    async fn delete_bucket_policy(
+        &self,
+        req: S3Request<DeleteBucketPolicyInput>,
+    ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
+        self.backend.delete_bucket_policy(req).await
+    }
+    async fn get_bucket_policy_status(
+        &self,
+        req: S3Request<GetBucketPolicyStatusInput>,
+    ) -> S3Result<S3Response<GetBucketPolicyStatusOutput>> {
+        self.backend.get_bucket_policy_status(req).await
+    }
+
+    // ---- Bucket ACL ----
+    async fn get_bucket_acl(
+        &self,
+        req: S3Request<GetBucketAclInput>,
+    ) -> S3Result<S3Response<GetBucketAclOutput>> {
+        self.backend.get_bucket_acl(req).await
+    }
+    async fn put_bucket_acl(
+        &self,
+        req: S3Request<PutBucketAclInput>,
+    ) -> S3Result<S3Response<PutBucketAclOutput>> {
+        self.backend.put_bucket_acl(req).await
+    }
+
+    // ---- Bucket CORS ----
+    async fn get_bucket_cors(
+        &self,
+        req: S3Request<GetBucketCorsInput>,
+    ) -> S3Result<S3Response<GetBucketCorsOutput>> {
+        self.backend.get_bucket_cors(req).await
+    }
+    async fn put_bucket_cors(
+        &self,
+        req: S3Request<PutBucketCorsInput>,
+    ) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        self.backend.put_bucket_cors(req).await
+    }
+    async fn delete_bucket_cors(
+        &self,
+        req: S3Request<DeleteBucketCorsInput>,
+    ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        self.backend.delete_bucket_cors(req).await
+    }
+
+    // ---- Bucket lifecycle ----
+    async fn get_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<GetBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
+        self.backend.get_bucket_lifecycle_configuration(req).await
+    }
+    async fn put_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<PutBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        self.backend.put_bucket_lifecycle_configuration(req).await
+    }
+    async fn delete_bucket_lifecycle(
+        &self,
+        req: S3Request<DeleteBucketLifecycleInput>,
+    ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
+        self.backend.delete_bucket_lifecycle(req).await
+    }
+
+    // ---- Bucket tagging ----
+    async fn get_bucket_tagging(
+        &self,
+        req: S3Request<GetBucketTaggingInput>,
+    ) -> S3Result<S3Response<GetBucketTaggingOutput>> {
+        self.backend.get_bucket_tagging(req).await
+    }
+    async fn put_bucket_tagging(
+        &self,
+        req: S3Request<PutBucketTaggingInput>,
+    ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
+        self.backend.put_bucket_tagging(req).await
+    }
+    async fn delete_bucket_tagging(
+        &self,
+        req: S3Request<DeleteBucketTaggingInput>,
+    ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
+        self.backend.delete_bucket_tagging(req).await
+    }
+
+    // ---- Bucket encryption ----
+    async fn get_bucket_encryption(
+        &self,
+        req: S3Request<GetBucketEncryptionInput>,
+    ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
+        self.backend.get_bucket_encryption(req).await
+    }
+    async fn put_bucket_encryption(
+        &self,
+        req: S3Request<PutBucketEncryptionInput>,
+    ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
+        self.backend.put_bucket_encryption(req).await
+    }
+    async fn delete_bucket_encryption(
+        &self,
+        req: S3Request<DeleteBucketEncryptionInput>,
+    ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
+        self.backend.delete_bucket_encryption(req).await
+    }
+
+    // ---- Bucket logging ----
+    async fn get_bucket_logging(
+        &self,
+        req: S3Request<GetBucketLoggingInput>,
+    ) -> S3Result<S3Response<GetBucketLoggingOutput>> {
+        self.backend.get_bucket_logging(req).await
+    }
+    async fn put_bucket_logging(
+        &self,
+        req: S3Request<PutBucketLoggingInput>,
+    ) -> S3Result<S3Response<PutBucketLoggingOutput>> {
+        self.backend.put_bucket_logging(req).await
+    }
+
+    // ---- Bucket notification ----
+    async fn get_bucket_notification_configuration(
+        &self,
+        req: S3Request<GetBucketNotificationConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketNotificationConfigurationOutput>> {
+        self.backend
+            .get_bucket_notification_configuration(req)
+            .await
+    }
+    async fn put_bucket_notification_configuration(
+        &self,
+        req: S3Request<PutBucketNotificationConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
+        self.backend
+            .put_bucket_notification_configuration(req)
+            .await
+    }
+
+    // ---- Bucket request payment ----
+    async fn get_bucket_request_payment(
+        &self,
+        req: S3Request<GetBucketRequestPaymentInput>,
+    ) -> S3Result<S3Response<GetBucketRequestPaymentOutput>> {
+        self.backend.get_bucket_request_payment(req).await
+    }
+    async fn put_bucket_request_payment(
+        &self,
+        req: S3Request<PutBucketRequestPaymentInput>,
+    ) -> S3Result<S3Response<PutBucketRequestPaymentOutput>> {
+        self.backend.put_bucket_request_payment(req).await
+    }
+
+    // ---- Bucket website ----
+    async fn get_bucket_website(
+        &self,
+        req: S3Request<GetBucketWebsiteInput>,
+    ) -> S3Result<S3Response<GetBucketWebsiteOutput>> {
+        self.backend.get_bucket_website(req).await
+    }
+    async fn put_bucket_website(
+        &self,
+        req: S3Request<PutBucketWebsiteInput>,
+    ) -> S3Result<S3Response<PutBucketWebsiteOutput>> {
+        self.backend.put_bucket_website(req).await
+    }
+    async fn delete_bucket_website(
+        &self,
+        req: S3Request<DeleteBucketWebsiteInput>,
+    ) -> S3Result<S3Response<DeleteBucketWebsiteOutput>> {
+        self.backend.delete_bucket_website(req).await
+    }
+
+    // ---- Bucket replication ----
+    async fn get_bucket_replication(
+        &self,
+        req: S3Request<GetBucketReplicationInput>,
+    ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
+        self.backend.get_bucket_replication(req).await
+    }
+    async fn put_bucket_replication(
+        &self,
+        req: S3Request<PutBucketReplicationInput>,
+    ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
+        self.backend.put_bucket_replication(req).await
+    }
+    async fn delete_bucket_replication(
+        &self,
+        req: S3Request<DeleteBucketReplicationInput>,
+    ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
+        self.backend.delete_bucket_replication(req).await
+    }
+
+    // ---- Bucket accelerate ----
+    async fn get_bucket_accelerate_configuration(
+        &self,
+        req: S3Request<GetBucketAccelerateConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketAccelerateConfigurationOutput>> {
+        self.backend.get_bucket_accelerate_configuration(req).await
+    }
+    async fn put_bucket_accelerate_configuration(
+        &self,
+        req: S3Request<PutBucketAccelerateConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketAccelerateConfigurationOutput>> {
+        self.backend.put_bucket_accelerate_configuration(req).await
+    }
+
+    // ---- Bucket ownership controls ----
+    async fn get_bucket_ownership_controls(
+        &self,
+        req: S3Request<GetBucketOwnershipControlsInput>,
+    ) -> S3Result<S3Response<GetBucketOwnershipControlsOutput>> {
+        self.backend.get_bucket_ownership_controls(req).await
+    }
+    async fn put_bucket_ownership_controls(
+        &self,
+        req: S3Request<PutBucketOwnershipControlsInput>,
+    ) -> S3Result<S3Response<PutBucketOwnershipControlsOutput>> {
+        self.backend.put_bucket_ownership_controls(req).await
+    }
+    async fn delete_bucket_ownership_controls(
+        &self,
+        req: S3Request<DeleteBucketOwnershipControlsInput>,
+    ) -> S3Result<S3Response<DeleteBucketOwnershipControlsOutput>> {
+        self.backend.delete_bucket_ownership_controls(req).await
+    }
+
+    // ---- Public access block ----
+    async fn get_public_access_block(
+        &self,
+        req: S3Request<GetPublicAccessBlockInput>,
+    ) -> S3Result<S3Response<GetPublicAccessBlockOutput>> {
+        self.backend.get_public_access_block(req).await
+    }
+    async fn put_public_access_block(
+        &self,
+        req: S3Request<PutPublicAccessBlockInput>,
+    ) -> S3Result<S3Response<PutPublicAccessBlockOutput>> {
+        self.backend.put_public_access_block(req).await
+    }
+    async fn delete_public_access_block(
+        &self,
+        req: S3Request<DeletePublicAccessBlockInput>,
+    ) -> S3Result<S3Response<DeletePublicAccessBlockOutput>> {
+        self.backend.delete_public_access_block(req).await
+    }
 }
 
 #[cfg(test)]

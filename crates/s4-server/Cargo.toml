@@ -10,6 +10,12 @@ description = "S4 — Squished S3 — GPU 透過圧縮 S3 互換ストレージ�
 [lints]
 workspace = true
 
+[features]
+default = []
+# Enable GPU compression via nvCOMP. Requires CUDA + NVCOMP_HOME at build time
+# and a CUDA-capable GPU at runtime. Propagates to s4-codec/nvcomp-gpu.
+nvcomp-gpu = ["s4-codec/nvcomp-gpu"]
+
 [[bin]]
 name = "s4"
 path = "src/main.rs"

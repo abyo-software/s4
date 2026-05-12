@@ -14,9 +14,9 @@ use s3s::auth::SimpleAuth;
 use s3s::host::SingleDomain;
 use s3s::service::S3ServiceBuilder;
 use s4_codec::cpu_zstd::CpuZstd;
-use s4_codec::dispatcher::AlwaysDispatcher;
+use s4_codec::dispatcher::{AlwaysDispatcher, SamplingDispatcher};
 use s4_codec::passthrough::Passthrough;
-use s4_codec::{CodecKind, CodecRegistry};
+use s4_codec::{CodecDispatcher, CodecKind, CodecRegistry};
 use s4_server::S4Service;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -27,7 +27,12 @@ enum CodecChoice {
     Passthrough,
     /// CPU zstd (GPU 不要、test bed)
     CpuZstd,
-    // TODO Phase 1 後半: NvcompBitcomp / NvcompZstd / NvcompGans / DietGpuAns
+    /// nvCOMP zstd-GPU (要 nvcomp-gpu feature)
+    #[cfg(feature = "nvcomp-gpu")]
+    NvcompZstd,
+    /// nvCOMP Bitcomp (整数列向け、要 nvcomp-gpu feature)
+    #[cfg(feature = "nvcomp-gpu")]
+    NvcompBitcomp,
 }
 
 impl CodecChoice {
@@ -35,8 +40,20 @@ impl CodecChoice {
         match self {
             Self::Passthrough => CodecKind::Passthrough,
             Self::CpuZstd => CodecKind::CpuZstd,
+            #[cfg(feature = "nvcomp-gpu")]
+            Self::NvcompZstd => CodecKind::NvcompZstd,
+            #[cfg(feature = "nvcomp-gpu")]
+            Self::NvcompBitcomp => CodecKind::NvcompBitcomp,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DispatcherChoice {
+    /// 常に CLI で指定した codec を使う
+    Always,
+    /// 入力 sample (entropy + magic bytes) で codec を自動選択
+    Sampling,
 }
 
 #[derive(Debug, Parser)]
@@ -59,13 +76,17 @@ struct Opt {
     #[clap(long)]
     endpoint_url: String,
 
-    /// 既定の圧縮 codec (PUT 時に dispatcher が選ぶ)
+    /// 既定の圧縮 codec (PUT 時に dispatcher が選ぶ default)
     #[clap(long, value_enum, default_value = "cpu-zstd")]
     codec: CodecChoice,
 
     /// CPU zstd の compression level (1-22)
     #[clap(long, default_value_t = CpuZstd::DEFAULT_LEVEL)]
     zstd_level: i32,
+
+    /// codec dispatcher: always (CLI 指定固定) / sampling (auto 選択)
+    #[clap(long, value_enum, default_value = "sampling")]
+    dispatcher: DispatcherChoice,
 }
 
 fn setup_tracing() {
@@ -78,12 +99,39 @@ fn setup_tracing() {
         .init();
 }
 
-fn build_registry(zstd_level: i32) -> Arc<CodecRegistry> {
-    Arc::new(
-        CodecRegistry::new(CodecKind::CpuZstd)
-            .with(Arc::new(Passthrough))
-            .with(Arc::new(CpuZstd::new(zstd_level))),
-    )
+fn build_registry(default: CodecKind, zstd_level: i32) -> Arc<CodecRegistry> {
+    let reg = CodecRegistry::new(default)
+        .with(Arc::new(Passthrough))
+        .with(Arc::new(CpuZstd::new(zstd_level)));
+    #[cfg(feature = "nvcomp-gpu")]
+    let reg = {
+        use s4_codec::nvcomp::{NvcompBitcompCodec, NvcompZstdCodec, is_gpu_available};
+        if is_gpu_available() {
+            let mut r = reg;
+            match NvcompZstdCodec::new() {
+                Ok(c) => r = r.with(Arc::new(c)),
+                Err(e) => tracing::warn!("nvcomp-zstd init failed: {e}"),
+            }
+            match NvcompBitcompCodec::default_general() {
+                Ok(c) => r = r.with(Arc::new(c)),
+                Err(e) => tracing::warn!("nvcomp-bitcomp init failed: {e}"),
+            }
+            r
+        } else {
+            tracing::warn!(
+                "nvcomp-gpu feature is enabled but no CUDA-capable GPU detected at runtime"
+            );
+            reg
+        }
+    };
+    Arc::new(reg)
+}
+
+fn build_dispatcher(choice: DispatcherChoice, default: CodecKind) -> Arc<dyn CodecDispatcher> {
+    match choice {
+        DispatcherChoice::Always => Arc::new(AlwaysDispatcher(default)),
+        DispatcherChoice::Sampling => Arc::new(SamplingDispatcher::new(default)),
+    }
 }
 
 #[tokio::main]
@@ -102,10 +150,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     );
     let proxy = s3s_aws::Proxy::from(client);
 
-    let registry = build_registry(opt.zstd_level);
-    let dispatcher = Arc::new(AlwaysDispatcher(opt.codec.as_kind()));
+    let default_kind = opt.codec.as_kind();
+    let registry = build_registry(default_kind, opt.zstd_level);
+    let dispatcher = build_dispatcher(opt.dispatcher, default_kind);
     info!(
         codec = ?opt.codec,
+        dispatcher = ?opt.dispatcher,
         registered = ?registry.kinds().collect::<Vec<_>>(),
         "S4 codec registry built"
     );
