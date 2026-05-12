@@ -33,7 +33,9 @@ pub enum Algo {
     /// nvCOMP Bitcomp — typed numeric column codec. The `data_type` hint
     /// is critical: Phase 0 saw ratio 3.59× with `Uint32` vs 1.19× with
     /// `Char` on the same posting-list dataset.
-    Bitcomp { data_type: BitcompDataType },
+    Bitcomp {
+        data_type: BitcompDataType,
+    },
 }
 
 /// Type hint passed through to nvCOMP's `nvcompBatchedBitcompFormatOpts`.

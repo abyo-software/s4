@@ -65,18 +65,18 @@ use crate::algo::BitcompDataType;
 use crate::error::{Error, Result};
 use crate::nvcomp_sys::cuda::{
     cudaError_t, cudaFree, cudaGetErrorString, cudaMalloc, cudaMemcpy, cudaMemcpyKind,
-    cudaStream_t, cudaStreamSynchronize, CUDA_SUCCESS,
+    cudaStreamSynchronize, cudaStream_t, CUDA_SUCCESS,
 };
-use crate::slab_alloc::SlabAllocator;
 use crate::nvcomp_sys::nvcomp::{
     nvcompBatchedBitcompCompressAsync, nvcompBatchedBitcompCompressGetMaxOutputChunkSize,
     nvcompBatchedBitcompCompressGetTempSizeSync, nvcompBatchedBitcompDecompressAsync,
     nvcompBatchedBitcompDecompressGetTempSizeAsync, nvcompBatchedBitcompDecompressOpts_t,
     nvcompBatchedBitcompFormatOpts, nvcompStatus_t, nvcompSuccess, nvcompType_t,
-    NVCOMP_BITCOMP_FORMAT_DEFAULT, NVCOMP_TYPE_CHAR, NVCOMP_TYPE_DOUBLE, NVCOMP_TYPE_FLOAT,
-    NVCOMP_TYPE_BFLOAT16, NVCOMP_TYPE_INT, NVCOMP_TYPE_LONGLONG, NVCOMP_TYPE_SHORT,
-    NVCOMP_TYPE_UCHAR, NVCOMP_TYPE_UINT, NVCOMP_TYPE_ULONGLONG, NVCOMP_TYPE_USHORT,
+    NVCOMP_BITCOMP_FORMAT_DEFAULT, NVCOMP_TYPE_BFLOAT16, NVCOMP_TYPE_CHAR, NVCOMP_TYPE_DOUBLE,
+    NVCOMP_TYPE_FLOAT, NVCOMP_TYPE_INT, NVCOMP_TYPE_LONGLONG, NVCOMP_TYPE_SHORT, NVCOMP_TYPE_UCHAR,
+    NVCOMP_TYPE_UINT, NVCOMP_TYPE_ULONGLONG, NVCOMP_TYPE_USHORT,
 };
+use crate::slab_alloc::SlabAllocator;
 
 /// Device-direct Bitcomp codec for v3 VRAM-resident cache.
 ///
@@ -164,7 +164,9 @@ impl BitcompDeviceCodec {
     /// must keep the stream alive for the codec's lifetime; [`Drop`]
     /// does NOT destroy a borrowed stream. No slab allocator.
     pub fn with_stream(data_type: BitcompDataType, stream: cudaStream_t) -> Result<Self> {
-        Self::with_stream_internal(data_type, stream, /*owns_stream=*/ false, /*with_slab=*/ false)
+        Self::with_stream_internal(
+            data_type, stream, /*owns_stream=*/ false, /*with_slab=*/ false,
+        )
     }
 
     /// Wave Z-1 #6 — construct a codec with a built-in size-class slab
@@ -181,20 +183,17 @@ impl BitcompDeviceCodec {
     }
 
     /// Wave Z-1 #6 — borrowed-stream variant of [`Self::new_with_slab`].
-    pub fn with_stream_and_slab(
-        data_type: BitcompDataType,
-        stream: cudaStream_t,
-    ) -> Result<Self> {
-        Self::with_stream_internal(data_type, stream, /*owns_stream=*/ false, /*with_slab=*/ true)
+    pub fn with_stream_and_slab(data_type: BitcompDataType, stream: cudaStream_t) -> Result<Self> {
+        Self::with_stream_internal(
+            data_type, stream, /*owns_stream=*/ false, /*with_slab=*/ true,
+        )
     }
 
     fn new_inner(data_type: BitcompDataType, with_slab: bool) -> Result<Self> {
         let mut stream: cudaStream_t = null_mut();
         // SAFETY: cudaStreamCreate writes a valid stream handle on
         // success; left untouched on failure.
-        let rc = unsafe {
-            crate::nvcomp_sys::cuda::cudaStreamCreate(&mut stream)
-        };
+        let rc = unsafe { crate::nvcomp_sys::cuda::cudaStreamCreate(&mut stream) };
         check_cuda(rc, "cudaStreamCreate(BitcompDeviceCodec)")?;
         match Self::with_stream_internal(data_type, stream, /*owns_stream=*/ true, with_slab) {
             Ok(c) => Ok(c),
@@ -238,7 +237,11 @@ impl BitcompDeviceCodec {
             d_batch_uncomp_ptrs: null_mut(),
             d_batch_statuses: null_mut(),
             d_batch_cap: 0,
-            slab: if with_slab { Some(SlabAllocator::new()) } else { None },
+            slab: if with_slab {
+                Some(SlabAllocator::new())
+            } else {
+                None
+            },
         };
         codec.alloc_metadata_singletons()?;
         Ok(codec)
@@ -262,10 +265,7 @@ impl BitcompDeviceCodec {
                 &mut max_out,
             )
         };
-        check_nvcomp(
-            status,
-            "nvcompBatchedBitcompCompressGetMaxOutputChunkSize",
-        )?;
+        check_nvcomp(status, "nvcompBatchedBitcompCompressGetMaxOutputChunkSize")?;
         // 256-byte alignment matches the existing `compress_chunked`
         // pattern in `nvcomp.rs` (cudaMalloc base alignment + Bitcomp
         // 16-byte output alignment requirement).
@@ -572,11 +572,7 @@ impl BitcompDeviceCodec {
             }
         }
         let n = entries.len();
-        let max_uncomp = entries
-            .iter()
-            .map(|(_, _, eu, _)| *eu)
-            .max()
-            .unwrap_or(0);
+        let max_uncomp = entries.iter().map(|(_, _, eu, _)| *eu).max().unwrap_or(0);
         let total_uncomp = entries.iter().map(|(_, _, eu, _)| *eu).sum::<usize>();
 
         // 1) Ensure batch metadata arrays are sized for N elements.
@@ -595,7 +591,10 @@ impl BitcompDeviceCodec {
                 /*max_total_uncompressed_bytes*/ total_uncomp,
             )
         };
-        check_nvcomp(status, "nvcompBatchedBitcompDecompressGetTempSizeAsync(batch)")?;
+        check_nvcomp(
+            status,
+            "nvcompBatchedBitcompDecompressGetTempSizeAsync(batch)",
+        )?;
 
         self.ensure_d_temp(temp_bytes)?;
 
@@ -757,8 +756,7 @@ impl BitcompDeviceCodec {
         }
         if entries.is_empty() {
             return Err(Error::Decompress(
-                "BitcompDeviceCodec::decompress_batch_into_slab: entries must be non-empty"
-                    .into(),
+                "BitcompDeviceCodec::decompress_batch_into_slab: entries must be non-empty".into(),
             ));
         }
         // Up-front validation (cheap, no device work).
@@ -977,12 +975,32 @@ impl BitcompDeviceCodec {
                 self.$field = p;
             }};
         }
-        alloc_dev!(d_uncomp_ptrs, std::mem::size_of::<*const c_void>(), "d_uncomp_ptrs");
-        alloc_dev!(d_uncomp_sizes, std::mem::size_of::<usize>(), "d_uncomp_sizes");
-        alloc_dev!(d_comp_ptrs, std::mem::size_of::<*const c_void>(), "d_comp_ptrs");
+        alloc_dev!(
+            d_uncomp_ptrs,
+            std::mem::size_of::<*const c_void>(),
+            "d_uncomp_ptrs"
+        );
+        alloc_dev!(
+            d_uncomp_sizes,
+            std::mem::size_of::<usize>(),
+            "d_uncomp_sizes"
+        );
+        alloc_dev!(
+            d_comp_ptrs,
+            std::mem::size_of::<*const c_void>(),
+            "d_comp_ptrs"
+        );
         alloc_dev!(d_comp_sizes, std::mem::size_of::<usize>(), "d_comp_sizes");
-        alloc_dev!(d_uncomp_buffer_sizes, std::mem::size_of::<usize>(), "d_uncomp_buffer_sizes");
-        alloc_dev!(d_statuses, std::mem::size_of::<nvcompStatus_t>(), "d_statuses");
+        alloc_dev!(
+            d_uncomp_buffer_sizes,
+            std::mem::size_of::<usize>(),
+            "d_uncomp_buffer_sizes"
+        );
+        alloc_dev!(
+            d_statuses,
+            std::mem::size_of::<nvcompStatus_t>(),
+            "d_statuses"
+        );
         Ok(())
     }
 
@@ -1137,14 +1155,18 @@ fn check_cuda(rc: cudaError_t, what: &'static str) -> Result<()> {
             std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned()
         }
     };
-    Err(Error::Compress(format!("CUDA error in {what}: {msg} (code={rc})")))
+    Err(Error::Compress(format!(
+        "CUDA error in {what}: {msg} (code={rc})"
+    )))
 }
 
 fn check_nvcomp(status: nvcompStatus_t, what: &'static str) -> Result<()> {
     if status == nvcompSuccess {
         Ok(())
     } else {
-        Err(Error::Compress(format!("nvCOMP error in {what}: code={status}")))
+        Err(Error::Compress(format!(
+            "nvCOMP error in {what}: code={status}"
+        )))
     }
 }
 
@@ -1233,14 +1255,11 @@ mod tests {
         let Some(mut codec) = try_codec() else { return };
         // Realistic-ish input: 2048 u32 = 8 KiB (one BitmapContainer's worth).
         let words: Vec<u32> = (0..2048u32).map(|i| (i * 31) & 0xff_ff).collect();
-        let input_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4)
-        };
-        let max_comp = BitcompDeviceCodec::max_compressed_size(
-            input_bytes.len(),
-            BitcompDataType::Uint32,
-        )
-        .unwrap();
+        let input_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) };
+        let max_comp =
+            BitcompDeviceCodec::max_compressed_size(input_bytes.len(), BitcompDataType::Uint32)
+                .unwrap();
         // SAFETY: round-trip with proper alloc/free below.
         unsafe {
             let d_uncomp = upload_to_device(input_bytes);
@@ -1287,9 +1306,7 @@ mod tests {
     fn compress_oversize_chunk_is_error() {
         let Some(mut codec) = try_codec() else { return };
         // SAFETY: the function rejects oversize before reading memory.
-        let res = unsafe {
-            codec.compress_one(null_mut(), (1 << 24) + 1, null_mut(), 1 << 25)
-        };
+        let res = unsafe { codec.compress_one(null_mut(), (1 << 24) + 1, null_mut(), 1 << 25) };
         assert!(res.is_err());
     }
 

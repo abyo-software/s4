@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/s4-server",
     "crates/s4-codec",
+    "crates/s4-codec/vendor/ferro-compress",
     "crates/s4-config",
 ]
 

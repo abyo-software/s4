@@ -28,11 +28,7 @@ extern "C" {
     pub fn cudaMalloc(devPtr: *mut *mut c_void, size: usize) -> cudaError_t;
     pub fn cudaFree(devPtr: *mut c_void) -> cudaError_t;
 
-    pub fn cudaHostAlloc(
-        pHost: *mut *mut c_void,
-        size: usize,
-        flags: c_uint,
-    ) -> cudaError_t;
+    pub fn cudaHostAlloc(pHost: *mut *mut c_void, size: usize, flags: c_uint) -> cudaError_t;
     pub fn cudaFreeHost(ptr: *mut c_void) -> cudaError_t;
 
     pub fn cudaMemcpy(

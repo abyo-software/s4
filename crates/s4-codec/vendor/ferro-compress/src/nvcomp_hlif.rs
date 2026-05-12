@@ -69,7 +69,7 @@ use crate::algo::BitcompDataType;
 use crate::error::{Error, Result};
 use crate::nvcomp_sys::cuda::{
     cudaError_t, cudaFree, cudaGetDeviceCount, cudaGetErrorString, cudaMalloc, cudaMemcpyAsync,
-    cudaMemcpyKind, cudaStream_t, cudaStreamCreate, cudaStreamDestroy, cudaStreamSynchronize,
+    cudaMemcpyKind, cudaStreamCreate, cudaStreamDestroy, cudaStreamSynchronize, cudaStream_t,
     CUDA_SUCCESS,
 };
 use crate::nvcomp_sys::nvcomp::{
@@ -292,7 +292,10 @@ impl HlifInner {
             *cap = 0;
         }
         let alloc_size = needed.div_ceil(1 << 20).max(1) << 20;
-        check_cuda(unsafe { cudaMalloc(slot, alloc_size) }, "cudaMalloc(hlif pool)")?;
+        check_cuda(
+            unsafe { cudaMalloc(slot, alloc_size) },
+            "cudaMalloc(hlif pool)",
+        )?;
         *cap = alloc_size;
         Ok(())
     }
@@ -400,12 +403,18 @@ impl Codec for BitcompHlifBackend {
     }
 
     fn compress(&self, input: &[u8], output: &mut Vec<u8>) -> Result<()> {
-        let mut inner = self.inner.lock().expect("BitcompHlifBackend inner poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("BitcompHlifBackend inner poisoned");
         compress_via_hlif(&mut inner, input, output)
     }
 
     fn decompress(&self, input: &[u8], output: &mut Vec<u8>) -> Result<()> {
-        let mut inner = self.inner.lock().expect("BitcompHlifBackend inner poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("BitcompHlifBackend inner poisoned");
         decompress_via_hlif(&mut inner, input, output)
     }
 
@@ -425,10 +434,7 @@ impl Codec for BitcompHlifBackend {
         // measured at 256 bytes for both Bitcomp and zstd on Phase F-0).
         let num_chunks = uncompressed_len.div_ceil(self.chunk_size).max(1);
         let per_chunk_overhead = 64usize;
-        uncompressed_len
-            + uncompressed_len / 64
-            + per_chunk_overhead * num_chunks
-            + 512
+        uncompressed_len + uncompressed_len / 64 + per_chunk_overhead * num_chunks + 512
     }
 }
 
@@ -512,10 +518,7 @@ impl Codec for ZstdHlifBackend {
         // chunk_size/200 + 64) than Bitcomp; we mirror that here.
         let num_chunks = uncompressed_len.div_ceil(self.chunk_size).max(1);
         let per_chunk_overhead = 64usize;
-        uncompressed_len
-            + uncompressed_len / 200
-            + per_chunk_overhead * num_chunks
-            + 512
+        uncompressed_len + uncompressed_len / 200 + per_chunk_overhead * num_chunks + 512
     }
 }
 
@@ -555,7 +558,11 @@ fn compress_via_hlif(inner: &mut HlifInner, input: &[u8], output: &mut Vec<u8>) 
 
     // Grow the persistent input + output pools to fit this call.
     HlifInner::ensure_buf(&mut inner.d_in, &mut inner.d_in_cap, input.len())?;
-    HlifInner::ensure_buf(&mut inner.d_out, &mut inner.d_out_cap, max_comp_bytes.max(1))?;
+    HlifInner::ensure_buf(
+        &mut inner.d_out,
+        &mut inner.d_out_cap,
+        max_comp_bytes.max(1),
+    )?;
 
     // H2D bulk input — async on the manager's stream so HLIF compress
     // can begin as soon as the H2D pipelines through the driver's
@@ -666,7 +673,11 @@ fn decompress_via_hlif(inner: &mut HlifInner, input: &[u8], output: &mut Vec<u8>
     };
     check_shim(rc, "hlif get_decompressed_output_size")?;
 
-    HlifInner::ensure_buf(&mut inner.d_decomp, &mut inner.d_decomp_cap, decomp_bytes.max(1))?;
+    HlifInner::ensure_buf(
+        &mut inner.d_decomp,
+        &mut inner.d_decomp_cap,
+        decomp_bytes.max(1),
+    )?;
 
     let mut decomp_actual: usize = 0;
     let rc = unsafe {

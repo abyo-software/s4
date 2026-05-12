@@ -134,7 +134,14 @@ impl Codec for NvcompCodec {
 
     fn compress(&self, input: &[u8], output: &mut Vec<u8>) -> Result<()> {
         let mut inner = self.inner.lock().expect("nvcomp codec inner poisoned");
-        compress_chunked(self.algo, self.chunk_size, self.stream, &mut inner, input, output)
+        compress_chunked(
+            self.algo,
+            self.chunk_size,
+            self.stream,
+            &mut inner,
+            input,
+            output,
+        )
     }
 
     fn decompress(&self, input: &[u8], output: &mut Vec<u8>) -> Result<()> {
@@ -401,10 +408,7 @@ fn check_nvcomp(status: nvcompStatus_t, what: &'static str) -> Result<()> {
 
 // ---------- Algo dispatch helpers ----------
 
-fn compress_get_max_output_chunk_size(
-    algo: Algo,
-    max_chunk: usize,
-) -> Result<usize> {
+fn compress_get_max_output_chunk_size(algo: Algo, max_chunk: usize) -> Result<usize> {
     let mut out = 0usize;
     let status = unsafe {
         match algo {
@@ -736,8 +740,7 @@ fn compress_chunked(
     for i in 0..num_chunks {
         let off = i * chunk_size;
         let end = (off + chunk_size).min(input.len());
-        inner.h_uncomp_ptrs[i] =
-            unsafe { (inner.d_uncomp as *const u8).add(off) as *const c_void };
+        inner.h_uncomp_ptrs[i] = unsafe { (inner.d_uncomp as *const u8).add(off) as *const c_void };
         inner.h_uncomp_sizes[i] = end - off;
         inner.h_comp_ptrs[i] =
             unsafe { (inner.d_comp as *mut u8).add(i * max_comp_chunk_bytes) as *mut c_void };
@@ -922,7 +925,13 @@ fn compress_chunked(
     let total_comp: usize = inner.h_comp_sizes[..num_chunks].iter().sum();
 
     // Write framed output: header + per-chunk extract from the bulk buffer.
-    write_header(algo, chunk_size, input.len(), &inner.h_comp_sizes[..num_chunks], output);
+    write_header(
+        algo,
+        chunk_size,
+        input.len(),
+        &inner.h_comp_sizes[..num_chunks],
+        output,
+    );
     let start = output.len();
     output.resize(start + total_comp, 0);
     let dst_base = output[start..].as_mut_ptr();
@@ -1075,8 +1084,7 @@ fn decompress_chunked(
     }
     let reserved = [input[5], input[6], input[7]];
     let algo = algo_from_header(input[4], reserved)?;
-    let orig_size =
-        u64::from_le_bytes(input[8..16].try_into().unwrap()) as usize;
+    let orig_size = u64::from_le_bytes(input[8..16].try_into().unwrap()) as usize;
     let chunk_size = u32::from_le_bytes(input[16..20].try_into().unwrap()) as usize;
     let num_chunks = u32::from_le_bytes(input[20..24].try_into().unwrap()) as usize;
 

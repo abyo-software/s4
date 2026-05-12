@@ -1248,6 +1248,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
+name = "ferro-compress-vendored"
+version = "0.0.1"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "ferroid"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2745,6 +2752,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "crc32c",
+ "ferro-compress-vendored",
  "serde",
  "thiserror",
  "tokio",

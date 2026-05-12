@@ -13,8 +13,8 @@
 [package]
 name = "ferro-compress-vendored"
 version = "0.0.1"
-edition = "2024"
-rust-version = "1.92"
+edition = "2021"
+rust-version = "1.85"
 license = "Apache-2.0 OR MIT"
 publish = false
 description = "Vendored ferro-compress subset for S4 (nvCOMP backend only)"

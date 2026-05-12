@@ -24,8 +24,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=NVCOMP_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=NVCC");
-    println!("cargo:rerun-if-changed=src/cuda_kernels/bitmap_op.cu");
-    println!("cargo:rerun-if-changed=src/cuda_kernels/stats_op.cu");
     println!("cargo:rerun-if-changed=src/cuda_kernels/nvcomp_hlif_shim.cpp");
 
     if std::env::var_os("CARGO_FEATURE_NVCOMP").is_none() {
@@ -45,8 +43,7 @@ fn main() {
     // ORIGIN-relative rpath so binaries find libnvcomp.so without LD_LIBRARY_PATH.
     println!("cargo:rustc-link-arg=-Wl,-rpath,{nvcomp_lib}");
 
-    let cuda_home =
-        std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
+    let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
     // CUDA layout differs between Linux distros and the NVIDIA dev-image base.
     // Try both lib64 and lib targets/.
     let cuda_lib_candidates = [
@@ -77,30 +74,27 @@ fn main() {
     );
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR unset under cargo"));
 
-    let nvcc = std::env::var("NVCC")
-        .ok()
-        .or_else(|| {
-            // Common locations: $CUDA_HOME/bin/nvcc, /usr/local/cuda/bin/nvcc, $PATH.
-            let candidate = format!("{cuda_home}/bin/nvcc");
-            if std::path::Path::new(&candidate).exists() {
-                Some(candidate)
-            } else if Command::new("nvcc").arg("--version").output().is_ok() {
-                Some("nvcc".to_string())
-            } else {
-                None
-            }
-        });
+    let nvcc = std::env::var("NVCC").ok().or_else(|| {
+        // Common locations: $CUDA_HOME/bin/nvcc, /usr/local/cuda/bin/nvcc, $PATH.
+        let candidate = format!("{cuda_home}/bin/nvcc");
+        if std::path::Path::new(&candidate).exists() {
+            Some(candidate)
+        } else if Command::new("nvcc").arg("--version").output().is_ok() {
+            Some("nvcc".to_string())
+        } else {
+            None
+        }
+    });
 
-    // Phase 2 C-2 Bool-AND kernel + Phase 2 E-1 stats reduction kernel.
-    // Add new entries to this list to compile additional CUDA kernels.
-    for (cu_name, ptx_name) in [
-        ("bitmap_op.cu", "bitmap_op.ptx"),
-        ("stats_op.cu", "stats_op.ptx"),
-    ] {
-        let cu = manifest_dir.join("src/cuda_kernels").join(cu_name);
-        let ptx = out_dir.join(ptx_name);
-        compile_cu_to_ptx(&cu, &ptx, nvcc.as_deref());
-    }
+    // Phase 2 C-2 Bool-AND kernel + Phase 2 E-1 stats reduction kernel are
+    // intentionally NOT vendored to S4 (they are FerroSearch-specific:
+    // Tantivy posting-list bit operations and column statistics reduction).
+    // Skip the .cu compile loop entirely — the upstream build.rs would emit
+    // empty PTX placeholders + cargo:warning, which is just noise for S4.
+    //
+    // If a future S4 feature needs custom CUDA kernels, copy the relevant
+    // .cu file into src/cuda_kernels/ and re-add an entry here.
+    let _: Option<&str> = nvcc.as_deref();
 
     // ---------- Phase F-1.5: HLIF C-ABI shim (C++ → static lib) ----------
     //
@@ -200,6 +194,7 @@ fn main() {
     }
 }
 
+#[allow(dead_code)]
 fn compile_cu_to_ptx(cu: &std::path::Path, ptx: &std::path::Path, nvcc: Option<&str>) {
     match nvcc {
         Some(nvcc_path) => {
@@ -250,6 +245,7 @@ fn compile_cu_to_ptx(cu: &std::path::Path, ptx: &std::path::Path, nvcc: Option<&
     }
 }
 
+#[allow(dead_code)]
 fn write_empty_ptx(path: &std::path::Path) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);

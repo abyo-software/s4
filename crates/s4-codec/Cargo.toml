@@ -10,6 +10,14 @@ description = "S4 codec layer — pluggable GPU/CPU compression backends (nvCOMP
 [lints]
 workspace = true
 
+[features]
+default = []
+# Opt-in GPU backend via NVIDIA nvCOMP. Requires CUDA toolchain (nvcc) and
+# NVCOMP_HOME env var pointing to an extracted nvCOMP redist tarball at build
+# time, plus a CUDA-capable GPU at runtime. Without this feature, S4 runs
+# CPU-only (cpu_zstd / passthrough).
+nvcomp-gpu = ["dep:ferro-compress-vendored"]
+
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
@@ -20,6 +28,8 @@ crc32c.workspace = true
 zstd.workspace = true
 tokio = { workspace = true }
 thiserror.workspace = true
+
+ferro-compress-vendored = { path = "vendor/ferro-compress", features = ["nvcomp"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
