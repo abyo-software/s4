@@ -922,12 +922,23 @@ impl<B: S3> S3 for S4Service<B> {
             };
             let mut framed = BytesMut::with_capacity(FRAME_HEADER_BYTES + compressed.len());
             write_frame(&mut framed, header, &compressed);
-            // S3 multipart の non-final part 最小サイズ (5 MiB) を満たすため
-            // padding frame を追加。FrameIter が S4P1 padding を skip する。
-            // 注: 最終 part も常に pad してしまっているが、最終 part だけ pad しない
-            // 最適化は S4Service が「最終 part か」を upload_part 時点で知れない
-            // ため Phase 2 (CompleteMultipartUpload で trim) で対応。
-            pad_to_minimum(&mut framed, S3_MULTIPART_MIN_PART_BYTES);
+            // v0.2 #5: heuristic-based padding skip for likely-final parts.
+            //
+            // AWS SDK / aws-cli / boto3 always send the final (and only the
+            // final) part below the configured part_size. So if the raw user
+            // part is already smaller than S3's 5 MiB multipart minimum, this
+            // is overwhelmingly likely to be the final part — and the final
+            // part is exempt from S3's size constraint. Skipping padding here
+            // saves up to ~5 MiB per object on highly compressible workloads.
+            //
+            // If a misbehaving client sends a tiny **non-final** part, S3
+            // itself rejects with EntityTooSmall at CompleteMultipartUpload —
+            // identical outcome to a vanilla S3 PUT, just earlier than
+            // padding-then-complete would catch it.
+            let likely_final = original_size < S3_MULTIPART_MIN_PART_BYTES as u64;
+            if !likely_final {
+                pad_to_minimum(&mut framed, S3_MULTIPART_MIN_PART_BYTES);
+            }
             let framed_bytes = framed.freeze();
             let new_len = framed_bytes.len() as i64;
             // 同じ wire 互換問題が multipart にもある (content-length / checksum)

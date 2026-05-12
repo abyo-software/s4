@@ -379,3 +379,119 @@ async fn multipart_range_get_uses_sidecar_partial_fetch() {
 
     let _ = shutdown.send(());
 }
+
+/// v0.2 #5: the final part of a multipart with a tiny highly-compressible
+/// tail must NOT be padded. Validates that the stored S3 size of the last
+/// part is close to (compressed payload + frame header), nowhere near the
+/// 5 MiB padding ceiling.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn multipart_final_part_skips_padding_for_tiny_tail() {
+    let minio = start_minio().await;
+    let (s4_endpoint, shutdown) = spawn_s4_server(&minio.endpoint_url).await;
+    let backend = build_aws_client(&minio.endpoint_url);
+    let _ = backend.create_bucket().bucket("trim-mp").send().await;
+    let s4_client = build_aws_client(&s4_endpoint);
+
+    // Two normal-size parts (8 MiB each, mostly random so they DON'T compress)
+    // + one tiny final part (200 KiB of highly compressible 'x' bytes).
+    fn random_part(seed: u64, size: usize) -> Bytes {
+        let mut state = seed;
+        let mut buf = Vec::with_capacity(size);
+        while buf.len() < size {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            buf.extend_from_slice(&state.to_le_bytes());
+        }
+        buf.truncate(size);
+        Bytes::from(buf)
+    }
+    let part_1 = random_part(0x1, 8 * 1024 * 1024);
+    let part_2 = random_part(0x2, 8 * 1024 * 1024);
+    // tiny final part: 200 KiB of highly compressible content
+    let part_final = Bytes::from(vec![b'x'; 200 * 1024]);
+
+    let create = s4_client
+        .create_multipart_upload()
+        .bucket("trim-mp")
+        .key("trim.bin")
+        .send()
+        .await
+        .expect("create_multipart_upload");
+    let upload_id = create.upload_id().expect("upload_id").to_string();
+
+    let mut completed_parts = Vec::new();
+    for (i, part_body) in [&part_1, &part_2, &part_final].iter().enumerate() {
+        let part_number = (i + 1) as i32;
+        let resp = s4_client
+            .upload_part()
+            .bucket("trim-mp")
+            .key("trim.bin")
+            .upload_id(&upload_id)
+            .part_number(part_number)
+            .body((**part_body).clone().into())
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("upload_part {part_number} failed: {e:?}"));
+        completed_parts.push(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .e_tag(resp.e_tag().unwrap_or_default())
+                .part_number(part_number)
+                .build(),
+        );
+    }
+    let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+        .set_parts(Some(completed_parts))
+        .build();
+    s4_client
+        .complete_multipart_upload()
+        .bucket("trim-mp")
+        .key("trim.bin")
+        .upload_id(&upload_id)
+        .multipart_upload(completed)
+        .send()
+        .await
+        .expect("complete_multipart_upload");
+
+    // Roundtrip: GET reconstructs original bytes exactly
+    let resp = s4_client
+        .get_object()
+        .bucket("trim-mp")
+        .key("trim.bin")
+        .send()
+        .await
+        .expect("get");
+    let got = resp.body.collect().await.expect("body").into_bytes();
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&part_1);
+    expected.extend_from_slice(&part_2);
+    expected.extend_from_slice(&part_final);
+    assert_eq!(got.as_ref(), expected.as_slice());
+
+    // Probe S3 directly: the last part stored should be tiny (no padding).
+    // We use list_parts to check sizes. Since CompleteMultipartUpload merges
+    // parts into one S3 object, individual part sizes are no longer queryable
+    // post-Complete — but the *combined* S3 object size tells us whether
+    // padding was applied. Without padding, total ≈ part_1_compressed +
+    // part_2_compressed + part_final_compressed + headers. With padding on the
+    // final part, total += ~5 MiB.
+    let stored = backend
+        .head_object()
+        .bucket("trim-mp")
+        .key("trim.bin")
+        .send()
+        .await
+        .expect("head stored");
+    let stored_size = stored.content_length().unwrap_or(0) as usize;
+    // Two random 8 MiB parts: ~8 MiB each compressed (random => no compression
+    // gain). Each padded to 5 MiB minimum but already over 5 MiB → no padding.
+    // Final part: 200 KiB of 'x' compresses to <300 bytes + frame header (28 B).
+    // Without padding skip, final part would be padded to 5 MiB.
+    // Expected total ≈ 16 MiB + small overhead, NOT 21+ MiB.
+    let expected_max = 16 * 1024 * 1024 + 100 * 1024; // generous slack for frame headers
+    assert!(
+        stored_size < expected_max,
+        "expected total stored size < {expected_max} (no padding on final part), got {stored_size}"
+    );
+
+    let _ = shutdown.send(());
+}
