@@ -298,6 +298,17 @@ EC2 GPU instance running S4. Here's an honest table to self-diagnose:
 - **Zstd decompression bomb hardening**: `Decoder + take(manifest.original_size + margin)`
   caps memory regardless of an attacker-controlled manifest claim
 
+### Storage class transitions
+- Each compressed object is stored as `<key>` + `<key>.s4index` sidecar.
+  S3 lifecycle rules must move both files together — a split pair breaks
+  Range GET (sidecar in IA + main in Glacier ⇒ `InvalidObjectState`).
+- Recommended: `"Filter": {}` (whole bucket) or a `Filter.Prefix` rule
+  that covers both `foo/...` and `foo/....s4index`. Avoid size- or
+  suffix-scoped filters that catch one but not the other.
+- See [docs/storage-class-transitions.md](docs/storage-class-transitions.md)
+  for two example lifecycle JSONs (IA-after-30d and prefix→Glacier-after-60d),
+  the anti-pattern walkthrough, and a `head-object` drift-audit recipe.
+
 ### S3 API coverage (45+ ops)
 - Compression hook: `put_object`, `get_object`, `upload_part`
 - Range GET: full S3 spec (`bytes=N-M`, `bytes=-N`, `bytes=N-`)

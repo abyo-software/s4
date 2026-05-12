@@ -228,6 +228,19 @@ MinIO S2 / Garage zstd との head-to-head ベンチは
   書き換え (実 MinIO + 実 aws-sdk-s3 で検証)
 - HEAD で original_size を返すため client tools が正しく扱える
 
+### Storage class transition (Standard → IA / Glacier)
+- 圧縮 object は `<key>` + `<key>.s4index` sidecar の 2 file 構成。S3
+  lifecycle rule は両方を **同じ class に揃えて** transition させる必要
+  あり。片方だけ Glacier に落ちると Range GET が `InvalidObjectState` で
+  落ちる、または sidecar fallback で full read 化して Range 最適化が無効
+- 推奨は `"Filter": {}` (bucket 全体) か、`foo/` prefix のように main +
+  sidecar 両方を確実にカバーする `Filter.Prefix`。`.s4index` suffix だけ /
+  size 閾値だけ等の分離 filter は drift の温床
+- 設定例 2 種 (30 日で IA / prefix 単位で 60 日後 Glacier)、anti-pattern
+  解説、`head-object` での drift 監査 recipe を
+  [docs/storage-class-transitions.md](docs/storage-class-transitions.md) に
+  まとめている
+
 ## v0.2.0 で完了した項目 (旧 Phase 2.2 計画)
 
 | 項目 | v0.2.0 status |
