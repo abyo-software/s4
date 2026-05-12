@@ -209,7 +209,7 @@ async fn main() {
     }
 
     for (label, data, skip) in workloads {
-        let skip_codec = |c: &str| skip.iter().any(|s| *s == c);
+        let skip_codec = |c: &str| skip.contains(&c);
 
         // CPU zstd level 3 (the s4-server default)
         if !skip_codec("cpu-zstd-3") {

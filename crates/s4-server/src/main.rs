@@ -420,7 +420,45 @@ where
         }
         _ => None,
     };
-    let scheme = if tls_state.is_some() { "https" } else { "http" };
+
+    // ACME (Let's Encrypt) acceptor — mutually exclusive with --tls-cert
+    // (clap rejects both being set). Drives renewal on a background task
+    // and returns two rustls configs the per-connection handler picks
+    // between based on TLS-ALPN-01 challenge detection.
+    let acme_acceptors: Option<Arc<s4_server::acme::AcmeAcceptors>> = match &opt.acme {
+        Some(domains_csv) => {
+            s4_server::tls::install_default_crypto_provider();
+            let domains: Vec<String> = domains_csv
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect();
+            let cache_dir = opt.acme_cache_dir.clone().unwrap_or_else(|| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                std::path::PathBuf::from(home).join(".s4/acme")
+            });
+            info!(
+                domains = ?domains,
+                staging = opt.acme_staging,
+                cache_dir = %cache_dir.display(),
+                "S4 ACME acceptor bootstrapping"
+            );
+            Some(Arc::new(s4_server::acme::bootstrap(
+                s4_server::acme::AcmeOptions {
+                    domains,
+                    contact: opt.acme_contact.clone(),
+                    cache_dir,
+                    staging: opt.acme_staging,
+                },
+            )))
+        }
+        None => None,
+    };
+
+    let scheme = if tls_state.is_some() || acme_acceptors.is_some() {
+        "https"
+    } else {
+        "http"
+    };
 
     info!(
         host = %opt.host,
@@ -444,10 +482,29 @@ where
         let svc = routed_service.clone();
         let server = http_server.clone();
         let watch_handle = graceful.watcher();
-        if let Some(state) = tls_state.as_ref() {
-            // Per-connection acceptor — picks up the latest swapped config
-            // on every accept, so a SIGHUP reload starts taking effect from
-            // the very next connection without dropping anything in flight.
+        if let Some(acceptors) = acme_acceptors.as_ref() {
+            // ACME path: every connection is inspected for TLS-ALPN-01
+            // challenge first; real TLS traffic gets the current cert.
+            let acceptors = Arc::clone(acceptors);
+            tokio::spawn(async move {
+                match s4_server::acme::accept_one(socket, &acceptors).await {
+                    Ok(Some(tls_stream)) => {
+                        let conn = server.serve_connection(TokioIo::new(tls_stream), svc);
+                        let conn = watch_handle.watch(conn.into_owned());
+                        let _ = conn.await;
+                    }
+                    Ok(None) => {
+                        // Challenge handled; nothing more to do.
+                    }
+                    Err(err) => {
+                        tracing::warn!("acme handshake failed: {err}");
+                    }
+                }
+            });
+        } else if let Some(state) = tls_state.as_ref() {
+            // Static TLS: per-connection acceptor picks up the latest
+            // swapped config so SIGHUP reload takes effect from the very
+            // next connection without dropping anything in flight.
             let acceptor = state.acceptor();
             tokio::spawn(async move {
                 let tls_stream = match acceptor.accept(socket).await {
