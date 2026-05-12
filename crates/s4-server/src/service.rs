@@ -1024,6 +1024,36 @@ impl<B: S3> S3 for S4Service<B> {
         }
         Ok(resp)
     }
+    /// v0.4 #17: filter S4-internal sidecars from versioned listings.
+    /// Same shape as `list_objects_v2` filter but applies to both the
+    /// `Versions` and `DeleteMarkers` arrays (each carries its own
+    /// `.s4index` versions on a versioned bucket where the sidecar has
+    /// been overwritten).
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        self.enforce_policy(&req, "s3:ListBucket", &req.input.bucket, None)?;
+        let mut resp = self.backend.list_object_versions(req).await?;
+        if let Some(versions) = resp.output.versions.as_mut() {
+            versions.retain(|v| {
+                v.key
+                    .as_ref()
+                    .map(|k| !k.ends_with(".s4index"))
+                    .unwrap_or(true)
+            });
+        }
+        if let Some(markers) = resp.output.delete_markers.as_mut() {
+            markers.retain(|m| {
+                m.key
+                    .as_ref()
+                    .map(|k| !k.ends_with(".s4index"))
+                    .unwrap_or(true)
+            });
+        }
+        Ok(resp)
+    }
+
     async fn create_multipart_upload(
         &self,
         mut req: S3Request<CreateMultipartUploadInput>,
@@ -1415,12 +1445,9 @@ impl<B: S3> S3 for S4Service<B> {
     }
 
     // ---- Versioning ----
-    async fn list_object_versions(
-        &self,
-        req: S3Request<ListObjectVersionsInput>,
-    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
-        self.backend.list_object_versions(req).await
-    }
+    // list_object_versions is implemented above in the compression-hook
+    // section so it filters S4-internal sidecars (v0.4 #17). Per-version
+    // S4 metadata is preserved by the backend automatically.
     async fn get_bucket_versioning(
         &self,
         req: S3Request<GetBucketVersioningInput>,
