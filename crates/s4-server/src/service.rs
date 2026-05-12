@@ -884,12 +884,7 @@ impl<B: S3> S3 for S4Service<B> {
             Self::principal_of(&req),
         )?;
         if let CopySource::Bucket { bucket, key, .. } = &req.input.copy_source {
-            self.enforce_policy(
-                "s3:GetObject",
-                &bucket.to_string(),
-                Some(&key.to_string()),
-                Self::principal_of(&req),
-            )?;
+            self.enforce_policy("s3:GetObject", bucket, Some(key), Self::principal_of(&req))?;
         }
         // S4-aware copy: source object に s4-* metadata がある場合、それを
         // destination に確実に preserve する。

@@ -316,28 +316,35 @@ async fn single_put_above_chunk_size_is_framed_with_sidecar() {
         .await
         .expect("put");
 
-    // peek the backend to verify framed format
-    let inner = backend_view.lock().unwrap();
-    let stored = inner
-        .get(&("bucket".into(), "framed_object".into()))
-        .unwrap();
+    // peek the backend to verify framed format. Clone what we need out of
+    // the lock then drop it before the next await (clippy:
+    // mutex_held_across_await).
+    let (stored_body, stored_meta, has_sidecar) = {
+        let inner = backend_view.lock().unwrap();
+        let stored = inner
+            .get(&("bucket".into(), "framed_object".into()))
+            .unwrap();
+        (
+            stored.body.clone(),
+            stored.metadata.clone(),
+            inner.contains_key(&("bucket".into(), "framed_object.s4index".into())),
+        )
+    };
     assert_eq!(
-        &stored.body[0..4],
+        &stored_body[0..4],
         b"S4F2",
         "framed body must start with S4F2 magic"
     );
-    let meta = stored.metadata.as_ref().expect("must have s4 metadata");
+    let meta = stored_meta.as_ref().expect("must have s4 metadata");
     assert_eq!(
         meta.get("s4-framed").map(String::as_str),
         Some("true"),
         "s4-framed flag must be set on framed objects"
     );
-    // sidecar must exist
     assert!(
-        inner.contains_key(&("bucket".into(), "framed_object.s4index".into())),
+        has_sidecar,
         "sidecar object must be written for multi-frame body"
     );
-    drop(inner);
 
     let resp = s4
         .get_object(get_request("bucket", "framed_object"))
@@ -367,12 +374,14 @@ async fn single_put_small_object_is_framed_without_sidecar() {
         .await
         .expect("put");
 
-    let inner = backend_view.lock().unwrap();
+    let has_sidecar = {
+        let inner = backend_view.lock().unwrap();
+        inner.contains_key(&("bucket".into(), "tiny.s4index".into()))
+    };
     assert!(
-        !inner.contains_key(&("bucket".into(), "tiny.s4index".into())),
+        !has_sidecar,
         "no sidecar should be written for single-frame objects"
     );
-    drop(inner);
 
     let resp = s4
         .get_object(get_request("bucket", "tiny"))
