@@ -38,7 +38,8 @@ use s4_codec::multipart::{
     write_frame,
 };
 use s4_codec::{ChunkManifest, CodecDispatcher, CodecKind, CodecRegistry};
-use tracing::debug;
+use std::time::Instant;
+use tracing::{debug, info};
 
 use crate::blob::{
     bytes_to_blob, chain_sample_with_rest, collect_blob, collect_with_sample, peek_sample,
@@ -188,6 +189,9 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         mut req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
+        let put_start = Instant::now();
+        let put_bucket = req.input.bucket.clone();
+        let put_key = req.input.key.clone();
         if let Some(blob) = req.input.body.take() {
             // Sample 4 KiB から codec を決定。streaming-aware codec なら streaming
             // compress fast path、そうでなければ従来の collect-then-compress。
@@ -254,7 +258,26 @@ impl<B: S3> S3 for S4Service<B> {
             req.input.checksum_sha1 = None;
             req.input.checksum_sha256 = None;
             req.input.content_md5 = None;
+            let original_size = manifest.original_size;
+            let compressed_size = manifest.compressed_size;
             req.input.body = Some(bytes_to_blob(compressed));
+            let backend_resp = self.backend.put_object(req).await;
+            info!(
+                op = "put_object",
+                bucket = %put_bucket,
+                key = %put_key,
+                codec = manifest.codec.as_str(),
+                bytes_in = original_size,
+                bytes_out = compressed_size,
+                ratio = format!(
+                    "{:.3}",
+                    if original_size == 0 { 1.0 } else { compressed_size as f64 / original_size as f64 }
+                ),
+                latency_ms = put_start.elapsed().as_millis() as u64,
+                ok = backend_resp.is_ok(),
+                "S4 put completed"
+            );
+            return backend_resp;
         }
         self.backend.put_object(req).await
     }
@@ -264,6 +287,9 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
+        let get_start = Instant::now();
+        let get_bucket = req.input.bucket.clone();
+        let get_key = req.input.key.clone();
         // Range GET は currently 非対応 (multipart frame parser が full-object 前提で
         // 動くため)。Range が指定されていたら head_object で codec metadata を見て、
         // S4-managed object なら 416 で reject (silent corruption より明確な拒否)。
@@ -325,10 +351,16 @@ impl<B: S3> S3 for S4Service<B> {
                 resp.output.checksum_sha256 = None;
                 resp.output.e_tag = None;
                 resp.output.body = Some(decompressed_blob);
-                debug!(
-                    codec = "cpu-zstd",
-                    original_size = m.original_size,
-                    "S4 get_object: streaming fast path"
+                info!(
+                    op = "get_object",
+                    bucket = %get_bucket,
+                    key = %get_key,
+                    codec = m.codec.as_str(),
+                    bytes_in = m.compressed_size,
+                    bytes_out = m.original_size,
+                    path = "streaming",
+                    setup_latency_ms = get_start.elapsed().as_millis() as u64,
+                    "S4 get started (streaming)"
                 );
                 return Ok(resp);
             }
@@ -358,9 +390,9 @@ impl<B: S3> S3 for S4Service<B> {
                 self.decompress_multipart(bytes, &resp.output.metadata)
                     .await?
             } else {
-                let manifest = manifest_opt.expect("non-multipart guarded above");
+                let manifest = manifest_opt.as_ref().expect("non-multipart guarded above");
                 self.registry
-                    .decompress(bytes, &manifest)
+                    .decompress(bytes, manifest)
                     .await
                     .map_err(internal("registry decompress"))?
             };
@@ -378,7 +410,18 @@ impl<B: S3> S3 for S4Service<B> {
             resp.output.checksum_sha1 = None;
             resp.output.checksum_sha256 = None;
             resp.output.e_tag = None;
+            let original_size = decompressed.len() as u64;
             resp.output.body = Some(bytes_to_blob(decompressed));
+            info!(
+                op = "get_object",
+                bucket = %get_bucket,
+                key = %get_key,
+                codec = manifest_opt.as_ref().map(|m| m.codec.as_str()).unwrap_or("multipart"),
+                bytes_out = original_size,
+                path = "buffered",
+                latency_ms = get_start.elapsed().as_millis() as u64,
+                "S4 get completed (buffered)"
+            );
         }
         Ok(resp)
     }
