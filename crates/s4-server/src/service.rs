@@ -141,6 +141,21 @@ impl<B: S3> S3 for S4Service<B> {
                 .await
                 .map_err(internal("registry compress"))?;
             write_manifest(&mut req.input.metadata, &manifest);
+            // 重要: content_length を圧縮後サイズで更新する。
+            // これを忘れると下流 (aws-sdk-s3 → S3) が宣言サイズ分の bytes を
+            // 待ち続けて RequestTimeout で失敗する (S3 仕様)。
+            req.input.content_length = Some(compressed.len() as i64);
+            // body を書き換えたので、客側が送ってきた original body 用の
+            // checksum / MD5 ヘッダは無効化する (そのまま転送すると下流 S3 が
+            // XAmzContentChecksumMismatch を返す)。S4 自身の整合性は
+            // ChunkManifest.crc32c で担保している。
+            req.input.checksum_algorithm = None;
+            req.input.checksum_crc32 = None;
+            req.input.checksum_crc32c = None;
+            req.input.checksum_crc64nvme = None;
+            req.input.checksum_sha1 = None;
+            req.input.checksum_sha256 = None;
+            req.input.content_md5 = None;
             req.input.body = Some(bytes_to_blob(compressed));
         }
         self.backend.put_object(req).await
@@ -166,6 +181,19 @@ impl<B: S3> S3 for S4Service<B> {
                 .decompress(bytes, &manifest)
                 .await
                 .map_err(internal("registry decompress"))?;
+            // 解凍後の真のサイズを返す (S3 client は content_length を信頼するので
+            // 圧縮 size のままだと downstream が body を途中で切ってしまう)
+            resp.output.content_length = Some(decompressed.len() as i64);
+            // 圧縮済 bytes の checksum を返すと AWS SDK 側で StreamingError
+            // (ChecksumMismatch) になる。ETag も backend が返した「圧縮済 bytes の
+            // MD5/checksum」なので意味的にズレる — クリアして S4 自身の crc32c
+            // (manifest 内) で integrity を保証する設計にする。
+            resp.output.checksum_crc32 = None;
+            resp.output.checksum_crc32c = None;
+            resp.output.checksum_crc64nvme = None;
+            resp.output.checksum_sha1 = None;
+            resp.output.checksum_sha256 = None;
+            resp.output.e_tag = None;
             resp.output.body = Some(bytes_to_blob(decompressed));
         }
         Ok(resp)
@@ -200,7 +228,20 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
-        self.backend.head_object(req).await
+        let mut resp = self.backend.head_object(req).await?;
+        if let Some(manifest) = extract_manifest(&resp.output.metadata) {
+            // 客側には decompress 後の意味のある content_length / checksum を返す。
+            // backend が返す圧縮済 bytes の checksum / e_tag は意味が違うため除去
+            // (S4 は manifest 内の crc32c で integrity を担保する)。
+            resp.output.content_length = Some(manifest.original_size as i64);
+            resp.output.checksum_crc32 = None;
+            resp.output.checksum_crc32c = None;
+            resp.output.checksum_crc64nvme = None;
+            resp.output.checksum_sha1 = None;
+            resp.output.checksum_sha256 = None;
+            resp.output.e_tag = None;
+        }
+        Ok(resp)
     }
     async fn delete_object(
         &self,
