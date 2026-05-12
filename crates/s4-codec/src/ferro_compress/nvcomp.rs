@@ -79,7 +79,7 @@ impl NvcompCodec {
 
     pub fn with_chunk_size(algo: Algo, chunk_size: usize) -> Result<Self> {
         match algo {
-            Algo::Snappy | Algo::Lz4 | Algo::Zstd | Algo::Bitcomp { .. } => {}
+            Algo::Snappy | Algo::Lz4 | Algo::Zstd | Algo::GDeflate | Algo::Bitcomp { .. } => {}
             other => return Err(Error::UnsupportedAlgo(other)),
         }
         if chunk_size == 0 || chunk_size > (1 << 24) {
@@ -1029,6 +1029,7 @@ fn algo_tag(algo: Algo) -> u8 {
         Algo::Lz4 => 2,
         Algo::Zstd => 3,
         Algo::Bitcomp { .. } => 4,
+        Algo::GDeflate => 5,
         _ => 0xff,
     }
 }
@@ -1110,6 +1111,7 @@ fn algo_from_header(tag: u8, reserved: [u8; 3]) -> Result<Algo> {
             let dt = bitcomp_data_type_from_tag(reserved[0])?;
             Ok(Algo::Bitcomp { data_type: dt })
         }
+        5 => Ok(Algo::GDeflate),
         _ => Err(Error::Decompress(format!("unknown algo tag: {tag}"))),
     }
 }

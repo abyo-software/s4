@@ -91,9 +91,9 @@ where
 /// TTFB は最初の chunk が decompress された時点で client に渡る。
 ///
 /// **multi-frame 対応**: zstd 仕様で「複数 frame の連結 = 1 つの valid な zstd
-/// stream」と定義されているため、`streaming_compress_nvcomp_zstd` のような
-/// per-chunk 圧縮された連結出力もそのまま decode 可能。`async_compression` の
-/// default は single-frame のため、明示的に `multiple_members(true)` を有効化。
+/// stream」と定義されているため、`streaming_compress_cpu_zstd` のような per-chunk
+/// 圧縮された連結出力もそのまま decode 可能。`async_compression` の default は
+/// single-frame のため、明示的に `multiple_members(true)` を有効化。
 pub fn cpu_zstd_decompress_stream(body: StreamingBlob) -> StreamingBlob {
     let read = blob_to_async_read(body);
     let mut decoder = ZstdDecoder::new(BufReader::new(read));
@@ -173,90 +173,6 @@ pub async fn streaming_compress_cpu_zstd(
         },
     ))
 }
-
-/// nvCOMP zstd 用の streaming compress (per-chunk pipelined GPU)。
-///
-/// **memory peak**: `chunk_size` (input chunk buffer) + `compressed_size` (output buffer)
-/// — `original_size` は完全に stream される (full input は RAM に乗らない)。
-/// 10 GB 入力 → 200 MB 出力 (50× 圧縮) なら peak ≈ 8 MiB + 200 MB = ~210 MB
-/// (vs naive `NvcompZstdCodec::compress(full_bytes)` だと peak 10 GB)。
-///
-/// **wire format**: 各 chunk の出力 (= 標準 zstd frame) を連結する。zstd 仕様で
-/// 「複数 frame の連結 = 1 つの valid な zstd stream」と定義されているため、
-/// 既存の decompress 経路 (`cpu_zstd_decompress_stream` / `NvcompZstdCodec::decompress`)
-/// を一切変更せずに round-trip 可能。
-///
-/// **default chunk size**: 8 MiB。これを下回る入力は 1 chunk = 1 GPU launch で済む。
-/// 巨大入力では chunk_size を上げると GPU launch overhead が減る一方 host RAM peak が
-/// 上がるトレードオフ。
-///
-/// **未実装の最適化** (v0.2.x で追加検討):
-/// - In-flight pipelining (stream K-1 compress 中に stream K の PCIe transfer 開始)。
-///   現状は per-chunk 直列 — chunk 内 GPU compute は走っているが、chunk 間 overlap なし。
-/// - 入力サイズ既知 (Content-Length あり) の場合、output buffer を事前 reserve。
-#[cfg(feature = "nvcomp-gpu")]
-pub async fn streaming_compress_nvcomp_zstd(
-    body: StreamingBlob,
-    chunk_size: usize,
-) -> Result<(Bytes, ChunkManifest), CodecError> {
-    use s4_codec::Codec;
-    use s4_codec::nvcomp::NvcompZstdCodec;
-
-    let codec: std::sync::Arc<dyn Codec> = std::sync::Arc::new(NvcompZstdCodec::new()?);
-    let mut read = blob_to_async_read(body);
-    // 圧縮率不明なので保守的に chunk_size の半分から始める (zstd は典型 2-10× 圧縮)。
-    let mut compressed_buf: Vec<u8> = Vec::with_capacity(chunk_size / 2);
-    let mut crc: u32 = 0;
-    let mut total_in: u64 = 0;
-    let mut chunk_buf = vec![0u8; chunk_size];
-
-    loop {
-        // chunk_size まで詰める (EOF で短くなる可能性あり)
-        let mut filled = 0;
-        while filled < chunk_size {
-            let n = read
-                .read(&mut chunk_buf[filled..])
-                .await
-                .map_err(CodecError::Io)?;
-            if n == 0 {
-                break;
-            }
-            filled += n;
-        }
-        if filled == 0 {
-            break;
-        }
-
-        crc = crc32c::crc32c_append(crc, &chunk_buf[..filled]);
-        total_in += filled as u64;
-
-        // GPU compress (spawn_blocking 内で nvCOMP batched API → CUDA stream)
-        let chunk_input = Bytes::copy_from_slice(&chunk_buf[..filled]);
-        let codec_clone = std::sync::Arc::clone(&codec);
-        let (compressed_chunk, _per_chunk_manifest) = codec_clone.compress(chunk_input).await?;
-        compressed_buf.extend_from_slice(&compressed_chunk);
-    }
-
-    let compressed_len = compressed_buf.len() as u64;
-    Ok((
-        Bytes::from(compressed_buf),
-        ChunkManifest {
-            codec: CodecKind::NvcompZstd,
-            original_size: total_in,
-            compressed_size: compressed_len,
-            crc32c: crc,
-        },
-    ))
-}
-
-/// nvcomp streaming compress の default chunk size。
-///
-/// 8 MiB を選んだ根拠:
-/// - GPU launch overhead amortized (per-launch ~5-50 µs vs per-chunk compress ~ms)
-/// - Host RAM peak が予測可能 (8 MiB chunk + ~compressed output)
-/// - nvCOMP HLIF default (64 KiB) より大きいが、batched API は chunk 内で更に細分化されるため OK
-#[cfg(feature = "nvcomp-gpu")]
-pub const DEFAULT_NVCOMP_STREAM_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 /// `streaming_compress_to_frames` の default chunk size。
 ///
@@ -449,12 +365,10 @@ mod tests {
         assert_eq!(out, original);
     }
 
-    /// Verifies the wire-format property the GPU streaming path relies on:
-    /// concatenated zstd frames are still a valid single zstd stream that the
-    /// streaming GET decoder can read. This is what lets
-    /// `streaming_compress_nvcomp_zstd` emit per-chunk nvCOMP zstd outputs
-    /// without any new framing layer — `cpu_zstd_decompress_stream` (with
-    /// `multiple_members(true)`) handles the result.
+    /// Verifies that `cpu_zstd_decompress_stream` correctly handles
+    /// multi-frame zstd streams (multi-call CPU encoder output produces
+    /// concatenated valid zstd frames per RFC 8478). `multiple_members(true)`
+    /// on the async_compression decoder is what makes this work.
     #[tokio::test]
     async fn concatenated_zstd_frames_are_a_single_valid_stream() {
         let chunk_a = Bytes::from(vec![b'a'; 50_000]);
@@ -483,10 +397,10 @@ mod tests {
         assert_eq!(out, Bytes::from(expected));
     }
 
-    /// Mirrors the chunking logic of `streaming_compress_nvcomp_zstd` using
-    /// CPU zstd as the per-chunk codec. Validates: chunk size handling,
-    /// CRC accumulation, manifest aggregation, end-to-end roundtrip via the
-    /// existing CPU zstd streaming decompressor.
+    /// Validates the chunked pipeline shape (chunk size, CRC accumulation,
+    /// manifest aggregation, roundtrip via streaming CPU zstd decoder) used
+    /// by both `streaming_compress_cpu_zstd` and the GPU codec paths in
+    /// `streaming_compress_to_frames`.
     #[tokio::test]
     async fn streaming_chunked_compress_pipeline_roundtrip() {
         // Use cpu zstd as a stand-in for the GPU codec to exercise the same
