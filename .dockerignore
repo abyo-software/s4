@@ -1,0 +1,22 @@
+# Reduce Docker build context — only ship src + Cargo + scripts
+target/
+.git/
+.github/
+S4_PROPOSAL.md
+*.md
+!README.md
+README.ja.md
+!CHANGELOG.md
+!CODE_OF_CONDUCT.md
+!CONTRIBUTING.md
+!SECURITY.md
+.idea/
+.vscode/
+*.log
+tmp/
+.cache/
+.env*
+!.env.example
+node_modules/
+__pycache__/
+*.pyc

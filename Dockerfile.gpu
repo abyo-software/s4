@@ -1,0 +1,73 @@
+# S4 (GPU build with NVIDIA nvCOMP) — multi-stage Dockerfile
+#
+# Requires NVIDIA Container Toolkit on the host:
+#   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
+#
+# Build:
+#   docker build -t s4:gpu -f Dockerfile.gpu .
+# Run:
+#   docker run --gpus all --rm -p 8014:8014 s4:gpu \
+#     --endpoint-url https://s3.us-east-1.amazonaws.com --host 0.0.0.0 \
+#     --codec nvcomp-zstd --dispatcher sampling
+#
+# nvCOMP redist tarball is downloaded at build time from
+# developer.download.nvidia.com (NVIDIA Software License Agreement applies —
+# building / pulling this image implies acceptance for the user).
+
+# ---- nvcomp downloader ----
+FROM debian:bookworm-slim AS nvcomp-fetch
+ARG NVCOMP_VERSION=5.2.0.10
+ARG NVCOMP_CUDA=cuda12
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt
+RUN curl -fL -o nvcomp.tar.xz \
+        "https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/linux-x86_64/nvcomp-linux-x86_64-${NVCOMP_VERSION}_${NVCOMP_CUDA}-archive.tar.xz" \
+    && mkdir -p /opt/nvcomp \
+    && tar -xJf nvcomp.tar.xz -C /opt/nvcomp --strip-components=1 \
+    && rm nvcomp.tar.xz \
+    && /bin/ls /opt/nvcomp/lib/libnvcomp.so
+
+# ---- builder ----
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
+WORKDIR /usr/src/s4
+ENV NVCOMP_HOME=/opt/nvcomp \
+    PATH=/root/.cargo/bin:/usr/local/cuda/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/nvcomp/lib:/usr/local/cuda/lib64
+
+# Install Rust
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates pkg-config build-essential \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+
+COPY --from=nvcomp-fetch /opt/nvcomp /opt/nvcomp
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY scripts ./scripts
+
+RUN cargo build --release -p s4-server --bin s4 --features s4-server/nvcomp-gpu
+
+# ---- runtime ----
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates wget \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=nvcomp-fetch /opt/nvcomp/lib/libnvcomp.so* /usr/local/lib/
+COPY --from=builder /usr/src/s4/target/release/s4 /usr/local/bin/s4
+COPY LICENSE NOTICE /usr/share/doc/s4/
+RUN ldconfig
+
+RUN useradd -r -u 10001 s4
+USER s4
+
+EXPOSE 8014
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD wget -qO- http://localhost:8014/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/s4"]
+CMD ["--host", "0.0.0.0", "--port", "8014", "--log-format", "json", \
+     "--codec", "nvcomp-zstd", "--dispatcher", "sampling"]

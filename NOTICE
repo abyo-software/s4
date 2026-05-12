@@ -1,0 +1,46 @@
+S4 — Squished S3
+Copyright 2026 abyo software 合同会社 (LLC)
+
+This product includes software developed by abyo software 合同会社
+and its contributors. Licensed under the Apache License, Version 2.0
+(the "License"); you may not use this file except in compliance with
+the License. You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+================================================================================
+Third-party components
+================================================================================
+
+This product bundles or links to the following third-party components.
+Each component remains under its own license:
+
+1. ferro-compress (vendored at crates/s4-codec/vendor/ferro-compress/)
+   - Origin: abyo software 合同会社 / FerroSearch project
+   - License: Apache-2.0 OR MIT (see vendor/ferro-compress/LICENSE and NOTICE)
+   - Purpose: NVIDIA nvCOMP Rust binding for GPU compression backend
+
+2. s3s (https://github.com/Nugine/s3s)
+   - License: Apache-2.0
+   - Purpose: S3-compatible HTTP service framework
+
+3. NVIDIA nvCOMP SDK (optional, when built with `--features nvcomp-gpu`)
+   - License: NVIDIA Software License Agreement (proprietary, NOT redistributed
+     by S4 — users must obtain from NVIDIA Developer)
+   - Purpose: GPU-accelerated compression codecs (zstd, Bitcomp, gANS)
+   - Distribution: BYO (bring-your-own) — set NVCOMP_HOME environment variable
+     pointing to extracted nvCOMP redist tarball at build time. S4 binaries
+     and Docker images do NOT bundle libnvcomp.
+
+4. Rust crates from the Rust ecosystem
+   - All under permissive licenses (MIT / Apache-2.0 / BSD)
+   - See `Cargo.lock` for the full list and `cargo tree --format "{p} {l}"` to
+     audit licenses
+
+================================================================================
+Trademark notice
+================================================================================
+
+"S4" and "Squished S3" are unregistered trademarks of abyo software 合同会社.
+"Amazon S3" and "AWS" are trademarks of Amazon.com, Inc. or its affiliates.
+S4 is not affiliated with, endorsed by, or sponsored by Amazon or AWS.

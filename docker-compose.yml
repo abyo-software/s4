@@ -1,0 +1,50 @@
+# Local quick-start: MinIO (mock S3) + S4 (CPU compression).
+# Usage:
+#   docker compose up -d
+#   aws --endpoint-url http://localhost:8014 s3 mb s3://demo
+#   aws --endpoint-url http://localhost:8014 s3 cp myfile.log s3://demo/
+#
+# Demo creds: minioadmin / minioadmin
+#
+# For GPU compression, see docker-compose.gpu.yml.
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"      # S3 API (raw)
+      - "9001:9001"      # Web console (http://localhost:9001)
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  s4:
+    build: .
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      RUST_LOG: info
+    command:
+      - --endpoint-url=http://minio:9000
+      - --host=0.0.0.0
+      - --port=8014
+      - --codec=cpu-zstd
+      - --dispatcher=sampling
+      - --log-format=json
+    ports:
+      - "8014:8014"      # S3 API (S4 wrap)
+
+volumes:
+  minio-data:
