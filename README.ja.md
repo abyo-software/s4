@@ -96,19 +96,59 @@ roundtrip。throughput は **uncompressed bytes / sec** (nvCOMP / lz4 / zstd 公
 
 | Workload | Codec | Original | Compressed | Ratio | Compress | Decompress |
 |---|---|---:|---:|---:|---:|---:|
-| nginx access log (256 MiB) | cpu-zstd-3 | 256 MiB | 1 MiB | **155.01×** | 3.68 GB/s | 3.04 GB/s |
-| nginx access log (256 MiB) | nvcomp-zstd | 256 MiB | 2 MiB | 95.60× | 1.71 GB/s | 2.70 GB/s |
-| nginx access log (256 MiB) | nvcomp-gdeflate | 256 MiB | 169 MiB | 1.51× | 1.02 GB/s | 2.40 GB/s |
-| Parquet 風 mixed (256 MiB) | cpu-zstd-3 | 256 MiB | 133 MiB | 1.92× | 0.73 GB/s | 1.79 GB/s |
-| Parquet 風 mixed (256 MiB) | nvcomp-zstd | 256 MiB | 131 MiB | **1.94×** | 1.40 GB/s | 2.51 GB/s |
-| Parquet 風 mixed (256 MiB) | nvcomp-gdeflate | 256 MiB | 183 MiB | 1.40× | 1.02 GB/s | 2.52 GB/s |
-| 既圧縮入力 (64 MiB) | cpu-zstd-3 | 64 MiB | 64 MiB | 1.00× | 2.14 GB/s | 2.88 GB/s |
-| 既圧縮入力 (64 MiB) | nvcomp-zstd | 64 MiB | 64 MiB | 1.00× | 0.80 GB/s | 2.25 GB/s |
-| 既圧縮入力 (64 MiB) | nvcomp-gdeflate | 64 MiB | 64 MiB | 1.00× | 0.89 GB/s | 2.26 GB/s |
+| nginx access log (256 MiB) | cpu-zstd-3 | 256 MiB | 1 MiB | **155.01×** | 2.72 GB/s | 2.26 GB/s |
+| nginx access log (256 MiB) | nvcomp-zstd | 256 MiB | 2 MiB | 95.60× | 1.27 GB/s | 2.06 GB/s |
+| nginx access log (256 MiB) | nvcomp-gdeflate | 256 MiB | 169 MiB | 1.51× | 0.79 GB/s | 1.98 GB/s |
+| Parquet 風 mixed (256 MiB) | cpu-zstd-3 | 256 MiB | 133 MiB | 1.92× | 0.55 GB/s | 1.38 GB/s |
+| Parquet 風 mixed (256 MiB) | nvcomp-zstd | 256 MiB | 131 MiB | 1.94× | 1.06 GB/s | 2.07 GB/s |
+| Parquet 風 mixed (256 MiB) | nvcomp-gdeflate | 256 MiB | 183 MiB | 1.40× | 0.79 GB/s | 1.93 GB/s |
+| Parquet 風 mixed (256 MiB) | nvcomp-bitcomp | 256 MiB | 122 MiB | **2.09×** | 1.20 GB/s | 1.08 GB/s |
+| Posting list (u32, 64 MiB) | cpu-zstd-3 | 64 MiB | 43 MiB | 1.48× | 1.03 GB/s | 1.47 GB/s |
+| Posting list (u32, 64 MiB) | nvcomp-zstd | 64 MiB | 42 MiB | 1.52× | 0.92 GB/s | 2.23 GB/s |
+| Posting list (u32, 64 MiB) | nvcomp-gdeflate | 64 MiB | 42 MiB | 1.51× | 0.67 GB/s | 1.97 GB/s |
+| Posting list (u32, 64 MiB) | nvcomp-bitcomp | 64 MiB | 5 MiB | **11.93×** | 1.09 GB/s | 1.27 GB/s |
+| Timestamp (i64, 64 MiB) | cpu-zstd-3 | 64 MiB | 24 MiB | 2.63× | 0.25 GB/s | 0.79 GB/s |
+| Timestamp (i64, 64 MiB) | nvcomp-zstd | 64 MiB | 24 MiB | 2.61× | 0.95 GB/s | 1.97 GB/s |
+| Timestamp (i64, 64 MiB) | nvcomp-gdeflate | 64 MiB | 48 MiB | 1.32× | 0.69 GB/s | 1.95 GB/s |
+| Timestamp (i64, 64 MiB) | nvcomp-bitcomp | 64 MiB | 21 MiB | **2.95×** | 1.20 GB/s | 1.04 GB/s |
+| doc_values (i64, 64 MiB) | cpu-zstd-3 | 64 MiB | 44 MiB | 1.45× | 0.23 GB/s | 0.89 GB/s |
+| doc_values (i64, 64 MiB) | nvcomp-zstd | 64 MiB | 34 MiB | **1.86×** | 0.80 GB/s | 2.28 GB/s |
+| doc_values (i64, 64 MiB) | nvcomp-gdeflate | 64 MiB | 48 MiB | 1.33× | 0.60 GB/s | 1.88 GB/s |
+| doc_values (i64, 64 MiB) | nvcomp-bitcomp | 64 MiB | 37 MiB | 1.72× | 0.85 GB/s | 1.08 GB/s |
+| 既圧縮入力 (64 MiB) | cpu-zstd-3 | 64 MiB | 64 MiB | 1.00× | 1.45 GB/s | 2.21 GB/s |
+| 既圧縮入力 (64 MiB) | nvcomp-zstd | 64 MiB | 64 MiB | 1.00× | 0.69 GB/s | 1.97 GB/s |
+| 既圧縮入力 (64 MiB) | nvcomp-gdeflate | 64 MiB | 64 MiB | 1.00× | 0.62 GB/s | 1.77 GB/s |
 
-**コスト換算** (AWS S3 Standard $0.023/GB/月): 1 TiB の nginx log →
-~6.6 GiB stored → **$0.15/月 vs $23.55/月 (99% saved)**。Parquet 系 mixed 業務で
-~50% saved。既圧縮入力は ratio 1.0× で素通し (= S4 が file を大きくしない)。
+**ハイライト**:
+- **`nvcomp-bitcomp` posting list u32: 11.93×** — Bitcomp の killer
+  use case (sorted u32 doc-id 列)。`cpu-zstd-3` の 1.48× と比べて 8 倍。
+- **`nvcomp-bitcomp` timestamps i64: 2.95×** — ms 増分 monotonic 時系列。
+- **`cpu-zstd-3` nginx log: 155.01×** — text/log の絶対王者。
+- **既圧縮入力**: 全 codec が 1.0× で素通し (= S4 が file を大きくしない)。
+
+## コスト試算 — S4 を入れる価値があるか?
+
+S4 が向いてるかどうかは **(a) 月額 S3 額、(b) データ圧縮率、(c) GPU EC2 instance
+コスト** の関数。誠実に自己診断できる表:
+
+| 月額 S3 | 圧縮で削減 (50–80%) | EC2 GPU 月額 | 純削減 | 判定 |
+|---:|---:|---:|---:|---|
+| $500   | $250 – $400     | ~$730 (g6.xlarge)    | **−$330 〜 −$480**    | ❌ 入れない方がいい |
+| $1,000 | $500 – $800     | ~$730                | **−$230 〜 +$70**     | ⚠️ 損益分岐、GPU を別用途でも使うなら |
+| $3,000 | $1,500 – $2,400 | ~$730                | **+$770 〜 +$1,670**  | ✅ 確かに節約 |
+| $10,000 | $5,000 – $8,000 | ~$1,860 (g6e.xlarge) | **+$3,140 〜 +$6,140** | ✅✅ 強い ROI |
+| $50,000 | $25,000 – $40,000 | ~$1,860            | **+$23,140 〜 +$38,140** | ✅✅✅ 大幅節約 |
+
+**注**:
+- 「圧縮で削減 50–80%」は log 系 (`cpu-zstd-3` 155×) や Parquet
+  (`nvcomp-zstd` ~2× + Range GET 効率化) の典型値。Pure 数値カラム
+  + `nvcomp-bitcomp` (sorted posting list 等) では **>10×** = 90%+ saved。
+- EC2 価格は us-east-1 on-demand (2026-05)。Spot だと ~70% off → 損益分岐
+  ラインが $1,000 から $300 に下がる。
+- S4 自体は OSS (Apache-2.0)、コストは EC2 instance + 運用工数のみ。
+- **月額 S3 が $1,000 未満で GPU 用途が他にないなら、入れない方がいい**。
+  S4 の `cpu-zstd` codec を小さい CPU instance で、 もしくは bucket 前段に
+  nginx + gzip を置くだけでもほぼ同じ削減ができる。
 
 **再現方法** (CUDA + nvCOMP 環境):
 

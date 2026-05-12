@@ -297,6 +297,14 @@ mod imp {
 #[cfg(feature = "nvcomp-gpu")]
 pub use imp::{NvcompBitcompCodec, NvcompGDeflateCodec, NvcompZstdCodec, is_gpu_available};
 
+/// nvCOMP Bitcomp typed-column hint. Selects the bit-packing layout the
+/// codec uses internally — the right choice can swing compression ratio
+/// from ~1.2× (`Char`, treating numeric data as opaque bytes) to >3.5×
+/// (`Uint32` on a sorted u32 posting list). Exposed publicly so callers
+/// can target their column shape without going through `default_general`.
+#[cfg(feature = "nvcomp-gpu")]
+pub use crate::ferro_compress::BitcompDataType;
+
 #[cfg(not(feature = "nvcomp-gpu"))]
 pub fn is_gpu_available() -> bool {
     false

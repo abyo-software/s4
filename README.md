@@ -150,34 +150,59 @@ target/release/s4 --endpoint-url https://s3.us-east-1.amazonaws.com \
 
 ## Benchmarks
 
-Single-pass roundtrip through `s4-codec`, August 2026, RTX 4070 Ti SUPER +
+Single-pass roundtrip through `s4-codec`. Hardware: RTX 4070 Ti SUPER +
 nvCOMP 5.x + Ryzen 9 9950X. Throughput is reported as **uncompressed bytes
 per second** (the convention nvCOMP / lz4 / zstd publish).
 
 | Workload | Codec | Original | Compressed | Ratio | Compress | Decompress |
 |---|---|---:|---:|---:|---:|---:|
-| nginx access log (256 MiB) | cpu-zstd-3 | 256 MiB | 1 MiB | **155.01×** | 3.68 GB/s | 3.04 GB/s |
-| nginx access log (256 MiB) | nvcomp-zstd | 256 MiB | 2 MiB | 95.60× | 1.71 GB/s | 2.70 GB/s |
-| nginx access log (256 MiB) | nvcomp-gdeflate | 256 MiB | 169 MiB | 1.51× | 1.02 GB/s | 2.40 GB/s |
-| Parquet-like mixed (256 MiB) | cpu-zstd-3 | 256 MiB | 133 MiB | 1.92× | 0.73 GB/s | 1.79 GB/s |
-| Parquet-like mixed (256 MiB) | nvcomp-zstd | 256 MiB | 131 MiB | **1.94×** | 1.40 GB/s | 2.51 GB/s |
-| Parquet-like mixed (256 MiB) | nvcomp-gdeflate | 256 MiB | 183 MiB | 1.40× | 1.02 GB/s | 2.52 GB/s |
-| Already-compressed (64 MiB) | cpu-zstd-3 | 64 MiB | 64 MiB | 1.00× | 2.14 GB/s | 2.88 GB/s |
-| Already-compressed (64 MiB) | nvcomp-zstd | 64 MiB | 64 MiB | 1.00× | 0.80 GB/s | 2.25 GB/s |
-| Already-compressed (64 MiB) | nvcomp-gdeflate | 64 MiB | 64 MiB | 1.00× | 0.89 GB/s | 2.26 GB/s |
+| nginx access log (256 MiB) | cpu-zstd-3 | 256 MiB | 1 MiB | **155.01×** | 2.72 GB/s | 2.26 GB/s |
+| nginx access log (256 MiB) | nvcomp-zstd | 256 MiB | 2 MiB | 95.60× | 1.27 GB/s | 2.06 GB/s |
+| nginx access log (256 MiB) | nvcomp-gdeflate | 256 MiB | 169 MiB | 1.51× | 0.79 GB/s | 1.98 GB/s |
+| Parquet-like mixed (256 MiB) | cpu-zstd-3 | 256 MiB | 133 MiB | 1.92× | 0.55 GB/s | 1.38 GB/s |
+| Parquet-like mixed (256 MiB) | nvcomp-zstd | 256 MiB | 131 MiB | 1.94× | 1.06 GB/s | 2.07 GB/s |
+| Parquet-like mixed (256 MiB) | nvcomp-gdeflate | 256 MiB | 183 MiB | 1.40× | 0.79 GB/s | 1.93 GB/s |
+| Parquet-like mixed (256 MiB) | nvcomp-bitcomp | 256 MiB | 122 MiB | **2.09×** | 1.20 GB/s | 1.08 GB/s |
+| Postings (u32, 64 MiB) | cpu-zstd-3 | 64 MiB | 43 MiB | 1.48× | 1.03 GB/s | 1.47 GB/s |
+| Postings (u32, 64 MiB) | nvcomp-zstd | 64 MiB | 42 MiB | 1.52× | 0.92 GB/s | 2.23 GB/s |
+| Postings (u32, 64 MiB) | nvcomp-gdeflate | 64 MiB | 42 MiB | 1.51× | 0.67 GB/s | 1.97 GB/s |
+| Postings (u32, 64 MiB) | nvcomp-bitcomp | 64 MiB | 5 MiB | **11.93×** | 1.09 GB/s | 1.27 GB/s |
+| Timestamps (i64, 64 MiB) | cpu-zstd-3 | 64 MiB | 24 MiB | 2.63× | 0.25 GB/s | 0.79 GB/s |
+| Timestamps (i64, 64 MiB) | nvcomp-zstd | 64 MiB | 24 MiB | 2.61× | 0.95 GB/s | 1.97 GB/s |
+| Timestamps (i64, 64 MiB) | nvcomp-gdeflate | 64 MiB | 48 MiB | 1.32× | 0.69 GB/s | 1.95 GB/s |
+| Timestamps (i64, 64 MiB) | nvcomp-bitcomp | 64 MiB | 21 MiB | **2.95×** | 1.20 GB/s | 1.04 GB/s |
+| doc_values (i64, 64 MiB) | cpu-zstd-3 | 64 MiB | 44 MiB | 1.45× | 0.23 GB/s | 0.89 GB/s |
+| doc_values (i64, 64 MiB) | nvcomp-zstd | 64 MiB | 34 MiB | **1.86×** | 0.80 GB/s | 2.28 GB/s |
+| doc_values (i64, 64 MiB) | nvcomp-gdeflate | 64 MiB | 48 MiB | 1.33× | 0.60 GB/s | 1.88 GB/s |
+| doc_values (i64, 64 MiB) | nvcomp-bitcomp | 64 MiB | 37 MiB | 1.72× | 0.85 GB/s | 1.08 GB/s |
+| Already-compressed (64 MiB) | cpu-zstd-3 | 64 MiB | 64 MiB | 1.00× | 1.45 GB/s | 2.21 GB/s |
+| Already-compressed (64 MiB) | nvcomp-zstd | 64 MiB | 64 MiB | 1.00× | 0.69 GB/s | 1.97 GB/s |
+| Already-compressed (64 MiB) | nvcomp-gdeflate | 64 MiB | 64 MiB | 1.00× | 0.62 GB/s | 1.77 GB/s |
 
 **Reading the table:**
 
-- **Compression ratio**: `cpu-zstd-3` is the default and dominates on text-like
-  workloads. `nvcomp-zstd` is competitive on Parquet/columnar data and frees
-  the CPU for serving more requests in parallel. `nvcomp-gdeflate` sits between
-  zstd and "no compression" — useful when you need DEFLATE-format wire compat.
-- **Throughput**: nvCOMP runs through the FCG1-framed batched API at the
-  default 64 KiB chunk size; production deployments using larger chunks via
-  `streaming_compress_to_frames` (see v0.2 #1) push GPU compress >5 GB/s on
-  highly compressible inputs.
+- **`cpu-zstd-3`** dominates on text — 155× on nginx logs is hard to beat.
+- **`nvcomp-bitcomp`** is the killer for typed numeric columns: 11.93× on
+  sorted u32 posting lists (vs ~1.5× for everything else), 2.95× on
+  monotonic i64 timestamps. The `data_type` hint is critical (`Char` on
+  numeric data degrades to ~1.2×); see [`s4_codec::nvcomp::BitcompDataType`]
+  for the typed constructors.
+- **`nvcomp-zstd`** is competitive on Parquet-like / mixed workloads and
+  frees the CPU for serving requests in parallel.
+- **`nvcomp-gdeflate`** sits between zstd and "no compression" — useful
+  when you need DEFLATE-format wire compat (in v0.3 the
+  [`gunzip`-compatible wrapper](https://github.com/abyo-software/s4/issues/26)
+  will make this codec serve `Content-Encoding: gzip` to any HTTP client).
 - **Already-compressed inputs** are correctly bypassed at ratio 1.0× by every
   codec — S4 never makes a file *bigger*.
+
+**Throughput note**: nvCOMP runs through the FCG1-framed batched API at
+the default 64 KiB chunk size, so per-call overhead dominates the 64 MiB
+input cases. Production deployments using larger chunks via
+`streaming_compress_to_frames` (v0.2 #1) push GPU compress >5 GB/s on
+highly compressible inputs. The full head-to-head bench vs MinIO S2 /
+Garage zstd is tracked in
+[issue #14](https://github.com/abyo-software/s4/issues/14).
 
 **Reproducing locally** (requires CUDA + nvCOMP):
 
@@ -187,8 +212,34 @@ NVCOMP_HOME=/opt/nvcomp LD_LIBRARY_PATH=/opt/nvcomp/lib \
     -p s4-codec --features nvcomp-gpu
 ```
 
-The full head-to-head benchmark suite vs MinIO S2 / Garage zstd is tracked
-in [issue #14](https://github.com/abyo-software/s4/issues/14).
+## Cost savings — does S4 make sense for your bill?
+
+S4 is **not** worth deploying for everyone. The economics depend on (a)
+your AWS S3 bill, (b) how compressible your data is, (c) the cost of the
+EC2 GPU instance running S4. Here's an honest table to self-diagnose:
+
+| Your monthly S3 bill | Likely savings (50–80%) | EC2 GPU cost | Net savings | Verdict |
+|---:|---:|---:|---:|---|
+| $500   | $250 – $400     | ~$730/mo (g6.xlarge)    | **−$330 to −$480**    | ❌ NOT worth it |
+| $1,000 | $500 – $800     | ~$730/mo                | **−$230 to +$70**     | ⚠️ Breakeven; only if you'd use the GPU for other work too |
+| $3,000 | $1,500 – $2,400 | ~$730/mo                | **+$770 to +$1,670**  | ✅ Real savings |
+| $10,000 | $5,000 – $8,000 | ~$1,860/mo (g6e.xlarge) | **+$3,140 to +$6,140** | ✅✅ Strong ROI |
+| $50,000 | $25,000 – $40,000 | ~$1,860/mo            | **+$23,140 to +$38,140** | ✅✅✅ Material savings |
+
+**Notes:**
+- "Likely savings 50–80%" is the typical range for log-heavy workloads
+  (`cpu-zstd-3` 155×) and Parquet (`nvcomp-zstd` ~2× plus better Range GET
+  efficiency). For pure-numeric column-store data with `nvcomp-bitcomp` on
+  sorted posting lists, the ratio swings to **>10×** — savings closer to
+  90%+.
+- EC2 prices are us-east-1 on-demand, May 2026. Spot instances cut these by
+  ~70%, breakeven at ~$300/mo S3 bill instead of $1,000.
+- S4 itself is open source (Apache-2.0) — the only cost is the EC2 instance
+  and your time.
+- **If your monthly S3 bill is under $1,000 and you're not already running
+  GPUs for other work, don't bother.** Use S4's `cpu-zstd` codec on a small
+  CPU instance, or front your bucket with nginx + gzip — both will give
+  most of the savings without GPU hardware.
 
 ## Production Features
 

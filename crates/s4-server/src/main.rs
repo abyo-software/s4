@@ -129,6 +129,31 @@ struct Opt {
     #[clap(long, requires = "tls_cert")]
     tls_key: Option<std::path::PathBuf>,
 
+    /// Comma-separated list of domains for ACME (Let's Encrypt) auto-cert.
+    /// Mutually exclusive with --tls-cert / --tls-key. Uses the TLS-ALPN-01
+    /// challenge handled inline on the listening port — no separate HTTP
+    /// listener required. The listener MUST be reachable from the public
+    /// internet on this --port for renewal to succeed.
+    #[clap(long, conflicts_with_all = ["tls_cert", "tls_key"])]
+    acme: Option<String>,
+
+    /// Contact email for ACME account registration. Required when --acme is
+    /// set; Let's Encrypt uses this for cert-expiry notifications.
+    #[clap(long, requires = "acme")]
+    acme_contact: Option<String>,
+
+    /// Directory for caching ACME account + cert state across restarts.
+    /// Default: `<HOME>/.s4/acme/`. The cert is renewed automatically at
+    /// the standard ~60-day mark.
+    #[clap(long, requires = "acme")]
+    acme_cache_dir: Option<std::path::PathBuf>,
+
+    /// Use the Let's Encrypt staging directory (no rate limits, but the
+    /// resulting cert is not browser-trusted). Recommended for first-run
+    /// validation; flip off once the deployment is confirmed working.
+    #[clap(long, requires = "acme")]
+    acme_staging: bool,
+
     /// Optional AWS-style bucket policy JSON file. When set, every PUT /
     /// GET / DELETE / List request is evaluated against the policy before
     /// being forwarded to the backend; explicit Deny or implicit deny

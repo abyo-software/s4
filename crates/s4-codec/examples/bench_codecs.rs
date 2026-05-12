@@ -86,6 +86,54 @@ mod workload {
         buf.truncate(size);
         Bytes::from(buf)
     }
+
+    /// Posting-list-style data: monotonically increasing u32 doc IDs with
+    /// small gaps. Models a search engine inverted index — the canonical
+    /// nvCOMP Bitcomp use case.
+    pub fn postings_u32(size: usize) -> Bytes {
+        let mut buf = Vec::with_capacity(size);
+        let mut id: u32 = 0;
+        while buf.len() + 4 <= size {
+            buf.extend_from_slice(&id.to_le_bytes());
+            // gap between 1 and 5 (small, sorted-ish posting list)
+            id = id.wrapping_add(1 + ((buf.len() as u32) & 0x3));
+        }
+        buf.truncate(size);
+        Bytes::from(buf)
+    }
+
+    /// Time-series-style data: monotonically increasing i64 timestamps in
+    /// nanoseconds, with small jitter. Models metric / observability data.
+    pub fn timestamps_i64(size: usize) -> Bytes {
+        let mut buf = Vec::with_capacity(size);
+        let mut t: i64 = 1_700_000_000_000_000_000; // ~Nov 2023 in ns
+        while buf.len() + 8 <= size {
+            buf.extend_from_slice(&t.to_le_bytes());
+            // ~1 ms increments with small jitter
+            t = t.wrapping_add(1_000_000 + (buf.len() as i64 & 0xff));
+        }
+        buf.truncate(size);
+        Bytes::from(buf)
+    }
+
+    /// Numeric column-store data: i64 doc_values with moderate variability.
+    /// Models a Lucene `LongPoint` or DuckDB BIGINT column. Values vary
+    /// across the full ~10^12 range (file IDs, microsecond timestamps,
+    /// row IDs, etc.) so the high bytes are not trivially redundant.
+    pub fn doc_values_i64(size: usize) -> Bytes {
+        let mut buf = Vec::with_capacity(size);
+        let mut state: u64 = 0xaaaaaaaa_55555555;
+        while buf.len() + 8 <= size {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            // Full 40-bit range (~10^12), the typical range for things like
+            // microsecond-since-epoch or row IDs. Avoids the toy "all high
+            // bytes are zero" pitfall.
+            let v = (state & 0xff_ffff_ffff) as i64;
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf.truncate(size);
+        Bytes::from(buf)
+    }
 }
 
 fn fmt_gbps(bytes: u64, secs: f64) -> String {
@@ -112,18 +160,37 @@ async fn main() {
     println!("| Workload | Codec | Original | Compressed | Ratio | Compress | Decompress |");
     println!("|---|---|---:|---:|---:|---:|---:|");
 
-    let workloads: Vec<(&str, Bytes)> = vec![
+    let workloads: Vec<(&str, Bytes, Vec<&str>)> = vec![
+        // (label, data, codecs to skip — empty = run all)
         (
             "nginx access log (256 MiB)",
             workload::nginx_log(256 * 1024 * 1024),
+            vec!["nvcomp-bitcomp"], // Bitcomp not designed for byte-aligned text
         ),
         (
             "parquet-like (256 MiB)",
             workload::parquet_like(256 * 1024 * 1024),
+            vec![],
+        ),
+        (
+            "postings (u32, 64 MiB)",
+            workload::postings_u32(64 * 1024 * 1024),
+            vec![],
+        ),
+        (
+            "timestamps (i64, 64 MiB)",
+            workload::timestamps_i64(64 * 1024 * 1024),
+            vec![],
+        ),
+        (
+            "doc_values (i64, 64 MiB)",
+            workload::doc_values_i64(64 * 1024 * 1024),
+            vec![],
         ),
         (
             "already-compressed (64 MiB)",
             workload::already_compressed(64 * 1024 * 1024),
+            vec!["nvcomp-bitcomp"], // pointless on high-entropy data
         ),
     ];
 
@@ -141,23 +208,50 @@ async fn main() {
         );
     }
 
-    for (label, data) in workloads {
+    for (label, data, skip) in workloads {
+        let skip_codec = |c: &str| skip.iter().any(|s| *s == c);
+
         // CPU zstd level 3 (the s4-server default)
-        let cpu = CpuZstd::default();
-        let (orig, comp, c, d) = measure_codec(&cpu, data.clone()).await;
-        print_row(label, "cpu-zstd-3", orig, comp, c, d);
+        if !skip_codec("cpu-zstd-3") {
+            let cpu = CpuZstd::default();
+            let (orig, comp, c, d) = measure_codec(&cpu, data.clone()).await;
+            print_row(label, "cpu-zstd-3", orig, comp, c, d);
+        }
 
         #[cfg(feature = "nvcomp-gpu")]
         {
-            use s4_codec::nvcomp::{NvcompGDeflateCodec, NvcompZstdCodec, is_gpu_available};
+            use s4_codec::nvcomp::{
+                NvcompBitcompCodec, NvcompGDeflateCodec, NvcompZstdCodec, is_gpu_available,
+            };
             if is_gpu_available() {
-                if let Ok(codec) = NvcompZstdCodec::new() {
+                if !skip_codec("nvcomp-zstd")
+                    && let Ok(codec) = NvcompZstdCodec::new()
+                {
                     let (o, cz, t_c, t_d) = measure_codec(&codec, data.clone()).await;
                     print_row(label, "nvcomp-zstd", o, cz, t_c, t_d);
                 }
-                if let Ok(codec) = NvcompGDeflateCodec::new() {
+                if !skip_codec("nvcomp-gdeflate")
+                    && let Ok(codec) = NvcompGDeflateCodec::new()
+                {
                     let (o, cz, t_c, t_d) = measure_codec(&codec, data.clone()).await;
                     print_row(label, "nvcomp-gdeflate", o, cz, t_c, t_d);
+                }
+                if !skip_codec("nvcomp-bitcomp") {
+                    use s4_codec::nvcomp::BitcompDataType;
+                    // Pick the right typed Bitcomp variant per workload — the
+                    // hint matters; Char on numeric data degrades to ~1.2×
+                    // while Uint32 on sorted posting lists hits 3.5×+.
+                    let dtype = if label.contains("u32") {
+                        BitcompDataType::Uint32
+                    } else if label.contains("i64") || label.contains("timestamp") {
+                        BitcompDataType::Int64
+                    } else {
+                        BitcompDataType::Char
+                    };
+                    if let Ok(codec) = NvcompBitcompCodec::new(dtype) {
+                        let (o, cz, t_c, t_d) = measure_codec(&codec, data.clone()).await;
+                        print_row(label, "nvcomp-bitcomp", o, cz, t_c, t_d);
+                    }
                 }
             } else {
                 println!("(GPU not detected at runtime — skipping nvcomp rows for this workload)");

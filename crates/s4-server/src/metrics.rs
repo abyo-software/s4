@@ -33,6 +33,8 @@ pub mod names {
     pub const REQUEST_LATENCY_SECONDS: &str = "s4_request_latency_seconds";
     pub const POLICY_DENIALS_TOTAL: &str = "s4_policy_denials_total";
     pub const TLS_CERT_RELOAD_TOTAL: &str = "s4_tls_cert_reload_total";
+    pub const ACME_RENEWAL_TOTAL: &str = "s4_acme_renewal_total";
+    pub const ACME_CERT_EXPIRY_SECONDS: &str = "s4_acme_cert_expiry_seconds";
 }
 
 /// v0.3 #10: bumped each time the operator triggers a SIGHUP-driven TLS
@@ -40,6 +42,21 @@ pub mod names {
 pub fn record_tls_cert_reload(ok: bool) {
     let result = if ok { "ok" } else { "err" };
     metrics::counter!(names::TLS_CERT_RELOAD_TOTAL, "result" => result).increment(1);
+}
+
+/// v0.3 #11: bumped each time rustls-acme triggers a renewal cycle (success
+/// or failure). Labels: `result` (= "ok" | "err"). Operators alert on this
+/// counter to catch a stuck renewal before the cert expires.
+pub fn record_acme_renewal(ok: bool) {
+    let result = if ok { "ok" } else { "err" };
+    metrics::counter!(names::ACME_RENEWAL_TOTAL, "result" => result).increment(1);
+}
+
+/// v0.3 #11: gauge of seconds until the active ACME cert expires. Operators
+/// alert when this drops below 14 days, which would mean renewal has been
+/// failing silently for ~46 days (Let's Encrypt 90-day cert lifetime).
+pub fn record_acme_cert_expiry(seconds_until_expiry: f64) {
+    metrics::gauge!(names::ACME_CERT_EXPIRY_SECONDS).set(seconds_until_expiry);
 }
 
 /// v0.2 #7: bumped each time the gateway's bucket policy denies a request.
