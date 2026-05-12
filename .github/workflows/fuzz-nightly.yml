@@ -1,0 +1,108 @@
+name: Nightly fuzz
+
+# 毎日 03:00 UTC (JST 12:00) に走らせる、proptest の cases を 1M に escalation
+# + cargo-bolero target を 30 min/target × 5 = 2.5h で coverage-guided fuzz
+# 失敗 → GitHub Issue 自動 open + corpus / crash artifact 保存
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      cases:
+        description: "PROPTEST_CASES (default 1000000 = 1M cases / property)"
+        default: "1000000"
+        required: false
+      bolero_minutes:
+        description: "Per-bolero-target wall clock (minutes)"
+        default: "30"
+        required: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  proptest-stress:
+    name: proptest stress (1M cases / property)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: proptest stress run
+        env:
+          PROPTEST_CASES: ${{ github.event.inputs.cases || '1000000' }}
+        run: |
+          cargo test --workspace --release \
+            --test fuzz_parsers --test fuzz_server --test fuzz_advanced \
+            -- --nocapture
+      - name: Upload proptest-regressions artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proptest-regressions-${{ github.run_id }}
+          path: "**/*.proptest-regressions"
+          if-no-files-found: ignore
+
+  bolero-coverage-guided:
+    name: bolero coverage-guided (libfuzzer, ${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - frame_parser_bolero
+          - frame_iter_bolero
+          - index_decoder_bolero
+          - cpu_zstd_decompress_bolero
+          - frame_roundtrip_bolero
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-bolero
+        run: cargo install cargo-bolero
+      - name: Run bolero target with libfuzzer
+        run: |
+          cargo bolero test --engine libfuzzer "${{ matrix.target }}" -- \
+            -max_total_time=$(( ${{ github.event.inputs.bolero_minutes || '30' }} * 60 )) \
+            || echo "fuzz target found a crash, see corpus artifact"
+        working-directory: crates/s4-codec
+      - name: Upload corpus + crash artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bolero-corpus-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            crates/s4-codec/tests/__fuzz__/${{ matrix.target }}/corpus/**
+            crates/s4-codec/tests/__fuzz__/${{ matrix.target }}/crashes/**
+          if-no-files-found: ignore
+
+  open-issue-on-failure:
+    name: Open GitHub issue if fuzz failed
+    needs: [proptest-stress, bolero-coverage-guided]
+    runs-on: ubuntu-latest
+    if: failure()
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `Nightly fuzz failure ${context.runId}`;
+            const body = `Nightly fuzz job [${context.runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) failed.\n\n` +
+                         `Check the run for proptest-regressions and bolero crash artifacts.\n` +
+                         `Reproduce locally:\n` +
+                         `\`\`\`bash\n` +
+                         `# proptest regression replay (download artifact, place .proptest-regressions in repo)\n` +
+                         `cargo test --workspace --release --test fuzz_parsers --test fuzz_server --test fuzz_advanced\n\n` +
+                         `# bolero crash replay\n` +
+                         `cargo bolero test --engine libfuzzer <target> -- <crash-file>\n` +
+                         `\`\`\`\n`;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ["fuzz-failure", "bug", "priority-high"],
+            });

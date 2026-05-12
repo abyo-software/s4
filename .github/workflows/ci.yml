@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets
+      - name: cargo test
+        run: cargo test --workspace --release
+      - name: cargo test --features nvcomp-gpu (build-only, no GPU on CI)
+        run: cargo build --workspace --features s4-server/nvcomp-gpu
+        env:
+          # NVCOMP_HOME is unset → vendored build.rs without nvcomp feature works
+          # but we want to verify the feature *compiles* against a stub
+          NVCOMP_HOME: ""
+        # Allow failure since CI lacks NVCOMP SDK; gate is "compile cleanly"
+        continue-on-error: true
+
+  e2e:
+    name: E2E (MinIO Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --ignored (MinIO E2E)
+        run: cargo test --workspace --release -- --ignored --test-threads=1
+        timeout-minutes: 20

@@ -167,40 +167,67 @@ export LD_LIBRARY_PATH=$NVCOMP_HOME/lib:$LD_LIBRARY_PATH
 cargo test --workspace --features s4-server/nvcomp-gpu -- --ignored
 ```
 
-### Fuzz testing (proptest, stable Rust)
+### Fuzz testing (3 層構成)
+
+#### 1. proptest (random / structural、stable Rust、CI で常時)
 
 ```bash
-cargo test --test fuzz_parsers --test fuzz_server   # 29 properties × 256+ cases
-PROPTEST_CASES=10000 cargo test --test fuzz_parsers --test fuzz_server  # stress
+cargo test --workspace --test fuzz_parsers --test fuzz_server --test fuzz_advanced
+PROPTEST_CASES=100000 cargo test --workspace --test fuzz_parsers --test fuzz_server --test fuzz_advanced
 ```
 
-`crates/s4-codec/tests/fuzz_parsers.rs` (低層 19 property):
+**38 properties × 100K cases = 3.8M executions in 6 minutes, zero failures**
+(stress run 確認済、PROPTEST_CASES=10000 デフォルト + 100K 拡張)。
 
-- `read_frame(random)` / `decode_index(random)` は **panic せず Result**
-- `FrameIter` over random bytes は **必ず terminate** (1 byte 入力で無限 Err
-  ループする初期実装バグを fuzz が発見、修正済)
-- 巨大 `compressed_size` を主張する frame / 巨大 `length` を主張する padding
-  → memory 確保せず安全に error
-- `write_frame ↔ read_frame` / `encode_index ↔ decode_index` の roundtrip
-- `pad_to_minimum` の output サイズ ≥ min_total
-- `lookup_range` の返す `RangePlan` の slice index が in-bounds
-- **CpuZstd compress ↔ decompress roundtrip** (random input)
-- **CpuZstd 解凍 bomb 防御**: 1 KB payload + 10 GB 主張 manifest
-  → bounded memory で SizeMismatch (zstd `Decoder + take(limit)` で実装)
-- **CodecKind**: 全 variant の id ↔ from_id, as_str ↔ from_str roundtrip
-  + 未知 id は None (新 codec 追加時の漏れ検出)
+| ファイル | 責務 | property 数 |
+|---|---|---|
+| `crates/s4-codec/tests/fuzz_parsers.rs` | 低層 parser DoS 耐性、roundtrip、enum 完全性、zstd bomb 防御 | 19 |
+| `crates/s4-server/tests/fuzz_server.rs` | resolve_range overflow、collect_blob、SamplingDispatcher 不変式 | 10 |
+| `crates/s4-codec/tests/fuzz_advanced.rs` | mutational (1 byte flip) / multi-frame sequence / **differential** (production parser vs naive reference) / pad+iter | 9 |
 
-`crates/s4-server/tests/fuzz_server.rs` (server 層 10 property):
+特に重要:
+- `cpu_zstd_bomb_caps_at_manifest_size` — 1 KB payload + 10 GB 主張 manifest
+  でも bounded memory で安全に SizeMismatch (zstd `Decoder + take(limit)` で実装)
+- `read_frame_matches_naive_reference` — production の最適化 parser と naive
+  reference parser の output が任意 input で完全一致 (差が出れば最適化バグ)
+- `frame_iter_with_trailing_garbage_doesnt_lose_prefix` — multi-frame の途中
+  以降が garbage でも、それまでの frame は完全に拾えて FrameIter が fused
 
-- `resolve_range(Range::Int / Suffix, total)` は **u64 全範囲で panic / overflow
-  なし**、成功時は start ≤ end ≤ total、total=0 は必ず Err
-- `collect_blob` chunk 列順序保存 + max_bytes 超過は必ず Oversized
-- `peek_sample(blob, N)`: sample.len() ≤ N、sample + rest = 元 body
-- `SamplingDispatcher.pick(random)` は閉じた CodecKind enum 内の値しか返さない
-- `AlwaysDispatcher` は任意 input 不変
+#### 2. bolero (coverage-guided 候補、stable Rust → nightly で本格)
 
-stress run 結果: **29 properties × 10000 cases = 290,000 fuzz cases pass in 34 sec、
-zero failures** (`PROPTEST_CASES=10000` で実行確認済)。
+```bash
+# stable で軽く回す (random engine)
+cargo test --test fuzz_bolero
+
+# 本格 coverage-guided (要 nightly + cargo-bolero)
+cargo install cargo-bolero
+cargo bolero test --engine libfuzzer frame_parser_bolero -- -max_total_time=86400
+# crash artifact を replay
+cargo bolero test --engine libfuzzer frame_parser_bolero -- corpus/<crash-input>
+```
+
+7 bolero targets (`crates/s4-codec/tests/fuzz_bolero.rs`)。corpus は
+`crates/s4-codec/tests/__fuzz__/<target>/corpus/` に蓄積、libfuzzer で新 branch
+を狙う。
+
+#### 3. CI nightly fuzz (自動 6h job)
+
+`.github/workflows/fuzz-nightly.yml` が毎日 03:00 UTC に走る:
+
+- **proptest stress**: PROPTEST_CASES=1M で全 38 property を release build で実行
+  (~6h 想定)、`*.proptest-regressions` を artifact として保存
+- **bolero coverage-guided**: nightly Rust + libfuzzer で 5 target を 30 min/target
+  並列実行 (matrix)、corpus + crash を artifact 保存
+- **issue 自動 open**: 失敗時に `fuzz-failure` ラベル付きで GitHub issue 生成、
+  reproduce 手順をテンプレ化
+
+#### Fuzz が実バグを検出した履歴
+
+- `FrameIter` 1 byte 入力で **無限 Err ループ** (DoS) → `fused: bool` で修正
+- `cpu_zstd::decompress` で **解凍 bomb で OOM** 可能 → `Decoder + take(limit)`
+  で hardening、SizeMismatch で安全に reject
+
+### Soak / load testing
 
 ### Soak / load testing
 
