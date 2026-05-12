@@ -109,30 +109,6 @@ pub fn bootstrap(opts: AcmeOptions) -> AcmeAcceptors {
     AcmeAcceptors { challenge, default }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Bootstrap returns two distinct rustls configs. We never reach
-    /// the Let's Encrypt servers in this unit test (the background
-    /// renewal task will retry forever without test-side observation),
-    /// so we just verify the synchronous return path.
-    #[tokio::test]
-    async fn bootstrap_returns_challenge_and_default_configs() {
-        crate::tls::install_default_crypto_provider();
-        let dir = tempfile::tempdir().unwrap();
-        let acceptors = bootstrap(AcmeOptions {
-            domains: vec!["example.test".into()],
-            contact: Some("ops@example.test".into()),
-            cache_dir: dir.path().to_path_buf(),
-            staging: true,
-        });
-        // Both configs must exist; they're distinct (challenge serves the
-        // TLS-ALPN-01 magic cert, default serves the real cert).
-        assert!(!Arc::ptr_eq(&acceptors.challenge, &acceptors.default));
-    }
-}
-
 /// Per-connection accept entry point. Inspect the ClientHello via
 /// `LazyConfigAcceptor`, then route to either the challenge config
 /// (TLS-ALPN-01 ack) or the default cert config (real traffic).
@@ -157,5 +133,29 @@ where
     } else {
         let tls = start.into_stream(acceptors.default.clone()).await?;
         Ok(Some(tls))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bootstrap returns two distinct rustls configs. We never reach
+    /// the Let's Encrypt servers in this unit test (the background
+    /// renewal task will retry forever without test-side observation),
+    /// so we just verify the synchronous return path.
+    #[tokio::test]
+    async fn bootstrap_returns_challenge_and_default_configs() {
+        crate::tls::install_default_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let acceptors = bootstrap(AcmeOptions {
+            domains: vec!["example.test".into()],
+            contact: Some("ops@example.test".into()),
+            cache_dir: dir.path().to_path_buf(),
+            staging: true,
+        });
+        // Both configs must exist; they're distinct (challenge serves the
+        // TLS-ALPN-01 magic cert, default serves the real cert).
+        assert!(!Arc::ptr_eq(&acceptors.challenge, &acceptors.default));
     }
 }
