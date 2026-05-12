@@ -1,0 +1,21 @@
+[package]
+name = "s4-codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "S4 codec layer — pluggable GPU/CPU compression backends (nvCOMP, DietGPU, CPU zstd)"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }

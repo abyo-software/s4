@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/s4-server",
+    "crates/s4-codec",
+    "crates/s4-config",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.92"
+license = "Proprietary"
+authors = ["abyo software (masumi-ryugo) <abyo.software@gmail.com>"]
+repository = "https://github.com/abyo-software/s4"
+
+[workspace.dependencies]
+s3s = "0.13"
+s3s-aws = "0.13"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.124"
+aws-credential-types = "1"
+tokio = { version = "1", features = ["full"] }
+hyper = "1.8"
+hyper-util = { version = "0.1", features = [
+    "server-auto",
+    "server-graceful",
+    "http1",
+    "http2",
+    "tokio",
+] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"

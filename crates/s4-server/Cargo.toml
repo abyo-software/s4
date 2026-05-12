@@ -1,0 +1,33 @@
+[package]
+name = "s4-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "S4 — Squished S3 — GPU 透過圧縮 S3 互換ストレージゲートウェイ (server binary)"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "s4"
+path = "src/main.rs"
+
+[dependencies]
+s3s.workspace = true
+s3s-aws.workspace = true
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+aws-credential-types.workspace = true
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+
+s4-codec = { path = "../s4-codec" }
+s4-config = { path = "../s4-config" }

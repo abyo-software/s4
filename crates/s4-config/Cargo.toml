@@ -1,0 +1,15 @@
+[package]
+name = "s4-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "S4 設定型と config loader"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+anyhow.workspace = true
