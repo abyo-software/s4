@@ -13,7 +13,41 @@ workflow:
 The bucket has a 1-day expiration lifecycle rule and incomplete-multipart-upload
 cleanup, so cost is bounded to <$1/month under nightly cadence.
 
-## One-time setup
+## Quick start (recommended)
+
+One command does everything — Terraform apply + push the three outputs
+into the repo's GitHub Actions Variables:
+
+```bash
+./scripts/bootstrap-aws-e2e.sh
+```
+
+The script is idempotent: re-run it whenever Terraform state or AWS
+credentials change and it will refresh the GitHub variables to match.
+
+Prerequisites the script verifies up-front (and errors out cleanly if
+any are missing):
+- AWS credentials configured (`aws sts get-caller-identity` must succeed)
+- GitHub CLI authenticated with `repo` scope (`gh auth status` must succeed)
+- `terraform` >= 1.5, `aws`, `gh`, `jq` on `PATH`
+
+Optional env-var overrides forwarded to Terraform:
+
+| Var | Default | Purpose |
+|---|---|---|
+| `AWS_REGION` | `us-east-1` | AWS region |
+| `BUCKET_PREFIX` | `s4-aws-e2e` | S3 bucket name prefix |
+| `GITHUB_REPO` | `abyo-software/s4` | OIDC `sub:` filter (which repo can assume the role) |
+| `GH_REPO` | `abyo-software/s4` | Repo to push the Variables to (defaults to `GITHUB_REPO`) |
+
+When the script finishes it prints a summary block with the three
+variable names + values that were set.
+
+## Manual setup (fallback)
+
+If the bootstrap script can't run for some reason (e.g. you only have
+Terraform and want to set the GitHub variables by hand), the equivalent
+manual steps:
 
 You need:
 - AWS account + credentials with permissions to create S3 buckets, IAM roles,
