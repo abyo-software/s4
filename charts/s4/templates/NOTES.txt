@@ -1,0 +1,39 @@
+Thanks for installing {{ .Chart.Name }} {{ .Chart.AppVersion }}!
+
+The S4 gateway is now reaching:
+  backend endpoint : {{ .Values.backend.endpointUrl }}
+  default codec    : {{ .Values.codec }}
+  replicas         : {{ .Values.replicas }}
+  TLS on listener  : {{ if include "s4.tlsActive" . }}enabled{{ else }}disabled (plain HTTP){{ end }}
+  bucket policy    : {{ if include "s4.policyActive" . }}enforced{{ else }}none (all requests allowed){{ end }}
+
+1. Port-forward and try a roundtrip with aws-cli:
+
+   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "s4.fullname" . }} 8014:{{ .Values.service.port }}
+
+   # in another shell:
+   aws --endpoint-url {{ if include "s4.tlsActive" . }}https{{ else }}http{{ end }}://localhost:8014 \
+       s3 mb s3://demo
+   aws --endpoint-url {{ if include "s4.tlsActive" . }}https{{ else }}http{{ end }}://localhost:8014 \
+       s3 cp ./somefile s3://demo/somefile
+   aws --endpoint-url {{ if include "s4.tlsActive" . }}https{{ else }}http{{ end }}://localhost:8014 \
+       s3 cp s3://demo/somefile -
+
+2. Check pod logs:
+
+   kubectl --namespace {{ .Release.Namespace }} logs -l app.kubernetes.io/instance={{ .Release.Name }} -f
+
+{{- if not .Values.backend.region }}
+
+NOTE: backend.region is empty. The AWS SDK in the pod will fall back to
+      whatever region resolution it can do; if your endpoint requires a
+      region (e.g. plain s3.amazonaws.com), set --set backend.region=us-east-1.
+{{- end }}
+
+{{- if eq .Values.image.repository "docker.io/abyosoftware/s4" }}
+
+NOTE: The official Docker Hub image (docker.io/abyosoftware/s4) is NOT yet
+      published as of chart 0.1.0. Build it locally and load it into your
+      cluster (kind / minikube / k3d), or push to your own registry and
+      override --set image.repository=...
+{{- end }}

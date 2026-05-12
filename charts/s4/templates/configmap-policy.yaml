@@ -1,0 +1,11 @@
+{{- if and .Values.policy.json (not .Values.policy.existingConfigMap) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "s4.policyConfigMapName" . }}
+  labels:
+    {{- include "s4.labels" . | nindent 4 }}
+data:
+  policy.json: |
+{{ .Values.policy.json | indent 4 }}
+{{- end }}

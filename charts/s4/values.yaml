@@ -1,0 +1,178 @@
+# Default values for s4.
+# This is a YAML-formatted file. Lines starting with `# --` are doc comments
+# rendered by `helm-docs`; keep them in sync with charts/s4/README.md.
+
+# -- Number of S4 gateway replicas. S4 itself is stateless (state lives in the
+# backing S3 bucket), so this can be scaled horizontally. Two replicas give a
+# basic rolling-update floor.
+replicas: 2
+
+image:
+  # -- Container image registry + repository. Note: the `abyosoftware/s4`
+  # image on Docker Hub is NOT yet published as of chart 0.1.0 — build it
+  # locally (`docker build -t abyosoftware/s4:0.3.0 .`) and `kind load
+  # docker-image abyosoftware/s4:0.3.0` (or push to your own registry) until
+  # the official image lands.
+  repository: docker.io/abyosoftware/s4
+  # -- Image tag. Defaults to .Chart.appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+  # -- Image pull secrets, e.g. [{name: regcred}].
+  pullSecrets: []
+
+# -- Override generated names.
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # -- If true, a ServiceAccount is created. If false, an existing one is used.
+  create: true
+  # -- Annotations to add to the ServiceAccount (e.g. for IRSA on EKS).
+  annotations: {}
+  # -- Name to use. If create=true and name is empty, a name is generated.
+  name: ""
+
+backend:
+  # -- REQUIRED. Backend S3 endpoint URL the gateway forwards to.
+  # Example: https://s3.us-east-1.amazonaws.com
+  endpointUrl: ""
+  # -- Optional AWS region. Set as the AWS_REGION env var on the pod; some
+  # SDK code paths require this even when --endpoint-url is explicit.
+  region: ""
+
+# -- Default compression codec. One of: cpu-zstd, nvcomp-zstd, nvcomp-bitcomp,
+# nvcomp-gdeflate, identity. nvcomp-* require gpu.enabled=true and a GPU build
+# of the image (see Dockerfile.gpu).
+codec: cpu-zstd
+
+# -- CPU zstd level (1-22). Only meaningful for cpu-zstd / when sampling
+# selects cpu-zstd at runtime.
+zstdLevel: 3
+
+# -- Codec dispatcher: "always" pins to .codec, "sampling" auto-selects per
+# object using entropy + magic-byte sampling.
+dispatcher: sampling
+
+# -- Log format: "pretty" or "json". JSON is recommended in production
+# (CloudWatch Logs / fluent-bit friendly).
+logFormat: json
+
+# -- Optional OpenTelemetry OTLP gRPC endpoint, e.g. http://otel-collector:4317.
+otlpEndpoint: ""
+
+gpu:
+  # -- Enable GPU scheduling. When true, the pod requests
+  # `nvidia.com/gpu: <count>` and a node selector / runtime class can be
+  # applied. The image MUST be the GPU build (Dockerfile.gpu) for nvCOMP to
+  # actually load.
+  enabled: false
+  # -- GPUs requested per pod.
+  count: 1
+  # -- Node selector for GPU nodes (overlaid on top of .nodeSelector).
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  # -- Optional runtime class (e.g. "nvidia" on NVIDIA Container Toolkit).
+  runtimeClassName: ""
+
+tls:
+  # -- Enable HTTPS termination on the listener. When true, the chart wires
+  # --tls-cert / --tls-key from one of the sources below.
+  enabled: false
+  # -- Inline PEM (multi-line). If both `cert` and `key` are non-empty, the
+  # chart renders a Secret and mounts it. Use `existingSecret` instead for
+  # cert-manager-managed certs.
+  cert: ""
+  key: ""
+  # -- Reference to an existing tls-type Secret (e.g. one issued by
+  # cert-manager). Keys default to the kubernetes.io/tls convention
+  # (tls.crt / tls.key); override below if your secret uses different keys.
+  existingSecret: ""
+  certKey: tls.crt
+  keyKey: tls.key
+
+policy:
+  # -- AWS-style bucket-policy JSON, multi-line string. When non-empty the
+  # chart renders a ConfigMap and passes --policy /etc/s4/policy.json.
+  # See README.md "Bucket policy enforcement" for the supported subset.
+  json: ""
+  # -- Reference to a pre-existing ConfigMap with key `policy.json`. Mutually
+  # exclusive with `policy.json`.
+  existingConfigMap: ""
+
+service:
+  type: ClusterIP
+  port: 8014
+  # -- Annotations on the Service object (e.g. for AWS NLB tuning if you
+  # change type to LoadBalancer).
+  annotations: {}
+
+ingress:
+  # -- Most production deployments will front S4 with an Ingress / Gateway
+  # for path/host routing. Disabled by default.
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: s4.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: s4-tls
+  #    hosts:
+  #      - s4.example.com
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+podAnnotations: {}
+podLabels: {}
+
+# -- Pod-level securityContext. S4 binary runs as uid 10001 in the official
+# Dockerfile.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Container-level securityContext.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -- Extra environment variables (list of {name, value} or {name, valueFrom}).
+extraEnv: []
+
+# -- Extra volumes / mounts for the pod.
+extraVolumes: []
+extraVolumeMounts: []
+
+# -- Liveness/readiness probes hit /health on the listener port.
+probes:
+  liveness:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    initialDelaySeconds: 2
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3

@@ -93,6 +93,22 @@ aws --endpoint-url http://localhost:8014 s3 cp parquet-file.parq s3://demo/
 
 See [docker-compose.gpu.yml](docker-compose.gpu.yml) for details.
 
+### Kubernetes (Helm)
+
+```bash
+helm install s4 ./charts/s4 \
+  --set backend.endpointUrl=https://s3.us-east-1.amazonaws.com \
+  --set backend.region=us-east-1
+kubectl port-forward svc/s4 8014:8014
+```
+
+The chart in [`charts/s4/`](charts/s4/) ships a stateless Deployment + Service
+(ClusterIP, port 8014), optional GPU node selector (`gpu.enabled=true` for
+nvCOMP), inline or cert-manager TLS, and bucket-policy ConfigMap. See
+[charts/s4/README.md](charts/s4/README.md) for the values table and notes
+on building the image locally (the `abyosoftware/s4` image is not yet on
+Docker Hub).
+
 ### Build from source
 
 ```bash

@@ -1,0 +1,179 @@
+{{- if not .Values.backend.endpointUrl -}}
+{{- fail "backend.endpointUrl is required (e.g. --set backend.endpointUrl=https://s3.us-east-1.amazonaws.com)" -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "s4.fullname" . }}
+  labels:
+    {{- include "s4.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      {{- include "s4.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "s4.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- if include "s4.policyActive" . }}
+        # Roll pods when the policy changes.
+        checksum/policy: {{ tpl (toYaml .Values.policy) . | sha256sum }}
+        {{- end }}
+        {{- if include "s4.tlsActive" . }}
+        checksum/tls: {{ tpl (toYaml .Values.tls) . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "s4.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if and .Values.gpu.enabled .Values.gpu.runtimeClassName }}
+      runtimeClassName: {{ .Values.gpu.runtimeClassName }}
+      {{- end }}
+      containers:
+        - name: s4
+          image: {{ include "s4.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          args:
+            - --host=0.0.0.0
+            - --port={{ .Values.service.port }}
+            - --endpoint-url={{ .Values.backend.endpointUrl }}
+            - --codec={{ .Values.codec }}
+            - --zstd-level={{ .Values.zstdLevel }}
+            - --dispatcher={{ .Values.dispatcher }}
+            - --log-format={{ .Values.logFormat }}
+            {{- if .Values.otlpEndpoint }}
+            - --otlp-endpoint={{ .Values.otlpEndpoint }}
+            - --service-name={{ include "s4.fullname" . }}
+            {{- end }}
+            {{- if include "s4.tlsActive" . }}
+            - --tls-cert=/etc/s4/tls/{{ .Values.tls.certKey }}
+            - --tls-key=/etc/s4/tls/{{ .Values.tls.keyKey }}
+            {{- end }}
+            {{- if include "s4.policyActive" . }}
+            - --policy=/etc/s4/policy/policy.json
+            {{- end }}
+          env:
+            {{- if .Values.backend.region }}
+            - name: AWS_REGION
+              value: {{ .Values.backend.region | quote }}
+            - name: AWS_DEFAULT_REGION
+              value: {{ .Values.backend.region | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+              {{- if include "s4.tlsActive" . }}
+              scheme: HTTPS
+              {{- end }}
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+              {{- if include "s4.tlsActive" . }}
+              scheme: HTTPS
+              {{- end }}
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
+          resources:
+            {{- if .Values.resources.requests }}
+            requests:
+              {{- toYaml .Values.resources.requests | nindent 14 }}
+            {{- end }}
+            limits:
+              {{- if .Values.resources.limits }}
+              {{- toYaml .Values.resources.limits | nindent 14 }}
+              {{- end }}
+              {{- if .Values.gpu.enabled }}
+              nvidia.com/gpu: {{ .Values.gpu.count }}
+              {{- end }}
+          volumeMounts:
+            # readOnlyRootFilesystem=true ⇒ give the process a writable tmp.
+            - name: tmp
+              mountPath: /tmp
+            {{- if include "s4.policyActive" . }}
+            - name: policy
+              mountPath: /etc/s4/policy
+              readOnly: true
+            {{- end }}
+            {{- if include "s4.tlsActive" . }}
+            - name: tls
+              mountPath: /etc/s4/tls
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if include "s4.policyActive" . }}
+        - name: policy
+          configMap:
+            name: {{ include "s4.policyConfigMapName" . }}
+            items:
+              - key: policy.json
+                path: policy.json
+        {{- end }}
+        {{- if include "s4.tlsActive" . }}
+        - name: tls
+          secret:
+            secretName: {{ include "s4.tlsSecretName" . }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- if or .Values.nodeSelector (and .Values.gpu.enabled .Values.gpu.nodeSelector) }}
+      nodeSelector:
+        {{- with .Values.nodeSelector }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.gpu.enabled }}
+        {{- with .Values.gpu.nodeSelector }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

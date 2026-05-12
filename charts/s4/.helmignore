@@ -1,0 +1,24 @@
+# Patterns to ignore when building Helm chart packages.
+# Same as the upstream `helm create` default plus a couple of project extras.
+.DS_Store
+.git/
+.gitignore
+.bzr/
+.bzrignore
+.hg/
+.hgignore
+.svn/
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+.project
+.idea/
+*.tmproj
+.vscode/
+# OWNERS files (Kubernetes convention)
+OWNERS
+# Local Helm artifacts
+*.tgz
+charts/

@@ -1,0 +1,32 @@
+apiVersion: v2
+name: s4
+description: Drop-in S3-compatible storage gateway with GPU-accelerated transparent compression.
+type: application
+# Chart version follows the chart itself; bump on chart-only changes.
+version: 0.1.0
+# appVersion tracks the s4-server release shipped on crates.io / Docker Hub.
+appVersion: "0.3.0"
+kubeVersion: ">=1.24.0-0"
+home: https://github.com/abyo-software/s4
+sources:
+  - https://github.com/abyo-software/s4
+keywords:
+  - s3
+  - object-storage
+  - compression
+  - gpu
+  - nvcomp
+  - zstd
+  - gateway
+maintainers:
+  - name: abyo-software
+    email: abyo.software@gmail.com
+    url: https://github.com/abyo-software
+icon: https://raw.githubusercontent.com/abyo-software/s4/main/.github/assets/logo.png
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/links: |
+    - name: Source
+      url: https://github.com/abyo-software/s4
+    - name: Issues
+      url: https://github.com/abyo-software/s4/issues
