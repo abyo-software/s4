@@ -286,6 +286,32 @@ impl<B: S3> S4Service<B> {
     }
 }
 
+/// Parse a CopySourceRange header value (`bytes=N-M`, `bytes=N-`, `bytes=-N`)
+/// into the s3s::dto::Range used by the GetObject path. The S3 spec only
+/// allows `bytes=N-M` for upload_part_copy (no suffix or open-ended), so
+/// reject the other variants for parity with AWS.
+fn parse_copy_source_range(s: &str) -> Result<s3s::dto::Range, String> {
+    let rest = s
+        .strip_prefix("bytes=")
+        .ok_or_else(|| format!("CopySourceRange must start with 'bytes=', got {s:?}"))?;
+    let (a, b) = rest
+        .split_once('-')
+        .ok_or_else(|| format!("CopySourceRange must be 'bytes=N-M', got {s:?}"))?;
+    let first: u64 = a
+        .parse()
+        .map_err(|_| format!("CopySourceRange first byte not a number: {a:?}"))?;
+    let last: u64 = b
+        .parse()
+        .map_err(|_| format!("CopySourceRange last byte not a number: {b:?}"))?;
+    if last < first {
+        return Err(format!("CopySourceRange last < first: {s:?}"));
+    }
+    Ok(s3s::dto::Range::Int {
+        first,
+        last: Some(last),
+    })
+}
+
 fn is_multipart_object(metadata: &Option<Metadata>) -> bool {
     metadata
         .as_ref()
@@ -1080,10 +1106,149 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<UploadPartCopyInput>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
-        // 注: source が S4-compressed の場合、bytes の partial copy は壊れる。
-        //     S3 spec の仕様上 byte-range で copy できるが、S4 の compress block
-        //     boundary とは無関係。Phase 2 で per-part 圧縮を入れた後に再考。
-        self.backend.upload_part_copy(req).await
+        // v0.2 #6: byte-range aware copy when the source is S4-framed.
+        //
+        // For a framed source (multipart upload OR single-PUT framed-v2),
+        // a naive byte-range passthrough would copy compressed bytes that
+        // don't align with S4 frame boundaries — silently corrupting the
+        // result. Instead we GET the source through S4 (which handles
+        // decompression + Range), re-compress + re-frame as a new part,
+        // and forward as upload_part. For non-framed sources (S4-untouched
+        // raw objects), passthrough is correct and we keep the original
+        // (cheaper) code path.
+        let CopySource::Bucket {
+            bucket: src_bucket,
+            key: src_key,
+            ..
+        } = &req.input.copy_source
+        else {
+            return self.backend.upload_part_copy(req).await;
+        };
+        let src_bucket = src_bucket.to_string();
+        let src_key = src_key.to_string();
+
+        // Probe metadata to decide whether the source needs S4-aware copy.
+        let head_input = HeadObjectInput {
+            bucket: src_bucket.clone(),
+            key: src_key.clone(),
+            ..Default::default()
+        };
+        let head_req = S3Request {
+            input: head_input,
+            method: http::Method::HEAD,
+            uri: req.uri.clone(),
+            headers: req.headers.clone(),
+            extensions: http::Extensions::new(),
+            credentials: req.credentials.clone(),
+            region: req.region.clone(),
+            service: req.service.clone(),
+            trailing_headers: None,
+        };
+        let needs_s4_copy = match self.backend.head_object(head_req).await {
+            Ok(h) => {
+                is_multipart_object(&h.output.metadata) || is_framed_v2_object(&h.output.metadata)
+            }
+            Err(_) => false,
+        };
+        if !needs_s4_copy {
+            return self.backend.upload_part_copy(req).await;
+        }
+
+        // Resolve the optional source byte range to pass to GET.
+        let source_range = req
+            .input
+            .copy_source_range
+            .as_ref()
+            .map(|r| parse_copy_source_range(r))
+            .transpose()
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, e))?;
+
+        // GET source via S4 (handles decompression + sidecar partial fetch
+        // when range is present). The result is the requested user-visible
+        // byte range, fully decompressed.
+        let mut get_input = GetObjectInput {
+            bucket: src_bucket.clone(),
+            key: src_key.clone(),
+            ..Default::default()
+        };
+        get_input.range = source_range;
+        let get_req = S3Request {
+            input: get_input,
+            method: http::Method::GET,
+            uri: req.uri.clone(),
+            headers: req.headers.clone(),
+            extensions: http::Extensions::new(),
+            credentials: req.credentials.clone(),
+            region: req.region.clone(),
+            service: req.service.clone(),
+            trailing_headers: None,
+        };
+        let get_resp = self.get_object(get_req).await?;
+        let blob = get_resp.output.body.ok_or_else(|| {
+            S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "upload_part_copy: empty body from source GET",
+            )
+        })?;
+        let bytes = collect_blob(blob, self.max_body_bytes)
+            .await
+            .map_err(internal("collect upload_part_copy source body"))?;
+
+        // Compress + frame as a fresh part (mirrors upload_part path).
+        let sample_len = bytes.len().min(SAMPLE_BYTES);
+        let codec_kind = self.dispatcher.pick(&bytes[..sample_len]).await;
+        let original_size = bytes.len() as u64;
+        let (compressed, manifest) = self
+            .registry
+            .compress(bytes, codec_kind)
+            .await
+            .map_err(internal("registry compress upload_part_copy"))?;
+        let header = FrameHeader {
+            codec: codec_kind,
+            original_size,
+            compressed_size: compressed.len() as u64,
+            crc32c: manifest.crc32c,
+        };
+        let mut framed = BytesMut::with_capacity(FRAME_HEADER_BYTES + compressed.len());
+        write_frame(&mut framed, header, &compressed);
+        let likely_final = original_size < S3_MULTIPART_MIN_PART_BYTES as u64;
+        if !likely_final {
+            pad_to_minimum(&mut framed, S3_MULTIPART_MIN_PART_BYTES);
+        }
+        let framed_bytes = framed.freeze();
+        let framed_len = framed_bytes.len() as i64;
+
+        // Forward as upload_part to the destination multipart upload.
+        let part_input = UploadPartInput {
+            bucket: req.input.bucket.clone(),
+            key: req.input.key.clone(),
+            part_number: req.input.part_number,
+            upload_id: req.input.upload_id.clone(),
+            body: Some(bytes_to_blob(framed_bytes)),
+            content_length: Some(framed_len),
+            ..Default::default()
+        };
+        let part_req = S3Request {
+            input: part_input,
+            method: http::Method::PUT,
+            uri: req.uri.clone(),
+            headers: req.headers.clone(),
+            extensions: http::Extensions::new(),
+            credentials: req.credentials.clone(),
+            region: req.region.clone(),
+            service: req.service.clone(),
+            trailing_headers: None,
+        };
+        let upload_resp = self.backend.upload_part(part_req).await?;
+
+        let copy_output = UploadPartCopyOutput {
+            copy_part_result: Some(CopyPartResult {
+                e_tag: upload_resp.output.e_tag.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Ok(S3Response::new(copy_output))
     }
 
     // ---- Object lock / retention / legal hold ----
@@ -1446,5 +1611,37 @@ mod tests {
         meta.insert(META_CODEC.into(), "cpu-zstd".into());
         let opt = Some(meta);
         assert!(extract_manifest(&opt).is_none());
+    }
+
+    #[test]
+    fn parse_copy_source_range_basic() {
+        let r = parse_copy_source_range("bytes=10-20").unwrap();
+        match r {
+            s3s::dto::Range::Int { first, last } => {
+                assert_eq!(first, 10);
+                assert_eq!(last, Some(20));
+            }
+            _ => panic!("expected Int range"),
+        }
+    }
+
+    #[test]
+    fn parse_copy_source_range_rejects_inverted() {
+        let err = parse_copy_source_range("bytes=20-10").unwrap_err();
+        assert!(err.contains("last < first"));
+    }
+
+    #[test]
+    fn parse_copy_source_range_rejects_missing_prefix() {
+        let err = parse_copy_source_range("10-20").unwrap_err();
+        assert!(err.contains("must start with 'bytes='"));
+    }
+
+    #[test]
+    fn parse_copy_source_range_rejects_open_ended() {
+        // S3 upload_part_copy spec requires N-M (closed); suffix and
+        // open-ended forms are not allowed for this header.
+        assert!(parse_copy_source_range("bytes=10-").is_err());
+        assert!(parse_copy_source_range("bytes=-10").is_err());
     }
 }

@@ -380,6 +380,100 @@ async fn multipart_range_get_uses_sidecar_partial_fetch() {
     let _ = shutdown.send(());
 }
 
+/// v0.2 #6: upload_part_copy from a framed source object copies the
+/// **user-visible** byte range (decompressed), not raw compressed bytes.
+/// Validates the byte-range translation through the sidecar / GET path.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn upload_part_copy_with_range_from_framed_source() {
+    let minio = start_minio().await;
+    let (s4_endpoint, shutdown) = spawn_s4_server(&minio.endpoint_url).await;
+    let backend = build_aws_client(&minio.endpoint_url);
+    let _ = backend.create_bucket().bucket("upcp").send().await;
+    let s4_client = build_aws_client(&s4_endpoint);
+
+    // 1) PUT a 6 MiB single-PUT object (will be framed-v2 with sidecar)
+    let payload: Bytes = (0u32..(6 * 1024 * 1024 / 4))
+        .flat_map(|n| n.to_le_bytes())
+        .collect::<Vec<u8>>()
+        .into();
+    s4_client
+        .put_object()
+        .bucket("upcp")
+        .key("source.bin")
+        .body(payload.clone().into())
+        .send()
+        .await
+        .expect("put source");
+
+    // 2) Start a destination multipart and upload_part_copy a slice
+    let create = s4_client
+        .create_multipart_upload()
+        .bucket("upcp")
+        .key("dest.bin")
+        .send()
+        .await
+        .expect("create_multipart_upload");
+    let upload_id = create.upload_id().expect("upload_id").to_string();
+
+    // Copy bytes 100_000..=199_999 (100 KiB user-visible) as part 1
+    let copy_start = 100_000u64;
+    let copy_end_inclusive = 199_999u64;
+    let resp = s4_client
+        .upload_part_copy()
+        .bucket("upcp")
+        .key("dest.bin")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .copy_source("upcp/source.bin")
+        .copy_source_range(format!("bytes={copy_start}-{copy_end_inclusive}"))
+        .send()
+        .await
+        .expect("upload_part_copy");
+    let etag = resp
+        .copy_part_result
+        .as_ref()
+        .and_then(|r| r.e_tag.clone())
+        .unwrap_or_default();
+
+    s4_client
+        .complete_multipart_upload()
+        .bucket("upcp")
+        .key("dest.bin")
+        .upload_id(&upload_id)
+        .multipart_upload(
+            aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                .set_parts(Some(vec![
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .e_tag(etag)
+                        .part_number(1)
+                        .build(),
+                ]))
+                .build(),
+        )
+        .send()
+        .await
+        .expect("complete_multipart_upload");
+
+    // 3) GET the destination — should be byte-equal to source[100_000..=199_999]
+    let resp = s4_client
+        .get_object()
+        .bucket("upcp")
+        .key("dest.bin")
+        .send()
+        .await
+        .expect("get dest");
+    let got = resp.body.collect().await.expect("body").into_bytes();
+    let expected = &payload[copy_start as usize..=copy_end_inclusive as usize];
+    assert_eq!(
+        got.as_ref(),
+        expected,
+        "upload_part_copy must copy the user-visible byte range, not raw compressed bytes"
+    );
+
+    let _ = shutdown.send(());
+}
+
 /// v0.2 #5: the final part of a multipart with a tiny highly-compressible
 /// tail must NOT be padded. Validates that the stored S3 size of the last
 /// part is close to (compressed payload + frame header), nowhere near the
