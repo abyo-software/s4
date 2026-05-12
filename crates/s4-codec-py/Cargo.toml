@@ -1,0 +1,62 @@
+[package]
+name = "s4-codec-py"
+version = "0.1.0"
+# Edition 2021 (not 2024) — PyO3 0.22's proc-macros generate code that
+# trips edition-2024's `unsafe-op-in-unsafe-fn` hard-error. Upgrading to
+# pyo3 0.23+ would let us go to 2024, but 0.22 is the latest stable line
+# documented in the issue and the rest of the workspace's pin.
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "README.md"
+description = "Python (pyo3) bindings for s4-codec — in-process GPU/CPU compression for ML / ETL pipelines."
+
+# NOTE: we deliberately do NOT inherit `[workspace.lints]` (which sets
+# `unsafe_code = "deny"`) — the `pyo3` proc-macros expand to `unsafe`
+# blocks (FFI into CPython is inherently unsafe), so denying unsafe code
+# here would block compilation. The unsafe surface is confined to the
+# pyo3-generated glue; our own code stays safe Rust.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+# pyo3 0.22's `#[pymethods]` macro expands `PyResult` return types to
+# include a `.into()` that's a no-op when the function already returns
+# `PyResult<T>` directly. Filing this against pyo3 upstream isn't worth
+# blocking the workspace's `-D warnings` clippy gate on.
+useless_conversion = "allow"
+
+[lib]
+name = "s4_codec"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+# Forward to s4-codec/nvcomp-gpu. Requires CUDA toolchain at build time and
+# a CUDA-capable GPU at runtime. See README.md for details.
+nvcomp-gpu = ["s4-codec-rs/nvcomp-gpu"]
+
+[dependencies]
+# `extension-module` tells PyO3 to *not* link libpython into the cdylib
+# (the Python interpreter that loads the .so provides those symbols at
+# runtime). This is what makes the cdylib build cleanly on a CI runner
+# that has no Python development package installed — `cargo check` /
+# `cargo build` produce a .so that's only meant to be loaded by Python,
+# never executed standalone.
+#
+# `abi3-py39` opts into the CPython stable ABI ≥ 3.9, which means a single
+# wheel works on any CPython 3.9..=latest *and* `cargo check` doesn't
+# bind to the host's Python minor version (so a runner with bleeding-edge
+# Python 3.14 doesn't trip PyO3 0.22's "newer than PyO3's maximum
+# supported version" guard).
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+# Renamed import (`s4_codec_rs` instead of the crate's natural `s4_codec`)
+# so the symbol doesn't collide with our own cdylib's library name
+# (`s4_codec`, dictated by the Python module name).
+s4-codec-rs = { package = "s4-codec", path = "../s4-codec", version = "0.3.0" }
+bytes = { workspace = true }
+tokio = { workspace = true }

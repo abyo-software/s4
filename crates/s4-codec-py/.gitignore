@@ -1,0 +1,13 @@
+# maturin / wheel build artifacts
+target/wheels/
+*.whl
+*.tar.gz
+
+# venv used for `maturin develop`
+.venv/
+venv/
+
+# pytest / pyc
+__pycache__/
+*.pyc
+.pytest_cache/

@@ -1,0 +1,42 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "s4-codec"
+version = "0.1.0"
+description = "Python bindings for s4-codec — in-process GPU/CPU compression (zstd / gzip / nvCOMP) for ML and ETL pipelines."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "abyo software 合同会社" },
+    { name = "masumi-ryugo", email = "abyo.software@gmail.com" },
+]
+keywords = ["s3", "compression", "gpu", "nvcomp", "zstd", "gzip"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: System :: Archiving :: Compression",
+]
+
+[project.urls]
+Homepage = "https://github.com/abyo-software/s4"
+Repository = "https://github.com/abyo-software/s4"
+Documentation = "https://github.com/abyo-software/s4#readme"
+Issues = "https://github.com/abyo-software/s4/issues"
+
+[tool.maturin]
+# The cdylib's library name is `s4_codec` (= the importable Python module).
+# Maturin maps that to the `s4-codec` PyPI distribution name automatically.
+module-name = "s4_codec"
+features = ["pyo3/extension-module"]
+strip = true
