@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-13
+
+Twelve v0.4 milestone issues delivered (#15–#26). Theme: **production
+operations, language reach, security, ecosystem**. The gateway now has
+rate limiting, S3-style access logs, server-managed at-rest encryption
+and adaptive streaming chunk sizing, plus a CPU-gzip codec that yields
+plain `gunzip`-decodable bytes. Reach extends with PyO3 in-process
+binding, a wasm32 browser-side decoder, and a Helm chart for K8s
+deployments. Operations get a one-command AWS-E2E nightly bootstrap
+and storage-class transition guidance.
+
+### Added
+
+- **AWS-E2E one-command bootstrap** (#15) — `scripts/bootstrap-aws-e2e.sh`
+  drives `terraform apply` (S3 bucket + IAM role) and pushes the
+  outputs into `gh variable set` so the nightly E2E workflow can run
+  unattended. No new AWS resources are created if the workflow is
+  never enabled — operator opt-in.
+- **Adaptive S4F2 chunk sizing** (#16) — `pick_chunk_size(content_length)`
+  picks 1 MiB / 4 MiB / 16 MiB tiers (≤1 MiB / ≤100 MiB / >100 MiB).
+  Small objects no longer pay the multi-frame overhead; large objects
+  parallelise more under streaming pipelining (#12).
+- **`list_object_versions` filters S4 sidecars** (#17) — `.s4ix`
+  sidecars never surface to clients, matching the existing
+  `list_objects_v2` behaviour.
+- **Wire-overhead micro-bench for v0.2 framed single-PUT** (#18) —
+  `bench_framed_overhead.rs` measures the 28-byte S4F2 header cost:
+  23.14 % on 1 KiB, 0.23 % on 100 KiB, 0.03 % on 1 MiB. Documents the
+  small-object regime where the overhead is non-trivial and points
+  callers at adaptive sizing (#16).
+- **Token-bucket rate limiting** (#19) — `--rate-limit` accepts a
+  glob-matched ruleset (e.g. `principal=alice,bucket=hot,rps=200,burst=400`)
+  with first-match-wins evaluation and per-(rule, principal, bucket)
+  limiter cells via `governor` + `dashmap`. New
+  `s4_rate_limit_throttled_total{rule,bucket}` Prometheus counter.
+- **S3-style access log emission** (#20) — `--access-log local:dir/`
+  writes hourly-rotated S3 server-access-log lines (one per
+  PUT/GET/HEAD/DELETE) covering remote IP, principal, bucket+key,
+  status, bytes, and request-id. `s3://` destinations are explicitly
+  rejected with a clear error (deferred to follow-up).
+- **SSE-S4 server-managed AES-256-GCM at rest** (#21) — `--sse-s4-key`
+  takes a 32-byte key (raw / hex / base64). PUT compresses → encrypts
+  with the new `S4E1` wire frame (4-byte magic + 1-byte algo + 12-byte
+  nonce + 16-byte tag + ciphertext); GET reverses it. Tampered
+  ciphertext fails AES-GCM auth and surfaces as InternalError;
+  encrypted GET against a no-key gateway surfaces as InvalidRequest.
+  Scope cuts (deferred): SSE-C, per-object KMS, key rotation.
+- **Storage-class transition guidance** (#22) —
+  `docs/storage-class-transitions.md` documents the sidecar coupling
+  rule (object + `.s4ix` must transition together) and gives a Terraform
+  lifecycle example matching both prefixes.
+- **Python binding via PyO3** (#23) — new `crates/s4-codec-py/`
+  exposes `CpuZstd`, `CpuGzip`, and `gpu_available()` to Python
+  through `abi3-py39`. `maturin build` ships a single wheel that
+  works across CPython 3.9+. Publish flow documented in the crate
+  README (PyPI credentials not in CI yet).
+- **Browser-side WASM decoder** (#24) — new `crates/s4-codec-wasm/`
+  builds to `wasm32-unknown-unknown` and exposes
+  `decompressFramed(bytes)` / `decompressSingle(bytes, codec_id)` /
+  `supportedCodecs()` via wasm-bindgen. Lets a static-site frontend
+  decode S4F2 objects served straight from S3 with no gateway hop.
+  npm publish flow documented (npm token not in CI yet).
+- **Helm chart MVP** (#25) — `charts/s4/` (Chart.yaml + values.yaml +
+  templates/) deploys S4 to Kubernetes with configurable upstream
+  endpoint, replicas, ServiceMonitor for Prometheus, and an optional
+  `Secret` for the SSE-S4 key. ArtifactHub publish flow documented.
+- **`cpu-gzip` codec wire-compatible with stock `gunzip`** (#26) —
+  new `CodecKind::CpuGzip` (id `7`) using `flate2` produces plain
+  RFC 1952 gzip framing so a downstream consumer can `gunzip < object`
+  without S4 in the loop. Decompression-bomb hardening caps output at
+  100× input or 4 GiB, whichever is smaller.
+
+### Changed
+
+- Workspace gains `crates/s4-codec-py` and `crates/s4-codec-wasm`
+  members.
+
+### Notes
+
+- **PyPI / npm / ArtifactHub publish are out-of-band** for v0.4 — the
+  artifacts are buildable from the tagged tree and the publish flows
+  are documented per crate, but no credentials live in CI yet.
+- **AWS-E2E nightly remains opt-in.** The bootstrap script is a tool;
+  no resources get created until an operator runs it on their own
+  account.
+
 ## [0.3.0] — 2026-05-12
 
 Five v0.3 milestone issues delivered (#10 #11 #12 #13 #14). Theme:
