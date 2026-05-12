@@ -33,6 +33,7 @@ use std::sync::Arc;
 use bytes::BytesMut;
 use s3s::dto::*;
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use s4_codec::index::{FrameIndex, build_index_from_body, decode_index, encode_index, sidecar_key};
 use s4_codec::multipart::{
     FRAME_HEADER_BYTES, FrameHeader, FrameIter, S3_MULTIPART_MIN_PART_BYTES, pad_to_minimum,
     write_frame,
@@ -85,6 +86,173 @@ impl<B: S3> S4Service<B> {
     /// テスト用: backend を取り戻す (test helper、production では使わない)
     pub fn into_backend(self) -> B {
         self.backend
+    }
+
+    /// 必要 frame だけを backend に Range GET し、frame parse + decompress + slice
+    /// した結果を返す sidecar fast path。Range request の **帯域節約版**。
+    async fn partial_range_get(
+        &self,
+        req: &S3Request<GetObjectInput>,
+        plan: s4_codec::index::RangePlan,
+        client_start: u64,
+        client_end_exclusive: u64,
+        total_original: u64,
+        get_start: Instant,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        // 必要 byte 範囲だけを backend に partial GET
+        let backend_range = s3s::dto::Range::Int {
+            first: plan.byte_start,
+            last: Some(plan.byte_end_exclusive - 1),
+        };
+        let backend_input = GetObjectInput {
+            bucket: req.input.bucket.clone(),
+            key: req.input.key.clone(),
+            range: Some(backend_range),
+            ..Default::default()
+        };
+        let backend_req = S3Request {
+            input: backend_input,
+            method: req.method.clone(),
+            uri: req.uri.clone(),
+            headers: req.headers.clone(),
+            extensions: http::Extensions::new(),
+            credentials: req.credentials.clone(),
+            region: req.region.clone(),
+            service: req.service.clone(),
+            trailing_headers: None,
+        };
+        let mut backend_resp = self.backend.get_object(backend_req).await?;
+        let blob = backend_resp.output.body.take().ok_or_else(|| {
+            S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "backend partial GET returned empty body",
+            )
+        })?;
+        let bytes = collect_blob(blob, self.max_body_bytes)
+            .await
+            .map_err(internal("collect partial body"))?;
+
+        // frame parse + decompress
+        let mut combined = BytesMut::new();
+        for frame in FrameIter::new(bytes) {
+            let (header, payload) = frame.map_err(|e| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("partial-range frame parse: {e}"),
+                )
+            })?;
+            let chunk_manifest = ChunkManifest {
+                codec: header.codec,
+                original_size: header.original_size,
+                compressed_size: header.compressed_size,
+                crc32c: header.crc32c,
+            };
+            let decompressed = self
+                .registry
+                .decompress(payload, &chunk_manifest)
+                .await
+                .map_err(internal("partial-range decompress"))?;
+            combined.extend_from_slice(&decompressed);
+        }
+        let combined = combined.freeze();
+        let sliced = combined
+            .slice(plan.slice_start_in_combined as usize..plan.slice_end_in_combined as usize);
+
+        // response 組立て
+        let returned_size = sliced.len() as u64;
+        backend_resp.output.content_length = Some(returned_size as i64);
+        backend_resp.output.content_range = Some(format!(
+            "bytes {client_start}-{}/{total_original}",
+            client_end_exclusive - 1
+        ));
+        backend_resp.output.checksum_crc32 = None;
+        backend_resp.output.checksum_crc32c = None;
+        backend_resp.output.checksum_crc64nvme = None;
+        backend_resp.output.checksum_sha1 = None;
+        backend_resp.output.checksum_sha256 = None;
+        backend_resp.output.e_tag = None;
+        backend_resp.output.body = Some(bytes_to_blob(sliced));
+        backend_resp.status = Some(http::StatusCode::PARTIAL_CONTENT);
+
+        let elapsed = get_start.elapsed();
+        crate::metrics::record_get(
+            "partial",
+            plan.byte_end_exclusive - plan.byte_start,
+            returned_size,
+            elapsed.as_secs_f64(),
+            true,
+        );
+        info!(
+            op = "get_object",
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            bytes_in = plan.byte_end_exclusive - plan.byte_start,
+            bytes_out = returned_size,
+            total_object_size = total_original,
+            range = true,
+            path = "sidecar-partial",
+            latency_ms = elapsed.as_millis() as u64,
+            "S4 partial Range GET via sidecar index"
+        );
+        Ok(backend_resp)
+    }
+
+    /// `<key>.s4index` sidecar object を backend に書く。失敗しても本体 PUT は
+    /// 成功扱いにしたいので、err は warn ログのみ (Range GET の partial path が
+    /// 使えなくなるが、full read fallback で意味的には正しい結果を返す)。
+    async fn write_sidecar(&self, bucket: &str, key: &str, index: &FrameIndex) {
+        let bytes = encode_index(index);
+        let len = bytes.len() as i64;
+        let put_input = PutObjectInput {
+            bucket: bucket.into(),
+            key: sidecar_key(key),
+            body: Some(bytes_to_blob(bytes)),
+            content_length: Some(len),
+            content_type: Some("application/x-s4-index".into()),
+            ..Default::default()
+        };
+        let put_req = S3Request {
+            input: put_input,
+            method: http::Method::PUT,
+            uri: format!("/{bucket}/{}", sidecar_key(key)).parse().unwrap(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        if let Err(e) = self.backend.put_object(put_req).await {
+            tracing::warn!(
+                bucket,
+                key,
+                "S4 write_sidecar failed (Range GET will fall back to full read): {e}"
+            );
+        }
+    }
+
+    /// `<key>.s4index` sidecar を backend から読み出す。なければ None。
+    async fn read_sidecar(&self, bucket: &str, key: &str) -> Option<FrameIndex> {
+        let get_input = GetObjectInput {
+            bucket: bucket.into(),
+            key: sidecar_key(key),
+            ..Default::default()
+        };
+        let get_req = S3Request {
+            input: get_input,
+            method: http::Method::GET,
+            uri: format!("/{bucket}/{}", sidecar_key(key)).parse().unwrap(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let resp = self.backend.get_object(get_req).await.ok()?;
+        let blob = resp.output.body?;
+        let bytes = collect_blob(blob, 64 * 1024 * 1024).await.ok()?;
+        decode_index(bytes).ok()
     }
 
     /// Multipart object (frame 列) を解凍 → 元 bytes を再構築。
@@ -278,6 +446,11 @@ impl<B: S3> S3 for S4Service<B> {
             let codec_label = manifest.codec.as_str();
             req.input.body = Some(bytes_to_blob(compressed));
             let backend_resp = self.backend.put_object(req).await;
+            // 単発 PUT は frame 化していない (raw 圧縮 bytes をそのまま流す) ので
+            // sidecar は書かない。書いても partial-range fast path で
+            // S4F2 magic が見つからず failure する。Phase 2.2 で non-multipart も
+            // 全て frame 化に統一すれば sidecar を書ける (今は multipart 限定)
+            let _ = (original_size, compressed_size); // mute unused warnings
             let elapsed = put_start.elapsed();
             crate::metrics::record_put(
                 codec_label,
@@ -315,10 +488,27 @@ impl<B: S3> S3 for S4Service<B> {
         let get_bucket = req.input.bucket.clone();
         let get_key = req.input.key.clone();
         // Range request の事前検出 (decompress 後 slice する path に使う)。
-        // S4-managed object に対する Range は full-object decompress + slice で
-        // 実装する (= 帯域節約はないが意味的に正しい)。Phase 2.1 で frame index
-        // sidecar を経由した部分 fetch + decompress に最適化予定。
         let range_request = req.input.range.take();
+
+        // ====== Range GET の partial-fetch fast path (sidecar index 利用) ======
+        // sidecar `<key>.s4index` が存在し、multipart-framed object であれば
+        // 必要 frame だけを backend に Range GET し帯域節約する。
+        if let Some(ref r) = range_request
+            && let Some(index) = self.read_sidecar(&req.input.bucket, &req.input.key).await
+        {
+            let total = index.total_original_size();
+            let (start, end_exclusive) = match resolve_range(r, total) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(S3Error::with_message(S3ErrorCode::InvalidRange, e));
+                }
+            };
+            if let Some(plan) = index.lookup_range(start, end_exclusive) {
+                return self
+                    .partial_range_get(&req, plan, start, end_exclusive, total, get_start)
+                    .await;
+            }
+        }
         let mut resp = self.backend.get_object(req).await?;
         let is_multipart = is_multipart_object(&resp.output.metadata);
         let manifest_opt = extract_manifest(&resp.output.metadata);
@@ -508,7 +698,28 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        self.backend.delete_object(req).await
+        // sidecar も best-effort で削除 (失敗は無視 — 存在しない場合や IAM 制限を許容)
+        let bucket = req.input.bucket.clone();
+        let key = req.input.key.clone();
+        let resp = self.backend.delete_object(req).await?;
+        let sidecar_input = DeleteObjectInput {
+            bucket: bucket.clone(),
+            key: sidecar_key(&key),
+            ..Default::default()
+        };
+        let sidecar_req = S3Request {
+            input: sidecar_input,
+            method: http::Method::DELETE,
+            uri: format!("/{bucket}/{}", sidecar_key(&key)).parse().unwrap(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let _ = self.backend.delete_object(sidecar_req).await;
+        Ok(resp)
     }
     async fn delete_objects(
         &self,
@@ -584,13 +795,37 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<ListObjectsInput>,
     ) -> S3Result<S3Response<ListObjectsOutput>> {
-        self.backend.list_objects(req).await
+        let mut resp = self.backend.list_objects(req).await?;
+        // S4 内部 object (`*.s4index` sidecar 等) を顧客から隠す
+        if let Some(contents) = resp.output.contents.as_mut() {
+            contents.retain(|o| {
+                o.key
+                    .as_ref()
+                    .map(|k| !k.ends_with(".s4index"))
+                    .unwrap_or(true)
+            });
+        }
+        Ok(resp)
     }
     async fn list_objects_v2(
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
-        self.backend.list_objects_v2(req).await
+        let mut resp = self.backend.list_objects_v2(req).await?;
+        if let Some(contents) = resp.output.contents.as_mut() {
+            let before = contents.len();
+            contents.retain(|o| {
+                o.key
+                    .as_ref()
+                    .map(|k| !k.ends_with(".s4index"))
+                    .unwrap_or(true)
+            });
+            // key_count も補正 (S3 spec compliance)
+            if let Some(kc) = resp.output.key_count.as_mut() {
+                *kc -= (before - contents.len()) as i32;
+            }
+        }
+        Ok(resp)
     }
     async fn create_multipart_upload(
         &self,
@@ -673,7 +908,40 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        self.backend.complete_multipart_upload(req).await
+        let bucket = req.input.bucket.clone();
+        let key = req.input.key.clone();
+        let resp = self.backend.complete_multipart_upload(req).await?;
+        // CompleteMultipartUpload 成功 → 完成した object を full fetch して frame
+        // index を build、`<key>.s4index` sidecar として保存。これで Range GET の
+        // partial fetch path が利用可能になる (Range request の帯域節約)。
+        // 注: 巨大 object の場合この pass は重いが、Range query は一度 sidecar が
+        // できれば爆速になるので 1 回の cost は payback される
+        let bucket_clone = bucket.clone();
+        let key_clone = key.clone();
+        let get_input = GetObjectInput {
+            bucket: bucket_clone.clone(),
+            key: key_clone.clone(),
+            ..Default::default()
+        };
+        let get_req = S3Request {
+            input: get_input,
+            method: http::Method::GET,
+            uri: format!("/{bucket_clone}/{key_clone}").parse().unwrap(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        if let Ok(get_resp) = self.backend.get_object(get_req).await
+            && let Some(blob) = get_resp.output.body
+            && let Ok(body) = collect_blob(blob, self.max_body_bytes).await
+            && let Ok(index) = build_index_from_body(&body)
+        {
+            self.write_sidecar(&bucket, &key, &index).await;
+        }
+        Ok(resp)
     }
     async fn abort_multipart_upload(
         &self,

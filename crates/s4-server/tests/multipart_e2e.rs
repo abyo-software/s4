@@ -232,3 +232,150 @@ async fn multipart_upload_through_s4_with_per_part_compression() {
 
     let _ = shutdown.send(());
 }
+
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn multipart_range_get_uses_sidecar_partial_fetch() {
+    // multipart object に対する Range GET が sidecar `<key>.s4index` を経由して
+    // partial fetch (帯域節約) で動作することを確認。
+    let minio = start_minio().await;
+    let (s4_endpoint, shutdown) = spawn_s4_server(&minio.endpoint_url).await;
+    let backend = build_aws_client(&minio.endpoint_url);
+    let _ = backend.create_bucket().bucket("range-mp").send().await;
+
+    let s4_client = build_aws_client(&s4_endpoint);
+
+    // 30 MB × 3 part の multipart を作る
+    const PART_SIZE: usize = 30 * 1024 * 1024;
+    fn make_part(seed: u8, size: usize) -> Bytes {
+        let mut buf = Vec::with_capacity(size);
+        let pattern = format!("PART-{seed:02x} ");
+        while buf.len() < size {
+            buf.extend_from_slice(pattern.as_bytes());
+        }
+        buf.truncate(size);
+        Bytes::from(buf)
+    }
+    let parts = [
+        make_part(0xa, PART_SIZE),
+        make_part(0xb, PART_SIZE),
+        make_part(0xc, PART_SIZE),
+    ];
+    let mut full = Vec::with_capacity(PART_SIZE * 3);
+    for p in &parts {
+        full.extend_from_slice(p);
+    }
+    let full_payload = Bytes::from(full);
+
+    let create = s4_client
+        .create_multipart_upload()
+        .bucket("range-mp")
+        .key("big.dat")
+        .send()
+        .await
+        .expect("create");
+    let upload_id = create.upload_id().expect("upload_id").to_string();
+    let mut completed_parts = Vec::new();
+    for (i, p) in parts.iter().enumerate() {
+        let pn = (i + 1) as i32;
+        let resp = s4_client
+            .upload_part()
+            .bucket("range-mp")
+            .key("big.dat")
+            .upload_id(&upload_id)
+            .part_number(pn)
+            .body(p.clone().into())
+            .send()
+            .await
+            .expect("upload_part");
+        completed_parts.push(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .e_tag(resp.e_tag().unwrap_or_default())
+                .part_number(pn)
+                .build(),
+        );
+    }
+    s4_client
+        .complete_multipart_upload()
+        .bucket("range-mp")
+        .key("big.dat")
+        .upload_id(&upload_id)
+        .multipart_upload(
+            aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                .set_parts(Some(completed_parts))
+                .build(),
+        )
+        .send()
+        .await
+        .expect("complete");
+
+    // sidecar が backend に書かれていることを raw で確認
+    let sidecar = backend
+        .get_object()
+        .bucket("range-mp")
+        .key("big.dat.s4index")
+        .send()
+        .await
+        .expect("sidecar must be written by complete_multipart_upload");
+    let sidecar_bytes = sidecar
+        .body
+        .collect()
+        .await
+        .expect("sidecar body")
+        .into_bytes();
+    assert!(
+        sidecar_bytes.len() > 32,
+        "sidecar should have header + entries, got {} bytes",
+        sidecar_bytes.len()
+    );
+    assert_eq!(&sidecar_bytes[..4], b"S4IX", "sidecar magic mismatch");
+
+    // mid-range request: PART_SIZE × 1.5 周辺 = part 1 後半 + part 2 前半の境界
+    let start = (PART_SIZE * 3 / 2 - 1000) as u64;
+    let end = (PART_SIZE * 3 / 2 + 1000) as u64;
+    let resp = s4_client
+        .get_object()
+        .bucket("range-mp")
+        .key("big.dat")
+        .range(format!("bytes={start}-{}", end - 1))
+        .send()
+        .await
+        .expect("range get");
+    let body = resp.body.collect().await.expect("body").into_bytes();
+    assert_eq!(body.len(), 2000);
+    assert_eq!(body.as_ref(), &full_payload[start as usize..end as usize]);
+
+    // suffix range
+    let resp = s4_client
+        .get_object()
+        .bucket("range-mp")
+        .key("big.dat")
+        .range("bytes=-1024")
+        .send()
+        .await
+        .expect("suffix range");
+    let body = resp.body.collect().await.expect("body").into_bytes();
+    assert_eq!(body.len(), 1024);
+    assert_eq!(body.as_ref(), &full_payload[full_payload.len() - 1024..]);
+
+    // sidecar 削除後は full-read fallback でも動作すること
+    backend
+        .delete_object()
+        .bucket("range-mp")
+        .key("big.dat.s4index")
+        .send()
+        .await
+        .expect("delete sidecar");
+    let resp = s4_client
+        .get_object()
+        .bucket("range-mp")
+        .key("big.dat")
+        .range(format!("bytes={start}-{}", end - 1))
+        .send()
+        .await
+        .expect("range get after sidecar deleted (fallback)");
+    let body = resp.body.collect().await.expect("body").into_bytes();
+    assert_eq!(body.as_ref(), &full_payload[start as usize..end as usize]);
+
+    let _ = shutdown.send(());
+}
