@@ -76,6 +76,79 @@ pub enum BlobError {
     Read(String),
 }
 
+/// `blob` の先頭から最大 `sample_bytes` を読み出して `(sample, rest_stream)` に分ける。
+/// `sample` は collected Bytes、`rest_stream` は残りの未消費 chunk ストリーム。
+/// stream 全体が `sample_bytes` 未満ならば `rest_stream` は空。
+pub async fn peek_sample(
+    mut blob: StreamingBlob,
+    sample_bytes: usize,
+) -> Result<(Bytes, StreamingBlob), BlobError> {
+    let mut sample = BytesMut::with_capacity(sample_bytes);
+    let mut leftover: Option<Bytes> = None;
+    while sample.len() < sample_bytes {
+        match blob.next().await {
+            Some(Ok(chunk)) => {
+                let remaining = sample_bytes.saturating_sub(sample.len());
+                if chunk.len() <= remaining {
+                    sample.extend_from_slice(&chunk);
+                } else {
+                    sample.extend_from_slice(&chunk[..remaining]);
+                    leftover = Some(chunk.slice(remaining..));
+                    break;
+                }
+            }
+            Some(Err(e)) => return Err(BlobError::Read(format!("{e}"))),
+            None => break,
+        }
+    }
+    let sample_bytes = sample.freeze();
+    let rest = chain_leftover_with_blob(leftover, blob);
+    Ok((sample_bytes, rest))
+}
+
+/// `peek_sample` で取り出した sample を rest stream の先頭に再 prepend して
+/// 1 本のストリームに戻す。
+pub fn chain_sample_with_rest(sample: Bytes, rest: StreamingBlob) -> StreamingBlob {
+    let head = futures::stream::once(async move { Ok::<_, std::io::Error>(sample) });
+    let tail = rest.map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
+    StreamingBlob::wrap(head.chain(tail))
+}
+
+fn chain_leftover_with_blob(leftover: Option<Bytes>, rest: StreamingBlob) -> StreamingBlob {
+    match leftover {
+        Some(b) => chain_sample_with_rest(b, rest),
+        None => rest,
+    }
+}
+
+/// `peek_sample` の結果を再度結合した上で全体を Bytes に collect。GPU codec 経路用。
+pub async fn collect_with_sample(
+    sample: Bytes,
+    rest: StreamingBlob,
+    max_bytes: usize,
+) -> Result<Bytes, BlobError> {
+    if sample.len() > max_bytes {
+        return Err(BlobError::Oversized {
+            limit: max_bytes,
+            seen_at_least: sample.len(),
+        });
+    }
+    let mut buf = BytesMut::with_capacity(sample.len() + 4096);
+    buf.extend_from_slice(&sample);
+    let mut stream = rest;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| BlobError::Read(format!("{e}")))?;
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(BlobError::Oversized {
+                limit: max_bytes,
+                seen_at_least: buf.len() + chunk.len(),
+            });
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

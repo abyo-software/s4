@@ -23,14 +23,16 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use async_compression::Level;
 use async_compression::tokio::bufread::ZstdDecoder;
+use async_compression::tokio::write::ZstdEncoder;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use s3s::StdError;
 use s3s::dto::StreamingBlob;
 use s3s::stream::{ByteStream, RemainingLength};
-use s4_codec::CodecKind;
-use tokio::io::{AsyncRead, BufReader};
+use s4_codec::{ChunkManifest, CodecError, CodecKind};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_util::io::{ReaderStream, StreamReader};
 
 /// `StreamingBlob` を AsyncRead として扱えるラッパ。
@@ -96,6 +98,88 @@ pub fn supports_streaming_decompress(codec: CodecKind) -> bool {
     matches!(codec, CodecKind::Passthrough | CodecKind::CpuZstd)
 }
 
+pub fn supports_streaming_compress(codec: CodecKind) -> bool {
+    matches!(codec, CodecKind::Passthrough | CodecKind::CpuZstd)
+}
+
+/// `body` を CPU zstd で **input-streaming** 圧縮し、(compressed bytes, manifest)
+/// を返す。memory peak は zstd window + 64 KiB read buffer + 圧縮済 output ≈
+/// `compressed_size + ~100 MB`。**入力 5 GB を 100 MB に圧縮するケースで peak は
+/// ~200 MB** (vs. naive bytes-buffered だと peak 5 GB)。
+///
+/// 圧縮済 output 全体を Bytes として保持する理由は backend (aws-sdk-s3) が
+/// chunked-without-content-length を SigV4 chunked encoding interceptor で reject
+/// するため。Phase 2.1 で SigV4 streaming mode に対応すれば true streaming PUT
+/// (compressed output も streaming) に拡張可。
+pub async fn streaming_compress_cpu_zstd(
+    body: StreamingBlob,
+    level: i32,
+) -> Result<(Bytes, ChunkManifest), CodecError> {
+    let mut read = blob_to_async_read(body);
+    let mut compressed_buf: Vec<u8> = Vec::with_capacity(256 * 1024);
+    let mut crc: u32 = 0;
+    let mut total_in: u64 = 0;
+    let mut in_buf = vec![0u8; 64 * 1024];
+
+    {
+        let mut encoder = ZstdEncoder::with_quality(&mut compressed_buf, Level::Precise(level));
+        loop {
+            let n = read.read(&mut in_buf).await.map_err(CodecError::Io)?;
+            if n == 0 {
+                break;
+            }
+            crc = crc32c::crc32c_append(crc, &in_buf[..n]);
+            total_in += n as u64;
+            encoder
+                .write_all(&in_buf[..n])
+                .await
+                .map_err(CodecError::Io)?;
+        }
+        encoder.shutdown().await.map_err(CodecError::Io)?;
+    }
+
+    let compressed_len = compressed_buf.len() as u64;
+    Ok((
+        Bytes::from(compressed_buf),
+        ChunkManifest {
+            codec: CodecKind::CpuZstd,
+            original_size: total_in,
+            compressed_size: compressed_len,
+            crc32c: crc,
+        },
+    ))
+}
+
+/// `body` を passthrough で集めるだけ。CRC32C も計算する。
+pub async fn streaming_passthrough(
+    body: StreamingBlob,
+) -> Result<(Bytes, ChunkManifest), CodecError> {
+    let mut read = blob_to_async_read(body);
+    let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
+    let mut crc: u32 = 0;
+    let mut total: u64 = 0;
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let n = read.read(&mut chunk).await.map_err(CodecError::Io)?;
+        if n == 0 {
+            break;
+        }
+        crc = crc32c::crc32c_append(crc, &chunk[..n]);
+        total += n as u64;
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let len = buf.len() as u64;
+    Ok((
+        Bytes::from(buf),
+        ChunkManifest {
+            codec: CodecKind::Passthrough,
+            original_size: total,
+            compressed_size: len,
+            crc32c: crc,
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +234,39 @@ mod tests {
         let out_blob = async_read_to_blob(blob_to_async_read(blob));
         let out = collect(out_blob).await;
         assert_eq!(out, original);
+    }
+
+    #[tokio::test]
+    async fn streaming_compress_then_decompress_roundtrip() {
+        let original = Bytes::from(vec![b'q'; 200_000]);
+        let blob = make_blob(original.clone());
+        let (compressed, manifest) = streaming_compress_cpu_zstd(blob, 3).await.unwrap();
+        assert!(
+            compressed.len() < original.len() / 100,
+            "should be highly compressible"
+        );
+        assert_eq!(manifest.codec, CodecKind::CpuZstd);
+        assert_eq!(manifest.original_size, original.len() as u64);
+        assert_eq!(manifest.compressed_size, compressed.len() as u64);
+        // crc32c は all-in-one と一致する
+        assert_eq!(manifest.crc32c, crc32c::crc32c(&original));
+
+        // Decompress 経路で完全に元に戻る
+        let decompressed_blob = cpu_zstd_decompress_stream(make_blob(compressed));
+        let out = collect(decompressed_blob).await;
+        assert_eq!(out, original);
+    }
+
+    #[tokio::test]
+    async fn streaming_passthrough_yields_input_unchanged() {
+        let original = Bytes::from_static(b"hello world");
+        let (out, manifest) = streaming_passthrough(make_blob(original.clone()))
+            .await
+            .unwrap();
+        assert_eq!(out, original);
+        assert_eq!(manifest.codec, CodecKind::Passthrough);
+        assert_eq!(manifest.original_size, original.len() as u64);
+        assert_eq!(manifest.compressed_size, original.len() as u64);
+        assert_eq!(manifest.crc32c, crc32c::crc32c(&original));
     }
 }

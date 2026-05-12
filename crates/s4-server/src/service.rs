@@ -40,8 +40,13 @@ use s4_codec::multipart::{
 use s4_codec::{ChunkManifest, CodecDispatcher, CodecKind, CodecRegistry};
 use tracing::debug;
 
-use crate::blob::{bytes_to_blob, collect_blob};
-use crate::streaming::{cpu_zstd_decompress_stream, supports_streaming_decompress};
+use crate::blob::{
+    bytes_to_blob, chain_sample_with_rest, collect_blob, collect_with_sample, peek_sample,
+};
+use crate::streaming::{
+    cpu_zstd_decompress_stream, streaming_compress_cpu_zstd, streaming_passthrough,
+    supports_streaming_compress, supports_streaming_decompress,
+};
 
 /// PUT body の先頭 sampling で渡す最大 byte 数。
 const SAMPLE_BYTES: usize = 4096;
@@ -184,23 +189,55 @@ impl<B: S3> S3 for S4Service<B> {
         mut req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
         if let Some(blob) = req.input.body.take() {
-            let bytes = collect_blob(blob, self.max_body_bytes)
+            // Sample 4 KiB から codec を決定。streaming-aware codec なら streaming
+            // compress fast path、そうでなければ従来の collect-then-compress。
+            let (sample, rest_stream) = peek_sample(blob, SAMPLE_BYTES)
                 .await
-                .map_err(internal("collect put body"))?;
-            let sample_len = bytes.len().min(SAMPLE_BYTES);
-            let kind = self.dispatcher.pick(&bytes[..sample_len]).await;
-            debug!(
-                bucket = ?req.input.bucket,
-                key = ?req.input.key,
-                bytes = bytes.len(),
-                codec = kind.as_str(),
-                "S4 put_object: compressing"
-            );
-            let (compressed, manifest) = self
-                .registry
-                .compress(bytes, kind)
-                .await
-                .map_err(internal("registry compress"))?;
+                .map_err(internal("peek put sample"))?;
+            let sample_len = sample.len().min(SAMPLE_BYTES);
+            let kind = self.dispatcher.pick(&sample[..sample_len]).await;
+
+            let (compressed, manifest) = if supports_streaming_compress(kind) {
+                // streaming fast path: input は memory に collect しない
+                let chained = chain_sample_with_rest(sample, rest_stream);
+                debug!(
+                    bucket = ?req.input.bucket,
+                    key = ?req.input.key,
+                    codec = kind.as_str(),
+                    path = "streaming",
+                    "S4 put_object: compressing (streaming)"
+                );
+                match kind {
+                    CodecKind::CpuZstd => {
+                        // dispatcher の default zstd level (3) を使う。CLI で
+                        // `--zstd-level` を変えても registry 内の codec を
+                        // 経由せず streaming に分岐するため反映されない。
+                        // Phase 2.1 で `streaming_compress` への level 注入を検討
+                        streaming_compress_cpu_zstd(chained, 3).await
+                    }
+                    CodecKind::Passthrough => streaming_passthrough(chained).await,
+                    other => unreachable!("supports_streaming_compress lied: {other:?}"),
+                }
+                .map_err(internal("streaming compress"))?
+            } else {
+                // GPU codec 等は batch API なので bytes-buffered path
+                let bytes = collect_with_sample(sample, rest_stream, self.max_body_bytes)
+                    .await
+                    .map_err(internal("collect put body (gpu path)"))?;
+                debug!(
+                    bucket = ?req.input.bucket,
+                    key = ?req.input.key,
+                    bytes = bytes.len(),
+                    codec = kind.as_str(),
+                    path = "buffered",
+                    "S4 put_object: compressing (buffered)"
+                );
+                self.registry
+                    .compress(bytes, kind)
+                    .await
+                    .map_err(internal("registry compress"))?
+            };
+
             write_manifest(&mut req.input.metadata, &manifest);
             // 重要: content_length を圧縮後サイズで更新する。
             // これを忘れると下流 (aws-sdk-s3 → S3) が宣言サイズ分の bytes を
