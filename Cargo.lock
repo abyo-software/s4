@@ -4004,6 +4004,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.9.0",
  "hyper-util",
+ "md-5 0.10.6",
  "metrics",
  "metrics-exporter-prometheus",
  "opentelemetry",

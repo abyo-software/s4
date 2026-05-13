@@ -75,6 +75,11 @@ rand = "0.8"
 base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
+# v0.5 #27: SSE-C key fingerprinting. AWS S3 SSE-C uses MD5 of the
+# customer key (sent as `x-amz-server-side-encryption-customer-key-MD5`)
+# as a non-secret tag the server stores to verify GETs supply the same
+# key. MD5 is fine here — it's a fingerprint, not a security primitive.
+md-5 = "0.10"
 # v0.5 #33: SigV4a (asymmetric ECDSA-P256-SHA256) signature verification.
 # Used only for verifying SigV4a-signed S3 requests; key issuance / signing
 # is out of scope (operators load PEM-encoded P-256 public keys via
