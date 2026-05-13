@@ -117,8 +117,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 aws-sdk-sns = { version = "1", optional = true }
 aws-sdk-sqs = { version = "1", optional = true }
 
-s4-codec = { path = "../s4-codec", version = "0.7.0" }
-s4-config = { path = "../s4-config", version = "0.7.0" }
+s4-codec = { path = "../s4-codec", version = "0.7.1" }
+s4-config = { path = "../s4-config", version = "0.7.1" }
 # v0.6 #41: S3 Select — server-side SQL filter on object body.
 sqlparser = "0.51"
 csv = "1"

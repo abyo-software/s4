@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-05-13
+
+Operator-UX patch release surfaced by a dogfood walkthrough against
+MinIO + aws-cli. No new features, no API changes.
+
+### Fixed
+
+- All nine `--*-state-file` flags (versioning / object-lock /
+  mfa-delete / cors / inventory / notifications / tagging /
+  replication / lifecycle) now accept an empty file as "start fresh,
+  use this path for future snapshot dumps". Previously, `touch
+  /tmp/foo.json && --versioning-state-file /tmp/foo.json` failed at
+  boot with `EOF while parsing` because `from_json("")` rejected
+  empty input — operators had to hand-write a non-trivial empty
+  snapshot JSON before the manager would attach. The empty-file
+  branch is centralised in a new `read_state_file_or_fresh(path)`
+  helper that covers all three "start fresh" cases (empty path,
+  missing file, empty / whitespace-only file content).
+
+### Documentation
+
+- `--*-state-file` docstrings updated to drop the misleading "pass
+  `--flag ""` (empty path)" hint that never worked under clap's
+  value-required parsing. The accurate workflow is `--flag
+  /tmp/whatever.json` (file may be missing or empty).
+
 ## [0.7.0] — 2026-05-13
 
 E2E hardening sprint — six v0.7 milestone issues delivered (#44–#49).
