@@ -453,3 +453,167 @@ async fn sigv4a_verify_real_listener_e2e() {
         "403 body must surface SignatureDoesNotMatch: {body}"
     );
 }
+
+/// v0.7 #46 Inventory scanner E2E against the MinIO container backend.
+///
+/// Boots a MinIO container, points an `S4Service<s3s_aws::Proxy>` at it
+/// with an `InventoryManager` attached, PUTs three source-bucket
+/// objects via the raw aws-sdk-s3 client, then drives
+/// `inventory::run_scan_once` end-to-end:
+///
+/// 1. The scanner walks the source bucket via `list_objects_v2`,
+///    HEADs each object, renders the CSV + manifest.json, and PUTs
+///    both to the destination bucket prefix (`inv/<src>/<id>/...`).
+/// 2. A raw aws-sdk-s3 `list_objects_v2` against the destination
+///    bucket sees exactly one `.csv` and one `manifest.json` under
+///    the configured prefix.
+/// 3. A raw aws-sdk-s3 `get_object` of the CSV reads back a
+///    well-formed body: 1 header line + 3 data rows = 4 lines, with
+///    each source key appearing quoted.
+///
+/// Same invocation pattern as `lifecycle_scanner_expires_objects_via_minio_backend`
+/// — the test wires the manager via `with_inventory(...)` and invokes
+/// the scanner directly so the cadence loop in `main.rs` is not in
+/// the test path (it just delegates to the same `run_scan_once`).
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn inventory_scanner_writes_csv_to_destination_bucket_via_minio() {
+    use s4_server::inventory::{
+        InventoryConfig, InventoryManager, run_scan_once as run_inv_scan_once,
+    };
+
+    let fixture = start_minio().await;
+    let aws_client = build_aws_client(&fixture.endpoint_url).await;
+    let src_bucket = "s4-inv-src";
+    let dst_bucket = "s4-inv-dst";
+    ensure_bucket(&aws_client, src_bucket).await;
+    ensure_bucket(&aws_client, dst_bucket).await;
+
+    // Seed three source-bucket objects via the raw aws-sdk-s3 client
+    // (the scanner walks the backend irrespective of the codec layer;
+    // raw PUT keeps the test focused on the inventory CSV-emission
+    // path).
+    for (key, body) in [
+        ("alpha.txt", "AAA"),
+        ("nested/beta.bin", "BB"),
+        ("z.txt", "Z"),
+    ] {
+        aws_client
+            .put_object()
+            .bucket(src_bucket)
+            .key(key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(
+                body.as_bytes().to_vec(),
+            ))
+            .send()
+            .await
+            .expect("seed put");
+    }
+
+    // Build the S4Service with an Inventory manager attached. Config
+    // is `daily_csv` from src → dst under the `inv` prefix, freshly
+    // put so `due()` returns true on the first scan.
+    let proxy = s3s_aws::Proxy::from(aws_client.clone());
+    let mgr = Arc::new(InventoryManager::new());
+    mgr.put(InventoryConfig::daily_csv("e2e-d1", src_bucket, dst_bucket, "inv"));
+    let s4 = Arc::new(
+        S4Service::new(
+            proxy,
+            make_registry(),
+            Arc::new(AlwaysDispatcher(CodecKind::Passthrough)),
+        )
+        .with_inventory(Arc::clone(&mgr)),
+    );
+
+    // Drive the v0.7 #46 inventory scanner end-to-end against the
+    // MinIO backend.
+    let report = run_inv_scan_once(&s4).await.expect("scan");
+    eprintln!("inventory scan report: {report:?}");
+    assert_eq!(report.configs_evaluated, 1);
+    assert_eq!(report.buckets_scanned, 1);
+    assert_eq!(report.objects_listed, 3);
+    assert_eq!(report.csvs_written, 1);
+    assert_eq!(report.errors, 0);
+
+    // Verify the destination bucket via raw aws-sdk-s3 list. Exactly
+    // one `.csv` and one `manifest.json` must land under the
+    // configured prefix.
+    let listed = aws_client
+        .list_objects_v2()
+        .bucket(dst_bucket)
+        .prefix(format!("inv/{src_bucket}/e2e-d1/"))
+        .send()
+        .await
+        .expect("list dst");
+    let dst_keys: Vec<String> = listed
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(str::to_owned))
+        .collect();
+    let csv_keys: Vec<String> = dst_keys
+        .iter()
+        .filter(|k| k.ends_with(".csv"))
+        .cloned()
+        .collect();
+    let manifest_keys: Vec<String> = dst_keys
+        .iter()
+        .filter(|k| k.ends_with("manifest.json"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        csv_keys.len(),
+        1,
+        "exactly one CSV must land in dst; got {dst_keys:?}"
+    );
+    assert_eq!(
+        manifest_keys.len(),
+        1,
+        "exactly one manifest.json must land in dst; got {dst_keys:?}"
+    );
+
+    // GET the CSV back through raw aws-sdk-s3 and assert it's
+    // well-formed (header + 3 rows + each source key quoted).
+    let csv_body = aws_client
+        .get_object()
+        .bucket(dst_bucket)
+        .key(&csv_keys[0])
+        .send()
+        .await
+        .expect("get CSV")
+        .body
+        .collect()
+        .await
+        .expect("collect")
+        .into_bytes();
+    let csv_text = std::str::from_utf8(&csv_body).expect("utf8");
+    let line_count = csv_text.lines().count();
+    assert_eq!(line_count, 4, "header + 3 rows; got:\n{csv_text}");
+    assert!(csv_text.starts_with("Bucket,Key,VersionId"));
+    assert!(csv_text.contains("\"alpha.txt\""));
+    assert!(csv_text.contains("\"nested/beta.bin\""));
+    assert!(csv_text.contains("\"z.txt\""));
+
+    // GET the manifest and assert it carries the canonical AWS-style
+    // shape (sourceBucket / destinationBucket / files[]).
+    let manifest_body = aws_client
+        .get_object()
+        .bucket(dst_bucket)
+        .key(&manifest_keys[0])
+        .send()
+        .await
+        .expect("get manifest")
+        .body
+        .collect()
+        .await
+        .expect("collect")
+        .into_bytes();
+    let manifest_text = std::str::from_utf8(&manifest_body).expect("utf8");
+    let manifest_json: serde_json::Value =
+        serde_json::from_str(manifest_text).expect("manifest must be JSON");
+    assert_eq!(manifest_json["sourceBucket"], src_bucket);
+    assert_eq!(manifest_json["destinationBucket"], dst_bucket);
+    assert_eq!(manifest_json["fileFormat"], "CSV");
+    let files = manifest_json["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 1, "one CSV file recorded in manifest");
+    assert_eq!(files[0]["key"], csv_keys[0]);
+}

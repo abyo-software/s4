@@ -931,96 +931,49 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         );
         s4 = s4.with_cors(std::sync::Arc::new(mgr));
     }
-    // v0.6 #36: wire the in-memory S3 Inventory manager when
-    // --inventory-state-file is supplied. Empty / missing path starts
-    // a fresh manager, populated path is loaded as a JSON snapshot
-    // produced previously by `InventoryManager::to_json`. The matching
-    // background scheduler (one tokio task per process) wakes every
-    // `--inventory-scan-interval-hours` to log the set of currently-
-    // due configurations and stamp `mark_run`. Walking the source
-    // bucket and writing the CSV / manifest end-to-end through the
-    // attached backend is intentionally deferred: it requires a
-    // back-reference from the scheduler into `S4Service` for
-    // `list_objects_v2`, and the test path
-    // (`InventoryManager::run_once_for_test`) already covers the CSV /
-    // manifest emission shape so this scheduler skeleton is enough to
-    // ship the configuration-management half of v0.6 #36 without
-    // putting a half-wired bucket-walk in front of users.
-    if let Some(ref path) = opt.inventory_state_file {
-        let mgr = if path.as_os_str().is_empty() || !path.exists() {
-            s4_server::inventory::InventoryManager::new()
+    // v0.6 #36 + v0.7 #46: wire the in-memory S3 Inventory manager when
+    // --inventory-state-file is supplied. Empty / missing path starts a
+    // fresh manager, populated path is loaded as a JSON snapshot
+    // produced previously by `InventoryManager::to_json`.
+    //
+    // v0.7 #46: the matching background scheduler (one tokio task per
+    // process) now executes a real scan every
+    // `--inventory-scan-interval-hours` — see
+    // `s4_server::inventory::run_scan_once`. The scanner walks every
+    // bucket whose inventory configuration is `due()`, lists its
+    // objects via `list_objects_v2`, HEADs each one for size / etag /
+    // last_modified / SSE flags, renders the CSV + manifest.json, and
+    // PUTs both to the destination bucket prefix. `mark_run` stamps on
+    // success. The Arc handle is captured into the outer
+    // `inventory_to_scan` so the scanner spawn can run AFTER `s4_arc`
+    // exists (the scanner wants `&Arc<S4Service<B>>`, mirroring the
+    // v0.7 #45 lifecycle pattern below).
+    let inventory_to_scan: Option<std::sync::Arc<s4_server::inventory::InventoryManager>> =
+        if let Some(ref path) = opt.inventory_state_file {
+            let mgr = if path.as_os_str().is_empty() || !path.exists() {
+                s4_server::inventory::InventoryManager::new()
+            } else {
+                let raw = std::fs::read_to_string(path).map_err(|e| {
+                    format!("--inventory-state-file {}: read failed: {e}", path.display())
+                })?;
+                s4_server::inventory::InventoryManager::from_json(&raw).map_err(|e| {
+                    format!(
+                        "--inventory-state-file {}: parse failed: {e}",
+                        path.display()
+                    )
+                })?
+            };
+            let mgr = std::sync::Arc::new(mgr);
+            info!(
+                path = %path.display(),
+                interval_hours = opt.inventory_scan_interval_hours,
+                "S4 inventory manager attached (v0.7 #46 scanner active; CSV format only — Parquet/ORC deferred)"
+            );
+            s4 = s4.with_inventory(std::sync::Arc::clone(&mgr));
+            Some(mgr)
         } else {
-            let raw = std::fs::read_to_string(path).map_err(|e| {
-                format!("--inventory-state-file {}: read failed: {e}", path.display())
-            })?;
-            s4_server::inventory::InventoryManager::from_json(&raw).map_err(|e| {
-                format!(
-                    "--inventory-state-file {}: parse failed: {e}",
-                    path.display()
-                )
-            })?
+            None
         };
-        let mgr = std::sync::Arc::new(mgr);
-        info!(
-            path = %path.display(),
-            interval_hours = opt.inventory_scan_interval_hours,
-            "S4 inventory manager attached (in-memory; v0.6 #36 single-instance scope; bucket-walk wiring deferred)"
-        );
-        // Spawn the cadence loop. It owns an `Arc` clone of the
-        // manager (the `S4Service` keeps the other clone via
-        // `with_inventory`). On every tick it iterates all attached
-        // configs and, for each one whose `due()` returns true, logs
-        // the trigger and stamps `mark_run` so the next tick doesn't
-        // re-fire. Real bucket walking is the deferred follow-up
-        // described above.
-        let scheduler_mgr = std::sync::Arc::clone(&mgr);
-        let interval_hours = u64::from(opt.inventory_scan_interval_hours.max(1));
-        tokio::spawn(async move {
-            let mut ticker =
-                tokio::time::interval(std::time::Duration::from_secs(interval_hours * 3600));
-            // Skip the first immediate tick — the CLI already logged
-            // "manager attached" so we don't want a duplicate "tick"
-            // line in the same millisecond.
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                let now = chrono::Utc::now();
-                // Snapshot the set of (bucket, id) keys via the JSON
-                // serialiser so we don't hold the manager's RwLock
-                // across `due()` / `mark_run()` calls below (each of
-                // those takes its own short-lived lock).
-                let due_pairs: Vec<(String, String)> = scheduler_mgr
-                    .to_json()
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                    .as_ref()
-                    .and_then(|v| v.get("configs"))
-                    .and_then(|c| c.as_object())
-                    .map(|o| {
-                        o.keys()
-                            .filter_map(|k| {
-                                let mut parts = k.splitn(2, '\u{1F}');
-                                let b = parts.next()?.to_owned();
-                                let i = parts.next()?.to_owned();
-                                Some((b, i))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                for (bucket, id) in due_pairs {
-                    if scheduler_mgr.due(&bucket, &id, now) {
-                        tracing::info!(
-                            bucket = %bucket,
-                            id = %id,
-                            "S4 inventory: configuration due (bucket walk + CSV write deferred — call run_once_for_test in tests)"
-                        );
-                        scheduler_mgr.mark_run(&bucket, &id, now);
-                    }
-                }
-            }
-        });
-        s4 = s4.with_inventory(mgr);
-    }
     // v0.6 #35: wire the in-memory bucket-notification manager when
     // --notifications-state-file is supplied. Same shape as the
     // versioning / object-lock / cors / inventory flags — empty /
@@ -1203,6 +1156,45 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
                     }
                     Err(e) => {
                         tracing::warn!("S4 lifecycle scan failed: {e}");
+                    }
+                }
+            }
+        });
+    }
+
+    // Spawn the v0.7 #46 inventory scanner if the manager is wired.
+    // Same Arc-clone shape as the lifecycle scanner above: the
+    // background task holds one `Arc<S4Service<...>>` clone, the s3s
+    // listener (via `SharedService`) holds the other. The scanner
+    // walks every due (bucket, id) inventory configuration, lists +
+    // HEADs each source object, renders the CSV + manifest.json, and
+    // PUTs both to the destination bucket prefix — see
+    // `s4_server::inventory::run_scan_once` for the full spec.
+    if inventory_to_scan.is_some() {
+        let scan_handle = std::sync::Arc::clone(&s4_arc);
+        let interval_hours = u64::from(opt.inventory_scan_interval_hours.max(1));
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(interval_hours * 3600));
+            // Skip the first immediate tick — the CLI already logged
+            // "manager attached" so we don't want a duplicate "tick"
+            // line in the same millisecond.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match s4_server::inventory::run_scan_once(&scan_handle).await {
+                    Ok(report) => {
+                        tracing::info!(
+                            buckets_scanned = report.buckets_scanned,
+                            configs_evaluated = report.configs_evaluated,
+                            csvs_written = report.csvs_written,
+                            objects_listed = report.objects_listed,
+                            errors = report.errors,
+                            "S4 inventory scan complete"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("S4 inventory scan failed: {e}");
                     }
                 }
             }
