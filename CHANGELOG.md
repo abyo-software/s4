@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-05-13
+
+Eight v0.6 milestone issues delivered (#35–#42). Theme: **ecosystem
+completion — drop-in S3 replacement**. With v0.4 (operations) and v0.5
+(security) shipped, v0.6 closes the remaining S3 API surface gaps so
+existing AWS SDK / s3 client code lights up against an S4 endpoint
+without per-feature workarounds.
+
+### Added
+
+- **Bucket Notifications** (#35) — `PutBucketNotificationConfiguration`
+  + a fire-and-forget dispatcher. Webhook destinations always available;
+  SQS / SNS gated behind `--features aws-events`. AWS-shaped event JSON
+  payloads. New CLI `--notifications-state-file <PATH>`. Drop counter
+  `s4_notifications_dropped_total{dest}` after the 3-attempt retry
+  budget.
+- **Inventory CSV daily reports** (#36) — `InventoryManager` per-bucket
+  configs + AWS schema-compatible CSV output + manifest.json. Background
+  scheduler (`--inventory-scan-interval-hours`, default 1) marks runs;
+  test-driven `run_once_for_test` end-to-end emission path. New CLI
+  `--inventory-state-file <PATH>`.
+- **Lifecycle execution scaffolding** (#37) — `LifecycleManager`
+  evaluates Expiration / Transition / NoncurrentVersionExpiration rules
+  against (key, age, size, tags). `PutBucketLifecycleConfiguration`
+  handlers replaced with manager-aware impls. Background scanner
+  skeleton via `--lifecycle-scan-interval-hours` (default 24); actual
+  bucket-walk + delete invocation deferred to v0.7. New metric
+  `s4_lifecycle_actions_total{bucket,action}`.
+- **CORS bucket configuration + preflight match** (#38) — `CorsManager`
+  + `PutBucketCors` / `GetBucketCors` / `DeleteBucketCors` handlers +
+  `S4Service::handle_preflight(bucket, origin, method, headers)` for
+  the listener-side OPTIONS interceptor (full routing wire-up follow-up).
+  S3-spec declaration-order first-match-wins evaluation. New CLI
+  `--cors-state-file <PATH>`.
+- **Object + Bucket Tagging + IAM tag conditions** (#39) — `TagManager`
+  per-(bucket, key) and per-bucket tag stores. `Put/Get/DeleteObjectTagging`
+  + `Put/Get/DeleteBucketTagging` handlers. PUT honours the
+  `x-amz-tagging` header (URL-encoded query). `policy.rs` extended with
+  `s3:ExistingObjectTag/<key>` and `s3:RequestObjectTag/<key>` Condition
+  keys (fail-closed when tag is absent). New CLI `--tagging-state-file <PATH>`.
+- **Cross-bucket Replication** (#40) — `ReplicationManager` per-bucket
+  rules with prefix / tag filter and priority. PUT to source bucket
+  triggers async tokio::spawn copy to destination bucket; status
+  surfaced via `x-amz-replication-status` metadata on HEAD/GET.
+  Highest-priority enabled rule wins (S3 spec). 3-attempt retry budget;
+  failures bump `s4_replication_dropped_total{bucket}`. New CLI
+  `--replication-state-file <PATH>`.
+- **S3 Select** (#41) — `SelectObjectContent` handler with a
+  sqlparser-backed SQL subset (SELECT cols / `_N` / `*`, WHERE with
+  `=`/`<>`/`<`/`>`/`<=`/`>=`/`LIKE`/`AND`/`OR`/`NOT`/`IS NULL`, string
+  / int / float / bool / NULL literals, numeric promotion). CSV + JSON
+  Lines input; AWS event-stream output (Records / Stats / End frames
+  with proper CRC framing). GPU stub (`select_gpu`) wired but inactive
+  for v0.7+ acceleration.
+- **MFA Delete** (#42) — `MfaDeleteManager` per-bucket MFA Delete
+  state + RFC 6238 TOTP verification on DELETE / DELETE-version /
+  PutBucketVersioning(MfaDelete=Enabled). Single shared secret with
+  per-bucket override; ±1 30-second clock skew tolerance. New CLIs
+  `--mfa-delete-state-file <PATH>` and `--mfa-default-secret-file <PATH>`.
+
+### Changed
+
+- Workspace bumped to 0.6.0.
+- `S4Service::backend` is now `Arc<B>` (was `B`) so the replication
+  dispatcher can spawn destination-bucket PUTs through the same backend.
+
+### Notes
+
+- **Background scanners**: lifecycle (#37) and inventory (#36) ship the
+  evaluator + manager + handler set, but the actual periodic
+  `list_objects_v2` walk is skeleton-only. Deferred so the per-bucket
+  iteration shape (Arc back-ref into `S4Service`) can be designed once
+  rather than per-feature.
+- **Single-instance scope**: replication (#40), notifications (#35),
+  inventory (#36), lifecycle (#37), tagging (#39), CORS (#38), MFA
+  Delete (#42) all hold state in-memory per gateway. JSON snapshot
+  load/dump APIs are in place; SIGUSR1 dump-back hooks are deferred to
+  v0.7+. Multi-instance coordination (true cross-region replication,
+  shared secret distribution) is out of scope for v0.6.
+- **S3 Select scope cuts**: Parquet / ORC input rejected; aggregates /
+  GROUP BY / JOIN / ORDER BY / LIMIT / DISTINCT / function calls return
+  `UnsupportedFeature`.
+
 ## [0.5.0] — 2026-05-13
 
 Eight v0.5 milestone issues delivered (#27–#34). Theme: **regulated-
