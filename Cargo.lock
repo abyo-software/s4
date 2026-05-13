@@ -4114,7 +4114,7 @@ dependencies = [
 
 [[package]]
 name = "s4-codec"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4156,7 +4156,7 @@ dependencies = [
 
 [[package]]
 name = "s4-config"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -4164,7 +4164,7 @@ dependencies = [
 
 [[package]]
 name = "s4-server"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "aes-gcm",
  "anyhow",

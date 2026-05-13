@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-05-13
+
+Security hotfix surfaced by a post-v0.8.0 audit of v0.4–v0.8 quality
+gaps. **Includes a cryptographic security regression fix** (#57) — any
+deployment that uses streaming SSE under high PUT volume per key
+should upgrade.
+
+### Fixed (security)
+
+- **S4E5 chunked-SSE nonce salt widened 4 B → 8 B (`S4E6` frame)** (#57) —
+  v0.8.0 #52's S4E5 frame used a 4-byte per-PUT salt. AES-GCM nonce
+  uniqueness is the foundation of authentication; with a 32-bit salt
+  the birthday collision is at ~77 k PUTs per key (50 % probability).
+  Two AES-GCM messages under the same `(key, nonce)` **leaks the
+  authentication key + plaintext XOR** — a categorical IND-CPA /
+  IND-CCA break. The new `S4E6` frame uses an 8-byte salt (50 % at
+  ~5.06 × 10⁹ PUTs per key — **~65,000× headroom**). Existing S4E5
+  objects keep decrypting via back-compat read; new PUTs emit S4E6.
+  `chunk_count` now caps at 24 bits = 16,777,215 (×1 MiB chunk_size =
+  16 PiB per object — three orders over S3's 5 GiB cap).
+- **SSE-KMS DEK plaintext zeroized on drop** (#58) — defense in depth.
+  `KmsBackend::generate_dek` / `decrypt_dek` return
+  `Zeroizing<Vec<u8>>`; `service.rs` PUT / GET / multipart Complete
+  branches hold the stack `[u8; 32]` in `Zeroizing<[u8; 32]>`. Process
+  memory dump / swap-out / core dump can no longer leak a previously-
+  used DEK after the PUT / GET that used it returns.
+- **Multipart Complete atomic per (bucket, key)** (#59) — v0.8.0
+  BUG-5 fix routed Complete through "GET assembled body → encrypt →
+  PUT back". Two concurrent Completes on the same key (different
+  upload-ids) raced: client B could read client A's plaintext between
+  A's GET and A's PUT. New per-(bucket, key) `tokio::Mutex` in a
+  `DashMap` shard serialises the critical section; lock entries are
+  pruned lazily when their `Arc::strong_count` drops to 1.
+
+### CI
+
+- **AwsKms feature: real KMS roundtrip workflow** (#60) — new
+  `.github/workflows/aws-kms-e2e.yml` (env-var-gated, no-op-on-missing
+  per the v0.7.1 fix pattern) runs `aws_kms_roundtrip` and
+  `aws_kms_unwrap_unknown_arn_fails` against a real AWS KMS key on
+  schedule + workflow_dispatch + `aws-kms-e2e` PR label. Closes the
+  "feature compiled but never validated end-to-end" gap from v0.6 #28.
+
+### Notes
+
+- **Migration from v0.8.0 S4E5 objects**: not required at install
+  time. Operators near the 65 k birthday limit on a single key should
+  rotate the keyring slot (keep the old key in
+  `--sse-s4-key-rotated`) and let lifecycle / replication re-emit
+  affected objects as S4E6.
+- **SSE-C chunked variant**: still buffered (S4E3 only). Chunked
+  SSE-C / SSE-KMS variants deferred to a future release.
+
 ## [0.8.0] — 2026-05-13
 
 Performance / GPU pipeline doubling-down — circle back to the original

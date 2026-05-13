@@ -57,6 +57,6 @@ pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
 # Renamed import (`s4_codec_rs` instead of the crate's natural `s4_codec`)
 # so the symbol doesn't collide with our own cdylib's library name
 # (`s4_codec`, dictated by the Python module name).
-s4-codec-rs = { package = "s4-codec", path = "../s4-codec", version = "0.8.0" }
+s4-codec-rs = { package = "s4-codec", path = "../s4-codec", version = "0.8.1" }
 bytes = { workspace = true }
 tokio = { workspace = true }
