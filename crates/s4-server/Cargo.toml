@@ -132,6 +132,13 @@ totp-rs = { version = "5", default-features = false }
 # the same crate transitively, but listing it here keeps the import path
 # stable if totp-rs ever drops its base32 re-export.
 base32 = "0.5"
+# v0.7 #49: percent-encode S3 object keys before splicing them into a
+# synthetic `/{bucket}/{key}` request URI used by the sidecar / replication
+# helpers. S3 keys can contain spaces, control bytes, and arbitrary
+# Unicode that would make `format!(...).parse::<Uri>()` panic; we encode
+# the byte-stream so the resulting URI is always parseable, and fall back
+# to a typed `S3Error` if anything still fails.
+percent-encoding = "2"
 
 [dev-dependencies]
 tempfile = "3"

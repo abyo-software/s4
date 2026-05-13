@@ -54,6 +54,64 @@ use crate::streaming::{
 /// PUT body の先頭 sampling で渡す最大 byte 数。
 const SAMPLE_BYTES: usize = 4096;
 
+/// v0.7 #49: percent-encoding set covering everything that is **not** an
+/// `unreserved` character per RFC 3986 §2.3, **plus** we additionally
+/// encode the path-reserved sub-delims that `http::Uri` rejects in a
+/// path segment (`?`, `#`, `%`, control bytes, space, etc.). We
+/// deliberately keep `/` un-encoded because S3 keys legally use `/` as
+/// a logical separator and the rest of the synthetic URI relies on the
+/// path layout `/{bucket}/{key}` round-tripping byte-for-byte.
+const URI_KEY_ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'|')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'[')
+    .add(b']')
+    .add(b'%');
+
+/// v0.7 #49: build the synthetic `/{bucket}/{key}` request URI used by
+/// the sidecar / replication helpers when they re-enter the backend
+/// trait without going through the HTTP layer. S3 object keys can
+/// contain spaces, control bytes, and arbitrary Unicode that would
+/// make `format!(...).parse::<http::Uri>()` panic; we percent-encode
+/// the key bytes (RFC 3986 path segment) and the bucket name (defensive
+/// — bucket names are normally DNS-safe, but the helper is the single
+/// choke-point) before splicing them in. If the encoded form *still*
+/// fails to parse (extremely unlikely once everything outside the
+/// unreserved set is escaped) we surface a typed `400 InvalidObjectName`
+/// instead of crashing the worker.
+pub(crate) fn safe_object_uri(bucket: &str, key: &str) -> S3Result<http::Uri> {
+    use percent_encoding::utf8_percent_encode;
+    let bucket_enc = utf8_percent_encode(bucket, URI_KEY_ENCODE_SET);
+    let key_enc = utf8_percent_encode(key, URI_KEY_ENCODE_SET);
+    let raw = format!("/{bucket_enc}/{key_enc}");
+    raw.parse::<http::Uri>().map_err(|e| {
+        // S3 spec uses `InvalidObjectName` (HTTP 400) for keys that
+        // can't be represented in a request URI. The generated
+        // `S3ErrorCode` enum doesn't expose a typed variant for it,
+        // so we round-trip through `from_bytes` which preserves the
+        // canonical wire string while falling back to InvalidArgument
+        // if even that lookup fails (cannot happen at runtime — kept
+        // as a belt-and-suspenders branch so this helper never
+        // panics).
+        let code = S3ErrorCode::from_bytes(b"InvalidObjectName")
+            .unwrap_or(S3ErrorCode::InvalidArgument);
+        S3Error::with_message(
+            code,
+            format!("object key cannot be encoded as a request URI: {e}"),
+        )
+    })
+}
+
 /// v0.4 #20: captured at the start of a handler, before the request is
 /// consumed by the backend call, so the matching `record_access` at
 /// end-of-request can fill in the structured access log entry.
@@ -1050,9 +1108,26 @@ impl<B: S3> S4Service<B> {
     async fn write_sidecar(&self, bucket: &str, key: &str, index: &FrameIndex) {
         let bytes = encode_index(index);
         let len = bytes.len() as i64;
+        let sidecar = sidecar_key(key);
+        // v0.7 #49: synthetic re-entry URI must be percent-encoded; if
+        // the (already legally-arbitrary) S3 key produces something we
+        // cannot encode at all, drop the sidecar PUT (the GET path
+        // falls back to a full read on a missing sidecar) instead of
+        // panicking on `parse().unwrap()`.
+        let uri = match safe_object_uri(bucket, &sidecar) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!(
+                    bucket,
+                    key,
+                    "S4 write_sidecar skipped (key not URI-encodable): {e}"
+                );
+                return;
+            }
+        };
         let put_input = PutObjectInput {
             bucket: bucket.into(),
-            key: sidecar_key(key),
+            key: sidecar,
             body: Some(bytes_to_blob(bytes)),
             content_length: Some(len),
             content_type: Some("application/x-s4-index".into()),
@@ -1061,7 +1136,7 @@ impl<B: S3> S4Service<B> {
         let put_req = S3Request {
             input: put_input,
             method: http::Method::PUT,
-            uri: format!("/{bucket}/{}", sidecar_key(key)).parse().unwrap(),
+            uri,
             headers: http::HeaderMap::new(),
             extensions: http::Extensions::new(),
             credentials: None,
@@ -1080,15 +1155,18 @@ impl<B: S3> S4Service<B> {
 
     /// `<key>.s4index` sidecar を backend から読み出す。なければ None。
     async fn read_sidecar(&self, bucket: &str, key: &str) -> Option<FrameIndex> {
+        let sidecar = sidecar_key(key);
+        // v0.7 #49: same encode-or-bail treatment as write_sidecar.
+        let uri = safe_object_uri(bucket, &sidecar).ok()?;
         let get_input = GetObjectInput {
             bucket: bucket.into(),
-            key: sidecar_key(key),
+            key: sidecar,
             ..Default::default()
         };
         let get_req = S3Request {
             input: get_input,
             method: http::Method::GET,
-            uri: format!("/{bucket}/{}", sidecar_key(key)).parse().unwrap(),
+            uri,
             headers: http::HeaderMap::new(),
             extensions: http::Extensions::new(),
             credentials: None,
@@ -2727,23 +2805,30 @@ impl<B: S3> S3 for S4Service<B> {
         if let Some(mgr) = self.tagging.as_ref() {
             mgr.delete_object_tags(&bucket, &key);
         }
-        let sidecar_input = DeleteObjectInput {
-            bucket: bucket.clone(),
-            key: sidecar_key(&key),
-            ..Default::default()
-        };
-        let sidecar_req = S3Request {
-            input: sidecar_input,
-            method: http::Method::DELETE,
-            uri: format!("/{bucket}/{}", sidecar_key(&key)).parse().unwrap(),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
-        let _ = self.backend.delete_object(sidecar_req).await;
+        let sidecar = sidecar_key(&key);
+        // v0.7 #49: skip the sidecar DELETE if the key + sidecar suffix
+        // can't be encoded into a request URI — the primary delete
+        // already succeeded and a stale sidecar is harmless (Range GET
+        // re-validates the underlying object on next read).
+        if let Ok(uri) = safe_object_uri(&bucket, &sidecar) {
+            let sidecar_input = DeleteObjectInput {
+                bucket: bucket.clone(),
+                key: sidecar,
+                ..Default::default()
+            };
+            let sidecar_req = S3Request {
+                input: sidecar_input,
+                method: http::Method::DELETE,
+                uri,
+                headers: http::HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            let _ = self.backend.delete_object(sidecar_req).await;
+        }
         // v0.6 #35: legacy unversioned-bucket hard delete fires the
         // canonical `ObjectRemoved:Delete` event.
         self.fire_delete_notification(
@@ -3082,28 +3167,36 @@ impl<B: S3> S3 for S4Service<B> {
         // できれば爆速になるので 1 回の cost は payback される
         let bucket_clone = bucket.clone();
         let key_clone = key.clone();
-        let get_input = GetObjectInput {
-            bucket: bucket_clone.clone(),
-            key: key_clone.clone(),
-            ..Default::default()
-        };
-        let get_req = S3Request {
-            input: get_input,
-            method: http::Method::GET,
-            uri: format!("/{bucket_clone}/{key_clone}").parse().unwrap(),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
-        if let Ok(get_resp) = self.backend.get_object(get_req).await
-            && let Some(blob) = get_resp.output.body
-            && let Ok(body) = collect_blob(blob, self.max_body_bytes).await
-            && let Ok(index) = build_index_from_body(&body)
-        {
-            self.write_sidecar(&bucket, &key, &index).await;
+        // v0.7 #49: percent-encode the synthetic GET URI before
+        // re-entering the backend; if the key is genuinely
+        // un-encodable we just skip the sidecar build (Complete returns
+        // the original success response — Range GETs degrade to a full
+        // read on the missing sidecar, which is the existing behaviour
+        // for any object < the streaming threshold).
+        if let Ok(uri) = safe_object_uri(&bucket_clone, &key_clone) {
+            let get_input = GetObjectInput {
+                bucket: bucket_clone.clone(),
+                key: key_clone.clone(),
+                ..Default::default()
+            };
+            let get_req = S3Request {
+                input: get_input,
+                method: http::Method::GET,
+                uri,
+                headers: http::HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            if let Ok(get_resp) = self.backend.get_object(get_req).await
+                && let Some(blob) = get_resp.output.body
+                && let Ok(body) = collect_blob(blob, self.max_body_bytes).await
+                && let Ok(index) = build_index_from_body(&body)
+            {
+                self.write_sidecar(&bucket, &key, &index).await;
+            }
         }
         Ok(resp)
     }
@@ -5231,5 +5324,71 @@ mod tests {
         // open-ended forms are not allowed for this header.
         assert!(parse_copy_source_range("bytes=10-").is_err());
         assert!(parse_copy_source_range("bytes=-10").is_err());
+    }
+
+    // v0.7 #49: safe_object_uri must round-trip every legal S3 key
+    // (which includes spaces, slashes, control chars, raw UTF-8) into
+    // a parseable `http::Uri` instead of panicking like the previous
+    // `format!(...).parse().unwrap()` call sites did.
+
+    #[test]
+    fn safe_object_uri_basic_ascii() {
+        let uri = safe_object_uri("bucket", "key").expect("ascii must be safe");
+        assert_eq!(uri.path(), "/bucket/key");
+    }
+
+    #[test]
+    fn safe_object_uri_encodes_spaces() {
+        let uri = safe_object_uri("bucket", "key with spaces").expect("must encode spaces");
+        // RFC 3986 path-segment encoding turns ' ' into %20.
+        assert!(
+            uri.path().contains("%20"),
+            "expected percent-encoded space, got {}",
+            uri.path()
+        );
+        assert!(uri.path().starts_with("/bucket/"));
+    }
+
+    #[test]
+    fn safe_object_uri_preserves_slashes() {
+        // S3 keys legally contain '/' as a logical path separator —
+        // the helper must NOT escape it (otherwise the synthetic URI
+        // changes the perceived hierarchy).
+        let uri =
+            safe_object_uri("bucket", "key/with/slashes").expect("slashes must round-trip");
+        assert_eq!(uri.path(), "/bucket/key/with/slashes");
+    }
+
+    #[test]
+    fn safe_object_uri_handles_newline_without_panic() {
+        // Newlines are control chars in URIs; whether the result is
+        // Ok (encoded as %0A) or Err (parse rejects), the helper
+        // MUST NOT panic. Either outcome is acceptable.
+        let _ = safe_object_uri("bucket", "key\n");
+    }
+
+    #[test]
+    fn safe_object_uri_handles_null_byte_without_panic() {
+        let _ = safe_object_uri("bucket", "key\0bad");
+    }
+
+    #[test]
+    fn safe_object_uri_handles_unicode_without_panic() {
+        // RTL override, BOM, plain Japanese — none should panic.
+        let _ = safe_object_uri("bucket", "rtl\u{202E}override");
+        let _ = safe_object_uri("bucket", "\u{FEFF}bom-key");
+        let _ = safe_object_uri("bucket", "日本語キー");
+    }
+
+    #[test]
+    fn safe_object_uri_no_panic_for_every_byte() {
+        // Exhaustive byte coverage: 0x00..=0xFF as a 1-byte key.
+        // None of these may panic. (0x80..=0xFF are not valid UTF-8
+        // by themselves; we go through `String::from_utf8_lossy` so
+        // the helper sees a real `&str` regardless of the raw byte.)
+        for b in 0u8..=255 {
+            let s = String::from_utf8_lossy(&[b]).into_owned();
+            let _ = safe_object_uri("bucket", &s);
+        }
     }
 }

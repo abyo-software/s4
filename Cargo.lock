@@ -4180,6 +4180,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "p256 0.13.2",
+ "percent-encoding",
  "pin-project-lite",
  "proptest",
  "rand 0.8.6",

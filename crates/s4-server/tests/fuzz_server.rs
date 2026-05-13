@@ -6,13 +6,20 @@
 //!
 //! `cargo test -p s4-server --test fuzz_server` で実行。
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use bytes::Bytes;
 use futures::stream;
 use proptest::prelude::*;
+use s3s::dto::*;
 use s3s::dto::{Range, StreamingBlob};
+use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use s4_codec::CodecKind;
 use s4_codec::dispatcher::{AlwaysDispatcher, CodecDispatcher, SamplingDispatcher};
-use s4_server::blob::{collect_blob, peek_sample};
+use s4_codec::{CodecRegistry, passthrough::Passthrough};
+use s4_server::S4Service;
+use s4_server::blob::{bytes_to_blob, collect_blob, peek_sample};
 use s4_server::service::resolve_range;
 
 fn rt() -> tokio::runtime::Runtime {
@@ -194,5 +201,223 @@ proptest! {
         let rt = rt();
         let got = rt.block_on(d.pick(&sample));
         prop_assert_eq!(got, kind);
+    }
+}
+
+// ====== v0.7 #49: URL-parse hardening — keys with arbitrary bytes ======
+
+/// Minimal in-memory S3 backend used only by the v0.7 #49 byte-coverage
+/// fuzz; mirrors the `roundtrip.rs` MemoryBackend but trims it to the
+/// 4 ops the fuzz exercises (PUT / GET / HEAD / DELETE) so this test
+/// file stays self-contained.
+struct FuzzBackend {
+    inner: Arc<Mutex<HashMap<(String, String), Bytes>>>,
+}
+
+impl FuzzBackend {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl S3 for FuzzBackend {
+    async fn put_object(
+        &self,
+        mut req: S3Request<PutObjectInput>,
+    ) -> S3Result<S3Response<PutObjectOutput>> {
+        let body = match req.input.body.take() {
+            Some(blob) => collect_blob(blob, 1024 * 1024).await.map_err(|e| {
+                S3Error::with_message(S3ErrorCode::InternalError, format!("collect: {e}"))
+            })?,
+            None => Bytes::new(),
+        };
+        self.inner
+            .lock()
+            .unwrap()
+            .insert((req.input.bucket.clone(), req.input.key.clone()), body);
+        Ok(S3Response::new(PutObjectOutput::default()))
+    }
+
+    async fn get_object(
+        &self,
+        req: S3Request<GetObjectInput>,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        let key = (req.input.bucket.clone(), req.input.key.clone());
+        let bytes = {
+            let lock = self.inner.lock().unwrap();
+            lock.get(&key).cloned()
+        };
+        let bytes = bytes.ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey))?;
+        let len = bytes.len() as i64;
+        let out = GetObjectOutput {
+            body: Some(bytes_to_blob(bytes)),
+            content_length: Some(len),
+            ..Default::default()
+        };
+        Ok(S3Response::new(out))
+    }
+
+    async fn head_object(
+        &self,
+        req: S3Request<HeadObjectInput>,
+    ) -> S3Result<S3Response<HeadObjectOutput>> {
+        let key = (req.input.bucket.clone(), req.input.key.clone());
+        let lock = self.inner.lock().unwrap();
+        let stored = lock
+            .get(&key)
+            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey))?;
+        let out = HeadObjectOutput {
+            content_length: Some(stored.len() as i64),
+            ..Default::default()
+        };
+        Ok(S3Response::new(out))
+    }
+
+    async fn delete_object(
+        &self,
+        req: S3Request<DeleteObjectInput>,
+    ) -> S3Result<S3Response<DeleteObjectOutput>> {
+        let key = (req.input.bucket.clone(), req.input.key.clone());
+        self.inner.lock().unwrap().remove(&key);
+        Ok(S3Response::new(DeleteObjectOutput::default()))
+    }
+}
+
+fn make_fuzz_service() -> S4Service<FuzzBackend> {
+    let registry = Arc::new(CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)));
+    let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
+    S4Service::new(FuzzBackend::new(), registry, dispatcher)
+}
+
+/// Helper: synthesise a request with the literal "/" URI (the only
+/// always-safe Uri value); the per-handler logic uses
+/// `req.input.bucket / .key` for routing, so the request URI is
+/// metadata only — fuzz inputs can therefore vary the key freely
+/// without poisoning the test harness itself.
+fn put_req(bucket: &str, key: &str) -> S3Request<PutObjectInput> {
+    S3Request {
+        input: PutObjectInput {
+            bucket: bucket.into(),
+            key: key.into(),
+            body: Some(bytes_to_blob(Bytes::from_static(b"x"))),
+            ..Default::default()
+        },
+        method: http::Method::PUT,
+        uri: "/".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+fn get_req(bucket: &str, key: &str) -> S3Request<GetObjectInput> {
+    S3Request {
+        input: GetObjectInput {
+            bucket: bucket.into(),
+            key: key.into(),
+            ..Default::default()
+        },
+        method: http::Method::GET,
+        uri: "/".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+fn head_req(bucket: &str, key: &str) -> S3Request<HeadObjectInput> {
+    S3Request {
+        input: HeadObjectInput {
+            bucket: bucket.into(),
+            key: key.into(),
+            ..Default::default()
+        },
+        method: http::Method::HEAD,
+        uri: "/".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+fn delete_req(bucket: &str, key: &str) -> S3Request<DeleteObjectInput> {
+    S3Request {
+        input: DeleteObjectInput {
+            bucket: bucket.into(),
+            key: key.into(),
+            ..Default::default()
+        },
+        method: http::Method::DELETE,
+        uri: "/".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+/// v0.7 #49: every byte 0x00..=0xFF (as a 1-byte UTF-8-lossy key) plus
+/// a battery of awkward Unicode scalars must be PUT / GET / HEAD /
+/// DELETE-able through `S4Service` without panicking. Whether the
+/// handler returns Ok or a typed `S3Error` is irrelevant — the
+/// previous `format!(...).parse::<Uri>().unwrap()` call sites would
+/// crash the worker on, e.g. raw `\n` or `\0`; this test is the
+/// regression guard for that crash.
+#[test]
+fn fuzz_keys_with_every_byte() {
+    let rt = rt();
+    let s4 = make_fuzz_service();
+    let bucket = "test-bucket";
+
+    // Build the corpus: 256 single-byte keys + selected adversarial
+    // Unicode scalars that historically broke URI parsers.
+    let mut keys: Vec<String> = (0u8..=255)
+        .map(|b| String::from_utf8_lossy(&[b]).into_owned())
+        .collect();
+    // Common DoS / homoglyph / hidden-bidi inputs.
+    keys.push("\u{202E}".into()); // RTL override
+    keys.push("\u{0000}".into()); // NULL via Unicode escape (= byte 0x00, dup ok)
+    keys.push("\u{FEFF}".into()); // BOM / zero-width no-break space
+    keys.push("\u{200B}".into()); // zero-width space
+    keys.push("\u{200E}".into()); // LTR mark
+    keys.push("\u{2028}".into()); // line separator
+    keys.push("\u{2029}".into()); // paragraph separator
+    // Surrogate code points are *not* valid in `&str` (Rust enforces
+    // well-formed UTF-8), so we cover the unpaired-surrogate concern
+    // by feeding the bytes that *would* form one (already in the
+    // 0x00..=0xFF sweep above as raw lone bytes — `from_utf8_lossy`
+    // turns them into U+FFFD, which is itself a worthwhile input).
+    // High-plane / non-BMP scalars:
+    keys.push("\u{1F4A9}".into()); // U+1F4A9 PILE OF POO (4-byte UTF-8)
+    keys.push("\u{10FFFF}".into()); // last legal scalar
+    // Long mixed-script + control sandwich:
+    keys.push("a/\u{0000}b\u{202E}c/\u{FEFF}日本".into());
+
+    for key in &keys {
+        // PUT must not panic.
+        let _ = rt.block_on(s4.put_object(put_req(bucket, key)));
+        // GET must not panic (may return NoSuchKey for keys whose PUT
+        // failed; either outcome is acceptable for this regression).
+        let _ = rt.block_on(s4.get_object(get_req(bucket, key)));
+        // HEAD must not panic.
+        let _ = rt.block_on(s4.head_object(head_req(bucket, key)));
+        // DELETE must not panic; this is the path that exercises the
+        // sidecar-DELETE re-entry (line ~2818 pre-fix), which used to
+        // unwrap on `format!("/{bucket}/{}", sidecar_key(&key))`.
+        let _ = rt.block_on(s4.delete_object(delete_req(bucket, key)));
     }
 }
