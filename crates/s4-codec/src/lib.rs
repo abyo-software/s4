@@ -130,6 +130,86 @@ pub struct ChunkManifest {
     pub crc32c: u32,
 }
 
+/// v0.8 #55: per-op telemetry returned by `CodecRegistry::compress_with_telemetry`
+/// / `decompress_with_telemetry`. Lets the s4-server caller stamp Prometheus
+/// metrics (`s4_gpu_compress_seconds`, `s4_gpu_throughput_bytes_per_sec`,
+/// `s4_gpu_oom_total`) without s4-codec needing a `metrics` dep itself —
+/// callback pattern keeps the codec dep tree slim.
+///
+/// Fields:
+/// - `codec`: stable codec kind name (`CodecKind::as_str()` —
+///   `"cpu-zstd"` / `"nvcomp-zstd"` / etc).
+/// - `bytes_in`: input length to the operation. For compress this is the
+///   uncompressed input; for decompress this is the compressed input.
+/// - `bytes_out`: output length. For compress = compressed; for decompress
+///   = decompressed.
+/// - `gpu_seconds`: `Some(elapsed_secs)` for GPU-backed codecs (Nvcomp*),
+///   `None` for CPU codecs (CpuZstd / Passthrough / CpuGzip). Callers
+///   skip the GPU metric stamp when this is `None`.
+/// - `oom`: `true` iff the operation failed with an OOM-classified error.
+///   The associated `Result` is still `Err(...)`; this flag exists so the
+///   stamp helper can tell OOM apart from generic backend errors without
+///   introspecting the `CodecError` chain at the call site.
+#[derive(Debug, Clone, Copy)]
+pub struct CompressTelemetry {
+    pub codec: &'static str,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub gpu_seconds: Option<f64>,
+    pub oom: bool,
+}
+
+impl CompressTelemetry {
+    /// CPU-codec convenience constructor — `gpu_seconds = None`,
+    /// `oom = false`. Used by passthrough / cpu-zstd / cpu-gzip path.
+    pub fn cpu(codec: &'static str, bytes_in: u64, bytes_out: u64) -> Self {
+        Self {
+            codec,
+            bytes_in,
+            bytes_out,
+            gpu_seconds: None,
+            oom: false,
+        }
+    }
+
+    /// GPU-codec convenience constructor — populates `gpu_seconds`
+    /// from the measured wall-clock duration of the inner compress /
+    /// decompress call.
+    pub fn gpu(codec: &'static str, bytes_in: u64, bytes_out: u64, seconds: f64) -> Self {
+        Self {
+            codec,
+            bytes_in,
+            bytes_out,
+            gpu_seconds: Some(seconds),
+            oom: false,
+        }
+    }
+
+    /// Mark this telemetry as the OOM-failure shape — paired with
+    /// `Err(CodecError::Backend(...))`. Callers stamp
+    /// `s4_gpu_oom_total{codec=...}` when this is `true`.
+    pub fn with_oom(mut self) -> Self {
+        self.oom = true;
+        self
+    }
+}
+
+/// v0.8 #55: heuristic OOM classifier. nvCOMP / cudarc surface OOM as a
+/// `CodecError::Backend(anyhow!("...out of memory..."))` (the underlying
+/// CUDA driver returns `CUDA_ERROR_OUT_OF_MEMORY` which `cudarc` /
+/// nvCOMP stringify); we substring-match for the well-known fragments
+/// so the metric stamp doesn't need to thread a typed error variant
+/// through the FFI boundary. Returns `true` only on a high-confidence
+/// match; non-OOM backend errors (CRC mismatch, IO error, etc.) yield
+/// `false` and are stamped as plain `s4_requests_total{result="err"}`
+/// without bumping the OOM counter.
+pub fn looks_like_oom(err: &CodecError) -> bool {
+    let s = err.to_string().to_ascii_lowercase();
+    s.contains("out of memory")
+        || s.contains("cudaerrormemoryallocation")
+        || s.contains("cuda_error_out_of_memory")
+}
+
 /// codec 操作のエラー型。`anyhow::Error` ではなく専用型にすることで、上位 (S4Service) が
 /// HTTP エラーコードを意味的に出し分けやすくする。
 #[derive(Debug, Error)]

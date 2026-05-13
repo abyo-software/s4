@@ -39,7 +39,7 @@ use s4_codec::multipart::{
     FRAME_HEADER_BYTES, FrameHeader, FrameIter, S3_MULTIPART_MIN_PART_BYTES, pad_to_minimum,
     write_frame,
 };
-use s4_codec::{ChunkManifest, CodecDispatcher, CodecKind, CodecRegistry};
+use s4_codec::{ChunkManifest, CodecDispatcher, CodecKind, CodecRegistry, CompressTelemetry};
 use std::time::Instant;
 use tracing::{debug, info};
 
@@ -53,6 +53,22 @@ use crate::streaming::{
 
 /// PUT body の先頭 sampling で渡す最大 byte 数。
 const SAMPLE_BYTES: usize = 4096;
+
+/// v0.8 #55: stamp the GPU pipeline metrics (`s4_gpu_compress_seconds`,
+/// `s4_gpu_throughput_bytes_per_sec`, `s4_gpu_oom_total`) from a
+/// `CompressTelemetry` returned by `CodecRegistry::compress_with_telemetry`.
+/// CPU codecs (`gpu_seconds = None`) are no-ops here — they're already
+/// covered by the existing `s4_request_latency_seconds` / `s4_bytes_*`
+/// counters in the request-level `record_put` / `record_get` calls.
+#[inline]
+fn stamp_gpu_compress_telemetry(tel: &CompressTelemetry) {
+    if let Some(secs) = tel.gpu_seconds {
+        crate::metrics::record_gpu_compress(tel.codec, secs, tel.bytes_in, tel.bytes_out);
+    }
+    if tel.oom {
+        crate::metrics::record_gpu_oom(tel.codec);
+    }
+}
 
 /// v0.7 #49: percent-encoding set covering everything that is **not** an
 /// `unreserved` character per RFC 3986 §2.3, **plus** we additionally
@@ -1774,11 +1790,15 @@ impl<B: S3> S3 for S4Service<B> {
                     path = "buffered",
                     "S4 put_object: compressing (buffered, raw blob)"
                 );
-                let (body, m) = self
-                    .registry
-                    .compress(bytes, kind)
-                    .await
-                    .map_err(internal("registry compress"))?;
+                // v0.8 #55: telemetry-returning compress so we can stamp
+                // GPU-pipeline Prometheus metrics (`s4_gpu_compress_seconds`,
+                // throughput gauge, OOM counter) for nvcomp / dietgpu codecs.
+                // CPU codecs come back with `gpu_seconds = None` and the
+                // stamp helper short-circuits — no extra cost on CPU path.
+                let (compress_res, tel) =
+                    self.registry.compress_with_telemetry(bytes, kind).await;
+                stamp_gpu_compress_telemetry(&tel);
+                let (body, m) = compress_res.map_err(internal("registry compress"))?;
                 (body, m, false)
             };
 
@@ -3205,11 +3225,13 @@ impl<B: S3> S3 for S4Service<B> {
             let sample_len = bytes.len().min(SAMPLE_BYTES);
             let codec_kind = self.dispatcher.pick(&bytes[..sample_len]).await;
             let original_size = bytes.len() as u64;
-            let (compressed, manifest) = self
+            // v0.8 #55: telemetry-returning compress (GPU metrics stamp).
+            let (compress_res, tel) = self
                 .registry
-                .compress(bytes, codec_kind)
-                .await
-                .map_err(internal("registry compress part"))?;
+                .compress_with_telemetry(bytes, codec_kind)
+                .await;
+            stamp_gpu_compress_telemetry(&tel);
+            let (compressed, manifest) = compress_res.map_err(internal("registry compress part"))?;
             let header = FrameHeader {
                 codec: codec_kind,
                 original_size,
@@ -3526,11 +3548,14 @@ impl<B: S3> S3 for S4Service<B> {
         let sample_len = bytes.len().min(SAMPLE_BYTES);
         let codec_kind = self.dispatcher.pick(&bytes[..sample_len]).await;
         let original_size = bytes.len() as u64;
-        let (compressed, manifest) = self
+        // v0.8 #55: telemetry-returning compress (GPU metrics stamp).
+        let (compress_res, tel) = self
             .registry
-            .compress(bytes, codec_kind)
-            .await
-            .map_err(internal("registry compress upload_part_copy"))?;
+            .compress_with_telemetry(bytes, codec_kind)
+            .await;
+        stamp_gpu_compress_telemetry(&tel);
+        let (compressed, manifest) =
+            compress_res.map_err(internal("registry compress upload_part_copy"))?;
         let header = FrameHeader {
             codec: codec_kind,
             original_size,

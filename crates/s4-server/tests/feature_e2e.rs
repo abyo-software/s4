@@ -3164,3 +3164,172 @@ async fn s3_select_gpu_filter_via_aws_sdk() {
 
     let _ = spawned.shutdown.send(());
 }
+
+// =============================================================================
+// v0.8 #55 — GPU pipeline Prometheus metrics E2E.
+// =============================================================================
+//
+// Drives a real PUT through an S4 listener configured with a GPU codec
+// (NvcompBitcomp) as the dispatcher's pick, then scrapes `/metrics` to
+// verify `s4_gpu_compress_seconds_count{codec="nvcomp-bitcomp"} >= 1`.
+//
+// ## Why NvcompBitcomp and not NvcompZstd
+//
+// `service::put_object` routes streaming-aware codecs through
+// `streaming::streaming_compress_to_frames` (which calls
+// `registry.compress` per chunk — no telemetry). With the
+// `nvcomp-gpu` feature on, that path covers `Passthrough`, `CpuZstd`,
+// **and `NvcompZstd`**. Non-streaming GPU codecs (`NvcompBitcomp`,
+// `NvcompGDeflate`) take the buffered path in `service.rs` ~L1777,
+// which IS the one that calls
+// `registry.compress_with_telemetry(...)` and stamps GPU metrics in
+// this PR. Per-chunk telemetry inside the streaming path is a v0.8
+// follow-up (touching `streaming.rs` is out of scope for this PR).
+//
+// So we exercise NvcompBitcomp here — it's the natural match for the
+// metric stamp's call-site coverage. The scrape format / label /
+// histogram-count semantics are the same regardless of which codec
+// fires.
+//
+// ## Runtime gating
+//
+// `#[cfg(feature = "nvcomp-gpu")]` covers compile-time. At runtime
+// the test self-skips with `eprintln!` if `is_gpu_available()`
+// returns false (no CUDA driver loadable / no visible device) so it
+// stays green on CPU-only CI hosts that nonetheless build with the
+// feature for type-check coverage.
+#[cfg(feature = "nvcomp-gpu")]
+#[tokio::test]
+async fn gpu_metrics_scrape_after_put() {
+    use s4_codec::nvcomp::{NvcompBitcompCodec, is_gpu_available};
+    use std::sync::OnceLock;
+
+    if !is_gpu_available() {
+        eprintln!(
+            "gpu_metrics_scrape_after_put: skipping (no CUDA-capable GPU detected at runtime)"
+        );
+        return;
+    }
+
+    // Prometheus recorder is a process-global. Multiple integration
+    // tests in the same binary would race on `install_recorder()` so
+    // we gate behind a `OnceLock` (same pattern http_e2e.rs uses for
+    // its `/metrics` test).
+    static METRICS_HANDLE:
+        OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
+
+    let minio = start_minio().await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+
+    // Build the S4 stack manually so we can attach the GPU codec +
+    // an `AlwaysDispatcher` pinned to NvcompBitcomp (otherwise the
+    // entropy-based dispatcher might pick CpuZstd / Passthrough on
+    // our synthetic payload and the GPU metric never fires).
+    let proxy = s3s_aws::Proxy::from(backend_client.clone());
+    let bitcomp = NvcompBitcompCodec::default_general()
+        .expect("NvcompBitcompCodec init (CUDA driver loaded above)");
+    let registry = std::sync::Arc::new(
+        CodecRegistry::new(CodecKind::NvcompBitcomp)
+            .with(std::sync::Arc::new(Passthrough))
+            .with(std::sync::Arc::new(s4_codec::cpu_zstd::CpuZstd::default()))
+            .with(std::sync::Arc::new(bitcomp)),
+    );
+    let dispatcher = std::sync::Arc::new(AlwaysDispatcher(CodecKind::NvcompBitcomp));
+    let s4 = S4Service::new(proxy, registry, dispatcher);
+
+    let mut svc = S3ServiceBuilder::new(s4);
+    svc.set_auth(SimpleAuth::from_single(MINIO_USER, MINIO_PASS));
+    let service = svc.build();
+
+    let metrics_handle = METRICS_HANDLE
+        .get_or_init(s4_server::metrics::install)
+        .clone();
+    let router = HealthRouterV2::new(service, None).with_metrics(metrics_handle);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let local = listener.local_addr().expect("local addr");
+    let endpoint_url = format!("http://{local}");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let http_server = ConnBuilderV2::new(TokioExecV2::new());
+        let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+        let mut shutdown_rx = std::pin::pin!(shutdown_rx);
+        loop {
+            tokio::select! {
+                accept = listener.accept() => match accept {
+                    Ok((socket, _)) => {
+                        let conn = http_server
+                            .serve_connection(TokioIoV2::new(socket), router.clone());
+                        let conn = graceful.watch(conn.into_owned());
+                        tokio::spawn(async move { let _ = conn.await; });
+                    }
+                    Err(e) => { eprintln!("accept: {e}"); continue; }
+                },
+                _ = shutdown_rx.as_mut() => break,
+            }
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), graceful.shutdown()).await;
+    });
+
+    // Bucket on the backend, then a 10 MiB PUT through S4. Bytes are
+    // a strided i64 column (8 KiB sample * 1280 = 10 MiB) — the kind
+    // of payload Bitcomp is actually designed for, so the codec
+    // doesn't error out on non-numeric data.
+    let s4_client = build_aws_client_v2(&endpoint_url);
+    ensure_bucket(&backend_client, "gpu-metrics-e2e").await;
+    let mut payload: Vec<u8> = Vec::with_capacity(10 * 1024 * 1024);
+    let mut counter: i64 = 0;
+    while payload.len() < 10 * 1024 * 1024 {
+        payload.extend_from_slice(&counter.to_le_bytes());
+        counter = counter.wrapping_add(1);
+    }
+    s4_client
+        .put_object()
+        .bucket("gpu-metrics-e2e")
+        .key("col-i64.bin")
+        .body(bytes::Bytes::from(payload).into())
+        .send()
+        .await
+        .expect("PUT 10 MiB column");
+
+    // Scrape /metrics off the same listener.
+    let metrics_body = reqwest::get(format!("{endpoint_url}/metrics"))
+        .await
+        .expect("GET /metrics")
+        .text()
+        .await
+        .expect("read /metrics body");
+
+    // The histogram macro emits `<name>_count` / `<name>_sum` /
+    // `<name>_bucket{le=...}` lines in the prometheus text format.
+    // We only need the count — `>= 1` proves the stamp helper ran.
+    let needle = r#"s4_gpu_compress_seconds_count{codec="nvcomp-bitcomp"}"#;
+    let count_line = metrics_body
+        .lines()
+        .find(|l| l.starts_with(needle))
+        .unwrap_or_else(|| {
+            panic!(
+                "missing `{needle}` in /metrics body. Full body:\n{metrics_body}"
+            )
+        });
+    // Line shape: `s4_gpu_compress_seconds_count{codec="nvcomp-bitcomp"} <n>`
+    let n: u64 = count_line
+        .split_whitespace()
+        .next_back()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("could not parse histogram count from `{count_line}`"));
+    assert!(
+        n >= 1,
+        "expected s4_gpu_compress_seconds_count >= 1 after one GPU PUT, got {n}. Body:\n{metrics_body}"
+    );
+
+    // Throughput gauge should also be present (set on every GPU op).
+    assert!(
+        metrics_body.contains(r#"s4_gpu_throughput_bytes_per_sec{codec="nvcomp-bitcomp",op="compress"}"#),
+        "missing throughput gauge for compress op. Body:\n{metrics_body}"
+    );
+
+    let _ = shutdown_tx.send(());
+}

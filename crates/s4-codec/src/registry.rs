@@ -10,10 +10,27 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 
-use crate::{ChunkManifest, Codec, CodecError, CodecKind};
+use crate::{ChunkManifest, Codec, CodecError, CodecKind, CompressTelemetry, looks_like_oom};
+
+/// v0.8 #55: which `CodecKind` values are GPU-backed, for the telemetry
+/// path's `gpu_seconds: Some(...)` decision. Hard-coded here (not on
+/// `CodecKind`) so adding a CPU codec doesn't accidentally flip it on,
+/// and adding a GPU codec is a deliberate one-line edit reviewers can
+/// catch in diff.
+fn is_gpu_kind(kind: CodecKind) -> bool {
+    matches!(
+        kind,
+        CodecKind::NvcompZstd
+            | CodecKind::NvcompBitcomp
+            | CodecKind::NvcompGans
+            | CodecKind::NvcompGDeflate
+            | CodecKind::DietGpuAns
+    )
+}
 
 /// codec dispatch レジストリ。`Arc` 越しに S4Service / 複数タスクから共有する想定。
 pub struct CodecRegistry {
@@ -78,6 +95,122 @@ impl CodecRegistry {
     ) -> Result<Bytes, CodecError> {
         let codec = self.lookup(manifest.codec)?;
         codec.decompress(input, manifest).await
+    }
+
+    /// v0.8 #55: same as [`Self::compress`] but additionally returns a
+    /// [`CompressTelemetry`] describing the operation (codec name,
+    /// input/output size, GPU wall-clock seconds for GPU codecs, OOM
+    /// flag on failure). Lets `s4-server` stamp Prometheus metrics
+    /// (`s4_gpu_compress_seconds`, `s4_gpu_throughput_bytes_per_sec`,
+    /// `s4_gpu_oom_total`) without `s4-codec` itself depending on the
+    /// `metrics` crate (callback / return-value pattern, keeps the
+    /// codec dep tree slim).
+    ///
+    /// On `Ok`, telemetry has the measured `bytes_in` / `bytes_out` and
+    /// `gpu_seconds = Some(secs)` for GPU kinds, `None` for CPU. On
+    /// `Err`, telemetry has `bytes_in = input.len() as u64` and
+    /// `bytes_out = 0`, with `oom = true` iff the error string matches
+    /// the OOM heuristic ([`crate::looks_like_oom`]).
+    pub async fn compress_with_telemetry(
+        &self,
+        input: Bytes,
+        kind: CodecKind,
+    ) -> (
+        Result<(Bytes, ChunkManifest), CodecError>,
+        CompressTelemetry,
+    ) {
+        let bytes_in = input.len() as u64;
+        let codec = match self.lookup(kind) {
+            Ok(c) => c,
+            Err(e) => {
+                let tel = CompressTelemetry {
+                    codec: kind.as_str(),
+                    bytes_in,
+                    bytes_out: 0,
+                    gpu_seconds: None,
+                    oom: false,
+                };
+                return (Err(e), tel);
+            }
+        };
+        let is_gpu = is_gpu_kind(kind);
+        let started = Instant::now();
+        let result = codec.compress(input).await;
+        let elapsed = started.elapsed().as_secs_f64();
+        match &result {
+            Ok((out, _manifest)) => {
+                let bytes_out = out.len() as u64;
+                let tel = if is_gpu {
+                    CompressTelemetry::gpu(kind.as_str(), bytes_in, bytes_out, elapsed)
+                } else {
+                    CompressTelemetry::cpu(kind.as_str(), bytes_in, bytes_out)
+                };
+                (result, tel)
+            }
+            Err(e) => {
+                let mut tel = if is_gpu {
+                    CompressTelemetry::gpu(kind.as_str(), bytes_in, 0, elapsed)
+                } else {
+                    CompressTelemetry::cpu(kind.as_str(), bytes_in, 0)
+                };
+                if looks_like_oom(e) {
+                    tel = tel.with_oom();
+                }
+                (result, tel)
+            }
+        }
+    }
+
+    /// v0.8 #55: telemetry-returning decompress. Mirrors
+    /// [`Self::compress_with_telemetry`] for the GET / decompress side
+    /// so operators can dashboard GPU decompress p99 separately from
+    /// the compress histogram.
+    pub async fn decompress_with_telemetry(
+        &self,
+        input: Bytes,
+        manifest: &ChunkManifest,
+    ) -> (Result<Bytes, CodecError>, CompressTelemetry) {
+        let bytes_in = input.len() as u64;
+        let kind = manifest.codec;
+        let codec = match self.lookup(kind) {
+            Ok(c) => c,
+            Err(e) => {
+                let tel = CompressTelemetry {
+                    codec: kind.as_str(),
+                    bytes_in,
+                    bytes_out: 0,
+                    gpu_seconds: None,
+                    oom: false,
+                };
+                return (Err(e), tel);
+            }
+        };
+        let is_gpu = is_gpu_kind(kind);
+        let started = Instant::now();
+        let result = codec.decompress(input, manifest).await;
+        let elapsed = started.elapsed().as_secs_f64();
+        match &result {
+            Ok(out) => {
+                let bytes_out = out.len() as u64;
+                let tel = if is_gpu {
+                    CompressTelemetry::gpu(kind.as_str(), bytes_in, bytes_out, elapsed)
+                } else {
+                    CompressTelemetry::cpu(kind.as_str(), bytes_in, bytes_out)
+                };
+                (result, tel)
+            }
+            Err(e) => {
+                let mut tel = if is_gpu {
+                    CompressTelemetry::gpu(kind.as_str(), bytes_in, 0, elapsed)
+                } else {
+                    CompressTelemetry::cpu(kind.as_str(), bytes_in, 0)
+                };
+                if looks_like_oom(e) {
+                    tel = tel.with_oom();
+                }
+                (result, tel)
+            }
+        }
     }
 }
 
@@ -148,5 +281,67 @@ mod tests {
             err,
             CodecError::UnregisteredCodec(CodecKind::NvcompBitcomp)
         ));
+    }
+
+    /// v0.8 #55: telemetry on a CPU codec should set `gpu_seconds = None`
+    /// (no GPU-metric stamp at the call site) and report the correct
+    /// input/output sizes, even though the timing measurement still runs.
+    #[tokio::test]
+    async fn compress_with_telemetry_cpu_marks_gpu_seconds_none() {
+        let r = registry();
+        let input = Bytes::from(vec![b'a'; 1024]);
+        let (res, tel) = r
+            .compress_with_telemetry(input.clone(), CodecKind::CpuZstd)
+            .await;
+        let (out, _manifest) = res.expect("compress ok");
+        assert_eq!(tel.codec, "cpu-zstd");
+        assert_eq!(tel.bytes_in, input.len() as u64);
+        assert_eq!(tel.bytes_out, out.len() as u64);
+        assert!(
+            tel.gpu_seconds.is_none(),
+            "CPU codec must report gpu_seconds=None, got {:?}",
+            tel.gpu_seconds
+        );
+        assert!(!tel.oom);
+    }
+
+    /// v0.8 #55: telemetry on an unregistered codec should surface the
+    /// `UnregisteredCodec` error AND a populated telemetry shell so the
+    /// caller's stamp helper can still increment a generic `requests
+    /// _total{result="err"}` if it wants to (no panic-on-error path).
+    #[tokio::test]
+    async fn compress_with_telemetry_unregistered_returns_telemetry() {
+        let r = registry();
+        let input = Bytes::from(vec![b'b'; 32]);
+        let (res, tel) = r
+            .compress_with_telemetry(input.clone(), CodecKind::NvcompBitcomp)
+            .await;
+        assert!(matches!(
+            res,
+            Err(CodecError::UnregisteredCodec(CodecKind::NvcompBitcomp))
+        ));
+        assert_eq!(tel.codec, "nvcomp-bitcomp");
+        assert_eq!(tel.bytes_in, input.len() as u64);
+        assert_eq!(tel.bytes_out, 0);
+        assert!(tel.gpu_seconds.is_none());
+        assert!(!tel.oom);
+    }
+
+    /// v0.8 #55: telemetry-returning decompress on a CPU codec round
+    /// trips and reports the decompressed (output) byte count.
+    #[tokio::test]
+    async fn decompress_with_telemetry_cpu_reports_output_size() {
+        let r = registry();
+        let input = Bytes::from(vec![b'c'; 1024]);
+        let (compressed, manifest) = r.compress(input.clone(), CodecKind::CpuZstd).await.unwrap();
+        let (res, tel) = r
+            .decompress_with_telemetry(compressed.clone(), &manifest)
+            .await;
+        let out = res.expect("decompress ok");
+        assert_eq!(out, input);
+        assert_eq!(tel.codec, "cpu-zstd");
+        assert_eq!(tel.bytes_in, compressed.len() as u64);
+        assert_eq!(tel.bytes_out, input.len() as u64);
+        assert!(tel.gpu_seconds.is_none());
     }
 }

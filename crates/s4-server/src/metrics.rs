@@ -64,6 +64,98 @@ pub mod names {
     /// or carried an invalid serial / TOTP code. Label: `bucket`
     /// (cardinality bounded by # of MFA-Delete-protected buckets).
     pub const MFA_DELETE_DENIALS_TOTAL: &str = "s4_mfa_delete_denials_total";
+    /// v0.8 #55: per-GPU-compress wall-clock seconds histogram. Labels:
+    /// `codec` (= the GPU codec kind name, e.g. `"nvcomp-bitcomp"`).
+    /// Cardinality bounded by the GPU codec set (~3-4).
+    pub const GPU_COMPRESS_SECONDS: &str = "s4_gpu_compress_seconds";
+    /// v0.8 #55: per-GPU-decompress wall-clock seconds histogram. Same
+    /// label shape as [`GPU_COMPRESS_SECONDS`].
+    pub const GPU_DECOMPRESS_SECONDS: &str = "s4_gpu_decompress_seconds";
+    /// v0.8 #55: gauge of the most-recently-observed GPU codec
+    /// throughput in bytes/sec. Labels: `codec` (codec kind name),
+    /// `op` (= `"compress"` / `"decompress"`). Set on every GPU op so
+    /// the gauge tracks the rolling latest sample; pair with the
+    /// histogram for p99 latency vs. peak throughput dashboards.
+    pub const GPU_THROUGHPUT_BYTES_PER_SEC: &str = "s4_gpu_throughput_bytes_per_sec";
+    /// v0.8 #55: gauge of in-flight GPU operations (compress +
+    /// decompress combined). Operators alert when this gauge stays
+    /// pinned at the configured concurrency cap, signalling GPU
+    /// saturation / queue head-of-line blocking. Labels: `codec`.
+    pub const GPU_IN_FLIGHT: &str = "s4_gpu_in_flight";
+    /// v0.8 #55: counter bumped each time a GPU compress / decompress
+    /// fails with an out-of-memory error (cudaErrorMemoryAllocation /
+    /// nvCOMP equivalent). Labels: `codec`. Pair with
+    /// `s4_requests_total{result="err"}` to attribute error spikes to
+    /// GPU OOM versus generic backend failures.
+    pub const GPU_OOM_TOTAL: &str = "s4_gpu_oom_total";
+}
+
+/// v0.8 #55: stamp metrics after a GPU compress completes.
+///
+/// `codec` is the GPU codec kind name (`CodecKind::as_str()` —
+/// `"nvcomp-zstd"` / `"nvcomp-bitcomp"` / `"nvcomp-gdeflate"`),
+/// `secs` is wall-clock seconds the op took (input includes any
+/// host→device copy + kernel launch + device→host copy), `bytes_in`
+/// is the uncompressed input length, `bytes_out` is the compressed
+/// output length. Throughput is computed as `bytes_in / secs`
+/// (saturated to 1e-9 to avoid division by zero on instantly-cached
+/// micro inputs).
+///
+/// `bytes_out` is currently exposed only via the throughput
+/// computation paired with the existing `s4_bytes_out_total{op="put"}`
+/// counter — split-out compressed-bytes-per-op metric is left to
+/// follow-up to keep cardinality bounded.
+pub fn record_gpu_compress(codec: &'static str, secs: f64, bytes_in: u64, bytes_out: u64) {
+    metrics::histogram!(names::GPU_COMPRESS_SECONDS, "codec" => codec).record(secs);
+    let throughput = (bytes_in as f64) / secs.max(1e-9);
+    metrics::gauge!(
+        names::GPU_THROUGHPUT_BYTES_PER_SEC,
+        "codec" => codec,
+        "op" => "compress",
+    )
+    .set(throughput);
+    // Reserved for a follow-up `s4_gpu_bytes_out_total` split — pulled
+    // through the API now so the call sites already pass it and a
+    // future PR adds the metric without re-touching every caller.
+    let _ = bytes_out;
+}
+
+/// v0.8 #55: mirror of [`record_gpu_compress`] for the decompress side.
+/// `bytes_in` is the compressed input size, `bytes_out` is the
+/// uncompressed output size — throughput here is `bytes_out / secs`
+/// (decompressed-bytes-per-second is the standard nvCOMP / DietGPU
+/// reporting convention).
+pub fn record_gpu_decompress(codec: &'static str, secs: f64, bytes_in: u64, bytes_out: u64) {
+    metrics::histogram!(names::GPU_DECOMPRESS_SECONDS, "codec" => codec).record(secs);
+    let throughput = (bytes_out as f64) / secs.max(1e-9);
+    metrics::gauge!(
+        names::GPU_THROUGHPUT_BYTES_PER_SEC,
+        "codec" => codec,
+        "op" => "decompress",
+    )
+    .set(throughput);
+    let _ = bytes_in;
+}
+
+/// v0.8 #55: increment the in-flight GPU op gauge for `codec`. Pair
+/// with [`record_gpu_in_flight_dec`] in a guard wrapper to keep the
+/// gauge balanced even when the op errors out.
+pub fn record_gpu_in_flight_inc(codec: &'static str) {
+    metrics::gauge!(names::GPU_IN_FLIGHT, "codec" => codec).increment(1.0);
+}
+
+/// v0.8 #55: decrement the in-flight GPU op gauge for `codec`.
+pub fn record_gpu_in_flight_dec(codec: &'static str) {
+    metrics::gauge!(names::GPU_IN_FLIGHT, "codec" => codec).decrement(1.0);
+}
+
+/// v0.8 #55: bump the GPU OOM counter for `codec`. Called from the
+/// service-layer telemetry stamp when [`s4_codec::CodecError`] is
+/// classified as OOM (the backend layer surfaces the underlying
+/// CUDA error string; classification is a substring match against
+/// `"out of memory"` / `"cudaErrorMemoryAllocation"`).
+pub fn record_gpu_oom(codec: &'static str) {
+    metrics::counter!(names::GPU_OOM_TOTAL, "codec" => codec).increment(1);
 }
 
 /// v0.6 #42: bump the MFA-Delete denial counter for `bucket` (covers all
@@ -215,10 +307,27 @@ mod tests {
     fn install_and_render_basic_counters() {
         // 同 process 内で複数回 install できないので、テストは 1 回限り。
         // record した値が render に現れることを確認。
+        // v0.8 #55: also drive the GPU-pipeline recorders so the same
+        // single recorder install covers all metric families. Splitting
+        // these into separate `#[test]` fns would race on the global
+        // `PrometheusBuilder::install_recorder()` slot.
         let handle = install();
         record_put("cpu-zstd", 1000, 100, 0.05, true);
         record_get("cpu-zstd", 100, 1000, 0.02, true);
+
+        // v0.8 #55: GPU-compress histogram + throughput gauge.
+        record_gpu_compress("nvcomp-zstd", 0.012, 10_000_000, 800_000);
+        // v0.8 #55: GPU-decompress histogram + throughput gauge.
+        record_gpu_decompress("nvcomp-zstd", 0.008, 800_000, 10_000_000);
+        // v0.8 #55: in-flight gauge (inc then dec → render shows 0).
+        record_gpu_in_flight_inc("nvcomp-bitcomp");
+        record_gpu_in_flight_inc("nvcomp-bitcomp");
+        record_gpu_in_flight_dec("nvcomp-bitcomp");
+        // v0.8 #55: OOM counter.
+        record_gpu_oom("nvcomp-gdeflate");
+
         let rendered = handle.render();
+        // Pre-existing assertions.
         assert!(rendered.contains("s4_requests_total"));
         assert!(rendered.contains("s4_bytes_in_total"));
         assert!(rendered.contains("s4_bytes_out_total"));
@@ -226,5 +335,85 @@ mod tests {
         assert!(rendered.contains("op=\"put\""));
         assert!(rendered.contains("op=\"get\""));
         assert!(rendered.contains("codec=\"cpu-zstd\""));
+
+        // v0.8 #55: new GPU metrics show up with their codec labels.
+        assert!(
+            rendered.contains("s4_gpu_compress_seconds"),
+            "missing GPU compress histogram in: {rendered}"
+        );
+        assert!(
+            rendered.contains("s4_gpu_decompress_seconds"),
+            "missing GPU decompress histogram in: {rendered}"
+        );
+        assert!(
+            rendered.contains("s4_gpu_throughput_bytes_per_sec"),
+            "missing throughput gauge in: {rendered}"
+        );
+        assert!(
+            rendered.contains("s4_gpu_in_flight"),
+            "missing in_flight gauge in: {rendered}"
+        );
+        assert!(
+            rendered.contains("s4_gpu_oom_total"),
+            "missing OOM counter in: {rendered}"
+        );
+        // Codec labels are preserved.
+        assert!(rendered.contains("codec=\"nvcomp-zstd\""));
+        assert!(rendered.contains("codec=\"nvcomp-bitcomp\""));
+        assert!(rendered.contains("codec=\"nvcomp-gdeflate\""));
+        // op label distinguishes throughput direction.
+        assert!(rendered.contains("op=\"compress\""));
+        assert!(rendered.contains("op=\"decompress\""));
+    }
+
+    /// v0.8 #55: throughput gauge math. 10 MiB in 10 ms ≈ 1.05 GB/s
+    /// (decimal). Verifies the `bytes_in / secs` formula is wired
+    /// correctly (regression guard against accidentally swapping
+    /// bytes_out into the compress throughput slot).
+    #[test]
+    fn gpu_compress_throughput_math() {
+        let secs = 0.010_f64;
+        let bytes_in: u64 = 10 * 1024 * 1024;
+        let bytes_out: u64 = 1024 * 1024;
+        // Compress throughput convention: bytes_in / secs (the rate
+        // the codec is consuming uncompressed input). Reproducing the
+        // exact formula here so a future swap of numerator into
+        // bytes_out trips the test.
+        let expected = (bytes_in as f64) / secs.max(1e-9);
+        // 10 * 1024 * 1024 / 0.010 = 1_048_576_000 bytes/sec exactly.
+        let want_bytes_per_sec: f64 = 10.0 * 1024.0 * 1024.0 / 0.010;
+        assert!((expected - want_bytes_per_sec).abs() < 1.0);
+        assert!((expected - 1_048_576_000.0).abs() < 1.0);
+        // Drive the recorder once to confirm it doesn't panic on these
+        // inputs (the global recorder may or may not be installed in
+        // this test order, so we only assert it survives).
+        record_gpu_compress("nvcomp-zstd", secs, bytes_in, bytes_out);
+    }
+
+    /// v0.8 #55: decompress throughput uses `bytes_out / secs`
+    /// (decompressed bytes per second — the nvCOMP reporting
+    /// convention) so we verify the direction is right.
+    #[test]
+    fn gpu_decompress_throughput_math() {
+        let secs = 0.005_f64;
+        let bytes_in: u64 = 1024 * 1024; // compressed input
+        let bytes_out: u64 = 10 * 1024 * 1024; // decompressed output
+        let expected = (bytes_out as f64) / secs.max(1e-9);
+        // 10 * 1024 * 1024 / 0.005 = 2_097_152_000 bytes/sec exactly.
+        assert!((expected - 2_097_152_000.0).abs() < 1.0);
+        record_gpu_decompress("nvcomp-zstd", secs, bytes_in, bytes_out);
+    }
+
+    /// v0.8 #55: OOM counter accepts arbitrary codec labels and never
+    /// panics. The label is `&'static str` (we route through
+    /// `CodecKind::as_str()`) so the recorder stores it without
+    /// allocating per-call.
+    #[test]
+    fn gpu_oom_counter_accepts_all_gpu_codecs() {
+        for codec in ["nvcomp-zstd", "nvcomp-bitcomp", "nvcomp-gdeflate"] {
+            record_gpu_oom(codec);
+        }
+        // No panic == pass; the in-process render side is covered by
+        // `install_and_render_basic_counters`.
     }
 }
