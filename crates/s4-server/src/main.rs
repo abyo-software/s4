@@ -7,10 +7,11 @@
 
 use std::error::Error;
 use std::io::IsTerminal;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use aws_credential_types::provider::ProvideCredentials;
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3s::S3;
@@ -93,9 +94,11 @@ struct Opt {
     #[clap(long)]
     domain: Option<String>,
 
-    /// バックエンド S3 endpoint (例: https://s3.us-east-1.amazonaws.com)
+    /// バックエンド S3 endpoint (例: https://s3.us-east-1.amazonaws.com)。
+    /// 通常 (server mode) は必須。`verify-audit-log` 等の non-server
+    /// subcommand では指定不要 (server 起動時に runtime 検証する)。
     #[clap(long)]
-    endpoint_url: String,
+    endpoint_url: Option<String>,
 
     /// 既定の圧縮 codec (PUT 時に dispatcher が選ぶ default)
     #[clap(long, value_enum, default_value = "cpu-zstd")]
@@ -190,6 +193,44 @@ struct Opt {
     /// destination).
     #[clap(long)]
     access_log: Option<std::path::PathBuf>,
+
+    /// v0.5 #31: optional HMAC-SHA256 key for tamper-evident audit log
+    /// chaining. When set together with --access-log, every emitted
+    /// access-log line gets a trailing hex HMAC column and each rotated
+    /// batch file starts with `# prev_file_tail=<hex>` so the chain
+    /// extends across rotations. Format: `raw:<bytes>`, `hex:<hex>`,
+    /// or `base64:<b64>`. Verify with the `verify-audit-log` subcommand.
+    #[clap(long)]
+    audit_log_hmac_key: Option<String>,
+
+    /// v0.5 #31: optional subcommand. When omitted, runs the gateway
+    /// (existing v0.4 behaviour). Available subcommands:
+    /// `verify-audit-log <FILE> --hmac-key <SPEC>` walks an audit-log
+    /// file and reports the first chain break (or "OK" when intact).
+    #[command(subcommand)]
+    command: Option<Cmd>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Cmd {
+    /// Walk an audit-log file produced by `--access-log` +
+    /// `--audit-log-hmac-key`, recompute each line's HMAC, and report
+    /// the first chain break (or "OK" if the chain is intact).
+    VerifyAuditLog(VerifyAuditLogArgs),
+}
+
+#[derive(Debug, Args)]
+struct VerifyAuditLogArgs {
+    /// Path to the audit-log file to verify. Comment lines starting
+    /// with `# prev_file_tail=<hex>` reset the running prev-HMAC, so a
+    /// rotated chain can be walked one file at a time in order.
+    file: std::path::PathBuf,
+
+    /// HMAC-SHA256 key used to produce the chain. Same shape as
+    /// `--audit-log-hmac-key`: `raw:<bytes>`, `hex:<hex>`, or
+    /// `base64:<b64>`.
+    #[clap(long = "hmac-key")]
+    hmac_key: String,
 }
 
 fn setup_tracing(
@@ -314,14 +355,27 @@ fn build_dispatcher(choice: DispatcherChoice, default: CodecKind) -> Arc<dyn Cod
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     let opt = Opt::parse();
+
+    // v0.5 #31: dispatch non-server subcommands before booting the
+    // gateway (no tracing init, no AWS SDK config required — the
+    // verifier is a pure file-walk).
+    if let Some(cmd) = opt.command.as_ref() {
+        return run_subcommand(cmd);
+    }
+
     setup_tracing(
         opt.log_format,
         opt.otlp_endpoint.as_deref(),
         &opt.service_name,
     )?;
 
+    let endpoint_url = opt.endpoint_url.as_deref().ok_or(
+        "--endpoint-url is required when running as a server (omit only \
+         for non-server subcommands like verify-audit-log)",
+    )?;
+
     let sdk_conf = aws_config::from_env()
-        .endpoint_url(&opt.endpoint_url)
+        .endpoint_url(endpoint_url)
         .load()
         .await;
     let client = aws_sdk_s3::Client::from_conf(
@@ -358,7 +412,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     }
     if let Some(ref dir) = opt.access_log {
         let dest = s4_server::access_log::AccessLogDest { dir: dir.clone() };
-        let log = std::sync::Arc::new(s4_server::access_log::AccessLog::new(dest));
+        let mut log = s4_server::access_log::AccessLog::new(dest);
+        if let Some(ref spec) = opt.audit_log_hmac_key {
+            let key = s4_server::audit_log::AuditHmacKey::from_str(spec)
+                .map_err(|e| format!("--audit-log-hmac-key: {e}"))?;
+            info!(
+                len = key.as_bytes().len(),
+                "S4 audit-log HMAC chain enabled (v0.5 #31)"
+            );
+            log = log.with_hmac_key(std::sync::Arc::new(key));
+        }
+        let log = std::sync::Arc::new(log);
         let _flusher = log.spawn_flusher();
         info!(dir = %dir.display(), "S4 access log emitter started");
         s4 = s4.with_access_log(log);
@@ -376,6 +440,43 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         s4 = s4.with_policy(std::sync::Arc::new(policy));
     }
     run_server(s4, &sdk_conf, &opt, ready_client).await
+}
+
+/// v0.5 #31: dispatch a non-server subcommand. Currently the only one
+/// is `verify-audit-log`, which walks an audit-log file and prints a
+/// short report (and exits non-zero on chain break).
+fn run_subcommand(cmd: &Cmd) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    match cmd {
+        Cmd::VerifyAuditLog(args) => {
+            let key = s4_server::audit_log::AuditHmacKey::from_str(&args.hmac_key)
+                .map_err(|e| format!("--hmac-key: {e}"))?;
+            let report = s4_server::audit_log::verify_audit_log(&args.file, &key)
+                .map_err(|e| format!("verify-audit-log {}: {e}", args.file.display()))?;
+            match report.first_break {
+                None => {
+                    println!(
+                        "OK {} ({} lines, {} chained entries verified)",
+                        args.file.display(),
+                        report.total_lines,
+                        report.ok_lines
+                    );
+                    Ok(())
+                }
+                Some(br) => {
+                    eprintln!(
+                        "BREAK {} at line {} ({} lines total, {} OK before break)",
+                        args.file.display(),
+                        br.line_no,
+                        report.total_lines,
+                        report.ok_lines
+                    );
+                    eprintln!("  expected hmac: {}", br.expected_hmac);
+                    eprintln!("  actual hmac:   {}", br.actual_hmac);
+                    Err(format!("audit-log chain break at line {}", br.line_no).into())
+                }
+            }
+        }
+    }
 }
 
 fn build_ready_check(client: aws_sdk_s3::Client) -> ReadyCheck {
@@ -519,7 +620,7 @@ where
         host = %opt.host,
         port = opt.port,
         scheme,
-        endpoint_url = %opt.endpoint_url,
+        endpoint_url = opt.endpoint_url.as_deref().unwrap_or("<unset>"),
         "S4 listening (paths /health and /ready served alongside S3 traffic)"
     );
 

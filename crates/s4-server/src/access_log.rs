@@ -38,6 +38,10 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use tokio::sync::Mutex;
 
+use crate::audit_log::{
+    AuditHmacKey, PREV_TAIL_COMMENT_PREFIX, chain_step, genesis_prev, hex_encode,
+};
+
 /// Per-request structured fields collected at handler completion. The
 /// emitter renders this into the on-the-wire S3 access-log format on
 /// flush.
@@ -102,6 +106,32 @@ pub struct AccessLog {
     flush_every_secs: u64,
     max_entries_before_flush: usize,
     batch_counter: Arc<std::sync::atomic::AtomicU64>,
+    /// v0.5 #31: optional HMAC-SHA256 key. When `Some(...)`, the
+    /// flusher appends a hex HMAC column to every line and emits a
+    /// `# prev_file_tail=<hex>` comment at the top of each rotated
+    /// batch file so the chain extends across rotations.
+    hmac_key: Option<Arc<AuditHmacKey>>,
+    /// Running chain state — the last HMAC the flusher emitted (or
+    /// the genesis seed if nothing has been emitted yet). Updated
+    /// in-place at the end of each flush batch.
+    chain_state: Arc<Mutex<ChainState>>,
+}
+
+#[derive(Debug, Clone)]
+struct ChainState {
+    last_hmac: [u8; 32],
+    /// True once at least one batch has been written, so the next
+    /// batch knows it must emit a `# prev_file_tail=` comment.
+    primed: bool,
+}
+
+impl Default for ChainState {
+    fn default() -> Self {
+        Self {
+            last_hmac: genesis_prev(),
+            primed: false,
+        }
+    }
 }
 
 impl AccessLog {
@@ -112,7 +142,20 @@ impl AccessLog {
             flush_every_secs: 60,
             max_entries_before_flush: 5_000,
             batch_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            hmac_key: None,
+            chain_state: Arc::new(Mutex::new(ChainState::default())),
         }
+    }
+
+    /// v0.5 #31: turn on tamper-evident HMAC chaining. Every emitted
+    /// line gets a trailing hex HMAC column, and each new batch file
+    /// starts with a `# prev_file_tail=<hex>` comment so the chain
+    /// extends across rotations. Without this builder, lines are
+    /// emitted exactly as before (back-compat with v0.4 #20 readers).
+    #[must_use]
+    pub fn with_hmac_key(mut self, key: Arc<AuditHmacKey>) -> Self {
+        self.hmac_key = Some(key);
+        self
     }
 
     pub async fn record(&self, entry: AccessLogEntry) {
@@ -134,6 +177,8 @@ impl AccessLog {
         let buf = Arc::clone(&self.buf);
         let interval = self.flush_every_secs;
         let counter = Arc::clone(&self.batch_counter);
+        let hmac_key = self.hmac_key.clone();
+        let chain_state = Arc::clone(&self.chain_state);
         if let Err(e) = std::fs::create_dir_all(&dest.dir) {
             tracing::warn!(
                 "S4 access log: could not create dir {}: {e}",
@@ -154,7 +199,15 @@ impl AccessLog {
                 let now = SystemTime::now();
                 let batch = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let path = dest.path_for(now, batch);
-                let body = render_lines(&drained);
+                let body = if let Some(key) = hmac_key.as_ref() {
+                    let mut state = chain_state.lock().await;
+                    let (rendered, new_last) = render_lines_chained(&drained, key, &state);
+                    state.last_hmac = new_last;
+                    state.primed = true;
+                    rendered
+                } else {
+                    render_lines(&drained)
+                };
                 let body_bytes: Bytes = Bytes::from(body);
                 let path_clone = path.clone();
                 let res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
@@ -178,6 +231,46 @@ impl AccessLog {
             }
         })
     }
+}
+
+/// Render `entries` with a trailing HMAC column on each line, plus a
+/// `# prev_file_tail=<hex>` preamble when `state.primed` is true (i.e.
+/// this is not the very first batch). Returns the rendered text and
+/// the final chain HMAC, which the caller must persist back to the
+/// shared state.
+///
+/// Each line's HMAC is computed over `prev_hmac || line_no_hmac`,
+/// where `line_no_hmac` is the bytes of the line WITHOUT the trailing
+/// HMAC column AND WITHOUT the trailing newline. The producer then
+/// appends ` <hex>\n` to land on the wire format the verifier expects.
+fn render_lines_chained(
+    entries: &[AccessLogEntry],
+    key: &AuditHmacKey,
+    state: &ChainState,
+) -> (String, [u8; 32]) {
+    // Reserve a generous budget: ~256 chars per base line + 65 for
+    // " <hex>\n", plus 80 for the preamble.
+    let mut out = String::with_capacity(entries.len() * 320 + 80);
+    if state.primed {
+        out.push_str(PREV_TAIL_COMMENT_PREFIX);
+        out.push_str(&hex_encode(&state.last_hmac));
+        out.push('\n');
+    }
+    let base = render_lines(entries);
+    let mut prev = state.last_hmac;
+    for raw_line in base.split_inclusive('\n') {
+        let line = raw_line.trim_end_matches('\n');
+        if line.is_empty() {
+            continue;
+        }
+        let mac = chain_step(key, &prev, line.as_bytes());
+        out.push_str(line);
+        out.push(' ');
+        out.push_str(&hex_encode(&mac));
+        out.push('\n');
+        prev = mac;
+    }
+    (out, prev)
 }
 
 /// Public wrapper for ease of `Arc<AccessLog>` plumbing in S4Service.
@@ -270,6 +363,82 @@ mod tests {
         // 2026-05-13 00:00:00 UTC = 1779048000s
         let (y, mo, d, h) = unix_to_ymdh(1_779_148_800);
         assert!(y == 2026 && (1..=12).contains(&mo) && (1..=31).contains(&d) && h < 24);
+    }
+
+    fn sample_entry(bucket: &str) -> AccessLogEntry {
+        AccessLogEntry {
+            time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            bucket: bucket.into(),
+            remote_ip: Some("10.0.0.1".into()),
+            requester: Some("AKIATEST".into()),
+            operation: "REST.PUT.OBJECT",
+            key: Some("k".into()),
+            request_uri: "PUT /b/k HTTP/1.1".into(),
+            http_status: 200,
+            error_code: None,
+            bytes_sent: 0,
+            object_size: 4096,
+            total_time_ms: 12,
+            user_agent: Some("aws-cli/2.0".into()),
+        }
+    }
+
+    #[test]
+    fn chained_render_produces_verifiable_output() {
+        use std::str::FromStr;
+
+        use crate::audit_log::{AuditHmacKey, verify_audit_bytes};
+        let key = AuditHmacKey::from_str("raw:0123456789abcdef0123456789abcdef").unwrap();
+        let entries = vec![sample_entry("b1"), sample_entry("b2"), sample_entry("b3")];
+        let state = ChainState::default();
+        let (text, _last) = render_lines_chained(&entries, &key, &state);
+        // No prev_file_tail comment on the first batch.
+        assert!(!text.starts_with("# prev_file_tail="));
+        // Each line ends with " <64 hex>\n"
+        for raw in text.split_inclusive('\n') {
+            let line = raw.trim_end_matches('\n');
+            if line.is_empty() {
+                continue;
+            }
+            assert!(line.len() > 65);
+            let suf = &line[line.len() - 65..];
+            assert!(suf.starts_with(' '));
+            assert!(suf[1..].chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        // Verifier is happy.
+        let report =
+            verify_audit_bytes(std::path::Path::new("<mem>"), text.as_bytes(), &key).unwrap();
+        assert!(report.first_break.is_none());
+        assert_eq!(report.ok_lines, 3);
+    }
+
+    #[test]
+    fn second_batch_emits_prev_file_tail_and_chains() {
+        use std::str::FromStr;
+
+        use crate::audit_log::{AuditHmacKey, verify_audit_bytes};
+        let key = AuditHmacKey::from_str("raw:0123456789abcdef0123456789abcdef").unwrap();
+
+        // First batch.
+        let entries1 = vec![sample_entry("b1")];
+        let mut state = ChainState::default();
+        let (text1, last1) = render_lines_chained(&entries1, &key, &state);
+        state.last_hmac = last1;
+        state.primed = true;
+
+        // Second batch — must start with # prev_file_tail= and verify
+        // when fed independently to the verifier.
+        let entries2 = vec![sample_entry("b2")];
+        let (text2, _) = render_lines_chained(&entries2, &key, &state);
+        assert!(text2.starts_with("# prev_file_tail="));
+        let report =
+            verify_audit_bytes(std::path::Path::new("<mem>"), text2.as_bytes(), &key).unwrap();
+        assert!(report.first_break.is_none(), "second batch must verify");
+        assert_eq!(report.ok_lines, 1);
+        // First batch verifies on its own too.
+        let r1 =
+            verify_audit_bytes(std::path::Path::new("<mem>"), text1.as_bytes(), &key).unwrap();
+        assert!(r1.first_break.is_none());
     }
 
     #[test]
