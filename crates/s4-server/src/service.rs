@@ -1823,18 +1823,27 @@ impl<B: S3> S3 for S4Service<B> {
             // The `s4-encrypted: aes-256-gcm` metadata flag is set in
             // both encrypted modes; the on-disk frame magic distinguishes
             // S4E1 / S4E2 / S4E3 so GET picks the right decrypt path.
-            let sse_c_material = extract_sse_c_material(
-                &req.input.sse_customer_algorithm,
-                &req.input.sse_customer_key,
-                &req.input.sse_customer_key_md5,
-            )?;
+            // v0.7 #48 BUG-2/3 fix: take() the SSE fields off req.input
+            // so the encryption headers are NOT forwarded to the
+            // backend. S4 owns the encrypt-then-store contract; if we
+            // leave the headers in place, real S3-compat backends
+            // (MinIO / AWS) try to apply their own SSE on top and
+            // either reject (MinIO requires HTTPS for SSE-C) or fail
+            // (MinIO has no KMS configured). MemoryBackend ignored
+            // these so mock tests passed.
+            let sse_c_alg = req.input.sse_customer_algorithm.take();
+            let sse_c_key = req.input.sse_customer_key.take();
+            let sse_c_md5 = req.input.sse_customer_key_md5.take();
+            let sse_header = req.input.server_side_encryption.take();
+            let sse_kms_key = req.input.ssekms_key_id.take();
+            let sse_c_material = extract_sse_c_material(&sse_c_alg, &sse_c_key, &sse_c_md5)?;
             // v0.5 #28: SSE-KMS request? Resolves to None unless the
             // request asks for `aws:kms` AND a key id is available
             // (explicit header or gateway default). When set, we'll
             // generate a per-object DEK below.
             let kms_key_id = extract_kms_key_id(
-                &req.input.server_side_encryption,
-                &req.input.ssekms_key_id,
+                &sse_header,
+                &sse_kms_key,
                 self.kms_default_key_id.as_deref(),
             );
             // v0.5 #32: in compliance-strict mode, every PUT must
@@ -1847,11 +1856,7 @@ impl<B: S3> S3 for S4Service<B> {
                 && sse_c_material.is_none()
                 && kms_key_id.is_none()
                 && self.sse_keyring.is_none()
-                && req
-                    .input
-                    .server_side_encryption
-                    .as_ref()
-                    .map(|s| s.as_str())
+                && sse_header.as_ref().map(|s| s.as_str())
                     != Some(ServerSideEncryption::AES256)
             {
                 return Err(S3Error::with_message(
@@ -1893,11 +1898,18 @@ impl<B: S3> S3 for S4Service<B> {
             } else {
                 None
             };
+            // v0.7 #48 BUG-4 fix: stamp the SSE *type* into metadata
+            // alongside `s4-encrypted` so HEAD (which doesn't fetch the
+            // body) can echo the correct `x-amz-server-side-encryption`
+            // value. Without this, HEAD on an SSE-KMS object would not
+            // echo `aws:kms` because the frame magic is only available
+            // on the body (which HEAD doesn't read).
             let body_to_send = if let Some(ref m) = sse_c_material {
-                req.input
-                    .metadata
-                    .get_or_insert_with(Default::default)
-                    .insert("s4-encrypted".into(), "aes-256-gcm".into());
+                let meta = req.input.metadata.get_or_insert_with(Default::default);
+                meta.insert("s4-encrypted".into(), "aes-256-gcm".into());
+                meta.insert("s4-sse-type".into(), "AES256".into());
+                meta.insert("s4-sse-c-key-md5".into(),
+                    base64::engine::general_purpose::STANDARD.encode(m.key_md5));
                 crate::sse::encrypt_with_source(
                     &compressed,
                     crate::sse::SseSource::CustomerKey {
@@ -1906,19 +1918,24 @@ impl<B: S3> S3 for S4Service<B> {
                     },
                 )
             } else if let Some((ref dek, ref wrapped)) = kms_wrap {
-                req.input
-                    .metadata
-                    .get_or_insert_with(Default::default)
-                    .insert("s4-encrypted".into(), "aes-256-gcm".into());
+                let meta = req.input.metadata.get_or_insert_with(Default::default);
+                meta.insert("s4-encrypted".into(), "aes-256-gcm".into());
+                meta.insert("s4-sse-type".into(), "aws:kms".into());
+                meta.insert("s4-sse-kms-key-id".into(), wrapped.key_id.clone());
                 crate::sse::encrypt_with_source(
                     &compressed,
                     crate::sse::SseSource::Kms { dek, wrapped },
                 )
             } else if let Some(keyring) = self.sse_keyring.as_ref() {
-                req.input
-                    .metadata
-                    .get_or_insert_with(Default::default)
-                    .insert("s4-encrypted".into(), "aes-256-gcm".into());
+                // SSE-S4 is server-driven transparent encryption; the
+                // client didn't ask for SSE. We stamp `s4-encrypted`
+                // (internal flag the GET path needs) but deliberately
+                // do NOT stamp `s4-sse-type` — that lights up the HEAD
+                // echo of `x-amz-server-side-encryption: AES256`,
+                // which would falsely advertise AWS-style SSE-S3
+                // semantics the operator didn't request.
+                let meta = req.input.metadata.get_or_insert_with(Default::default);
+                meta.insert("s4-encrypted".into(), "aes-256-gcm".into());
                 crate::sse::encrypt_v2(&compressed, keyring)
             } else {
                 compressed.clone()
@@ -1929,6 +1946,15 @@ impl<B: S3> S3 for S4Service<B> {
             // destination bucket. `Bytes` clone is cheap (refcounted).
             let replication_body = body_to_send.clone();
             let replication_metadata = req.input.metadata.clone();
+            // v0.7 #48 BUG-1 fix: SSE encryption (S4E1/E2/E3/E4 frames)
+            // makes the body longer than the post-compression bytes
+            // (header + nonce + tag overhead). The earlier
+            // content_length stamp at compressed.len() is now stale, so
+            // re-stamp from the actual bytes about to be sent or the
+            // backend (real S3 / MinIO) rejects with
+            // `StreamLengthMismatch`. MemoryBackend never validated
+            // this, which is why mock-only tests passed.
+            req.input.content_length = Some(body_to_send.len() as i64);
             req.input.body = Some(bytes_to_blob(body_to_send));
             // v0.5 #34: pre-allocate a version-id when the bucket is
             // Enabled, then redirect the backend storage key to the
@@ -2673,6 +2699,36 @@ impl<B: S3> S3 for S4Service<B> {
         {
             resp.output.replication_status =
                 Some(s3s::dto::ReplicationStatus::from(status.as_aws_str().to_owned()));
+        }
+        // v0.7 #48 BUG-4 fix: HEAD must echo SSE indicators so SDKs
+        // and pipelines see the same posture they got on PUT. The PUT
+        // path stamps `s4-sse-type` metadata for exactly this — HEAD
+        // doesn't fetch the body, so it can't peek frame magic.
+        if let Some(meta) = resp.output.metadata.as_ref()
+            && let Some(sse_type) = meta.get("s4-sse-type")
+        {
+            {
+                match sse_type.as_str() {
+                    "aws:kms" => {
+                        resp.output.server_side_encryption = Some(
+                            ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                        );
+                        if let Some(key_id) = meta.get("s4-sse-kms-key-id") {
+                            resp.output.ssekms_key_id = Some(key_id.clone());
+                        }
+                    }
+                    _ => {
+                        resp.output.server_side_encryption = Some(
+                            ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                        );
+                        if let Some(md5) = meta.get("s4-sse-c-key-md5") {
+                            resp.output.sse_customer_algorithm =
+                                Some(crate::sse::SSE_C_ALGORITHM.into());
+                            resp.output.sse_customer_key_md5 = Some(md5.clone());
+                        }
+                    }
+                }
+            }
         }
         Ok(resp)
     }
