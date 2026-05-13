@@ -45,6 +45,35 @@ pub fn load_tls_config(
     Ok(Arc::new(config))
 }
 
+/// v0.5 #32: load a TLS config restricted to TLS 1.3 only — used by
+/// `--compliance-mode strict` (regulated-industry deployments where
+/// TLS 1.2's CBC + RSA-key-exchange ciphers are off-limits). Failures
+/// to negotiate fall back to a clean handshake-failure rather than a
+/// downgrade.
+pub fn load_tls_config_tls13_only(
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<Arc<ServerConfig>, Box<dyn Error + Send + Sync + 'static>> {
+    use std::fs::File;
+    use std::io::BufReader;
+    use tokio_rustls::rustls::version::TLS13;
+
+    let mut cert_reader = BufReader::new(File::open(cert_path)?);
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    if certs.is_empty() {
+        return Err(format!("no certificates found in {}", cert_path.display()).into());
+    }
+    let mut key_reader = BufReader::new(File::open(key_path)?);
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)?
+        .ok_or_else(|| format!("no private key found in {}", key_path.display()))?;
+    let mut config = ServerConfig::builder_with_protocol_versions(&[&TLS13])
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
 /// Installs the `ring` crypto provider as the process-wide default. rustls
 /// 0.23+ requires this before any `ServerConfig::builder()` call. Idempotent.
 pub fn install_default_crypto_provider() {
@@ -59,10 +88,14 @@ pub struct TlsState {
     cfg: ArcSwap<ServerConfig>,
     cert_path: PathBuf,
     key_path: PathBuf,
+    /// v0.5 #32: when set, reload uses the TLS 1.3-only loader so a
+    /// hot-reload preserves the compliance posture instead of silently
+    /// dropping back to the default 1.2+1.3 acceptance.
+    tls13_only: bool,
 }
 
 impl TlsState {
-    /// Initial load — fails on parse error.
+    /// Initial load — fails on parse error. Accepts TLS 1.2 + 1.3.
     pub fn load(
         cert_path: impl Into<PathBuf>,
         key_path: impl Into<PathBuf>,
@@ -74,6 +107,25 @@ impl TlsState {
             cfg: ArcSwap::from(cfg),
             cert_path,
             key_path,
+            tls13_only: false,
+        })
+    }
+
+    /// v0.5 #32: TLS 1.3-only initial load — fails on parse error.
+    /// Reloads via [`Self::reload`] also use the 1.3-only loader, so a
+    /// SIGHUP hot-swap can't accidentally re-enable 1.2.
+    pub fn load_tls13_only(
+        cert_path: impl Into<PathBuf>,
+        key_path: impl Into<PathBuf>,
+    ) -> Result<Self, Box<dyn Error + Send + Sync + 'static>> {
+        let cert_path = cert_path.into();
+        let key_path = key_path.into();
+        let cfg = load_tls_config_tls13_only(&cert_path, &key_path)?;
+        Ok(Self {
+            cfg: ArcSwap::from(cfg),
+            cert_path,
+            key_path,
+            tls13_only: true,
         })
     }
 
@@ -88,7 +140,11 @@ impl TlsState {
     /// failed to parse — the previous config remains in effect either way,
     /// so a bad reload never causes a listener outage.
     pub fn reload(&self) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-        let new_cfg = load_tls_config(&self.cert_path, &self.key_path)?;
+        let new_cfg = if self.tls13_only {
+            load_tls_config_tls13_only(&self.cert_path, &self.key_path)?
+        } else {
+            load_tls_config(&self.cert_path, &self.key_path)?
+        };
         self.cfg.store(new_cfg);
         Ok(())
     }

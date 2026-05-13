@@ -70,6 +70,13 @@ enum DispatcherChoice {
     Sampling,
 }
 
+/// v0.5 #32: regulated-industry posture switch.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ComplianceMode {
+    /// TLS 1.3-only + audit-signed + SSE-required + object-lock manager.
+    Strict,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum LogFormat {
     /// 人間向け (terminal でカラー化、tracing-subscriber default)
@@ -269,6 +276,18 @@ struct Opt {
     #[clap(long, value_name = "PATH")]
     object_lock_state_file: Option<std::path::PathBuf>,
 
+    /// v0.5 #32: regulated-industry posture switch. `strict` enforces
+    /// at boot the presence of TLS (--tls-cert/--tls-key OR --acme,
+    /// forced to TLS 1.3-only), --access-log + --audit-log-hmac-key
+    /// (both), SSE (--sse-s4-key OR --kms-local-dir), and
+    /// --object-lock-state-file. At runtime, every PUT must declare
+    /// SSE (x-amz-server-side-encryption header or SSE-C customer-key
+    /// headers); requests without one are rejected with 400. The
+    /// gauge `s4_compliance_mode_active{mode="strict"}` is set to 1
+    /// when active, so a fleet-wide alert can confirm coverage.
+    #[clap(long, value_name = "MODE", value_enum)]
+    compliance_mode: Option<ComplianceMode>,
+
     /// v0.5 #31: optional subcommand. When omitted, runs the gateway
     /// (existing v0.4 behaviour). Available subcommands:
     /// `verify-audit-log <FILE> --hmac-key <SPEC>` walks an audit-log
@@ -466,6 +485,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         return run_subcommand(cmd);
     }
 
+    // v0.5 #32: enforce compliance-mode prereqs *before* anything
+    // costly (tracing init, AWS SDK auth probe). A misconfigured boot
+    // exits with a clear, actionable error.
+    if let Some(mode) = opt.compliance_mode {
+        validate_compliance_mode(&opt, mode)?;
+    }
+
     setup_tracing(
         opt.log_format,
         opt.otlp_endpoint.as_deref(),
@@ -645,7 +671,49 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         );
         s4 = s4.with_object_lock(std::sync::Arc::new(mgr));
     }
+    if matches!(opt.compliance_mode, Some(ComplianceMode::Strict)) {
+        s4 = s4.with_compliance_strict(true);
+        s4_server::metrics::record_compliance_mode_active("strict");
+        info!("S4 compliance-mode strict ACTIVE — every PUT must declare SSE");
+    }
     run_server(s4, &sdk_conf, &opt, ready_client).await
+}
+
+/// v0.5 #32: enforce compliance-mode prerequisites at boot. Each
+/// missing piece is reported with an actionable hint rather than
+/// surfacing as a runtime 5xx after a deploy.
+fn validate_compliance_mode(
+    opt: &Opt,
+    mode: ComplianceMode,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    match mode {
+        ComplianceMode::Strict => {}
+    }
+    let mut missing: Vec<&'static str> = Vec::new();
+    if opt.tls_cert.is_none() && opt.acme.is_none() {
+        missing.push("TLS (--tls-cert/--tls-key OR --acme)");
+    }
+    if opt.access_log.is_none() {
+        missing.push("--access-log <DIR>");
+    }
+    if opt.audit_log_hmac_key.is_none() {
+        missing.push("--audit-log-hmac-key <SPEC>");
+    }
+    if opt.sse_s4_key.is_none() && opt.kms_local_dir.is_none() {
+        missing.push("SSE (--sse-s4-key OR --kms-local-dir)");
+    }
+    if opt.object_lock_state_file.is_none() {
+        missing.push("--object-lock-state-file <PATH>");
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "compliance-mode strict requires the following options to also be set: {}",
+            missing.join(", ")
+        )
+        .into())
+    }
 }
 
 /// v0.5 #31: dispatch a non-server subcommand. Currently the only one
@@ -747,7 +815,12 @@ where
     let tls_state: Option<Arc<s4_server::tls::TlsState>> = match (&opt.tls_cert, &opt.tls_key) {
         (Some(cert), Some(key)) => {
             s4_server::tls::install_default_crypto_provider();
-            let state = Arc::new(s4_server::tls::TlsState::load(cert, key)?);
+            let state = if matches!(opt.compliance_mode, Some(ComplianceMode::Strict)) {
+                tracing::info!("compliance-mode strict: TLS restricted to 1.3-only");
+                Arc::new(s4_server::tls::TlsState::load_tls13_only(cert, key)?)
+            } else {
+                Arc::new(s4_server::tls::TlsState::load(cert, key)?)
+            };
             // SIGHUP handler — operators rotate cert + key files and
             // `kill -HUP <pid>` to atomically swap the active config.
             // Re-read failures (missing file / bad PEM / key mismatch) are

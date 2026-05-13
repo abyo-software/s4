@@ -1983,3 +1983,48 @@ async fn object_lock_bucket_default_auto_applies_on_put() {
         .await
         .expect("bypass permits delete");
 }
+
+// ------------------------------------------------------------------
+// v0.5 #32: compliance-mode strict — every PUT must declare SSE.
+// ------------------------------------------------------------------
+
+#[tokio::test]
+async fn compliance_strict_rejects_put_without_sse() {
+    let backend = MemoryBackend::new();
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    )
+    .with_compliance_strict(true);
+    // PUT with no SSE header at all → 400 InvalidRequest.
+    let err = s4
+        .put_object(put_request("bucket", "k", Bytes::from_static(b"plaintext")))
+        .await
+        .expect_err("compliance-strict must reject plaintext PUT");
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("InvalidRequest") || dbg.contains("compliance-mode strict"),
+        "expected compliance-mode reject, got {dbg}"
+    );
+}
+
+#[tokio::test]
+async fn compliance_strict_accepts_put_with_keyring_configured() {
+    use std::sync::Arc;
+    let backend = MemoryBackend::new();
+    let key = Arc::new(s4_server::sse::SseKey::from_bytes(&[0x77u8; 32]).unwrap());
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    )
+    .with_sse_key(key)
+    .with_compliance_strict(true);
+    // Keyring configured → server-side SSE-S4 is implicit, plain PUT
+    // is OK because the gateway will encrypt regardless.
+    let _ = s4
+        .put_object(put_request("bucket", "k", Bytes::from_static(b"plaintext")))
+        .await
+        .expect("strict PUT must succeed when SSE-S4 keyring is configured");
+}

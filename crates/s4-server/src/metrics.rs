@@ -36,6 +36,13 @@ pub mod names {
     pub const ACME_RENEWAL_TOTAL: &str = "s4_acme_renewal_total";
     pub const ACME_CERT_EXPIRY_SECONDS: &str = "s4_acme_cert_expiry_seconds";
     pub const RATE_LIMIT_THROTTLED_TOTAL: &str = "s4_rate_limit_throttled_total";
+    pub const COMPLIANCE_MODE_ACTIVE: &str = "s4_compliance_mode_active";
+}
+
+/// v0.5 #32: stamp the gauge so operators can `up{...} * on() s4_compliance_mode_active`
+/// to confirm at-a-glance that the strict gate is live across the fleet.
+pub fn record_compliance_mode_active(mode: &'static str) {
+    metrics::gauge!(names::COMPLIANCE_MODE_ACTIVE, "mode" => mode).set(1.0);
 }
 
 /// v0.4 #19: bumped each time a request is rejected by the rate limiter.

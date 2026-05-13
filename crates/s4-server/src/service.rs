@@ -118,6 +118,12 @@ pub struct S4Service<B: S3> {
     /// existing v0.4 deployments are unaffected until they explicitly
     /// call `with_object_lock(...)`.
     object_lock: Option<Arc<crate::object_lock::ObjectLockManager>>,
+    /// v0.5 #32: when `true`, every PUT must carry an SSE indicator
+    /// (`x-amz-server-side-encryption`, the SSE-C customer-key headers,
+    /// or be matched against a configured server-managed keyring/KMS).
+    /// Set by `--compliance-mode strict` after the boot-time
+    /// prerequisite check passes.
+    compliance_strict: bool,
 }
 
 impl<B: S3> S4Service<B> {
@@ -143,7 +149,20 @@ impl<B: S3> S4Service<B> {
             kms: None,
             kms_default_key_id: None,
             object_lock: None,
+            compliance_strict: false,
         }
+    }
+
+    /// v0.5 #32: enable strict compliance mode. Every PUT must carry an
+    /// SSE indicator (server-side encryption header or SSE-C customer
+    /// key); requests without one are rejected with 400 InvalidRequest.
+    /// Boot-time prerequisite checking lives in the binary
+    /// (`validate_compliance_mode`) so this flag is purely the runtime
+    /// switch.
+    #[must_use]
+    pub fn with_compliance_strict(mut self, on: bool) -> Self {
+        self.compliance_strict = on;
+        self
     }
 
     /// v0.5 #30: attach the in-memory Object Lock (WORM) enforcement
@@ -1076,6 +1095,29 @@ impl<B: S3> S3 for S4Service<B> {
                 &req.input.ssekms_key_id,
                 self.kms_default_key_id.as_deref(),
             );
+            // v0.5 #32: in compliance-strict mode, every PUT must
+            // declare SSE — either client-supplied (SSE-C), KMS, or by
+            // virtue of a server-side keyring being configured (which
+            // applies SSE-S4 to every PUT automatically). Requests that
+            // would otherwise land as plain compressed bytes are
+            // rejected with 400 InvalidRequest.
+            if self.compliance_strict
+                && sse_c_material.is_none()
+                && kms_key_id.is_none()
+                && self.sse_keyring.is_none()
+                && req
+                    .input
+                    .server_side_encryption
+                    .as_ref()
+                    .map(|s| s.as_str())
+                    != Some(ServerSideEncryption::AES256)
+            {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    "compliance-mode strict: PUT must include x-amz-server-side-encryption \
+                     (AES256 or aws:kms) or x-amz-server-side-encryption-customer-* headers",
+                ));
+            }
             // SSE-C and SSE-KMS are mutually exclusive on a single PUT
             // (AWS S3 returns 400 InvalidArgument). SSE-C wins by spec.
             if sse_c_material.is_some() && kms_key_id.is_some() {
