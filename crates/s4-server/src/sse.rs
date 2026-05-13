@@ -135,6 +135,13 @@ pub const SSE_MAGIC_V1: &[u8; 4] = b"S4E1";
 pub const SSE_MAGIC_V2: &[u8; 4] = b"S4E2";
 pub const SSE_MAGIC_V3: &[u8; 4] = b"S4E3";
 pub const SSE_MAGIC_V4: &[u8; 4] = b"S4E4";
+/// v0.8 #52: chunked variant of S4E2 — same SSE-S4 keyring source,
+/// but the body is sliced into independently-sealed AES-GCM chunks
+/// so the GET path can stream-decrypt + emit chunk-by-chunk instead
+/// of buffering the entire object before tag verify. See
+/// [`encrypt_v2_chunked`] / [`decrypt_chunked_stream`] for the on-
+/// the-wire layout.
+pub const SSE_MAGIC_V5: &[u8; 4] = b"S4E5";
 /// Back-compat alias — v0.4 callers that imported `SSE_MAGIC` mean S4E1.
 pub const SSE_MAGIC: &[u8; 4] = SSE_MAGIC_V1;
 
@@ -171,7 +178,7 @@ pub enum SseError {
     BadKeyLength { got: usize },
     #[error("SSE-encrypted body too short ({got} bytes; need at least {SSE_HEADER_BYTES})")]
     TooShort { got: usize },
-    #[error("SSE bad magic: expected S4E1/S4E2/S4E3/S4E4, got {got:?}")]
+    #[error("SSE bad magic: expected S4E1/S4E2/S4E3/S4E4/S4E5, got {got:?}")]
     BadMagic { got: [u8; 4] },
     #[error("SSE unsupported algo tag: {tag} (this build only knows AES-256-GCM = 1)")]
     UnsupportedAlgo { tag: u8 },
@@ -265,6 +272,29 @@ pub enum SseError {
     /// `KmsBackend::decrypt_dek` — boxed so the variant stays small.
     #[error("KMS unwrap: {0}")]
     KmsBackend(#[from] KmsError),
+    // --- v0.8 #52: S4E5 (chunked SSE-S4) specific errors ---
+    /// AES-GCM auth tag verify failed on chunk `chunk_index` of an
+    /// S4E5 body. Distinct from the all-or-nothing
+    /// [`SseError::DecryptFailed`] because the streaming GET may
+    /// have already emitted earlier chunks to the client by the
+    /// time chunk N fails — operators need the chunk index in audit
+    /// logs to triangulate which byte range was tampered with (or
+    /// which disk sector flipped).
+    #[error("S4E5 chunk {chunk_index} auth tag verify failed (key mismatch or chunk tampered with)")]
+    ChunkAuthFailed { chunk_index: u32 },
+    /// Caller asked [`encrypt_v2_chunked`] to use a chunk size of 0
+    /// — nonsensical (would loop forever). Surfaced as an error
+    /// rather than panicking so service.rs can map a bad
+    /// `--sse-chunk-size 0` configuration to a clear startup error.
+    #[error("S4E5 chunk_size must be > 0 (got 0)")]
+    ChunkSizeInvalid,
+    /// S4E5 frame is shorter than the fixed header or declares a
+    /// (chunk_count × per-chunk-bytes) total that overruns the
+    /// body. Almost certainly truncation / corruption — tampering
+    /// with the per-chunk ciphertext or tag would surface as
+    /// [`SseError::ChunkAuthFailed`] instead.
+    #[error("S4E5 frame truncated: {what}")]
+    ChunkFrameTruncated { what: &'static str },
 }
 
 /// 32-byte symmetric key. `bytes` is `pub` so call sites can construct
@@ -782,6 +812,22 @@ pub fn decrypt<'a, S: Into<SseSource<'a>>>(body: &[u8], source: S) -> Result<Byt
             // rather than silently failing.
             Err(SseError::KmsAsyncRequired)
         }
+        m if m == SSE_MAGIC_V5 => {
+            // v0.8 #52: S4E5 (chunked SSE-S4). Sync back-compat
+            // path — verifies + decrypts every chunk into a single
+            // Bytes. Callers that want true streaming (per-chunk
+            // emit) should use `decrypt_chunked_stream` instead.
+            // SSE-C and SSE-KMS sources are nonsensical here for
+            // the same reason as S4E2 (server-managed keyring only).
+            let keyring = match source {
+                SseSource::Keyring(kr) => kr,
+                SseSource::CustomerKey { .. } => {
+                    return Err(SseError::CustomerKeyUnexpected);
+                }
+                SseSource::Kms { .. } => return Err(SseError::CustomerKeyUnexpected),
+            };
+            decrypt_v5_buffered(body, keyring)
+        }
         _ => Err(SseError::BadMagic { got: magic }),
     }
 }
@@ -1136,7 +1182,11 @@ pub fn looks_encrypted(body: &[u8]) -> bool {
         return false;
     }
     let m = &body[..4];
-    m == SSE_MAGIC_V1 || m == SSE_MAGIC_V2 || m == SSE_MAGIC_V3 || m == SSE_MAGIC_V4
+    m == SSE_MAGIC_V1
+        || m == SSE_MAGIC_V2
+        || m == SSE_MAGIC_V3
+        || m == SSE_MAGIC_V4
+        || m == SSE_MAGIC_V5
 }
 
 /// Peek the SSE-S4 magic at the front of `body`, returning a
@@ -1158,11 +1208,497 @@ pub fn peek_magic(body: &[u8]) -> Option<&'static str> {
         m if m == SSE_MAGIC_V2 => Some("S4E2"),
         m if m == SSE_MAGIC_V3 => Some("S4E3"),
         m if m == SSE_MAGIC_V4 => Some("S4E4"),
+        // v0.8 #52: chunked SSE-S4. service.rs's GET handler
+        // dispatches "S4E5" → `decrypt_chunked_stream` for true
+        // streaming GET; the sync `decrypt(...)` also accepts S4E5
+        // (back-compat — buffered concat).
+        m if m == SSE_MAGIC_V5 => Some("S4E5"),
         _ => None,
     }
 }
 
 pub type SharedSseKey = Arc<SseKey>;
+
+// ===========================================================================
+// v0.8 #52 — S4E5: chunked variant of S4E2 for streaming GET
+// ===========================================================================
+//
+// ## Wire format
+//
+// ```text
+// magic         4B    "S4E5"
+// algo          1B    0x01 (AES-256-GCM)
+// key_id        2B    BE — keyring slot the active key was at PUT time
+// reserved      1B    0x00
+// chunk_size    4B    BE — plaintext bytes per chunk (final chunk may be smaller)
+// chunk_count   4B    BE — total chunks (always >= 1; empty plaintext = 1 zero-byte chunk)
+// salt          4B    random per-PUT, mixed into every nonce
+// [chunk_count] × {
+//   tag         16B   AES-GCM auth tag for this chunk
+//   ciphertext  N B   chunk_size bytes (final chunk: 0..=chunk_size bytes)
+// }
+// ```
+//
+// Fixed header = 20 bytes ([`S4E5_HEADER_BYTES`]). Per-chunk overhead =
+// 16 bytes (the tag — ciphertext is 1:1 with plaintext, AES-GCM is
+// CTR-mode). Total overhead for an N-byte plaintext at chunk size C:
+// `20 + ceil(N/C) * 16` bytes.
+//
+// ## Nonce derivation
+//
+// Each chunk's 12-byte AES-GCM nonce is built deterministically from
+// the salt + chunk index (no per-chunk random nonce stored on disk):
+//
+// ```text
+// nonce[0..4]  = b"E5\x00\x00"      (4-byte fixed magic-tag)
+// nonce[4..8]  = salt               (4-byte random per-PUT)
+// nonce[8..12] = chunk_index BE     (4-byte chunk number, 0..chunk_count)
+// ```
+//
+// Within one PUT (= one salt) the chunk_index varies, so nonces are
+// guaranteed unique per chunk. Across PUTs the salt is fresh
+// randomness from `OsRng`. Birthday-collision risk on the 4-byte
+// salt: ~50% at ~65,536 distinct PUTs under the same key. Deployments
+// that exceed that should plan a key rotation (or wait for the
+// follow-up issue widening the salt to 8 bytes).
+//
+// ## Per-chunk AAD
+//
+// AAD for chunk `i` of `n` total chunks: `b"S4E5"` || `algo` ||
+// `i_BE_u32` || `n_BE_u32` || `key_id_BE_u16` || `salt`. Includes
+// the chunk index so re-ordering or dropping chunks (which would
+// shift their nonces around) fails the AES-GCM tag — i.e. an
+// attacker cannot rearrange the on-disk chunk list to exfiltrate
+// plaintext from a different position.
+
+/// Fixed header size of an S4E5 frame, before any chunks. `magic 4 +
+/// algo 1 + key_id 2 + reserved 1 + chunk_size 4 + chunk_count 4 +
+/// salt 4` = 20 bytes.
+pub const S4E5_HEADER_BYTES: usize = 4 + 1 + 2 + 1 + 4 + 4 + 4; // = 20
+
+/// Per-chunk overhead inside an S4E5 frame: just the AES-GCM auth
+/// tag. `ciphertext.len() == plaintext.len()` (CTR mode), so a chunk
+/// of N plaintext bytes costs N + 16 on disk.
+pub const S4E5_PER_CHUNK_OVERHEAD: usize = TAG_LEN; // = 16
+
+/// 4-byte fixed prefix of every S4E5 nonce. Distinct from the bytes
+/// a random S4E1/E2 nonce could plausibly start with so debugging
+/// dumps can immediately tell "this is a chunked nonce" from the
+/// first 4 bytes.
+const S4E5_NONCE_TAG: [u8; 4] = [b'E', b'5', 0, 0];
+
+/// Build the per-chunk AAD for an S4E5 chunk. Includes magic + algo
+/// plus the structural chunk_index/total_chunks (so chunk reordering
+/// fails auth) plus key_id + salt (so header tampering — flipping
+/// key_id or salt — also fails auth).
+fn aad_v5(
+    chunk_index: u32,
+    total_chunks: u32,
+    key_id: u16,
+    salt: &[u8; 4],
+) -> [u8; 4 + 1 + 4 + 4 + 2 + 4] {
+    let mut aad = [0u8; 4 + 1 + 4 + 4 + 2 + 4]; // = 19
+    aad[..4].copy_from_slice(SSE_MAGIC_V5);
+    aad[4] = ALGO_AES_256_GCM;
+    aad[5..9].copy_from_slice(&chunk_index.to_be_bytes());
+    aad[9..13].copy_from_slice(&total_chunks.to_be_bytes());
+    aad[13..15].copy_from_slice(&key_id.to_be_bytes());
+    aad[15..19].copy_from_slice(salt);
+    aad
+}
+
+/// Derive the 12-byte AES-GCM nonce for chunk `chunk_index` from the
+/// per-PUT `salt`. Pure function; no RNG state — the same `(salt,
+/// chunk_index)` always yields the same nonce, which is the whole
+/// point: GET reads `salt` from the header and walks the chunks
+/// without storing 12 bytes of nonce per chunk.
+fn nonce_v5(salt: &[u8; 4], chunk_index: u32) -> [u8; NONCE_LEN] {
+    let mut n = [0u8; NONCE_LEN];
+    n[..4].copy_from_slice(&S4E5_NONCE_TAG);
+    n[4..8].copy_from_slice(salt);
+    n[8..12].copy_from_slice(&chunk_index.to_be_bytes());
+    n
+}
+
+/// v0.8 #52: encrypt `plaintext` under `keyring`'s active key,
+/// sliced into independently-sealed AES-GCM chunks of `chunk_size`
+/// plaintext bytes each. Returns the on-the-wire S4E5 frame.
+///
+/// Errors:
+/// - [`SseError::ChunkSizeInvalid`] if `chunk_size == 0`.
+///
+/// Empty plaintext is permitted and produces a frame with
+/// `chunk_count = 1, ciphertext_len = 0` (one all-tag chunk). That
+/// keeps the GET chunk-walk loop simpler — it never has to
+/// special-case zero chunks.
+///
+/// `chunk_size` is the *plaintext* bytes per chunk; the on-disk
+/// ciphertext per chunk is the same number (AES-GCM is CTR-mode),
+/// plus the 16-byte tag prepended.
+pub fn encrypt_v2_chunked(
+    plaintext: &[u8],
+    keyring: &SseKeyring,
+    chunk_size: usize,
+) -> Result<Bytes, SseError> {
+    if chunk_size == 0 {
+        return Err(SseError::ChunkSizeInvalid);
+    }
+    let (key_id, key) = keyring.active();
+    let cipher = Aes256Gcm::new(key.as_aes_key());
+    let mut salt = [0u8; 4];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+
+    // Always emit at least one chunk (so an empty plaintext still
+    // has a well-defined header → chunk_count >= 1 invariant).
+    let chunk_count: u32 = if plaintext.is_empty() {
+        1
+    } else {
+        plaintext
+            .len()
+            .div_ceil(chunk_size)
+            .try_into()
+            .expect("chunk_count overflows u32 — plaintext > 16 EiB at min chunk_size")
+    };
+
+    let mut out = Vec::with_capacity(
+        S4E5_HEADER_BYTES + plaintext.len() + (chunk_count as usize * S4E5_PER_CHUNK_OVERHEAD),
+    );
+    out.extend_from_slice(SSE_MAGIC_V5);
+    out.push(ALGO_AES_256_GCM);
+    out.extend_from_slice(&key_id.to_be_bytes());
+    out.push(0u8); // reserved
+    out.extend_from_slice(&(chunk_size as u32).to_be_bytes());
+    out.extend_from_slice(&chunk_count.to_be_bytes());
+    out.extend_from_slice(&salt);
+
+    for i in 0..chunk_count {
+        let off = (i as usize).saturating_mul(chunk_size);
+        let end = off.saturating_add(chunk_size).min(plaintext.len());
+        let chunk_pt: &[u8] = if off >= plaintext.len() {
+            // Empty-plaintext / past-end (only the single-chunk
+            // empty-plaintext case lands here).
+            &[]
+        } else {
+            &plaintext[off..end]
+        };
+        let nonce_bytes = nonce_v5(&salt, i);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let aad = aad_v5(i, chunk_count, key_id, &salt);
+        let ct_with_tag = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: chunk_pt,
+                    aad: &aad,
+                },
+            )
+            .expect("aes-gcm encrypt cannot fail with a 32-byte key");
+        debug_assert!(ct_with_tag.len() >= TAG_LEN);
+        let split = ct_with_tag.len() - TAG_LEN;
+        let (ct, tag) = ct_with_tag.split_at(split);
+        out.extend_from_slice(tag);
+        out.extend_from_slice(ct);
+        crate::metrics::record_sse_streaming_chunk("encrypt");
+    }
+    Ok(Bytes::from(out))
+}
+
+/// Parsed S4E5 header — fixed-layout fields. Used by both the
+/// buffered ([`decrypt_v5_buffered`]) and streaming
+/// ([`decrypt_chunked_stream`]) paths to share frame validation.
+#[derive(Debug, Clone, Copy)]
+struct S4E5Header {
+    key_id: u16,
+    chunk_size: u32,
+    chunk_count: u32,
+    salt: [u8; 4],
+    /// Byte offset where the chunk array starts (always
+    /// [`S4E5_HEADER_BYTES`]; carried in the struct so future
+    /// header extensions don't break callers).
+    chunks_offset: usize,
+}
+
+fn parse_s4e5_header(body: &[u8]) -> Result<S4E5Header, SseError> {
+    if body.len() < S4E5_HEADER_BYTES {
+        return Err(SseError::ChunkFrameTruncated { what: "header" });
+    }
+    if &body[..4] != SSE_MAGIC_V5 {
+        let mut got = [0u8; 4];
+        got.copy_from_slice(&body[..4]);
+        return Err(SseError::BadMagic { got });
+    }
+    let algo = body[4];
+    if algo != ALGO_AES_256_GCM {
+        return Err(SseError::UnsupportedAlgo { tag: algo });
+    }
+    let key_id = u16::from_be_bytes([body[5], body[6]]);
+    // body[7] = reserved (must be 0; authenticated as 0 via AAD).
+    let chunk_size = u32::from_be_bytes([body[8], body[9], body[10], body[11]]);
+    let chunk_count = u32::from_be_bytes([body[12], body[13], body[14], body[15]]);
+    let mut salt = [0u8; 4];
+    salt.copy_from_slice(&body[16..20]);
+    if chunk_size == 0 {
+        return Err(SseError::ChunkSizeInvalid);
+    }
+    if chunk_count == 0 {
+        return Err(SseError::ChunkFrameTruncated {
+            what: "chunk_count == 0",
+        });
+    }
+    Ok(S4E5Header {
+        key_id,
+        chunk_size,
+        chunk_count,
+        salt,
+        chunks_offset: S4E5_HEADER_BYTES,
+    })
+}
+
+/// Decrypt one S4E5 chunk. Used by both the buffered and streaming
+/// paths so AAD / nonce derivation lives in exactly one place.
+fn decrypt_v5_chunk(
+    cipher: &Aes256Gcm,
+    chunk_index: u32,
+    chunk_count: u32,
+    key_id: u16,
+    salt: &[u8; 4],
+    tag: &[u8; TAG_LEN],
+    ct: &[u8],
+) -> Result<Bytes, SseError> {
+    let nonce_bytes = nonce_v5(salt, chunk_index);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let aad = aad_v5(chunk_index, chunk_count, key_id, salt);
+    let mut ct_with_tag = Vec::with_capacity(ct.len() + TAG_LEN);
+    ct_with_tag.extend_from_slice(ct);
+    ct_with_tag.extend_from_slice(tag);
+    cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &ct_with_tag,
+                aad: &aad,
+            },
+        )
+        .map(Bytes::from)
+        .map_err(|_| SseError::ChunkAuthFailed { chunk_index })
+}
+
+/// Walk an S4E5 body chunk-by-chunk, calling `emit` on each
+/// successfully-verified plaintext chunk. Returns immediately on the
+/// first chunk that fails auth or is truncated. Shared core between
+/// the buffered ([`decrypt_v5_buffered`]) and streaming
+/// ([`decrypt_chunked_stream`]) paths.
+fn walk_s4e5<F: FnMut(Bytes) -> Result<(), SseError>>(
+    body: &[u8],
+    keyring: &SseKeyring,
+    mut emit: F,
+) -> Result<(), SseError> {
+    let hdr = parse_s4e5_header(body)?;
+    let key = keyring
+        .get(hdr.key_id)
+        .ok_or(SseError::KeyNotInKeyring { id: hdr.key_id })?;
+    let cipher = Aes256Gcm::new(key.as_aes_key());
+
+    let mut cursor = hdr.chunks_offset;
+    let chunk_size = hdr.chunk_size as usize;
+    for i in 0..hdr.chunk_count {
+        if cursor + TAG_LEN > body.len() {
+            return Err(SseError::ChunkFrameTruncated { what: "chunk tag" });
+        }
+        let tag_off = cursor;
+        let ct_off = tag_off + TAG_LEN;
+        let is_last = i + 1 == hdr.chunk_count;
+        let ct_len = if is_last {
+            if ct_off > body.len() {
+                return Err(SseError::ChunkFrameTruncated {
+                    what: "final chunk ciphertext",
+                });
+            }
+            let remaining = body.len() - ct_off;
+            if remaining > chunk_size {
+                return Err(SseError::ChunkFrameTruncated {
+                    what: "trailing bytes after final chunk",
+                });
+            }
+            remaining
+        } else {
+            chunk_size
+        };
+        let ct_end = ct_off + ct_len;
+        if ct_end > body.len() {
+            return Err(SseError::ChunkFrameTruncated {
+                what: "chunk ciphertext",
+            });
+        }
+        let mut tag = [0u8; TAG_LEN];
+        tag.copy_from_slice(&body[tag_off..ct_off]);
+        let ct = &body[ct_off..ct_end];
+        let plain = decrypt_v5_chunk(
+            &cipher,
+            i,
+            hdr.chunk_count,
+            hdr.key_id,
+            &hdr.salt,
+            &tag,
+            ct,
+        )?;
+        crate::metrics::record_sse_streaming_chunk("decrypt");
+        emit(plain)?;
+        cursor = ct_end;
+    }
+    if cursor != body.len() {
+        return Err(SseError::ChunkFrameTruncated {
+            what: "trailing bytes after declared chunk_count",
+        });
+    }
+    Ok(())
+}
+
+/// Sync back-compat path: decrypt every chunk and concatenate into
+/// a single `Bytes`. Memory peak = full plaintext (defeats the
+/// point of S4E5 streaming, but useful for callers that already
+/// need the whole body — e.g. server-side restream-rewrite paths or
+/// unit tests).
+fn decrypt_v5_buffered(body: &[u8], keyring: &SseKeyring) -> Result<Bytes, SseError> {
+    let hdr = parse_s4e5_header(body)?;
+    let mut out = Vec::with_capacity(hdr.chunk_size as usize * hdr.chunk_count as usize);
+    walk_s4e5(body, keyring, |chunk| {
+        out.extend_from_slice(&chunk);
+        Ok(())
+    })?;
+    Ok(Bytes::from(out))
+}
+
+/// v0.8 #52: stream-decrypt API for S4E5 bodies. Returns a
+/// [`futures::Stream`] that yields one `Bytes` per chunk in order.
+/// Each chunk is emitted only after AES-GCM tag verify succeeds, so
+/// the client never sees plaintext bytes that haven't been
+/// authenticated. A failing chunk yields its
+/// [`SseError::ChunkAuthFailed`] (with the chunk index) and ends
+/// the stream — earlier chunks may already have left the gateway,
+/// which matches the standard streaming-AEAD trade-off (operators
+/// MUST alert on the audit log + metric, not rely on connection
+/// close to guarantee atomicity).
+///
+/// Non-S4E5 magic surfaces as [`SseError::BadMagic`] /
+/// [`SseError::ChunkFrameTruncated`] on the first poll — the stream
+/// is "fail-fast" rather than "fall through to S4E2 buffered
+/// decrypt", because the caller has already dispatched on
+/// [`peek_magic`] by the time it hands a body to this function.
+///
+/// `body` is owned by the returned stream so the caller doesn't
+/// need to keep the bytes alive separately. The returned stream is
+/// `'static` — the `keyring` borrow is consumed up front to extract
+/// the per-frame key and build the AES cipher (which owns its key
+/// material), so the caller's keyring may be dropped immediately.
+pub fn decrypt_chunked_stream(
+    body: bytes::Bytes,
+    keyring: &SseKeyring,
+) -> impl futures::Stream<Item = Result<Bytes, SseError>> + 'static {
+    use futures::stream::{self, StreamExt};
+
+    // Cheap pre-validation: parse the header + look up the key
+    // once, up front, so a malformed frame surfaces on the first
+    // poll instead of being deferred behind the first-chunk loop.
+    // The `keyring` borrow ends here — we extract the AES key into
+    // the owned `Aes256Gcm` cipher, then store that in the stream
+    // state.
+    let prelude = (|| {
+        let hdr = parse_s4e5_header(&body)?;
+        let key = keyring
+            .get(hdr.key_id)
+            .ok_or(SseError::KeyNotInKeyring { id: hdr.key_id })?;
+        let cipher = Aes256Gcm::new(key.as_aes_key());
+        Ok::<_, SseError>((hdr, cipher))
+    })();
+
+    match prelude {
+        Err(e) => stream::iter(std::iter::once(Err(e))).left_stream(),
+        Ok((hdr, cipher)) => {
+            let chunks_offset = hdr.chunks_offset;
+            let state = ChunkedDecryptState {
+                body,
+                cipher,
+                hdr,
+                cursor: chunks_offset,
+                next_index: 0,
+            };
+            stream::try_unfold(state, decrypt_next_chunk).right_stream()
+        }
+    }
+}
+
+/// Per-stream state for [`decrypt_chunked_stream`]. Holds the owned
+/// `body` (so the stream stays self-contained), the prepared
+/// cipher, and the cursor position into the chunk array.
+struct ChunkedDecryptState {
+    body: bytes::Bytes,
+    cipher: Aes256Gcm,
+    hdr: S4E5Header,
+    cursor: usize,
+    next_index: u32,
+}
+
+async fn decrypt_next_chunk(
+    mut state: ChunkedDecryptState,
+) -> Result<Option<(Bytes, ChunkedDecryptState)>, SseError> {
+    if state.next_index >= state.hdr.chunk_count {
+        // Final boundary check — anything past the declared
+        // chunk_count would be a truncation / append attack.
+        if state.cursor != state.body.len() {
+            return Err(SseError::ChunkFrameTruncated {
+                what: "trailing bytes after declared chunk_count",
+            });
+        }
+        return Ok(None);
+    }
+    let i = state.next_index;
+    let chunk_size = state.hdr.chunk_size as usize;
+    if state.cursor + TAG_LEN > state.body.len() {
+        return Err(SseError::ChunkFrameTruncated { what: "chunk tag" });
+    }
+    let tag_off = state.cursor;
+    let ct_off = tag_off + TAG_LEN;
+    let is_last = i + 1 == state.hdr.chunk_count;
+    let ct_len = if is_last {
+        if ct_off > state.body.len() {
+            return Err(SseError::ChunkFrameTruncated {
+                what: "final chunk ciphertext",
+            });
+        }
+        let remaining = state.body.len() - ct_off;
+        if remaining > chunk_size {
+            return Err(SseError::ChunkFrameTruncated {
+                what: "trailing bytes after final chunk",
+            });
+        }
+        remaining
+    } else {
+        chunk_size
+    };
+    let ct_end = ct_off + ct_len;
+    if ct_end > state.body.len() {
+        return Err(SseError::ChunkFrameTruncated {
+            what: "chunk ciphertext",
+        });
+    }
+    let mut tag = [0u8; TAG_LEN];
+    tag.copy_from_slice(&state.body[tag_off..ct_off]);
+    let ct = &state.body[ct_off..ct_end];
+    let plain = decrypt_v5_chunk(
+        &state.cipher,
+        i,
+        state.hdr.chunk_count,
+        state.hdr.key_id,
+        &state.hdr.salt,
+        &tag,
+        ct,
+    )?;
+    crate::metrics::record_sse_streaming_chunk("decrypt");
+    state.cursor = ct_end;
+    state.next_index += 1;
+    Ok(Some((plain, state)))
+}
 
 #[cfg(test)]
 mod tests {
@@ -2100,5 +2636,238 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.8 #52: S4E5 chunked SSE-S4 — encrypt_v2_chunked / decrypt_chunked_stream
+    // -----------------------------------------------------------------------
+
+    use futures::StreamExt;
+
+    /// Drain a chunked-decrypt stream into a `Vec<Bytes>` for assertion.
+    /// Surfaces the first error verbatim (so tests can match on it).
+    async fn collect_chunks(
+        s: impl futures::Stream<Item = Result<Bytes, SseError>>,
+    ) -> Result<Vec<Bytes>, SseError> {
+        let mut out = Vec::new();
+        let mut s = std::pin::pin!(s);
+        while let Some(item) = s.next().await {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn s4e5_encrypt_layout_10mb_at_1mib() {
+        // 10 MB plaintext at 1 MiB chunk size → magic "S4E5",
+        // chunk_count=10, header bytes line up to the documented 20
+        // + 10 * 16 + 10 MB layout.
+        let kr = keyring_single(0x42);
+        let chunk_size = 1024 * 1024;
+        let pt_len = 10 * 1024 * 1024;
+        let pt = vec![0xAB_u8; pt_len];
+        let ct = encrypt_v2_chunked(&pt, &kr, chunk_size).expect("encrypt ok");
+        assert_eq!(&ct[..4], SSE_MAGIC_V5);
+        assert_eq!(ct[4], ALGO_AES_256_GCM);
+        assert_eq!(u16::from_be_bytes([ct[5], ct[6]]), 1, "key_id BE = active id");
+        assert_eq!(ct[7], 0, "reserved must be 0");
+        assert_eq!(
+            u32::from_be_bytes([ct[8], ct[9], ct[10], ct[11]]),
+            chunk_size as u32,
+            "chunk_size BE",
+        );
+        assert_eq!(
+            u32::from_be_bytes([ct[12], ct[13], ct[14], ct[15]]),
+            10,
+            "chunk_count BE — 10 MiB / 1 MiB = 10 (no remainder)",
+        );
+        assert_eq!(
+            ct.len(),
+            S4E5_HEADER_BYTES + 10 * S4E5_PER_CHUNK_OVERHEAD + pt_len,
+            "total = header + 10 tags + plaintext",
+        );
+        assert!(looks_encrypted(&ct), "looks_encrypted must accept S4E5");
+        assert_eq!(peek_magic(&ct), Some("S4E5"));
+    }
+
+    #[tokio::test]
+    async fn s4e5_decrypt_chunked_stream_byte_equal() {
+        // Round-trip: encrypt 10 MB at 1 MiB chunks, stream-decrypt,
+        // concatenate yielded chunks, byte-equal to original.
+        let kr = keyring_single(0x55);
+        let pt: Vec<u8> = (0..(10 * 1024 * 1024_u32)).map(|i| (i & 0xFF) as u8).collect();
+        let ct = encrypt_v2_chunked(&pt, &kr, 1024 * 1024).unwrap();
+        let stream = decrypt_chunked_stream(ct, &kr);
+        let chunks = collect_chunks(stream).await.expect("stream ok");
+        assert_eq!(chunks.len(), 10, "10 chunks expected for 10 MiB / 1 MiB");
+        let mut joined = Vec::with_capacity(pt.len());
+        for c in chunks {
+            joined.extend_from_slice(&c);
+        }
+        assert_eq!(joined.len(), pt.len(), "byte length matches");
+        assert_eq!(joined, pt, "byte-equal round-trip");
+    }
+
+    #[tokio::test]
+    async fn s4e5_single_chunk_for_small_object() {
+        // Plaintext smaller than chunk_size → chunk_count=1.
+        let kr = keyring_single(0x77);
+        let pt = b"tiny payload, smaller than chunk_size";
+        let ct = encrypt_v2_chunked(pt, &kr, 1024 * 1024).unwrap();
+        assert_eq!(
+            u32::from_be_bytes([ct[12], ct[13], ct[14], ct[15]]),
+            1,
+            "small plaintext = single chunk",
+        );
+        let stream = decrypt_chunked_stream(ct, &kr);
+        let chunks = collect_chunks(stream).await.expect("stream ok");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].as_ref(), pt);
+    }
+
+    #[tokio::test]
+    async fn s4e5_tampered_chunk_n_reports_chunk_index() {
+        // Tamper byte inside chunk index 3 (= 4th chunk) — the
+        // stream must yield 3 successful chunks, then
+        // ChunkAuthFailed { 3 }.
+        let kr = keyring_single(0x91);
+        let chunk_size = 1024;
+        let pt = vec![0xCD_u8; chunk_size * 8]; // 8 chunks
+        let mut ct = encrypt_v2_chunked(&pt, &kr, chunk_size).unwrap().to_vec();
+        // Locate chunk 3's first ciphertext byte: header (20) + 3 *
+        // (tag 16 + ct 1024) + tag 16 = 20 + 3*1040 + 16 = 3156.
+        let target = S4E5_HEADER_BYTES + 3 * (TAG_LEN + chunk_size) + TAG_LEN;
+        ct[target] ^= 0x42;
+        let stream = decrypt_chunked_stream(bytes::Bytes::from(ct), &kr);
+        let mut s = std::pin::pin!(stream);
+        // Chunks 0, 1, 2 must succeed.
+        for expected_i in 0..3_u32 {
+            let item = s.next().await.expect("yield");
+            item.unwrap_or_else(|e| panic!("chunk {expected_i}: {e:?}"));
+        }
+        // Chunk 3 fails with the right index.
+        let err = s.next().await.expect("yield error").unwrap_err();
+        assert!(
+            matches!(err, SseError::ChunkAuthFailed { chunk_index: 3 }),
+            "got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn s4e5_back_compat_s4e2_blob_rejected_with_clear_error() {
+        // Feeding an S4E2 frame to decrypt_chunked_stream should
+        // surface BadMagic on the first poll (NOT silently fall
+        // back — the caller is expected to peek_magic and dispatch).
+        let kr = keyring_single(0x12);
+        let s4e2 = encrypt_v2(b"a v2 blob, not chunked", &kr);
+        let stream = decrypt_chunked_stream(s4e2, &kr);
+        let result = collect_chunks(stream).await;
+        let err = result.unwrap_err();
+        assert!(matches!(err, SseError::BadMagic { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn s4e5_salt_uniqueness_birthday_smoke() {
+        // 4-byte salt → birthday paradox 50% collision at ~65,536
+        // PUTs. 1024 PUTs → ~0.012% collision; we don't enforce
+        // zero, just sanity-check the salt actually differs more
+        // than half the time (ensures we're sampling fresh
+        // randomness, not a stuck PRNG).
+        let kr = keyring_single(0x33);
+        let mut salts = std::collections::HashSet::new();
+        let n = 1024;
+        for _ in 0..n {
+            let ct = encrypt_v2_chunked(b"x", &kr, 64).unwrap();
+            let mut salt = [0u8; 4];
+            salt.copy_from_slice(&ct[16..20]);
+            salts.insert(salt);
+        }
+        assert!(
+            salts.len() > n / 2,
+            "expected most of the {n} salts to be unique (got {} unique)",
+            salts.len(),
+        );
+    }
+
+    #[test]
+    fn s4e5_chunk_size_zero_is_invalid() {
+        let kr = keyring_single(0x66);
+        let err = encrypt_v2_chunked(b"hi", &kr, 0).unwrap_err();
+        assert!(matches!(err, SseError::ChunkSizeInvalid));
+    }
+
+    #[tokio::test]
+    async fn s4e5_truncated_body_surfaces_chunk_frame_truncated() {
+        // Truncate inside chunk 2's tag → ChunkFrameTruncated, not
+        // panic, not silent success.
+        let kr = keyring_single(0xA1);
+        let chunk_size = 256;
+        let pt = vec![0u8; chunk_size * 4];
+        let ct = encrypt_v2_chunked(&pt, &kr, chunk_size).unwrap();
+        // Truncate to inside chunk 2's tag: header + chunk0 + chunk1
+        // + 8B partial of chunk2's tag.
+        let trunc = S4E5_HEADER_BYTES + 2 * (TAG_LEN + chunk_size) + 8;
+        let truncated = bytes::Bytes::copy_from_slice(&ct[..trunc]);
+        let stream = decrypt_chunked_stream(truncated, &kr);
+        let result = collect_chunks(stream).await;
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, SseError::ChunkFrameTruncated { .. }),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn s4e5_decrypt_buffered_round_trip_via_top_level_decrypt() {
+        // Sync `decrypt(blob, &keyring)` must also accept S4E5
+        // (back-compat path for callers that need the whole
+        // plaintext).
+        let kr = keyring_single(0xDE);
+        let pt = b"buffered sync decrypt path".repeat(32);
+        let ct = encrypt_v2_chunked(&pt, &kr, 13).unwrap();
+        let plain = decrypt(&ct, &kr).expect("buffered S4E5 decrypt ok");
+        assert_eq!(plain.as_ref(), pt.as_slice());
+    }
+
+    #[tokio::test]
+    async fn s4e5_unknown_key_id_in_frame_errors() {
+        // Encrypt under id=7, decrypt under a keyring that lacks id=7.
+        let kr_put = SseKeyring::new(7, key32(0xCC));
+        let kr_get = keyring_single(0xCC); // only id=1
+        let ct = encrypt_v2_chunked(b"orphan key", &kr_put, 64).unwrap();
+        // Sync path
+        let err = decrypt(&ct, &kr_get).unwrap_err();
+        assert!(matches!(err, SseError::KeyNotInKeyring { id: 7 }), "got {err:?}");
+        // Stream path
+        let stream = decrypt_chunked_stream(ct, &kr_get);
+        let result = collect_chunks(stream).await;
+        assert!(
+            matches!(result, Err(SseError::KeyNotInKeyring { id: 7 })),
+            "got {result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn s4e5_final_chunk_smaller_than_chunk_size() {
+        // Plaintext = 2.5 chunks → final chunk holds half the bytes.
+        let kr = keyring_single(0xEF);
+        let chunk_size = 100;
+        let pt: Vec<u8> = (0..250_u32).map(|i| i as u8).collect();
+        let ct = encrypt_v2_chunked(&pt, &kr, chunk_size).unwrap();
+        assert_eq!(
+            u32::from_be_bytes([ct[12], ct[13], ct[14], ct[15]]),
+            3,
+            "ceil(250/100) = 3 chunks",
+        );
+        // Total on-disk: 20 header + 3 tags (48) + 250 plaintext = 318.
+        assert_eq!(ct.len(), 20 + 48 + 250);
+        let stream = decrypt_chunked_stream(ct, &kr);
+        let chunks = collect_chunks(stream).await.expect("stream ok");
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 100);
+        assert_eq!(chunks[1].len(), 100);
+        assert_eq!(chunks[2].len(), 50, "final chunk is the remainder");
+        let joined: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+        assert_eq!(joined, pt);
     }
 }

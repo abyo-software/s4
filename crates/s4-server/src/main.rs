@@ -215,6 +215,21 @@ struct Opt {
     #[clap(long, value_name = "id=N,key=PATH")]
     sse_s4_key_rotated: Vec<String>,
 
+    /// v0.8 #52: plaintext bytes per AES-GCM chunk on the SSE-S4
+    /// PUT path. When > 0 (default 1 MiB), every SSE-S4 PUT writes
+    /// the chunked **S4E5** frame instead of the buffered S4E2
+    /// frame, so the matching GET can stream-decrypt chunk-by-chunk
+    /// (TTFB ≈ AES-GCM cost of one chunk on a 5 GiB object, instead
+    /// of waiting for the entire body's tag to verify). Set to `0`
+    /// to disable and revert to the legacy S4E2 buffered path
+    /// (kept around for back-compat with v0.7-and-earlier
+    /// deployments that need bit-for-bit identical output). Has no
+    /// effect when `--sse-s4-key` is absent. SSE-C / SSE-KMS are
+    /// intentionally unaffected (chunked variants are a follow-up
+    /// issue).
+    #[clap(long, value_name = "BYTES", default_value_t = 1_048_576)]
+    sse_chunk_size: usize,
+
     /// Optional S3-style access-log destination directory. When set,
     /// every completed PUT / GET / DELETE / List request is buffered
     /// and flushed to hourly-rotated `.log` files under the directory.
@@ -810,6 +825,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             keyring.add(id, std::sync::Arc::new(k));
         }
         s4 = s4.with_sse_keyring(std::sync::Arc::new(keyring));
+        // v0.8 #52: opt the SSE-S4 PUT path into the chunked S4E5
+        // frame for streaming GET. Skipped when the operator
+        // explicitly passes `--sse-chunk-size 0` (back-compat with
+        // legacy buffered S4E2). Logged so the ops dashboard /
+        // boot diff makes the choice obvious.
+        if opt.sse_chunk_size > 0 {
+            info!(
+                chunk_size = opt.sse_chunk_size,
+                "S4 SSE-S4 chunked frame (S4E5) enabled — GET will stream-decrypt chunk-by-chunk"
+            );
+            s4 = s4.with_sse_chunk_size(opt.sse_chunk_size);
+        } else {
+            info!(
+                "S4 SSE-S4 chunked frame (S4E5) disabled — using legacy buffered S4E2 frame"
+            );
+        }
     } else if !opt.sse_s4_key_rotated.is_empty() {
         return Err("--sse-s4-key-rotated requires --sse-s4-key (active key) to also be set".into());
     }

@@ -96,6 +96,14 @@ pub mod names {
     /// Always set to 1.0 — the operator filters by label to confirm
     /// the hardware-acceleration path is live (`s4_sse_aes_backend{kind="aes-ni"} == 1`).
     pub const SSE_AES_BACKEND: &str = "s4_sse_aes_backend";
+    /// v0.8 #52: counter bumped once per S4E5 chunk that flows
+    /// through the streaming SSE-S4 path. Label: `op` (= `"encrypt"`
+    /// for the PUT side, `"decrypt"` for the GET side). Operators
+    /// divide by `s4_requests_total{op="put"|"get"}` to compute
+    /// average chunks-per-object — pair with `--sse-chunk-size` to
+    /// verify the configured slicing actually fires (e.g. a 50 MiB
+    /// PUT at 1 MiB chunks should bump this counter by ~50).
+    pub const SSE_STREAMING_CHUNKS_TOTAL: &str = "s4_sse_streaming_chunks_total";
 }
 
 /// v0.8 #50: re-export of [`names::SSE_AES_BACKEND`] at the crate root
@@ -110,6 +118,17 @@ pub const SSE_AES_BACKEND: &str = names::SSE_AES_BACKEND;
 /// shows up on the very first `/metrics` scrape.
 pub fn record_sse_aes_backend(kind: &'static str) {
     metrics::gauge!(SSE_AES_BACKEND, "kind" => kind).set(1.0);
+}
+
+/// v0.8 #52: bump the per-S4E5-chunk counter. `op` is `"encrypt"`
+/// (PUT-side, fired from [`crate::sse::encrypt_v2_chunked`]) or
+/// `"decrypt"` (GET-side, fired from
+/// [`crate::sse::decrypt_chunked_stream`] / `decrypt_v5_buffered`
+/// per chunk). The counter pairs with `s4_requests_total` so
+/// dashboards can compute `chunks_per_request = streaming_chunks /
+/// requests`.
+pub fn record_sse_streaming_chunk(op: &'static str) {
+    metrics::counter!(names::SSE_STREAMING_CHUNKS_TOTAL, "op" => op).increment(1);
 }
 
 /// v0.8 #55: stamp metrics after a GPU compress completes.

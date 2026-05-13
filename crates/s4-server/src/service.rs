@@ -301,6 +301,14 @@ pub struct S4Service<B: S3> {
     /// store is gateway-internal and idle when no multipart is in
     /// flight. See [`crate::multipart_state`] for rationale.
     multipart_state: Arc<crate::multipart_state::MultipartStateStore>,
+    /// v0.8 #52: plaintext bytes per S4E5 chunk on the SSE-S4 PUT
+    /// path. `0` (default) → use the legacy buffered S4E2 path
+    /// (whole-body AES-GCM tag, GET buffers + verifies before
+    /// emitting). Non-zero → use the chunked S4E5 frame so GET can
+    /// stream-decrypt chunk-by-chunk. Wired by `--sse-chunk-size`
+    /// in `main.rs`. SSE-C and SSE-KMS are intentionally unaffected
+    /// (chunked variants tracked in a follow-up issue).
+    sse_chunk_size: usize,
 }
 
 impl<B: S3> S4Service<B> {
@@ -336,6 +344,12 @@ impl<B: S3> S4Service<B> {
             compliance_strict: false,
             sigv4a_gate: None,
             multipart_state: Arc::new(crate::multipart_state::MultipartStateStore::new()),
+            // v0.8 #52: chunked SSE-S4 disabled by default — opt
+            // in via `S4Service::with_sse_chunk_size(...)` /
+            // `--sse-chunk-size <BYTES>`. Default keeps the legacy
+            // S4E2 buffered path so existing deployments are
+            // bit-for-bit unchanged.
+            sse_chunk_size: 0,
         }
     }
 
@@ -826,6 +840,27 @@ impl<B: S3> S4Service<B> {
     #[must_use]
     pub fn with_sse_keyring(mut self, keyring: crate::sse::SharedSseKeyring) -> Self {
         self.sse_keyring = Some(keyring);
+        self
+    }
+
+    /// v0.8 #52: opt the SSE-S4 PUT path into the chunked S4E5 frame
+    /// (so the matching GET can stream-decrypt chunk-by-chunk
+    /// instead of buffering the entire body before tag verify).
+    /// `bytes` is the plaintext slice size — typically 1 MiB; 0
+    /// disables the path and reverts to the legacy S4E2 buffered
+    /// frame.
+    ///
+    /// SSE-C (S4E3) and SSE-KMS (S4E4) are intentionally untouched:
+    /// the chunked envelopes for those flows are a follow-up issue
+    /// (the customer-key wire surface needs separate version
+    /// negotiation).
+    ///
+    /// Has no effect when `with_sse_keyring` / `with_sse_key` is
+    /// not also set — the chunked path runs only on the SSE-S4
+    /// branch of `put_object`.
+    #[must_use]
+    pub fn with_sse_chunk_size(mut self, bytes: usize) -> Self {
+        self.sse_chunk_size = bytes;
         self
     }
 
@@ -1971,7 +2006,27 @@ impl<B: S3> S3 for S4Service<B> {
                 // semantics the operator didn't request.
                 let meta = req.input.metadata.get_or_insert_with(Default::default);
                 meta.insert("s4-encrypted".into(), "aes-256-gcm".into());
-                crate::sse::encrypt_v2(&compressed, keyring)
+                // v0.8 #52: when `--sse-chunk-size > 0` is configured,
+                // emit the chunked S4E5 frame so the matching GET can
+                // stream-decrypt instead of buffering 5 GiB before
+                // emitting a byte. Falls back to the buffered S4E2
+                // frame at chunk_size=0 (default) so existing
+                // deployments are bit-for-bit unchanged.
+                if self.sse_chunk_size > 0 {
+                    crate::sse::encrypt_v2_chunked(
+                        &compressed,
+                        keyring,
+                        self.sse_chunk_size,
+                    )
+                    .map_err(|e| {
+                        S3Error::with_message(
+                            S3ErrorCode::InternalError,
+                            format!("SSE-S4 chunked encrypt failed: {e}"),
+                        )
+                    })?
+                } else {
+                    crate::sse::encrypt_v2(&compressed, keyring)
+                }
             } else {
                 compressed.clone()
             };
@@ -2467,8 +2522,75 @@ impl<B: S3> S3 for S4Service<B> {
                     .map_err(internal("collect SSE-encrypted body"))?;
                 // v0.5 #28: peek the frame magic to route the right
                 // decrypt path. S4E4 means SSE-KMS — unwrap the DEK
-                // through the KMS backend (async). S4E1/E2/E3 take the
-                // sync path (keyring or customer key).
+                // through the KMS backend (async). S4E1/E2/E3 take
+                // the sync path (keyring or customer key).
+                //
+                // v0.8 #52: S4E5 takes the *streaming* path — we
+                // hand the response body a per-chunk
+                // verify-and-emit Stream so the client sees chunk 0
+                // plaintext after one chunk-worth of AES-GCM verify
+                // (vs. waiting for the whole body's tag), and the
+                // gateway no longer needs to materialize the full
+                // plaintext in memory before responding. SSE-C is
+                // out of scope for v0.8 #52 (chunked S4E3 is a
+                // follow-up), so the S4E5 path requires the
+                // SSE-S4 keyring to be wired and `get_sse_c_material`
+                // to be absent — otherwise we surface a clear
+                // misconfiguration error instead of silently falling
+                // through to the buffered S4E5 path.
+                if matches!(crate::sse::peek_magic(&body), Some("S4E5"))
+                    && get_sse_c_material.is_none()
+                {
+                    let keyring_arc = self.sse_keyring.clone().ok_or_else(|| {
+                        S3Error::with_message(
+                            S3ErrorCode::InvalidRequest,
+                            "object is SSE-S4 encrypted (S4E5) but no --sse-s4-key is configured on this gateway",
+                        )
+                    })?;
+                    let body_len = body.len() as u64;
+                    let stream =
+                        crate::sse::decrypt_chunked_stream(body, keyring_arc.as_ref());
+                    // Stream is `'static` (the keyring borrow is
+                    // consumed up front; the cipher lives inside
+                    // the stream state — see decrypt_chunked_stream
+                    // doc), so we can move it straight into a
+                    // StreamingBlob without lifetime gymnastics.
+                    use futures::StreamExt;
+                    let mapped = stream.map(|r| {
+                        r.map_err(|e| std::io::Error::other(format!(
+                            "SSE-S4 chunked decrypt: {e}"
+                        )))
+                    });
+                    use s3s::dto::StreamingBlob;
+                    resp.output.body = Some(StreamingBlob::wrap(mapped));
+                    // Plaintext content_length is unknown until all
+                    // chunks have been verified; null it out so the
+                    // ByteStream wrapper reports `unknown` to the
+                    // HTTP layer (which then emits chunked transfer-
+                    // encoding) rather than lying about the size.
+                    resp.output.content_length = None;
+                    // The backend's checksums + ETag describe the
+                    // encrypted body (S4E5 wire format), not the
+                    // plaintext we're about to stream — clear them
+                    // so the AWS SDK doesn't fail the GET with a
+                    // ChecksumMismatch on a successful round-trip.
+                    // Mirrors the streaming-zstd path at L1180-1185.
+                    resp.output.checksum_crc32 = None;
+                    resp.output.checksum_crc32c = None;
+                    resp.output.checksum_crc64nvme = None;
+                    resp.output.checksum_sha1 = None;
+                    resp.output.checksum_sha256 = None;
+                    resp.output.e_tag = None;
+                    let elapsed = get_start.elapsed();
+                    crate::metrics::record_get(
+                        "sse-s4-chunked",
+                        body_len,
+                        body_len,
+                        elapsed.as_secs_f64(),
+                        true,
+                    );
+                    return Ok(resp);
+                }
                 let plain = match crate::sse::peek_magic(&body) {
                     Some("S4E4") => {
                         let kms = self.kms.as_ref().ok_or_else(|| {
@@ -3664,7 +3786,28 @@ impl<B: S3> S3 for S4Service<B> {
                         // HEAD doesn't falsely advertise AWS-style
                         // SSE-S3 (matches the put_object L1929-L1939
                         // comment).
-                        crate::sse::encrypt_v2(&body, keyring)
+                        // v0.8 #52: same chunk_size dispatch as the
+                        // single-PUT branch — multipart Complete
+                        // re-encrypts the assembled body, so honoring
+                        // the chunked path here is required to keep
+                        // GET streaming on multipart-uploaded objects.
+                        if self.sse_chunk_size > 0 {
+                            crate::sse::encrypt_v2_chunked(
+                                &body,
+                                keyring,
+                                self.sse_chunk_size,
+                            )
+                            .map_err(|e| {
+                                S3Error::with_message(
+                                    S3ErrorCode::InternalError,
+                                    format!(
+                                        "SSE-S4 chunked encrypt failed at Complete: {e}"
+                                    ),
+                                )
+                            })?
+                        } else {
+                            crate::sse::encrypt_v2(&body, keyring)
+                        }
                     }
                     crate::multipart_state::MultipartSseMode::None => body.clone(),
                 };
