@@ -337,18 +337,14 @@ impl LifecycleManager {
     /// any previously-attached rules in one shot — matches AWS S3
     /// `PutBucketLifecycleConfiguration` (full replace, no merge).
     pub fn put(&self, bucket: &str, config: LifecycleConfig) {
-        self.by_bucket
-            .write()
-            .expect("lifecycle state RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.by_bucket, "lifecycle.by_bucket")
             .insert(bucket.to_owned(), config);
     }
 
     /// Return a clone of the bucket's configuration, if any.
     #[must_use]
     pub fn get(&self, bucket: &str) -> Option<LifecycleConfig> {
-        self.by_bucket
-            .read()
-            .expect("lifecycle state RwLock poisoned")
+        crate::lock_recovery::recover_read(&self.by_bucket, "lifecycle.by_bucket")
             .get(bucket)
             .cloned()
     }
@@ -356,20 +352,15 @@ impl LifecycleManager {
     /// Drop the bucket's lifecycle configuration (idempotent — missing
     /// bucket is OK).
     pub fn delete(&self, bucket: &str) {
-        self.by_bucket
-            .write()
-            .expect("lifecycle state RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.by_bucket, "lifecycle.by_bucket")
             .remove(bucket);
     }
 
     /// JSON snapshot for restart-recoverable state. Pair with
     /// [`Self::from_json`].
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        let by_bucket = self
-            .by_bucket
-            .read()
-            .expect("lifecycle state RwLock poisoned")
-            .clone();
+        let by_bucket =
+            crate::lock_recovery::recover_read(&self.by_bucket, "lifecycle.by_bucket").clone();
         let snap = LifecycleSnapshot { by_bucket };
         serde_json::to_string(&snap)
     }
@@ -561,10 +552,8 @@ impl LifecycleManager {
     pub fn record_action(&self, bucket: &str, action: &LifecycleAction) {
         let label = action.metric_label();
         let key = (bucket.to_owned(), label.to_owned());
-        let mut guard = self
-            .actions_total
-            .write()
-            .expect("lifecycle actions counter RwLock poisoned");
+        let mut guard =
+            crate::lock_recovery::recover_write(&self.actions_total, "lifecycle.actions_total");
         let entry = guard.entry(key).or_insert(0);
         *entry = entry.saturating_add(1);
         crate::metrics::record_lifecycle_action(bucket, label);
@@ -575,20 +564,14 @@ impl LifecycleManager {
     /// endpoints in the future).
     #[must_use]
     pub fn actions_snapshot(&self) -> HashMap<(String, String), u64> {
-        self.actions_total
-            .read()
-            .expect("lifecycle actions counter RwLock poisoned")
-            .clone()
+        crate::lock_recovery::recover_read(&self.actions_total, "lifecycle.actions_total").clone()
     }
 
     /// All buckets with a lifecycle configuration attached. Sorted for
     /// stable scanner ordering.
     #[must_use]
     pub fn buckets(&self) -> Vec<String> {
-        let map = self
-            .by_bucket
-            .read()
-            .expect("lifecycle state RwLock poisoned");
+        let map = crate::lock_recovery::recover_read(&self.by_bucket, "lifecycle.by_bucket");
         let mut out: Vec<String> = map.keys().cloned().collect();
         out.sort();
         out
@@ -2478,5 +2461,45 @@ mod tests {
         assert_eq!(report.buckets_scanned, 1);
         assert_eq!(report.aborted_multipart, 0);
         assert_eq!(report.action_errors, 0);
+    }
+
+    /// v0.8.4 #77 (audit H-8): a panic inside the `by_bucket` write
+    /// guard poisons the lock. `to_json` must recover via
+    /// [`crate::lock_recovery::recover_read`] and surface the data
+    /// instead of re-panicking on the SIGUSR1 dump-back path.
+    #[test]
+    fn lifecycle_to_json_after_panic_recovers_via_poison() {
+        let mgr = std::sync::Arc::new(LifecycleManager::new());
+        mgr.put(
+            "b",
+            LifecycleConfig {
+                rules: vec![LifecycleRule {
+                    id: "r1".into(),
+                    status: LifecycleStatus::Enabled,
+                    filter: LifecycleFilter::default(),
+                    expiration_days: Some(30),
+                    expiration_date: None,
+                    transitions: Vec::new(),
+                    noncurrent_version_expiration_days: None,
+                    abort_incomplete_multipart_upload_days: None,
+                }],
+            },
+        );
+        let mgr_cl = std::sync::Arc::clone(&mgr);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut g = mgr_cl.by_bucket.write().expect("clean lock");
+            g.entry("b2".into()).or_default();
+            panic!("force-poison");
+        }));
+        assert!(
+            mgr.by_bucket.is_poisoned(),
+            "write panic must poison by_bucket lock"
+        );
+        let json = mgr.to_json().expect("to_json after poison must succeed");
+        let mgr2 = LifecycleManager::from_json(&json).expect("from_json");
+        assert!(
+            mgr2.get("b").is_some(),
+            "recovered snapshot keeps original config"
+        );
     }
 }

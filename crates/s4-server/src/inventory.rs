@@ -216,22 +216,14 @@ impl InventoryManager {
     /// next scheduler tick).
     pub fn put(&self, config: InventoryConfig) {
         let key = (config.bucket.clone(), config.id.clone());
-        self.last_run
-            .write()
-            .expect("inventory last_run RwLock poisoned")
-            .remove(&key);
-        self.configs
-            .write()
-            .expect("inventory configs RwLock poisoned")
-            .insert(key, config);
+        crate::lock_recovery::recover_write(&self.last_run, "inventory.last_run").remove(&key);
+        crate::lock_recovery::recover_write(&self.configs, "inventory.configs").insert(key, config);
     }
 
     /// Fetch a clone of the configuration. `None` when not present.
     #[must_use]
     pub fn get(&self, bucket: &str, id: &str) -> Option<InventoryConfig> {
-        self.configs
-            .read()
-            .expect("inventory configs RwLock poisoned")
+        crate::lock_recovery::recover_read(&self.configs, "inventory.configs")
             .get(&(bucket.to_owned(), id.to_owned()))
             .cloned()
     }
@@ -240,7 +232,7 @@ impl InventoryManager {
     /// vector is sorted by `id` for stable list responses.
     #[must_use]
     pub fn list_for_bucket(&self, bucket: &str) -> Vec<InventoryConfig> {
-        let map = self.configs.read().expect("inventory configs RwLock poisoned");
+        let map = crate::lock_recovery::recover_read(&self.configs, "inventory.configs");
         let mut out: Vec<InventoryConfig> = map
             .iter()
             .filter(|((b, _id), _)| b == bucket)
@@ -258,7 +250,7 @@ impl InventoryManager {
     /// `ListBucketInventoryConfigurations` handler.
     #[must_use]
     pub fn list_all(&self) -> Vec<InventoryConfig> {
-        let map = self.configs.read().expect("inventory configs RwLock poisoned");
+        let map = crate::lock_recovery::recover_read(&self.configs, "inventory.configs");
         let mut out: Vec<InventoryConfig> = map.values().cloned().collect();
         out.sort_by(|a, b| a.bucket.cmp(&b.bucket).then_with(|| a.id.cmp(&b.id)));
         out
@@ -267,14 +259,8 @@ impl InventoryManager {
     /// Drop a config + its `last_run` (idempotent — missing keys are OK).
     pub fn delete(&self, bucket: &str, id: &str) {
         let key = (bucket.to_owned(), id.to_owned());
-        self.configs
-            .write()
-            .expect("inventory configs RwLock poisoned")
-            .remove(&key);
-        self.last_run
-            .write()
-            .expect("inventory last_run RwLock poisoned")
-            .remove(&key);
+        crate::lock_recovery::recover_write(&self.configs, "inventory.configs").remove(&key);
+        crate::lock_recovery::recover_write(&self.last_run, "inventory.last_run").remove(&key);
     }
 
     /// `true` when the configuration exists and either has never run, or its
@@ -283,11 +269,11 @@ impl InventoryManager {
     #[must_use]
     pub fn due(&self, bucket: &str, id: &str, now: DateTime<Utc>) -> bool {
         let key = (bucket.to_owned(), id.to_owned());
-        let cfgs = self.configs.read().expect("inventory configs RwLock poisoned");
+        let cfgs = crate::lock_recovery::recover_read(&self.configs, "inventory.configs");
         let Some(cfg) = cfgs.get(&key) else {
             return false;
         };
-        let runs = self.last_run.read().expect("inventory last_run RwLock poisoned");
+        let runs = crate::lock_recovery::recover_read(&self.last_run, "inventory.last_run");
         match runs.get(&key) {
             None => true,
             Some(prev) => {
@@ -300,16 +286,14 @@ impl InventoryManager {
     /// Stamp `(bucket, id) -> when` so `due` will say "false" until the
     /// next interval boundary.
     pub fn mark_run(&self, bucket: &str, id: &str, when: DateTime<Utc>) {
-        self.last_run
-            .write()
-            .expect("inventory last_run RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.last_run, "inventory.last_run")
             .insert((bucket.to_owned(), id.to_owned()), when);
     }
 
     /// Snapshot to JSON (operators can persist via `--inventory-state-file`).
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        let cfgs = self.configs.read().expect("inventory configs RwLock poisoned");
-        let runs = self.last_run.read().expect("inventory last_run RwLock poisoned");
+        let cfgs = crate::lock_recovery::recover_read(&self.configs, "inventory.configs");
+        let runs = crate::lock_recovery::recover_read(&self.last_run, "inventory.last_run");
         let snap = InventorySnapshot {
             configs: cfgs
                 .iter()
@@ -1520,6 +1504,35 @@ mod tests {
         assert!(
             list_resp.output.contents.unwrap_or_default().is_empty(),
             "no destination writes expected when config is not due"
+        );
+    }
+
+    /// v0.8.4 #77 (audit H-8): a panic inside the `configs` write
+    /// guard poisons the lock. `to_json` must recover via
+    /// [`crate::lock_recovery::recover_read`] and surface the data
+    /// instead of re-panicking on the SIGUSR1 dump-back path.
+    #[test]
+    fn inventory_to_json_after_panic_recovers_via_poison() {
+        let mgr = std::sync::Arc::new(InventoryManager::new());
+        mgr.put(InventoryConfig::daily_csv("inv1", "src", "dst", "reports/"));
+        let mgr_cl = std::sync::Arc::clone(&mgr);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut g = mgr_cl.configs.write().expect("clean lock");
+            g.insert(
+                ("src2".into(), "inv2".into()),
+                InventoryConfig::daily_csv("inv2", "src2", "dst2", "r/"),
+            );
+            panic!("force-poison");
+        }));
+        assert!(
+            mgr.configs.is_poisoned(),
+            "write panic must poison configs lock"
+        );
+        let json = mgr.to_json().expect("to_json after poison must succeed");
+        let mgr2 = InventoryManager::from_json(&json).expect("from_json");
+        assert!(
+            mgr2.get("src", "inv1").is_some(),
+            "recovered snapshot keeps original entry"
         );
     }
 }

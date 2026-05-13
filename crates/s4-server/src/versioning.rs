@@ -161,9 +161,7 @@ impl VersioningManager {
     /// Bucket の versioning state を取得。未設定は `Unversioned`。
     #[must_use]
     pub fn state(&self, bucket: &str) -> VersioningState {
-        self.state
-            .read()
-            .expect("versioning state RwLock poisoned")
+        crate::lock_recovery::recover_read(&self.state, "versioning.state")
             .get(bucket)
             .copied()
             .unwrap_or(VersioningState::Unversioned)
@@ -171,9 +169,7 @@ impl VersioningManager {
 
     /// `put_bucket_versioning` handler から呼ぶ。
     pub fn set_state(&self, bucket: &str, state: VersioningState) {
-        self.state
-            .write()
-            .expect("versioning state RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.state, "versioning.state")
             .insert(bucket.to_owned(), state);
     }
 
@@ -221,7 +217,7 @@ impl VersioningManager {
     /// overwrite する (S3 仕様: Suspended bucket の null version は唯一)。Enabled の
     /// vid (UUIDv4) を commit する場合は単純に末尾 push。
     pub fn commit_put_with_version(&self, bucket: &str, key: &str, entry: VersionEntry) {
-        let mut idx = self.index.write().expect("version index RwLock poisoned");
+        let mut idx = crate::lock_recovery::recover_write(&self.index, "versioning.index");
         let chain = idx
             .buckets
             .entry(bucket.to_owned())
@@ -244,7 +240,7 @@ impl VersioningManager {
     pub fn record_delete(&self, bucket: &str, key: &str) -> DeleteOutcome {
         let state = self.state(bucket);
         let now = Utc::now();
-        let mut idx = self.index.write().expect("version index RwLock poisoned");
+        let mut idx = crate::lock_recovery::recover_write(&self.index, "versioning.index");
         let chain = idx
             .buckets
             .entry(bucket.to_owned())
@@ -300,7 +296,7 @@ impl VersioningManager {
         key: &str,
         version_id: &str,
     ) -> Option<DeleteOutcome> {
-        let mut idx = self.index.write().expect("version index RwLock poisoned");
+        let mut idx = crate::lock_recovery::recover_write(&self.index, "versioning.index");
         let bucket_map = idx.buckets.get_mut(bucket)?;
         let chain = bucket_map.get_mut(key)?;
         let pos = chain.iter().position(|e| e.version_id == version_id)?;
@@ -321,7 +317,7 @@ impl VersioningManager {
         key: &str,
         version_id: &str,
     ) -> Option<VersionEntry> {
-        let idx = self.index.read().expect("version index RwLock poisoned");
+        let idx = crate::lock_recovery::recover_read(&self.index, "versioning.index");
         idx.buckets
             .get(bucket)?
             .get(key)?
@@ -334,7 +330,7 @@ impl VersioningManager {
     /// もそのまま返す — 客側 (handler) が `is_delete_marker` を見て 404 を
     /// 投げるかどうか決める。
     pub fn lookup_latest(&self, bucket: &str, key: &str) -> Option<VersionEntry> {
-        let idx = self.index.read().expect("version index RwLock poisoned");
+        let idx = crate::lock_recovery::recover_read(&self.index, "versioning.index");
         idx.buckets.get(bucket)?.get(key)?.last().cloned()
     }
 
@@ -357,7 +353,7 @@ impl VersioningManager {
         version_id_marker: Option<&str>,
         max_keys: usize,
     ) -> ListVersionsPage {
-        let idx = self.index.read().expect("version index RwLock poisoned");
+        let idx = crate::lock_recovery::recover_read(&self.index, "versioning.index");
         let Some(bucket_map) = idx.buckets.get(bucket) else {
             return ListVersionsPage::default();
         };
@@ -441,18 +437,11 @@ impl VersioningManager {
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         let snap = VersioningSnapshot {
             index: VersionIndex {
-                buckets: self
-                    .index
-                    .read()
-                    .expect("version index RwLock poisoned")
+                buckets: crate::lock_recovery::recover_read(&self.index, "versioning.index")
                     .buckets
                     .clone(),
             },
-            state: self
-                .state
-                .read()
-                .expect("versioning state RwLock poisoned")
-                .clone(),
+            state: crate::lock_recovery::recover_read(&self.state, "versioning.state").clone(),
         };
         serde_json::to_string(&snap)
     }
@@ -620,5 +609,33 @@ mod tests {
         assert_eq!(p1.versions.len(), p2.versions.len());
         assert_eq!(p1.delete_markers.len(), p2.delete_markers.len());
         assert_eq!(m.state("b"), m2.state("b"));
+    }
+
+    /// v0.8.4 #77 (audit H-8): a panic inside a write-guarded section
+    /// poisons the inner `index` `RwLock`. Without
+    /// [`crate::lock_recovery::recover_read`] the next `to_json` call
+    /// (e.g. SIGUSR1 dump-back) would re-panic and take the gateway
+    /// down. The recover-on-poison path must surface the post-panic
+    /// data instead.
+    #[test]
+    fn versioning_to_json_after_panic_recovers_via_poison() {
+        let m = VersioningManager::new();
+        m.set_state("b", VersioningState::Enabled);
+        let _ = m.record_put("b", "k", "etag1".into(), 10);
+        // Force-poison the index lock by panicking inside a write guard.
+        let m = std::sync::Arc::new(m);
+        let m_cl = std::sync::Arc::clone(&m);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut g = m_cl.index.write().expect("clean lock");
+            g.buckets.entry("b".into()).or_default();
+            panic!("force-poison");
+        }));
+        assert!(m.index.is_poisoned(), "write panic must poison index lock");
+        // to_json must NOT re-panic and must round-trip the pre-panic data.
+        let json = m.to_json().expect("to_json after poison must succeed");
+        let m2 = VersioningManager::from_json(&json).expect("from_json");
+        let page = m2.list_versions("b", None, None, None, 100);
+        assert_eq!(page.versions.len(), 1, "recovered snapshot keeps version");
+        assert_eq!(m2.state("b"), VersioningState::Enabled);
     }
 }

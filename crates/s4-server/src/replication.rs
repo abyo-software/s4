@@ -308,9 +308,7 @@ impl ReplicationManager {
     /// configuration is fully replaced (S3 spec — `PutBucketReplication`
     /// is upsert-style at the bucket scope, not per-rule patch).
     pub fn put(&self, bucket: &str, config: ReplicationConfig) {
-        self.by_bucket
-            .write()
-            .expect("replication state RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.by_bucket, "replication.by_bucket")
             .insert(bucket.to_owned(), config);
     }
 
@@ -320,18 +318,14 @@ impl ReplicationManager {
     /// service-layer handler maps `None` accordingly).
     #[must_use]
     pub fn get(&self, bucket: &str) -> Option<ReplicationConfig> {
-        self.by_bucket
-            .read()
-            .expect("replication state RwLock poisoned")
+        crate::lock_recovery::recover_read(&self.by_bucket, "replication.by_bucket")
             .get(bucket)
             .cloned()
     }
 
     /// Drop the configuration for `bucket`. Idempotent.
     pub fn delete(&self, bucket: &str) {
-        self.by_bucket
-            .write()
-            .expect("replication state RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.by_bucket, "replication.by_bucket")
             .remove(bucket);
     }
 
@@ -344,18 +338,18 @@ impl ReplicationManager {
     /// runs the same binary against its own snapshot.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         let snap = ReplicationSnapshot {
-            by_bucket: self
-                .by_bucket
-                .read()
-                .expect("replication state RwLock poisoned")
-                .clone(),
-            statuses: self
-                .statuses
-                .read()
-                .expect("replication state RwLock poisoned")
-                .iter()
-                .map(|(k, v)| (k.clone(), StatusOrEntry::Entry(v.clone())))
-                .collect(),
+            by_bucket: crate::lock_recovery::recover_read(
+                &self.by_bucket,
+                "replication.by_bucket",
+            )
+            .clone(),
+            statuses: crate::lock_recovery::recover_read(
+                &self.statuses,
+                "replication.statuses",
+            )
+            .iter()
+            .map(|(k, v)| (k.clone(), StatusOrEntry::Entry(v.clone())))
+            .collect(),
             next_generation: self.next_generation.load(Ordering::Relaxed),
         };
         serde_json::to_string(&snap)
@@ -406,10 +400,7 @@ impl ReplicationManager {
         key: &str,
         object_tags: &[(String, String)],
     ) -> Option<ReplicationRule> {
-        let map = self
-            .by_bucket
-            .read()
-            .expect("replication state RwLock poisoned");
+        let map = crate::lock_recovery::recover_read(&self.by_bucket, "replication.by_bucket");
         let cfg = map.get(bucket)?;
         let mut best: Option<&ReplicationRule> = None;
         for rule in &cfg.rules {
@@ -442,9 +433,7 @@ impl ReplicationManager {
     ///   `PENDING` instead of `None`.
     /// - Tests that don't care about generation (legacy assertions).
     pub fn record_status(&self, bucket: &str, key: &str, status: ReplicationStatus) {
-        self.statuses
-            .write()
-            .expect("replication state RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.statuses, "replication.statuses")
             .insert(
                 (bucket.to_owned(), key.to_owned()),
                 ReplicationStatusEntry {
@@ -484,10 +473,7 @@ impl ReplicationManager {
         generation: u64,
         status: ReplicationStatus,
     ) -> bool {
-        let mut map = self
-            .statuses
-            .write()
-            .expect("replication state RwLock poisoned");
+        let mut map = crate::lock_recovery::recover_write(&self.statuses, "replication.statuses");
         let now = Utc::now();
         let entry = map
             .entry((bucket.to_owned(), key.to_owned()))
@@ -528,10 +514,7 @@ impl ReplicationManager {
     /// Returns the number of entries removed (operators dashboard via
     /// `s4_replication_status_swept_total`).
     pub fn sweep_stale(&self, now: DateTime<Utc>, max_age: chrono::Duration) -> usize {
-        let mut map = self
-            .statuses
-            .write()
-            .expect("replication state RwLock poisoned");
+        let mut map = crate::lock_recovery::recover_write(&self.statuses, "replication.statuses");
         let cutoff = now - max_age;
         let stale: Vec<(String, String)> = map
             .iter()
@@ -560,9 +543,7 @@ impl ReplicationManager {
     /// AWS wire shape.
     #[must_use]
     pub fn lookup_status(&self, bucket: &str, key: &str) -> Option<ReplicationStatus> {
-        self.statuses
-            .read()
-            .expect("replication state RwLock poisoned")
+        crate::lock_recovery::recover_read(&self.statuses, "replication.statuses")
             .get(&(bucket.to_owned(), key.to_owned()))
             .map(|entry| entry.status.clone())
     }
@@ -613,7 +594,7 @@ pub fn warn_lock_propagation_skipped(source_bucket: &str, dest_bucket: &str) {
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
     let key = (source_bucket.to_owned(), dest_bucket.to_owned());
     let first_time = {
-        let mut guard = seen.lock().expect("warn-once HashSet Mutex poisoned");
+        let mut guard = crate::lock_recovery::recover_mutex(seen, "replication.warn_once_seen");
         guard.insert(key)
     };
     if first_time {
@@ -763,12 +744,12 @@ pub async fn replicate_object<F, Fut>(
         // older bytes. We use `record_status_if_newer` with the
         // **current** entry's status as a no-op when we're not stale,
         // but the cheap path is to peek and bail.
-        if let Some(entry) = manager
-            .statuses
-            .read()
-            .expect("replication state RwLock poisoned")
-            .get(&(source_bucket.clone(), source_key.clone()))
-            .cloned()
+        if let Some(entry) = crate::lock_recovery::recover_read(
+            &manager.statuses,
+            "replication.statuses",
+        )
+        .get(&(source_bucket.clone(), source_key.clone()))
+        .cloned()
             && entry.generation > generation
         {
             tracing::debug!(
@@ -1338,9 +1319,7 @@ mod tests {
         status: ReplicationStatus,
         recorded_at: DateTime<Utc>,
     ) {
-        mgr.statuses
-            .write()
-            .expect("replication state RwLock poisoned")
+        crate::lock_recovery::recover_write(&mgr.statuses, "replication.statuses")
             .insert(
                 (bucket.to_owned(), key.to_owned()),
                 ReplicationStatusEntry {
@@ -1453,10 +1432,8 @@ mod tests {
         // recorded_at defaulted to Utc::now() at deserialise time —
         // peek the inner entry to verify the timestamp is in the
         // [before, after] window of the from_json call.
-        let entries = mgr
-            .statuses
-            .read()
-            .expect("replication state RwLock poisoned");
+        let entries =
+            crate::lock_recovery::recover_read(&mgr.statuses, "replication.statuses");
         let entry = entries
             .get(&("src".to_owned(), "k".to_owned()))
             .expect("entry must exist");
@@ -1607,6 +1584,48 @@ mod tests {
         assert!(
             meta.get("x-amz-object-lock-legal-hold").is_none(),
             "no lock state ⇒ no legal-hold header"
+        );
+    }
+
+    /// v0.8.4 #77 (audit H-8): a panic inside the `statuses` write
+    /// guard poisons the lock. `to_json` must recover via
+    /// [`crate::lock_recovery::recover_read`] and surface the data
+    /// instead of re-panicking on the SIGUSR1 dump-back path.
+    #[test]
+    fn replication_to_json_after_panic_recovers_via_poison() {
+        let mgr = Arc::new(ReplicationManager::new());
+        mgr.put(
+            "src",
+            ReplicationConfig {
+                role: "arn:aws:iam::000:role/s4".into(),
+                rules: vec![rule("r1", 1, true, None, &[], "dst")],
+            },
+        );
+        mgr.record_status("src", "k", ReplicationStatus::Pending);
+
+        let mgr_cl = Arc::clone(&mgr);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut g = mgr_cl.statuses.write().expect("clean lock");
+            g.insert(
+                ("src".into(), "k2".into()),
+                ReplicationStatusEntry {
+                    status: ReplicationStatus::Pending,
+                    generation: 0,
+                    recorded_at: Utc::now(),
+                },
+            );
+            panic!("force-poison");
+        }));
+        assert!(
+            mgr.statuses.is_poisoned(),
+            "write panic must poison statuses lock"
+        );
+        let json = mgr.to_json().expect("to_json after poison must succeed");
+        let mgr2 = ReplicationManager::from_json(&json).expect("from_json");
+        assert_eq!(
+            mgr2.lookup_status("src", "k"),
+            Some(ReplicationStatus::Pending),
+            "recovered snapshot keeps original status"
         );
     }
 }

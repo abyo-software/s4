@@ -159,18 +159,14 @@ impl ObjectLockManager {
     /// be downgraded and retain-until cannot be shortened — the caller
     /// validates, this method just persists).
     pub fn set(&self, bucket: &str, key: &str, state: ObjectLockState) {
-        self.states
-            .write()
-            .expect("object-lock state RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.states, "object_lock.states")
             .insert((bucket.to_owned(), key.to_owned()), state);
     }
 
     /// Return a clone of the current state for `(bucket, key)`, if any.
     #[must_use]
     pub fn get(&self, bucket: &str, key: &str) -> Option<ObjectLockState> {
-        self.states
-            .read()
-            .expect("object-lock state RwLock poisoned")
+        crate::lock_recovery::recover_read(&self.states, "object_lock.states")
             .get(&(bucket.to_owned(), key.to_owned()))
             .cloned()
     }
@@ -179,10 +175,7 @@ impl ObjectLockManager {
     /// state if no entry exists yet (legal hold is allowed even without
     /// retention).
     pub fn set_legal_hold(&self, bucket: &str, key: &str, on: bool) {
-        let mut guard = self
-            .states
-            .write()
-            .expect("object-lock state RwLock poisoned");
+        let mut guard = crate::lock_recovery::recover_write(&self.states, "object_lock.states");
         let entry = guard
             .entry((bucket.to_owned(), key.to_owned()))
             .or_default();
@@ -193,18 +186,14 @@ impl ObjectLockManager {
     /// this bucket without explicit retention pick this up via
     /// [`Self::apply_default_on_put`].
     pub fn set_bucket_default(&self, bucket: &str, default: BucketObjectLockDefault) {
-        self.bucket_defaults
-            .write()
-            .expect("object-lock bucket-default RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.bucket_defaults, "object_lock.bucket_defaults")
             .insert(bucket.to_owned(), default);
     }
 
     /// Look up the bucket-default retention config, if any.
     #[must_use]
     pub fn bucket_default(&self, bucket: &str) -> Option<BucketObjectLockDefault> {
-        self.bucket_defaults
-            .read()
-            .expect("object-lock bucket-default RwLock poisoned")
+        crate::lock_recovery::recover_read(&self.bucket_defaults, "object_lock.bucket_defaults")
             .get(bucket)
             .copied()
     }
@@ -218,10 +207,7 @@ impl ObjectLockManager {
         let Some(default) = self.bucket_default(bucket) else {
             return;
         };
-        let mut guard = self
-            .states
-            .write()
-            .expect("object-lock state RwLock poisoned");
+        let mut guard = crate::lock_recovery::recover_write(&self.states, "object_lock.states");
         let key_pair = (bucket.to_owned(), key.to_owned());
         // Skip if any retention is already in effect — auto-apply must not
         // shorten an existing Compliance lock or wipe a legal hold.
@@ -240,27 +226,23 @@ impl ObjectLockManager {
     /// `service.rs` after a successful (= permitted) physical delete so the
     /// freed key can be re-armed by a future PUT under the bucket default.
     pub fn clear(&self, bucket: &str, key: &str) {
-        self.states
-            .write()
-            .expect("object-lock state RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.states, "object_lock.states")
             .remove(&(bucket.to_owned(), key.to_owned()));
     }
 
     /// JSON snapshot for restart-recoverable state. Pair with
     /// [`Self::from_json`].
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        let states: Vec<((String, String), ObjectLockState)> = self
-            .states
-            .read()
-            .expect("object-lock state RwLock poisoned")
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let bucket_defaults = self
-            .bucket_defaults
-            .read()
-            .expect("object-lock bucket-default RwLock poisoned")
-            .clone();
+        let states: Vec<((String, String), ObjectLockState)> =
+            crate::lock_recovery::recover_read(&self.states, "object_lock.states")
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+        let bucket_defaults = crate::lock_recovery::recover_read(
+            &self.bucket_defaults,
+            "object_lock.bucket_defaults",
+        )
+        .clone();
         let snap = ObjectLockSnapshot {
             states,
             bucket_defaults,
@@ -494,5 +476,37 @@ mod tests {
         assert!(m.get("b", "k").is_some());
         m.clear("b", "k");
         assert!(m.get("b", "k").is_none());
+    }
+
+    /// v0.8.4 #77 (audit H-8): a panic inside the `states` write guard
+    /// poisons the lock. `to_json` must recover via
+    /// [`crate::lock_recovery::recover_read`] and surface the data
+    /// instead of re-panicking.
+    #[test]
+    fn object_lock_to_json_after_panic_recovers_via_poison() {
+        let m = ObjectLockManager::new();
+        m.set(
+            "b",
+            "k",
+            ObjectLockState {
+                mode: Some(LockMode::Compliance),
+                retain_until: Some(Utc::now() + Duration::days(7)),
+                legal_hold_on: false,
+            },
+        );
+        let m = std::sync::Arc::new(m);
+        let m_cl = std::sync::Arc::clone(&m);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut g = m_cl.states.write().expect("clean lock");
+            g.entry(("b".into(), "k2".into())).or_default();
+            panic!("force-poison");
+        }));
+        assert!(m.states.is_poisoned(), "write panic must poison states lock");
+        let json = m.to_json().expect("to_json after poison must succeed");
+        let m2 = ObjectLockManager::from_json(&json).expect("from_json");
+        assert!(
+            m2.get("b", "k").is_some(),
+            "recovered snapshot keeps original entry"
+        );
     }
 }

@@ -199,9 +199,7 @@ impl MultipartStateStore {
     /// behaviour we want (treat a re-Create as the abandonment-clock
     /// restart).
     pub fn put(&self, upload_id: &str, ctx: MultipartUploadContext) {
-        self.by_upload_id
-            .write()
-            .expect("multipart-state by_upload_id RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.by_upload_id, "multipart_state.by_upload_id")
             .insert(upload_id.to_owned(), (ctx, Utc::now()));
     }
 
@@ -211,9 +209,7 @@ impl MultipartStateStore {
     /// in turn surfaces `NoSuchUpload`).
     #[must_use]
     pub fn get(&self, upload_id: &str) -> Option<MultipartUploadContext> {
-        self.by_upload_id
-            .read()
-            .expect("multipart-state by_upload_id RwLock poisoned")
+        crate::lock_recovery::recover_read(&self.by_upload_id, "multipart_state.by_upload_id")
             .get(upload_id)
             .map(|(c, _)| c.clone())
     }
@@ -223,9 +219,7 @@ impl MultipartStateStore {
     /// 32]>` wrapper inside the dropped `MultipartSseMode::SseC`
     /// variant zeros the key bytes during its `Drop`.
     pub fn remove(&self, upload_id: &str) {
-        self.by_upload_id
-            .write()
-            .expect("multipart-state by_upload_id RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.by_upload_id, "multipart_state.by_upload_id")
             .remove(upload_id);
     }
 
@@ -247,10 +241,10 @@ impl MultipartStateStore {
     /// explicit `now` from a fixed timestamp).
     pub fn sweep_stale(&self, now: DateTime<Utc>, max_age: chrono::Duration) -> usize {
         let cutoff = now - max_age;
-        let mut map = self
-            .by_upload_id
-            .write()
-            .expect("multipart-state by_upload_id RwLock poisoned");
+        let mut map = crate::lock_recovery::recover_write(
+            &self.by_upload_id,
+            "multipart_state.by_upload_id",
+        );
         let stale: Vec<String> = map
             .iter()
             .filter(|(_, (_, ts))| *ts < cutoff)
@@ -312,9 +306,7 @@ impl MultipartStateStore {
     /// tracking. Used by the assertion in `concurrent_put_lookup_race_free`.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.by_upload_id
-            .read()
-            .expect("multipart-state by_upload_id RwLock poisoned")
+        crate::lock_recovery::recover_read(&self.by_upload_id, "multipart_state.by_upload_id")
             .len()
     }
 }
@@ -644,5 +636,38 @@ mod tests {
             h.join().expect("worker thread panicked");
         }
         assert_eq!(store.len(), 8 * 250, "all puts must persist");
+    }
+
+    /// v0.8.4 #77 (audit H-8): a panic inside the `by_upload_id` write
+    /// guard poisons the lock. Subsequent reads (e.g. `get` /
+    /// `sweep_stale`) must recover via
+    /// [`crate::lock_recovery::recover_read`] /
+    /// [`crate::lock_recovery::recover_write`] and surface the data
+    /// instead of re-panicking. `MultipartStateStore` has no `to_json`
+    /// so this test exercises `get` directly — the same poison-recovery
+    /// helper is used.
+    #[test]
+    fn multipart_state_get_after_panic_recovers_via_poison() {
+        let store = Arc::new(MultipartStateStore::new());
+        store.put("u1", sample_ctx("b", "k"));
+        let store_cl = Arc::clone(&store);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut g = store_cl.by_upload_id.write().expect("clean lock");
+            g.insert("u2".to_owned(), (sample_ctx("b", "k2"), Utc::now()));
+            panic!("force-poison");
+        }));
+        assert!(
+            store.by_upload_id.is_poisoned(),
+            "write panic must poison by_upload_id lock"
+        );
+        let got = store.get("u1").expect("get after poison must succeed");
+        assert_eq!(got.bucket, "b");
+        assert_eq!(got.key, "k");
+        // sweep_stale (write path) must also recover, not panic.
+        let n = store.sweep_stale(
+            Utc::now() + chrono::Duration::hours(48),
+            chrono::Duration::hours(1),
+        );
+        assert!(n >= 1, "stale sweep must run + recover via poison");
     }
 }

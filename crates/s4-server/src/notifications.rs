@@ -215,9 +215,7 @@ impl NotificationManager {
     /// existing configuration is fully replaced (S3 spec — PutBucket... is
     /// upsert-style at the bucket scope, not per-rule patch).
     pub fn put(&self, bucket: &str, config: NotificationConfig) {
-        self.by_bucket
-            .write()
-            .expect("notification state RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.by_bucket, "notifications.by_bucket")
             .insert(bucket.to_owned(), config);
     }
 
@@ -227,18 +225,14 @@ impl NotificationManager {
     /// service-layer handler maps `None` → empty DTO accordingly.
     #[must_use]
     pub fn get(&self, bucket: &str) -> Option<NotificationConfig> {
-        self.by_bucket
-            .read()
-            .expect("notification state RwLock poisoned")
+        crate::lock_recovery::recover_read(&self.by_bucket, "notifications.by_bucket")
             .get(bucket)
             .cloned()
     }
 
     /// Drop all rules for `bucket`. Idempotent.
     pub fn delete(&self, bucket: &str) {
-        self.by_bucket
-            .write()
-            .expect("notification state RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.by_bucket, "notifications.by_bucket")
             .remove(bucket);
     }
 
@@ -246,11 +240,11 @@ impl NotificationManager {
     /// `--notifications-state-file` snapshot dumps).
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         let snap = NotificationSnapshot {
-            by_bucket: self
-                .by_bucket
-                .read()
-                .expect("notification state RwLock poisoned")
-                .clone(),
+            by_bucket: crate::lock_recovery::recover_read(
+                &self.by_bucket,
+                "notifications.by_bucket",
+            )
+            .clone(),
         };
         serde_json::to_string(&snap)
     }
@@ -277,10 +271,8 @@ impl NotificationManager {
         event: &EventType,
         key: &str,
     ) -> Vec<Destination> {
-        let map = self
-            .by_bucket
-            .read()
-            .expect("notification state RwLock poisoned");
+        let map =
+            crate::lock_recovery::recover_read(&self.by_bucket, "notifications.by_bucket");
         let cfg = match map.get(bucket) {
             Some(c) => c,
             None => return Vec::new(),
@@ -999,6 +991,45 @@ mod tests {
             mgr.dropped_total.load(Ordering::Relaxed),
             1,
             "drop counter must bump exactly once after retry budget exhausted"
+        );
+    }
+
+    /// v0.8.4 #77 (audit H-8): a panic inside the `by_bucket` write
+    /// guard poisons the lock. `to_json` must recover via
+    /// [`crate::lock_recovery::recover_read`] and surface the data
+    /// instead of re-panicking on the SIGUSR1 dump-back path.
+    #[test]
+    fn notifications_to_json_after_panic_recovers_via_poison() {
+        let mgr = std::sync::Arc::new(NotificationManager::new());
+        mgr.put(
+            "b",
+            NotificationConfig {
+                rules: vec![NotificationRule {
+                    id: "r1".into(),
+                    events: vec![EventType::ObjectCreatedPut],
+                    destination: Destination::Webhook {
+                        url: "http://example.invalid".into(),
+                    },
+                    filter_prefix: None,
+                    filter_suffix: None,
+                }],
+            },
+        );
+        let mgr_cl = std::sync::Arc::clone(&mgr);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut g = mgr_cl.by_bucket.write().expect("clean lock");
+            g.entry("b2".into()).or_default();
+            panic!("force-poison");
+        }));
+        assert!(
+            mgr.by_bucket.is_poisoned(),
+            "write panic must poison by_bucket lock"
+        );
+        let json = mgr.to_json().expect("to_json after poison must succeed");
+        let mgr2 = NotificationManager::from_json(&json).expect("from_json");
+        assert!(
+            mgr2.get("b").is_some(),
+            "recovered snapshot keeps original config"
         );
     }
 }

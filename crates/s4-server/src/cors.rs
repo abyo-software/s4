@@ -112,9 +112,7 @@ impl CorsManager {
     /// `put_bucket_cors` handler から呼ぶ。bucket の既存 configuration は
     /// **完全に置き換える** (S3 spec: PutBucketCors は upsert ではなく replace)。
     pub fn put(&self, bucket: &str, config: CorsConfig) {
-        self.by_bucket
-            .write()
-            .expect("CORS state RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.by_bucket, "cors.by_bucket")
             .insert(bucket.to_owned(), config);
     }
 
@@ -122,29 +120,21 @@ impl CorsManager {
     /// (handler 側で `NoSuchCORSConfiguration` 404 を返す材料)。
     #[must_use]
     pub fn get(&self, bucket: &str) -> Option<CorsConfig> {
-        self.by_bucket
-            .read()
-            .expect("CORS state RwLock poisoned")
+        crate::lock_recovery::recover_read(&self.by_bucket, "cors.by_bucket")
             .get(bucket)
             .cloned()
     }
 
     /// `delete_bucket_cors` handler から呼ぶ。bucket が無くても idempotent。
     pub fn delete(&self, bucket: &str) {
-        self.by_bucket
-            .write()
-            .expect("CORS state RwLock poisoned")
-            .remove(bucket);
+        crate::lock_recovery::recover_write(&self.by_bucket, "cors.by_bucket").remove(bucket);
     }
 
     /// snapshot を JSON 文字列にして返す。`--cors-state-file` 経路で
     /// 起動時 dump-load を将来 wire するための hook。
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         let snap = CorsSnapshot {
-            by_bucket: self
-                .by_bucket
-                .read()
-                .expect("CORS state RwLock poisoned")
+            by_bucket: crate::lock_recovery::recover_read(&self.by_bucket, "cors.by_bucket")
                 .clone(),
         };
         serde_json::to_string(&snap)
@@ -175,7 +165,7 @@ impl CorsManager {
         method: &str,
         request_headers: &[String],
     ) -> Option<CorsRule> {
-        let map = self.by_bucket.read().expect("CORS state RwLock poisoned");
+        let map = crate::lock_recovery::recover_read(&self.by_bucket, "cors.by_bucket");
         let cfg = map.get(bucket)?;
         for rule in &cfg.rules {
             if !rule_matches_origin(rule, origin) {
@@ -498,5 +488,36 @@ mod tests {
         let json = mgr.to_json().expect("to_json");
         let mgr2 = CorsManager::from_json(&json).expect("from_json");
         assert_eq!(mgr.get("b"), mgr2.get("b"));
+    }
+
+    /// v0.8.4 #77 (audit H-8): a panic inside the `by_bucket` write
+    /// guard poisons the lock. `to_json` must recover via
+    /// [`crate::lock_recovery::recover_read`] and surface the data
+    /// instead of re-panicking on the SIGUSR1 dump-back path.
+    #[test]
+    fn cors_to_json_after_panic_recovers_via_poison() {
+        let mgr = std::sync::Arc::new(CorsManager::new());
+        mgr.put(
+            "b",
+            CorsConfig {
+                rules: vec![rule(&["*"], &["GET"], &[])],
+            },
+        );
+        let mgr_cl = std::sync::Arc::clone(&mgr);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut g = mgr_cl.by_bucket.write().expect("clean lock");
+            g.entry("b2".into()).or_default();
+            panic!("force-poison");
+        }));
+        assert!(
+            mgr.by_bucket.is_poisoned(),
+            "write panic must poison by_bucket lock"
+        );
+        let json = mgr.to_json().expect("to_json after poison must succeed");
+        let mgr2 = CorsManager::from_json(&json).expect("from_json");
+        assert!(
+            mgr2.get("b").is_some(),
+            "recovered snapshot keeps original config"
+        );
     }
 }

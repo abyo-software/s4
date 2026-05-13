@@ -8,6 +8,7 @@ pub mod cors;
 pub mod inventory;
 pub mod kms;
 pub mod lifecycle;
+pub mod lock_recovery;
 pub mod metrics;
 pub mod mfa;
 pub mod multipart_state;

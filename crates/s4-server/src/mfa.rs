@@ -103,17 +103,13 @@ impl MfaDeleteManager {
     /// `is_enabled(bucket) == true` and no per-bucket override use this
     /// secret to verify the client-supplied TOTP code.
     pub fn set_default_secret(&self, secret: MfaSecret) {
-        *self
-            .default_secret
-            .write()
-            .expect("MFA default-secret RwLock poisoned") = Some(secret);
+        *crate::lock_recovery::recover_write(&self.default_secret, "mfa.default_secret") =
+            Some(secret);
     }
 
     /// Install (or replace) a per-bucket override.
     pub fn set_bucket_secret(&self, bucket: &str, secret: MfaSecret) {
-        self.by_bucket
-            .write()
-            .expect("MFA per-bucket RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.by_bucket, "mfa.by_bucket")
             .insert(bucket.to_owned(), secret);
     }
 
@@ -122,9 +118,7 @@ impl MfaDeleteManager {
     /// `x-amz-mfa`); `false` disables (the bucket falls back to the
     /// regular versioning DELETE flow).
     pub fn set_bucket_state(&self, bucket: &str, enabled: bool) {
-        self.enabled
-            .write()
-            .expect("MFA enabled-state RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.enabled, "mfa.enabled")
             .insert(bucket.to_owned(), enabled);
     }
 
@@ -132,9 +126,7 @@ impl MfaDeleteManager {
     /// `false` for never-configured buckets, matching S3 spec).
     #[must_use]
     pub fn is_enabled(&self, bucket: &str) -> bool {
-        self.enabled
-            .read()
-            .expect("MFA enabled-state RwLock poisoned")
+        crate::lock_recovery::recover_read(&self.enabled, "mfa.enabled")
             .get(bucket)
             .copied()
             .unwrap_or(false)
@@ -145,40 +137,27 @@ impl MfaDeleteManager {
     /// Returns `None` when neither has been configured.
     #[must_use]
     pub fn lookup_secret(&self, bucket: &str) -> Option<MfaSecret> {
-        if let Some(s) = self
-            .by_bucket
-            .read()
-            .expect("MFA per-bucket RwLock poisoned")
+        if let Some(s) = crate::lock_recovery::recover_read(&self.by_bucket, "mfa.by_bucket")
             .get(bucket)
             .cloned()
         {
             return Some(s);
         }
-        self.default_secret
-            .read()
-            .expect("MFA default-secret RwLock poisoned")
-            .clone()
+        crate::lock_recovery::recover_read(&self.default_secret, "mfa.default_secret").clone()
     }
 
     /// JSON snapshot for restart-recoverable state. Pair with
     /// [`Self::from_json`].
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         let snap = MfaSnapshot {
-            default_secret: self
-                .default_secret
-                .read()
-                .expect("MFA default-secret RwLock poisoned")
+            default_secret: crate::lock_recovery::recover_read(
+                &self.default_secret,
+                "mfa.default_secret",
+            )
+            .clone(),
+            by_bucket: crate::lock_recovery::recover_read(&self.by_bucket, "mfa.by_bucket")
                 .clone(),
-            by_bucket: self
-                .by_bucket
-                .read()
-                .expect("MFA per-bucket RwLock poisoned")
-                .clone(),
-            enabled: self
-                .enabled
-                .read()
-                .expect("MFA enabled-state RwLock poisoned")
-                .clone(),
+            enabled: crate::lock_recovery::recover_read(&self.enabled, "mfa.enabled").clone(),
         };
         serde_json::to_string(&snap)
     }
@@ -500,5 +479,34 @@ mod tests {
         // Bucket without an override falls back to the default.
         let s = m2.lookup_secret("other").expect("default survives");
         assert_eq!(s.serial, "DEFAULT");
+    }
+
+    /// v0.8.4 #77 (audit H-8): a panic inside the `enabled` write
+    /// guard poisons the lock. `to_json` must recover via
+    /// [`crate::lock_recovery::recover_read`] and surface the data
+    /// instead of re-panicking on the SIGUSR1 dump-back path.
+    #[test]
+    fn mfa_to_json_after_panic_recovers_via_poison() {
+        let m = std::sync::Arc::new(MfaDeleteManager::new());
+        m.set_default_secret(MfaSecret {
+            secret_base32: TEST_SECRET_B32.to_owned(),
+            serial: "DEFAULT".to_owned(),
+        });
+        m.set_bucket_state("b", true);
+        let m_cl = std::sync::Arc::clone(&m);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut g = m_cl.enabled.write().expect("clean lock");
+            g.insert("b2".into(), true);
+            panic!("force-poison");
+        }));
+        assert!(
+            m.enabled.is_poisoned(),
+            "write panic must poison enabled lock"
+        );
+        let json = m.to_json().expect("to_json after poison must succeed");
+        let m2 = MfaDeleteManager::from_json(&json).expect("from_json");
+        assert!(m2.is_enabled("b"), "recovered snapshot keeps enabled flag");
+        let secret = m2.lookup_secret("b").expect("default secret survives");
+        assert_eq!(secret.serial, "DEFAULT");
     }
 }

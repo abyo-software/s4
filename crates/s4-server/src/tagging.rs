@@ -193,9 +193,7 @@ impl TagManager {
     /// Replace (or create) the object-level tag set. AWS PutObjectTagging
     /// is a full-replace operation (no merge), so we mirror that.
     pub fn put_object_tags(&self, bucket: &str, key: &str, tags: TagSet) {
-        self.objects
-            .write()
-            .expect("tagging objects RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.objects, "tagging.objects")
             .insert((bucket.to_owned(), key.to_owned()), tags);
     }
 
@@ -203,9 +201,7 @@ impl TagManager {
     /// been set for `(bucket, key)`.
     #[must_use]
     pub fn get_object_tags(&self, bucket: &str, key: &str) -> Option<TagSet> {
-        self.objects
-            .read()
-            .expect("tagging objects RwLock poisoned")
+        crate::lock_recovery::recover_read(&self.objects, "tagging.objects")
             .get(&(bucket.to_owned(), key.to_owned()))
             .cloned()
     }
@@ -213,53 +209,40 @@ impl TagManager {
     /// Drop the object-level tag set for `(bucket, key)` (idempotent —
     /// missing entry is a no-op, matching AWS DeleteObjectTagging).
     pub fn delete_object_tags(&self, bucket: &str, key: &str) {
-        self.objects
-            .write()
-            .expect("tagging objects RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.objects, "tagging.objects")
             .remove(&(bucket.to_owned(), key.to_owned()));
     }
 
     /// Replace (or create) the bucket-level tag set.
     pub fn put_bucket_tags(&self, bucket: &str, tags: TagSet) {
-        self.buckets
-            .write()
-            .expect("tagging buckets RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.buckets, "tagging.buckets")
             .insert(bucket.to_owned(), tags);
     }
 
     /// Borrow-clone the bucket-level tag set.
     #[must_use]
     pub fn get_bucket_tags(&self, bucket: &str) -> Option<TagSet> {
-        self.buckets
-            .read()
-            .expect("tagging buckets RwLock poisoned")
+        crate::lock_recovery::recover_read(&self.buckets, "tagging.buckets")
             .get(bucket)
             .cloned()
     }
 
     /// Drop the bucket-level tag set (idempotent).
     pub fn delete_bucket_tags(&self, bucket: &str) {
-        self.buckets
-            .write()
-            .expect("tagging buckets RwLock poisoned")
+        crate::lock_recovery::recover_write(&self.buckets, "tagging.buckets")
             .remove(bucket);
     }
 
     /// JSON snapshot for restart-recoverable state. Pair with
     /// [`Self::from_json`].
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        let objects: Vec<((String, String), TagSet)> = self
-            .objects
-            .read()
-            .expect("tagging objects RwLock poisoned")
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let buckets = self
-            .buckets
-            .read()
-            .expect("tagging buckets RwLock poisoned")
-            .clone();
+        let objects: Vec<((String, String), TagSet)> =
+            crate::lock_recovery::recover_read(&self.objects, "tagging.objects")
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+        let buckets =
+            crate::lock_recovery::recover_read(&self.buckets, "tagging.buckets").clone();
         let snap = TagSnapshot { objects, buckets };
         serde_json::to_string(&snap)
     }
@@ -664,5 +647,34 @@ mod tests {
             matches!(err, TagError::TooManyTags { got: 11, max: MAX_TAGS_PER_OBJECT }),
             "got: {err:?}"
         );
+    }
+
+    /// v0.8.4 #77 (audit H-8): a panic inside the `objects` write guard
+    /// poisons the lock. `to_json` must recover via
+    /// [`crate::lock_recovery::recover_read`] and surface the data
+    /// instead of re-panicking.
+    #[test]
+    fn tagging_to_json_after_panic_recovers_via_poison() {
+        let m = TagManager::new();
+        m.put_object_tags(
+            "b",
+            "k",
+            TagSet::from_pairs(vec![("Project".into(), "Phoenix".into())])
+                .expect("valid"),
+        );
+        let m = std::sync::Arc::new(m);
+        let m_cl = std::sync::Arc::clone(&m);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut g = m_cl.objects.write().expect("clean lock");
+            g.entry(("b".into(), "k2".into())).or_default();
+            panic!("force-poison");
+        }));
+        assert!(
+            m.objects.is_poisoned(),
+            "write panic must poison objects lock"
+        );
+        let json = m.to_json().expect("to_json after poison must succeed");
+        let m2 = TagManager::from_json(&json).expect("from_json");
+        assert!(m2.get_object_tags("b", "k").is_some());
     }
 }

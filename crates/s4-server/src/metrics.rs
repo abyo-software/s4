@@ -154,6 +154,34 @@ pub mod names {
     /// per-pair signal (log) and aggregate volume (counter).
     pub const REPLICATION_LOCK_PROPAGATION_SKIPPED_TOTAL: &str =
         "s4_replication_lock_propagation_skipped_total";
+    /// v0.8.4 #77 (audit H-8): bumped each time a state-manager
+    /// `RwLock` / `Mutex` recovery helper (see [`crate::lock_recovery`])
+    /// observes a poisoned lock and forwards the inner data instead of
+    /// re-panicking. Labels: `lock` (= `"<manager>.<field>"`, e.g.
+    /// `"versioning.index"`, `"replication.statuses"`) and `kind`
+    /// (= `"read"` / `"write"` / `"mutex"`).
+    ///
+    /// A non-zero rate signals that a panic landed inside a guarded
+    /// section somewhere — the gateway kept serving (good), but the
+    /// underlying panic itself should still be investigated. Pair with
+    /// the WARN log lines emitted by the recovery helpers for the
+    /// per-call detail.
+    pub const LOCK_POISON_RECOVERY_TOTAL: &str = "s4_lock_poison_recovery_total";
+}
+
+/// v0.8.4 #77 (audit H-8): bump the lock-poison-recovery counter by 1.
+/// Called by [`crate::lock_recovery::recover_read`] /
+/// [`crate::lock_recovery::recover_write`] /
+/// [`crate::lock_recovery::recover_mutex`] each time a poisoned lock is
+/// recovered. `lock` is the `"<manager>.<field>"` static label; `kind`
+/// is `"read"` / `"write"` / `"mutex"`.
+pub fn record_lock_poison_recovery(lock: &'static str, kind: &'static str) {
+    metrics::counter!(
+        names::LOCK_POISON_RECOVERY_TOTAL,
+        "lock" => lock,
+        "kind" => kind,
+    )
+    .increment(1);
 }
 
 /// v0.8 #50: re-export of [`names::SSE_AES_BACKEND`] at the crate root
