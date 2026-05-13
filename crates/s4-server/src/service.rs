@@ -378,6 +378,16 @@ impl<B: S3> S4Service<B> {
         self.sigv4a_gate.as_ref()
     }
 
+    /// v0.8.2 #62: borrow the multipart state store so `main.rs` can
+    /// snapshot the `Arc` before the s3s `ServiceBuilder` consumes
+    /// the `S4Service`. The background `sweep_stale` task in `main.rs`
+    /// holds this `Arc` and ticks once an hour to drop abandoned
+    /// upload contexts (and their `Zeroizing<[u8; 32]>` SSE-C keys).
+    #[must_use]
+    pub fn multipart_state(&self) -> &Arc<crate::multipart_state::MultipartStateStore> {
+        &self.multipart_state
+    }
+
     /// v0.6 #39: attach the in-memory object + bucket Tagging manager.
     /// Once set, `Put/Get/Delete` `Object/Bucket Tagging` route
     /// through the manager (instead of forwarding to the backend),
@@ -3455,8 +3465,13 @@ impl<B: S3> S3 for S4Service<B> {
             ));
         }
         let sse_mode = if let Some(ref m) = sse_c_material {
+            // v0.8.2 #62 (H-6 audit fix): wrap the customer-supplied
+            // 32-byte key in `Zeroizing` so abandoned uploads (or
+            // normal Complete/Abort) wipe the key bytes on drop. The
+            // `key_md5` is the public fingerprint and stays as a
+            // bare `[u8; 16]`.
             crate::multipart_state::MultipartSseMode::SseC {
-                key: m.key,
+                key: zeroize::Zeroizing::new(m.key),
                 key_md5: m.key_md5,
             }
         } else if let Some(ref kid) = kms_key_id {
@@ -3576,21 +3591,104 @@ impl<B: S3> S3 for S4Service<B> {
         // encrypting the whole assembled body keeps the GET path's
         // `is_sse_encrypted` branch in get_object L2429 working
         // unchanged).
-        let _sse_ctx = self
+        let sse_ctx = self
             .multipart_state
             .get(req.input.upload_id.as_str());
-        // Strip the SSE-C client headers that AWS clients echo on
-        // every UploadPart per the multipart-with-SSE-C spec. We
-        // accept them here as authentication that the caller is the
-        // same one that initiated the upload (real-S3 enforces match)
-        // but do NOT forward to the backend; the `_sse_ctx` capture
-        // above already has the canonical key bytes from Create.
-        // Always-strip is safe even when no context is registered
-        // (legacy abandoned upload) — the backend gets a clean part
-        // request either way.
-        let _ = req.input.sse_customer_algorithm.take();
-        let _ = req.input.sse_customer_key.take();
-        let _ = req.input.sse_customer_key_md5.take();
+        // v0.8.2 #62 (H-1 audit fix): SSE-C key consistency check.
+        // The AWS S3 spec requires the same SSE-C key headers on
+        // every UploadPart and rejects mismatches with 400. Prior to
+        // #62 we silently stripped the headers (BUG-10 fix) without
+        // validating them, allowing a client to send part 1 under
+        // key-A and part 2 under key-B; both got stored, then
+        // re-encrypted with key-A on Complete — the client thinks
+        // part 2 is under key-B but a GET with key-B would in fact
+        // hit the part-1 ciphertext that was actually encrypted with
+        // key-A. That would either decrypt successfully (silent
+        // corruption: client lost track of which key encrypts what)
+        // or fail in a confusing way. Validate the per-part headers
+        // now and reject with 400 InvalidArgument on mismatch /
+        // omission / partial supply, matching real-S3 behaviour.
+        if let Some(ref ctx) = sse_ctx {
+            if let crate::multipart_state::MultipartSseMode::SseC { key_md5: ctx_md5, .. } =
+                &ctx.sse
+            {
+                let alg = req.input.sse_customer_algorithm.take();
+                let key_b64 = req.input.sse_customer_key.take();
+                let md5_b64 = req.input.sse_customer_key_md5.take();
+                match (alg, key_b64, md5_b64) {
+                    (Some(a), Some(k), Some(m)) => {
+                        // Parse + validate; if the per-part headers
+                        // are themselves malformed (algorithm not
+                        // AES256, MD5 mismatch, key not 32 bytes)
+                        // surface the same 400 the single-PUT path
+                        // would. Then compare the parsed MD5 to the
+                        // upload-context's MD5; mismatch is a
+                        // different-key UploadPart and must reject.
+                        let part_material =
+                            crate::sse::parse_customer_key_headers(&a, &k, &m)
+                                .map_err(sse_c_error_to_s3)?;
+                        if part_material.key_md5 != *ctx_md5 {
+                            return Err(S3Error::with_message(
+                                S3ErrorCode::InvalidArgument,
+                                "SSE-C key on UploadPart does not match the key supplied on CreateMultipartUpload",
+                            ));
+                        }
+                        // OK — same key as Create. Headers are
+                        // already taken off `req.input` so the
+                        // backend never sees them.
+                    }
+                    (None, None, None) => {
+                        // AWS S3 spec: SSE-C headers MUST be replayed
+                        // on every UploadPart of an SSE-C multipart.
+                        // Real-S3 returns 400 InvalidRequest in this
+                        // case; mirror that.
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InvalidRequest,
+                            "SSE-C requires customer-key headers on every UploadPart (CreateMultipartUpload was SSE-C)",
+                        ));
+                    }
+                    _ => {
+                        // Partial header set (e.g. algorithm + key
+                        // but no MD5) — same handling as the
+                        // single-PUT `extract_sse_c_material` helper.
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InvalidRequest,
+                            "SSE-C requires all three of: x-amz-server-side-encryption-customer-{algorithm,key,key-MD5}",
+                        ));
+                    }
+                }
+            } else {
+                // CreateMultipartUpload was non-SSE-C (None / SseS4 /
+                // SseKms). A part that arrives carrying SSE-C headers
+                // is either a confused client or an attempt to
+                // smuggle SSE-C around the gateway-internal SSE
+                // recipe. Reject with 400 InvalidRequest rather than
+                // silently strip — the strip would let the client
+                // believe the part was encrypted under their key
+                // when in fact the upload's encryption recipe is
+                // whatever the Create captured.
+                if req.input.sse_customer_algorithm.is_some()
+                    || req.input.sse_customer_key.is_some()
+                    || req.input.sse_customer_key_md5.is_some()
+                {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InvalidRequest,
+                        "UploadPart sent SSE-C headers but CreateMultipartUpload was not SSE-C",
+                    ));
+                }
+            }
+        } else {
+            // No upload context registered (gateway crashed between
+            // Create and Part, or pre-#62 abandoned-upload restore).
+            // We can't check key consistency in this case — strip
+            // the headers and let the request through unchanged so
+            // the backend's `NoSuchUpload` reply (or whatever it
+            // chooses to do) flows back to the client.
+            let _ = req.input.sse_customer_algorithm.take();
+            let _ = req.input.sse_customer_key.take();
+            let _ = req.input.sse_customer_key_md5.take();
+        }
+        let _sse_ctx = sse_ctx;
         if let Some(blob) = req.input.body.take() {
             let bytes = collect_blob(blob, self.max_body_bytes)
                 .await
@@ -3865,9 +3963,15 @@ impl<B: S3> S3 for S4Service<B> {
                             "s4-sse-c-key-md5".into(),
                             base64::engine::general_purpose::STANDARD.encode(key_md5),
                         );
+                        // v0.8.2 #62: `key` is `&Zeroizing<[u8; 32]>`;
+                        // auto-deref through one explicit binding so
+                        // `SseSource::CustomerKey` gets the `&[u8; 32]`
+                        // it expects (mirrors the SSE-KMS DEK shape
+                        // a few lines down).
+                        let key_ref: &[u8; 32] = key;
                         crate::sse::encrypt_with_source(
                             &body,
-                            crate::sse::SseSource::CustomerKey { key, key_md5 },
+                            crate::sse::SseSource::CustomerKey { key: key_ref, key_md5 },
                         )
                     }
                     crate::multipart_state::MultipartSseMode::SseKms { .. } => {

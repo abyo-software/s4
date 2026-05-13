@@ -2474,6 +2474,190 @@ async fn multipart_sse_c_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
+// 2b) v0.8.2 #62 (H-1) — UploadPart with a *different* SSE-C key than
+//     CreateMultipartUpload must reject with 400 InvalidArgument.
+// ---------------------------------------------------------------------------
+//
+// Pre-#62 behaviour: `upload_part` silently `take()`-d the SSE-C
+// headers off `req.input` for backend forwarding, but never validated
+// the per-part key against the upload-context key captured on Create.
+// A client that sent part 1 under key-A and part 2 under key-B got
+// both stored, then re-encrypted on Complete with whichever key the
+// Create captured — silent corruption (the client thought part 2
+// lived under key-B but in fact had been re-encrypted under key-A).
+// The fix in `upload_part` parses the per-part headers, validates
+// they form a well-formed SSE-C triple, and rejects with 400 when
+// the parsed MD5 differs from the upload-context's MD5. This test
+// drives that path through the wire — Create with key-A, UploadPart
+// (part 2) with key-B — and asserts the SDK surfaces an
+// `InvalidArgument` error.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn multipart_sse_c_part_key_mismatch_rejected() {
+    use base64::Engine as _;
+
+    let minio = start_minio().await;
+    let spawned = spawn_s4_with_options(&minio.endpoint_url, S4TestOpts::default()).await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    ensure_bucket(&backend_client, "mp-sse-c-mismatch").await;
+    let s4_client = build_aws_client_v2(&spawned.endpoint_url);
+
+    let key_a = [0xa5u8; 32];
+    let key_a_b64 = base64::engine::general_purpose::STANDARD.encode(key_a);
+    let md5_a_b64 = base64::engine::general_purpose::STANDARD
+        .encode(s4_server::sse::compute_key_md5(&key_a));
+    let key_b = [0xb6u8; 32];
+    let key_b_b64 = base64::engine::general_purpose::STANDARD.encode(key_b);
+    let md5_b_b64 = base64::engine::general_purpose::STANDARD
+        .encode(s4_server::sse::compute_key_md5(&key_b));
+
+    // CreateMultipartUpload with key-A.
+    let create = s4_client
+        .create_multipart_upload()
+        .bucket("mp-sse-c-mismatch")
+        .key("obj")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(key_a_b64.clone())
+        .sse_customer_key_md5(md5_a_b64.clone())
+        .send()
+        .await
+        .expect("create_multipart_upload with key-A");
+    let upload_id = create.upload_id().expect("upload_id").to_string();
+
+    // UploadPart 1 with key-A — must succeed (sanity that key-A
+    // round-trips cleanly through the part path on its own).
+    let part_body = bytes::Bytes::from(vec![0x42u8; 5 * 1024 * 1024]);
+    s4_client
+        .upload_part()
+        .bucket("mp-sse-c-mismatch")
+        .key("obj")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(key_a_b64.clone())
+        .sse_customer_key_md5(md5_a_b64.clone())
+        .body(part_body.clone().into())
+        .send()
+        .await
+        .expect("UploadPart 1 with the same key-A must succeed");
+
+    // UploadPart 2 with key-B — MUST be rejected with 400
+    // InvalidArgument. Pre-#62 this returned 200 OK and the part body
+    // was stored, then re-encrypted with key-A on Complete (silent
+    // corruption from the client's perspective).
+    let res = s4_client
+        .upload_part()
+        .bucket("mp-sse-c-mismatch")
+        .key("obj")
+        .upload_id(&upload_id)
+        .part_number(2)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(key_b_b64)
+        .sse_customer_key_md5(md5_b_b64)
+        .body(part_body.into())
+        .send()
+        .await;
+    let err = res.expect_err(
+        "v0.8.2 #62 (H-1): UploadPart with a different SSE-C key than \
+         CreateMultipartUpload must reject; got Ok (silent corruption)",
+    );
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("InvalidArgument") || dbg.contains("400")
+            || dbg.contains("does not match"),
+        "expected 400 InvalidArgument for mismatched SSE-C key on UploadPart; got: {dbg}"
+    );
+
+    // Cleanup — abort the upload so MinIO doesn't accumulate state.
+    let _ = s4_client
+        .abort_multipart_upload()
+        .bucket("mp-sse-c-mismatch")
+        .key("obj")
+        .upload_id(&upload_id)
+        .send()
+        .await;
+
+    let _ = spawned.shutdown.send(());
+}
+
+// ---------------------------------------------------------------------------
+// 2c) v0.8.2 #62 (H-1) — UploadPart with NO SSE-C headers, when
+//     CreateMultipartUpload was SSE-C, must reject with 400.
+// ---------------------------------------------------------------------------
+//
+// AWS S3 spec: when CreateMultipartUpload is SSE-C, every UploadPart
+// must replay the same triple of SSE-C headers. Pre-#62 we silently
+// stripped any such headers (or their absence) without validating
+// presence — meaning a client that omitted them on a part still got
+// the part stored, then re-encrypted with the Create key on Complete.
+// The fix rejects header omission with 400 InvalidRequest. This test
+// drives that path: Create with key-A, UploadPart (part 2) with no
+// SSE-C headers at all → must surface an error from the SDK.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn multipart_sse_c_part_omitted_headers_rejected() {
+    use base64::Engine as _;
+
+    let minio = start_minio().await;
+    let spawned = spawn_s4_with_options(&minio.endpoint_url, S4TestOpts::default()).await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    ensure_bucket(&backend_client, "mp-sse-c-omitted").await;
+    let s4_client = build_aws_client_v2(&spawned.endpoint_url);
+
+    let key_a = [0xc7u8; 32];
+    let key_a_b64 = base64::engine::general_purpose::STANDARD.encode(key_a);
+    let md5_a_b64 = base64::engine::general_purpose::STANDARD
+        .encode(s4_server::sse::compute_key_md5(&key_a));
+
+    // CreateMultipartUpload with key-A.
+    let create = s4_client
+        .create_multipart_upload()
+        .bucket("mp-sse-c-omitted")
+        .key("obj")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(key_a_b64.clone())
+        .sse_customer_key_md5(md5_a_b64.clone())
+        .send()
+        .await
+        .expect("create_multipart_upload with key-A");
+    let upload_id = create.upload_id().expect("upload_id").to_string();
+
+    // UploadPart 1 WITHOUT any SSE-C headers — MUST be rejected with
+    // 400 (AWS S3 spec; pre-#62 we silently let it through).
+    let part_body = bytes::Bytes::from(vec![0x91u8; 5 * 1024 * 1024]);
+    let res = s4_client
+        .upload_part()
+        .bucket("mp-sse-c-omitted")
+        .key("obj")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(part_body.into())
+        .send()
+        .await;
+    let err = res.expect_err(
+        "v0.8.2 #62 (H-1): UploadPart with no SSE-C headers on an SSE-C \
+         multipart upload must reject; got Ok (silent corruption)",
+    );
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("InvalidRequest") || dbg.contains("InvalidArgument")
+            || dbg.contains("400") || dbg.contains("SSE-C requires"),
+        "expected 400 for omitted SSE-C headers on UploadPart; got: {dbg}"
+    );
+
+    // Cleanup.
+    let _ = s4_client
+        .abort_multipart_upload()
+        .bucket("mp-sse-c-omitted")
+        .key("obj")
+        .upload_id(&upload_id)
+        .send()
+        .await;
+
+    let _ = spawned.shutdown.send(());
+}
+
+// ---------------------------------------------------------------------------
 // 3) Multipart × SSE-KMS — HEAD must echo aws:kms.
 // ---------------------------------------------------------------------------
 //

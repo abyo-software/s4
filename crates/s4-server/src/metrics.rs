@@ -104,6 +104,17 @@ pub mod names {
     /// verify the configured slicing actually fires (e.g. a 50 MiB
     /// PUT at 1 MiB chunks should bump this counter by ~50).
     pub const SSE_STREAMING_CHUNKS_TOTAL: &str = "s4_sse_streaming_chunks_total";
+    /// v0.8.2 #62: counter bumped each time the multipart abandoned-
+    /// upload sweep drops one or more `MultipartUploadContext`
+    /// entries (client called `CreateMultipartUpload` then never
+    /// invoked Complete / Abort within
+    /// `--multipart-abandoned-ttl-hours`). The increment is the
+    /// per-tick batch count returned by
+    /// `MultipartStateStore::sweep_stale`. Operators alert on a
+    /// sustained non-zero rate to catch buggy clients leaking
+    /// upload state (and, for SSE-C uploads, raw 32-byte customer
+    /// keys before the `Zeroizing<[u8; 32]>` Drop wipes them).
+    pub const MULTIPART_ABANDONED_UPLOADS_TOTAL: &str = "s4_multipart_abandoned_uploads_total";
 }
 
 /// v0.8 #50: re-export of [`names::SSE_AES_BACKEND`] at the crate root
@@ -129,6 +140,16 @@ pub fn record_sse_aes_backend(kind: &'static str) {
 /// requests`.
 pub fn record_sse_streaming_chunk(op: &'static str) {
     metrics::counter!(names::SSE_STREAMING_CHUNKS_TOTAL, "op" => op).increment(1);
+}
+
+/// v0.8.2 #62: bump the abandoned-multipart-upload counter by the
+/// per-tick batch count. Called from the hourly sweep task spawned in
+/// `main.rs` whenever `MultipartStateStore::sweep_stale` reports a
+/// non-zero number of pruned entries. `count == 0` ticks intentionally
+/// skip the call site (the counter only moves on non-trivial sweeps so
+/// the zero rate is the steady state).
+pub fn record_multipart_abandoned(count: u64) {
+    metrics::counter!(names::MULTIPART_ABANDONED_UPLOADS_TOTAL).increment(count);
 }
 
 /// v0.8 #55: stamp metrics after a GPU compress completes.

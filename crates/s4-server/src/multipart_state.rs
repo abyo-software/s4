@@ -32,6 +32,7 @@ use std::sync::RwLock;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
 use crate::object_lock::LockMode;
 use crate::tagging::TagSet;
@@ -45,7 +46,18 @@ use crate::tagging::TagSet;
 /// SSE-C / SSE-KMS materialise only when the client supplied the
 /// matching headers; SSE-S4 materialises whenever the gateway is booted
 /// with `--sse-s4-key` (or `with_sse_keyring(...)` in tests).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// v0.8.2 #62 (H-6 audit fix): the `SseC` variant's customer key is held
+/// in `Zeroizing<[u8; 32]>` so the raw 32-byte AES key is overwritten
+/// with `0u8` when the entry is dropped — either via `remove(upload_id)`
+/// on Complete/Abort, or via `sweep_stale(...)` on an abandoned upload.
+/// Process core dump / swap-out / KSM snapshot can no longer leak a
+/// previously-held SSE-C key after the upload's lifetime ends. The
+/// `key_md5` is deliberately a plain `[u8; 16]` — it's a public
+/// fingerprint (S3 puts it on the wire on every PUT/GET response) and
+/// requires no zeroization. Custom `PartialEq` ignores the `Zeroizing`
+/// wrapper so existing tests that match on the variant keep compiling.
+#[derive(Clone, Debug)]
 pub enum MultipartSseMode {
     /// Plaintext multipart. Backend stores raw framed bytes.
     None,
@@ -55,9 +67,12 @@ pub enum MultipartSseMode {
     SseS4,
     /// Per-request customer key. The 32-byte key + its 128-bit MD5 are
     /// kept in memory only for the lifetime of the upload, then dropped
-    /// when the entry is `remove(...)`'d on Complete or Abort.
+    /// when the entry is `remove(...)`'d on Complete or Abort. v0.8.2
+    /// #62: `key` is `Zeroizing<[u8; 32]>` so its bytes are wiped on
+    /// drop (vs. a bare `[u8; 32]` which would linger on the heap /
+    /// stack until the next allocation reuse).
     SseC {
-        key: [u8; 32],
+        key: Zeroizing<[u8; 32]>,
         key_md5: [u8; 16],
     },
     /// Named KMS key (resolved against the gateway's KMS backend on
@@ -66,6 +81,28 @@ pub enum MultipartSseMode {
         key_id: String,
     },
 }
+
+// Manual `PartialEq` / `Eq` so `Zeroizing<[u8; 32]>` (which doesn't
+// derive `PartialEq`) doesn't break the existing `assert_eq!` call
+// sites. Compares by deref to the inner `[u8; 32]`.
+impl PartialEq for MultipartSseMode {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (MultipartSseMode::None, MultipartSseMode::None) => true,
+            (MultipartSseMode::SseS4, MultipartSseMode::SseS4) => true,
+            (
+                MultipartSseMode::SseC { key: a, key_md5: am },
+                MultipartSseMode::SseC { key: b, key_md5: bm },
+            ) => a.as_slice() == b.as_slice() && am == bm,
+            (
+                MultipartSseMode::SseKms { key_id: a },
+                MultipartSseMode::SseKms { key_id: b },
+            ) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for MultipartSseMode {}
 
 /// Everything `CreateMultipartUpload` captured for `UploadPart` /
 /// `CompleteMultipartUpload` to act on. All fields are owned so the
@@ -102,8 +139,18 @@ pub struct MultipartUploadContext {
 /// In-memory side-table mapping `upload_id` → context. One of these
 /// hangs off `S4Service` (always-on, no flag — the per-upload state is
 /// gateway-internal).
+///
+/// v0.8.2 #62 (H-6 audit fix): each entry carries the `DateTime<Utc>`
+/// of its `put` insertion so `sweep_stale(now, max_age)` can drop
+/// abandoned upload contexts (client called `CreateMultipartUpload`,
+/// uploaded some parts, then crashed without invoking
+/// `CompleteMultipartUpload` / `AbortMultipartUpload`). Without the
+/// sweep, an SSE-C upload's raw 32-byte customer key would linger in
+/// `MultipartSseMode::SseC` indefinitely. The sweep + the new
+/// `Zeroizing` wrapper together bound the key's in-memory lifetime to
+/// `max_age` (default 24h via `--multipart-abandoned-ttl-hours`).
 pub struct MultipartStateStore {
-    by_upload_id: RwLock<HashMap<String, MultipartUploadContext>>,
+    by_upload_id: RwLock<HashMap<String, (MultipartUploadContext, DateTime<Utc>)>>,
     /// v0.8.1 #59: per-(bucket, key) `Mutex` used to serialize Complete
     /// operations on the same logical key. The race window the lock
     /// closes lives inside `service::complete_multipart_upload` between
@@ -144,11 +191,18 @@ impl MultipartStateStore {
     /// already present (extremely unlikely — backend issues fresh ids)
     /// the previous entry is overwritten silently to mirror
     /// `HashMap::insert`'s replace-on-collision semantics.
+    ///
+    /// v0.8.2 #62: the insertion timestamp (`Utc::now()`) is stored
+    /// alongside the context so `sweep_stale` can prune abandoned
+    /// uploads. The timestamp is set at insert-time only — re-puts on
+    /// the same `upload_id` (overwrite) reset the clock, which is the
+    /// behaviour we want (treat a re-Create as the abandonment-clock
+    /// restart).
     pub fn put(&self, upload_id: &str, ctx: MultipartUploadContext) {
         self.by_upload_id
             .write()
             .expect("multipart-state by_upload_id RwLock poisoned")
-            .insert(upload_id.to_owned(), ctx);
+            .insert(upload_id.to_owned(), (ctx, Utc::now()));
     }
 
     /// Snapshot the context for `upload_id`. `None` when no entry was
@@ -161,16 +215,52 @@ impl MultipartStateStore {
             .read()
             .expect("multipart-state by_upload_id RwLock poisoned")
             .get(upload_id)
-            .cloned()
+            .map(|(c, _)| c.clone())
     }
 
     /// Drop the entry. Called by Complete / Abort to release the SSE-C
-    /// key bytes and the tag-set memory promptly.
+    /// key bytes and the tag-set memory promptly. The `Zeroizing<[u8;
+    /// 32]>` wrapper inside the dropped `MultipartSseMode::SseC`
+    /// variant zeros the key bytes during its `Drop`.
     pub fn remove(&self, upload_id: &str) {
         self.by_upload_id
             .write()
             .expect("multipart-state by_upload_id RwLock poisoned")
             .remove(upload_id);
+    }
+
+    /// v0.8.2 #62 (H-6 audit fix): drop every entry whose insertion
+    /// timestamp is older than `now - max_age`. Returns the number of
+    /// entries swept. Called from a hourly background tick spawned in
+    /// `main.rs` (default TTL = 24 h, configurable via
+    /// `--multipart-abandoned-ttl-hours`).
+    ///
+    /// Each dropped `MultipartUploadContext` runs the inner
+    /// `MultipartSseMode::SseC { key: Zeroizing<[u8; 32]>, .. }`'s
+    /// `Drop`, wiping the customer-supplied AES key bytes from
+    /// process memory. SSE-S4 / SSE-KMS / None variants drop their
+    /// (smaller) state too; only SSE-C carries raw key material.
+    ///
+    /// The cutoff is computed as `now - max_age` rather than
+    /// `Utc::now() - max_age` so callers can drive the clock
+    /// deterministically in tests (the unit tests below pass an
+    /// explicit `now` from a fixed timestamp).
+    pub fn sweep_stale(&self, now: DateTime<Utc>, max_age: chrono::Duration) -> usize {
+        let cutoff = now - max_age;
+        let mut map = self
+            .by_upload_id
+            .write()
+            .expect("multipart-state by_upload_id RwLock poisoned");
+        let stale: Vec<String> = map
+            .iter()
+            .filter(|(_, (_, ts))| *ts < cutoff)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let count = stale.len();
+        for k in stale {
+            map.remove(&k);
+        }
+        count
     }
 
     /// v0.8.1 #59: get-or-create the per-(bucket, key) `Mutex` used to
@@ -278,16 +368,151 @@ mod tests {
         let key = [0xa5u8; 32];
         let key_md5 = [0xb6u8; 16];
         let mut ctx = sample_ctx("b", "k");
-        ctx.sse = MultipartSseMode::SseC { key, key_md5 };
+        ctx.sse = MultipartSseMode::SseC {
+            key: Zeroizing::new(key),
+            key_md5,
+        };
         store.put("u-sse-c", ctx);
         let got = store.get("u-sse-c").expect("entry must be present");
         match got.sse {
             MultipartSseMode::SseC { key: k, key_md5: m } => {
-                assert_eq!(k, key, "SSE-C key bytes must round-trip");
+                assert_eq!(*k, key, "SSE-C key bytes must round-trip");
                 assert_eq!(m, key_md5, "SSE-C MD5 must round-trip");
             }
             other => panic!("expected SseC variant, got {other:?}"),
         }
+    }
+
+    /// v0.8.2 #62 (H-6 fix): registering an SSE-C upload then
+    /// `remove`-ing it must drop the `Zeroizing<[u8; 32]>` key wrapper
+    /// — its `Drop` zeros the underlying 32 bytes. Direct verification
+    /// requires reading back the heap allocation that backed the
+    /// `Zeroizing` (UB in safe Rust); instead we assert the
+    /// behavioural contract: after `remove`, a fresh `get` returns
+    /// `None` (the entry is gone, so the `Drop` ran). We additionally
+    /// build a separate `Zeroizing<[u8; 32]>`, observe non-zero
+    /// content, then drop it under a `Box` — the post-drop heap
+    /// region is no longer reachable from safe Rust, so we settle for
+    /// the structural contract: the `Zeroize` derive on `Zeroizing`
+    /// is what actually wipes the bytes (covered by the `zeroize`
+    /// crate's own test suite). This test is the smoke check that we
+    /// kept the wrapper on the variant.
+    #[test]
+    fn sse_c_key_zeroized_on_remove() {
+        let store = MultipartStateStore::new();
+        let key = [0x77u8; 32];
+        let key_md5 = [0x33u8; 16];
+        let mut ctx = sample_ctx("b", "k");
+        ctx.sse = MultipartSseMode::SseC {
+            key: Zeroizing::new(key),
+            key_md5,
+        };
+        store.put("u-zero", ctx);
+        // Confirm the variant carries a `Zeroizing<[u8; 32]>` (not a
+        // bare `[u8; 32]`) by exercising `Deref` to `&[u8; 32]`. If
+        // someone later regresses the wrapper away, this access would
+        // still compile but the structural assertion below — that the
+        // store actually held the entry — is what the test is for.
+        let got = store.get("u-zero").expect("entry present");
+        match &got.sse {
+            MultipartSseMode::SseC { key: k, .. } => {
+                let _deref: &[u8; 32] = k; // typeof check: must be Zeroizing<[u8;32]>
+                assert_eq!(**k, key);
+            }
+            other => panic!("expected SseC, got {other:?}"),
+        }
+        drop(got);
+        store.remove("u-zero");
+        assert!(
+            store.get("u-zero").is_none(),
+            "removed entry must be gone (its Zeroizing<[u8;32]> ran Drop and wiped the key)"
+        );
+    }
+
+    /// v0.8.2 #62: with three entries inserted at staggered
+    /// timestamps, `sweep_stale(now, 24h)` must drop the two that are
+    /// older than 24 h and keep the recent one. We pin `now`
+    /// deterministically to avoid wall-clock flakes; the store's
+    /// internal `put` always stamps `Utc::now()` so we drive the
+    /// cutoff such that all three entries land before it.
+    #[test]
+    fn sweep_stale_drops_old_contexts() {
+        let store = MultipartStateStore::new();
+        // Insert three entries (all stamped with `Utc::now()` at
+        // insert time — within microseconds of each other on a normal
+        // machine).
+        store.put("u-1", sample_ctx("b", "k1"));
+        store.put("u-2", sample_ctx("b", "k2"));
+        store.put("u-3", sample_ctx("b", "k3"));
+        assert_eq!(store.len(), 3, "all three entries inserted");
+        // `now` 25 h in the future puts every existing entry beyond
+        // the 24 h cutoff → all three are stale.
+        let future = Utc::now() + chrono::Duration::hours(25);
+        let swept = store.sweep_stale(future, chrono::Duration::hours(24));
+        assert_eq!(swept, 3, "all three entries are older than 24 h cutoff");
+        assert_eq!(store.len(), 0, "store must be empty after sweep");
+    }
+
+    /// v0.8.2 #62: `sweep_stale` must NOT drop entries that are still
+    /// fresh. Inserts one entry, then sweeps with a `now` only 1 h
+    /// later — the entry is well within the 24 h TTL, so survives.
+    #[test]
+    fn sweep_stale_keeps_recent_contexts() {
+        let store = MultipartStateStore::new();
+        store.put("u-fresh", sample_ctx("b", "k"));
+        let near_future = Utc::now() + chrono::Duration::hours(1);
+        let swept = store.sweep_stale(near_future, chrono::Duration::hours(24));
+        assert_eq!(swept, 0, "1 h-old entry must NOT be swept under 24 h TTL");
+        assert!(store.get("u-fresh").is_some(), "fresh entry must remain");
+        assert_eq!(store.len(), 1);
+    }
+
+    /// v0.8.2 #62: mixed-age workload — two entries from "the past"
+    /// (we insert them, then advance the conceptual `now` past the
+    /// TTL) and one fresh entry. Sweep must return exactly 2 and
+    /// leave the fresh one intact. Verifies `sweep_stale` reports the
+    /// correct count for partial sweeps (the most common ops case).
+    #[test]
+    fn sweep_stale_count_returns_correct() {
+        let store = MultipartStateStore::new();
+        // Insert two "old" entries; we'll later sweep with a `now` so
+        // far ahead that these become stale.
+        store.put("old-1", sample_ctx("b", "k1"));
+        store.put("old-2", sample_ctx("b", "k2"));
+        // Sleep is too brittle for CI; instead drive the sweep
+        // cutoff so only the two "old" entries fall behind it. We
+        // emulate the third entry being "fresh" by inserting it
+        // *after* capturing the moment-in-time we'll sweep against.
+        let sweep_now = Utc::now() + chrono::Duration::hours(25);
+        // Now the third entry is inserted "in the future" relative
+        // to itself — but its timestamp will be `Utc::now()`, well
+        // before `sweep_now + 25h - 24h`. To keep the test
+        // self-contained we insert the fresh entry at a wall-clock
+        // close to `sweep_now`, not `Utc::now()`. We can't cheat the
+        // store's internal `Utc::now()` stamp from here, so we rely
+        // on the cutoff arithmetic: cutoff = sweep_now - 24h =
+        // Utc::now() + 1h, which is strictly after every real
+        // `Utc::now()` timestamp on the current entries → all three
+        // would be stale.
+        //
+        // Instead: insert the fresh entry, then choose a `sweep_now`
+        // such that exactly the first two are older than the cutoff
+        // and the fresh one is not.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let fresh_marker = Utc::now();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.put("fresh", sample_ctx("b", "k3"));
+        // cutoff = fresh_marker → strictly between the "old" inserts
+        // (timestamps before `fresh_marker`) and the fresh insert
+        // (timestamp after `fresh_marker`). Choose `sweep_now =
+        // fresh_marker + 24h` so `cutoff = fresh_marker`.
+        let sweep_at = fresh_marker + chrono::Duration::hours(24);
+        let swept = store.sweep_stale(sweep_at, chrono::Duration::hours(24));
+        assert_eq!(swept, 2, "exactly the two pre-marker entries must sweep");
+        assert!(store.get("fresh").is_some(), "post-marker entry survives");
+        assert!(store.get("old-1").is_none(), "old-1 must be gone");
+        assert!(store.get("old-2").is_none(), "old-2 must be gone");
+        let _ = sweep_now; // silence dead-code (kept to document the simpler-but-discarded plan)
     }
 
     /// v0.8.1 #59: `completion_lock(bucket, key)` must return the

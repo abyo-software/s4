@@ -477,6 +477,22 @@ struct Opt {
     #[clap(long, value_name = "N", default_value_t = 24)]
     lifecycle_scan_interval_hours: u32,
 
+    /// v0.8.2 #62 (H-6 audit fix): drop in-memory `MultipartUploadContext`
+    /// entries older than this many hours. The default mirrors AWS S3's
+    /// documented multipart-upload retention (24 h) and is configurable
+    /// per deployment so operators with longer-running uploads can
+    /// extend the TTL. The sweep runs once an hour on a detached tokio
+    /// task; on each tick, every entry whose `put` timestamp is older
+    /// than `now - max_age` is dropped, releasing its
+    /// `MultipartSseMode::SseC { key: Zeroizing<[u8; 32]>, .. }` and
+    /// wiping the SSE-C customer key bytes from process memory. Each
+    /// pruned batch increments `s4_multipart_abandoned_uploads_total`.
+    /// Setting to `0` disables the sweep (not recommended — abandoned
+    /// SSE-C uploads then leak their key for the lifetime of the
+    /// process).
+    #[clap(long, value_name = "N", default_value_t = 24)]
+    multipart_abandoned_ttl_hours: u32,
+
     /// v0.5 #32: regulated-industry posture switch. `strict` enforces
     /// at boot the presence of TLS (--tls-cert/--tls-key OR --acme,
     /// forced to TLS 1.3-only), --access-log + --audit-log-hmac-key
@@ -1281,6 +1297,54 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
                     Err(e) => {
                         tracing::warn!("S4 inventory scan failed: {e}");
                     }
+                }
+            }
+        });
+    }
+
+    // v0.8.2 #62 (H-6 audit fix): spawn the abandoned-multipart-upload
+    // sweep task. The task holds an `Arc<MultipartStateStore>` clone so
+    // the listener staying up keeps the sweep alive (and vice versa);
+    // both go away together on process shutdown. Tick cadence is fixed
+    // at 1 h (hourly) — the operator-tunable knob is the TTL itself
+    // (`--multipart-abandoned-ttl-hours`, default 24 h to match AWS S3
+    // multipart retention). A TTL of 0 disables the sweep entirely
+    // (logged at warn so the operator sees the choice in boot diff).
+    if opt.multipart_abandoned_ttl_hours == 0 {
+        tracing::warn!(
+            "S4 multipart abandoned-upload sweep DISABLED \
+             (--multipart-abandoned-ttl-hours=0). SSE-C customer keys \
+             on never-Completed uploads will linger for the lifetime \
+             of the process."
+        );
+    } else {
+        let mp_state = std::sync::Arc::clone(s4_arc.multipart_state());
+        let ttl_hours = i64::from(opt.multipart_abandoned_ttl_hours);
+        tracing::info!(
+            ttl_hours,
+            "S4 multipart abandoned-upload sweep active (hourly tick, TTL configurable via --multipart-abandoned-ttl-hours)"
+        );
+        tokio::spawn(async move {
+            // Sweep cadence is hourly regardless of TTL — the TTL
+            // governs which entries are stale, the cadence governs
+            // how often we look. Hourly is a safe upper bound on
+            // sweep latency for the default 24 h TTL.
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(3600));
+            // Skip the immediate tick — a freshly-booted process
+            // can't have any abandoned uploads yet.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let max_age = chrono::Duration::hours(ttl_hours);
+                let n = mp_state.sweep_stale(chrono::Utc::now(), max_age);
+                if n > 0 {
+                    tracing::info!(
+                        swept_count = n,
+                        ttl_hours,
+                        "S4 multipart abandoned-upload sweep pruned entries (SSE-C keys zeroized on drop)"
+                    );
+                    s4_server::metrics::record_multipart_abandoned(n as u64);
                 }
             }
         });
