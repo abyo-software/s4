@@ -139,26 +139,94 @@ pub struct ReplicationConfig {
     pub rules: Vec<ReplicationRule>,
 }
 
+/// Per-(source_bucket, source_key) replication status entry, paired
+/// with the **generation token** of the source PUT that produced it.
+///
+/// ## v0.8.2 #61 — generation token
+///
+/// Each `put_object` (or `complete_multipart_upload`) on a source key
+/// pulls a fresh, monotonically-increasing `generation` from the
+/// manager. The detached replication task carries that generation and
+/// only stamps the status when its generation is `>=` the stored one
+/// (CAS-style). A stale retry whose generation has been overtaken by a
+/// newer PUT is silently dropped, so the destination bucket never gets
+/// rolled back to older bytes. See [`ReplicationManager::next_generation`]
+/// + [`ReplicationManager::record_status_if_newer`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicationStatusEntry {
+    pub status: ReplicationStatus,
+    pub generation: u64,
+}
+
 /// JSON snapshot — `bucket -> ReplicationConfig`. Mirrors the shape of
 /// `notifications::NotificationSnapshot` so operators can hand-edit
 /// configurations across restart cycles.
+///
+/// ## v0.8.2 #61 back-compat
+///
+/// Pre-#61 snapshots stored `Vec<((String, String), ReplicationStatus)>`
+/// (status only; no generation). The new format stores
+/// `Vec<((String, String), ReplicationStatusEntry)>`. Serde is set up
+/// with `#[serde(untagged)]` on a wrapper enum so old snapshots load
+/// with `generation = 0`. A `generation = 0` entry is never stale —
+/// the very next PUT mints `generation = 1` which wins the CAS — so
+/// the migration is loss-free.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ReplicationSnapshot {
     by_bucket: HashMap<String, ReplicationConfig>,
     /// Per-(bucket, key) replication status. Persisted so a restart
     /// doesn't lose the COMPLETED stamp on already-replicated
     /// objects.
-    statuses: Vec<((String, String), ReplicationStatus)>,
+    statuses: Vec<((String, String), StatusOrEntry)>,
+    /// v0.8.2 #61: persist the next generation so a restart doesn't
+    /// reissue tokens that are still in-flight. Optional for
+    /// back-compat — pre-#61 snapshots restore with `next_generation = 1`.
+    #[serde(default)]
+    next_generation: u64,
+}
+
+/// Back-compat wrapper for snapshot deserialisation: accepts either a
+/// bare `ReplicationStatus` (pre-#61 schema) or a full
+/// `ReplicationStatusEntry`. `serde(untagged)` tries the variants in
+/// declaration order — the more-structured `Entry` variant first so
+/// new snapshots round-trip, falling back to bare `Status` for old
+/// snapshots.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum StatusOrEntry {
+    Entry(ReplicationStatusEntry),
+    Status(ReplicationStatus),
+}
+
+impl StatusOrEntry {
+    fn into_entry(self) -> ReplicationStatusEntry {
+        match self {
+            Self::Entry(e) => e,
+            Self::Status(s) => ReplicationStatusEntry {
+                status: s,
+                generation: 0,
+            },
+        }
+    }
 }
 
 /// In-memory manager of per-bucket replication configurations + per-
 /// (bucket, key) replication statuses.
 pub struct ReplicationManager {
     by_bucket: RwLock<HashMap<String, ReplicationConfig>>,
-    /// Per-(source_bucket, key) replication status. Looked up by
-    /// `head_object` / `get_object` to stamp `x-amz-replication-status`
-    /// on the response.
-    statuses: RwLock<HashMap<(String, String), ReplicationStatus>>,
+    /// Per-(source_bucket, key) replication status entry (status +
+    /// generation token). Looked up by `head_object` / `get_object` to
+    /// stamp `x-amz-replication-status` on the response.
+    statuses: RwLock<HashMap<(String, String), ReplicationStatusEntry>>,
+    /// v0.8.2 #61: monotonic per-source-PUT generation counter. Each
+    /// `put_object` (or `complete_multipart_upload`) on a replicated
+    /// source bucket calls [`Self::next_generation`] before spawning
+    /// its detached replication task. The dispatcher carries the
+    /// generation through to [`Self::record_status_if_newer`], which
+    /// drops the stamp + the destination write when a newer
+    /// generation has already won — guaranteeing the destination
+    /// can't be rolled back by a slow retry.
+    pub next_generation: AtomicU64,
     /// Bumped each time the dispatcher exhausts its retry budget on a
     /// destination PUT. Exposed publicly so the metrics layer can poll
     /// without taking the configuration lock.
@@ -180,14 +248,34 @@ impl std::fmt::Debug for ReplicationManager {
 }
 
 impl ReplicationManager {
-    /// Empty manager — no bucket has any replication rules.
+    /// Empty manager — no bucket has any replication rules. The
+    /// generation counter starts at 1 so the first PUT-issued token is
+    /// `1` (a stored entry's `generation = 0` from a pre-#61 snapshot
+    /// is then strictly less and the very next PUT wins the CAS).
     #[must_use]
     pub fn new() -> Self {
         Self {
             by_bucket: RwLock::new(HashMap::new()),
             statuses: RwLock::new(HashMap::new()),
+            next_generation: AtomicU64::new(1),
             dropped_total: AtomicU64::new(0),
         }
+    }
+
+    /// v0.8.2 #61: mint a fresh, monotonically-increasing generation
+    /// token. Caller is the per-source-PUT dispatcher fork (the body-
+    /// bearing `put_object` branch, the body-less `put_object` branch,
+    /// and `complete_multipart_upload`). The token is then carried
+    /// through [`replicate_object`] to [`Self::record_status_if_newer`]
+    /// so a stale retry can be detected and dropped.
+    ///
+    /// Uses `Relaxed` ordering — we only need uniqueness +
+    /// monotonicity per atomic; the cross-thread happens-before
+    /// between PUT-A's spawn and the dispatcher reading the body is
+    /// already established by `tokio::spawn`'s implicit
+    /// `Acquire/Release` on the task queue.
+    pub fn next_generation(&self) -> u64 {
+        self.next_generation.fetch_add(1, Ordering::Relaxed)
     }
 
     /// `put_bucket_replication` handler entry. The bucket's existing
@@ -222,7 +310,12 @@ impl ReplicationManager {
     }
 
     /// Serialise the entire manager state (configurations + per-key
-    /// statuses) to JSON.
+    /// statuses + next generation counter) to JSON. The status entries
+    /// are emitted in the v0.8.2 #61 schema (`ReplicationStatusEntry`);
+    /// readers built before #61 will see the embedded
+    /// `{ status, generation }` shape via the `untagged` enum and
+    /// (older binaries) reject — but the production restart path always
+    /// runs the same binary against its own snapshot.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         let snap = ReplicationSnapshot {
             by_bucket: self
@@ -235,8 +328,9 @@ impl ReplicationManager {
                 .read()
                 .expect("replication state RwLock poisoned")
                 .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .map(|(k, v)| (k.clone(), StatusOrEntry::Entry(v.clone())))
                 .collect(),
+            next_generation: self.next_generation.load(Ordering::Relaxed),
         };
         serde_json::to_string(&snap)
     }
@@ -244,11 +338,32 @@ impl ReplicationManager {
     /// Restore a manager from a previously-emitted snapshot. The
     /// `dropped_total` counter is reset to 0 — historical drops are
     /// runtime metrics, not configuration.
+    ///
+    /// ## Back-compat (v0.8.2 #61)
+    ///
+    /// Pre-#61 snapshots store bare `ReplicationStatus` (no
+    /// generation). The `untagged` `StatusOrEntry` enum picks them up
+    /// and assigns `generation = 0`, which the CAS-style
+    /// [`Self::record_status_if_newer`] treats as "always overridable
+    /// by the next real PUT" — guaranteed loss-free migration. The
+    /// `next_generation` counter defaults to `1` when the snapshot
+    /// predates #61 (= `serde(default)` on the field).
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
         let snap: ReplicationSnapshot = serde_json::from_str(s)?;
+        let statuses: HashMap<(String, String), ReplicationStatusEntry> = snap
+            .statuses
+            .into_iter()
+            .map(|(k, v)| (k, v.into_entry()))
+            .collect();
+        // Pre-#61 snapshots come back with `next_generation = 0`
+        // (`serde(default)` on `u64`); start fresh at 1 so all newly-
+        // minted tokens are strictly greater than the legacy
+        // `generation = 0` entries.
+        let next_gen = snap.next_generation.max(1);
         Ok(Self {
             by_bucket: RwLock::new(snap.by_bucket),
-            statuses: RwLock::new(snap.statuses.into_iter().collect()),
+            statuses: RwLock::new(statuses),
+            next_generation: AtomicU64::new(next_gen),
             dropped_total: AtomicU64::new(0),
         })
     }
@@ -287,26 +402,91 @@ impl ReplicationManager {
         best.cloned()
     }
 
-    /// Stamp the per-(bucket, key) replication status. Replaces any
-    /// previous entry — a `Failed` follows `Pending`, etc.
+    /// Stamp the per-(bucket, key) replication status with no
+    /// generation guard. Replaces any previous entry. **Generation is
+    /// reset to 0** (= overridable by the next real PUT) — callers
+    /// that hold a generation token must use
+    /// [`Self::record_status_if_newer`] instead.
+    ///
+    /// Use cases (kept for back-compat + the eager `Pending` stamp the
+    /// service-layer dispatcher emits before spawning the actual
+    /// replication task):
+    /// - Eager `Pending` stamp synchronously alongside the source PUT
+    ///   so a HEAD between PUT-return and dispatcher-completion sees
+    ///   `PENDING` instead of `None`.
+    /// - Tests that don't care about generation (legacy assertions).
     pub fn record_status(&self, bucket: &str, key: &str, status: ReplicationStatus) {
         self.statuses
             .write()
             .expect("replication state RwLock poisoned")
-            .insert((bucket.to_owned(), key.to_owned()), status);
+            .insert(
+                (bucket.to_owned(), key.to_owned()),
+                ReplicationStatusEntry {
+                    status,
+                    generation: 0,
+                },
+            );
+    }
+
+    /// v0.8.2 #61: CAS-style stamp. Only updates the entry when
+    /// `generation >= entry.generation`; rejects the update (returns
+    /// `false`) when `generation < entry.generation` because a newer
+    /// PUT has already won and we must not roll the source's status
+    /// back to a stale terminal state.
+    ///
+    /// ## Returns
+    ///
+    /// - `true` — the stamp was accepted; the caller may proceed with
+    ///   the destination-bucket PUT (in [`replicate_object`]) /
+    ///   declare success.
+    /// - `false` — a strictly-newer generation has already stamped the
+    ///   entry; the caller must **drop the destination write** to
+    ///   avoid overwriting newer bytes with a stale retry's body.
+    ///
+    /// Equality (`generation == entry.generation`) is accepted because
+    /// the same generation may legitimately stamp twice across the
+    /// dispatcher's retry budget (`Pending` → `Completed` on the same
+    /// task).
+    pub fn record_status_if_newer(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation: u64,
+        status: ReplicationStatus,
+    ) -> bool {
+        let mut map = self
+            .statuses
+            .write()
+            .expect("replication state RwLock poisoned");
+        let entry = map
+            .entry((bucket.to_owned(), key.to_owned()))
+            .or_insert(ReplicationStatusEntry {
+                status: ReplicationStatus::Pending,
+                generation: 0,
+            });
+        if generation < entry.generation {
+            return false;
+        }
+        entry.generation = generation;
+        entry.status = status;
+        true
     }
 
     /// Look up the recorded replication status for `(bucket, key)`.
     /// Returns `None` when no PUT to this key has triggered
     /// replication (= the object is not under any replication rule, or
     /// it predates the rule's creation).
+    ///
+    /// The `generation` field of the entry is intentionally not
+    /// surfaced here — it's an internal CAS guard, not part of the
+    /// AWS wire shape.
     #[must_use]
     pub fn lookup_status(&self, bucket: &str, key: &str) -> Option<ReplicationStatus> {
         self.statuses
             .read()
             .expect("replication state RwLock poisoned")
             .get(&(bucket.to_owned(), key.to_owned()))
-            .cloned()
+            .map(|entry| entry.status.clone())
     }
 }
 
@@ -349,11 +529,41 @@ const RETRY_BASE_MS: u64 = 50;
 /// - Stamps the destination metadata with `x-amz-replication-status:
 ///   REPLICA` so a HEAD on the replica is distinguishable.
 /// - On callback success, records `(source_bucket, source_key) →
-///   Completed` in the manager.
+///   Completed` in the manager **iff this task's `generation` is not
+///   already overtaken** (CAS-style guard — see [`ReplicationManager::
+///   record_status_if_newer`]).
 /// - On callback failure, retries up to [`RETRY_ATTEMPTS`] times with
 ///   exponential backoff (50ms / 100ms / 200ms). After the budget is
 ///   exhausted, records `Failed`, bumps `dropped_total`, and emits the
-///   matching Prometheus counter.
+///   matching Prometheus counter — also CAS-guarded.
+///
+/// ## v0.8.2 #61 — generation token + destination key override
+///
+/// The two new parameters fix the audit's C-1 + C-3 findings:
+///
+/// - `generation` — monotonic per-source-PUT token from
+///   [`ReplicationManager::next_generation`]. CAS-stamps the source's
+///   status + **suppresses the actual destination PUT** when the
+///   token has been overtaken. Without this guard, a slow retry of
+///   PUT-A could land in the destination *after* PUT-B has already
+///   replicated — rolling the destination back to A's bytes. With
+///   the guard, A's task notices B's higher generation has won and
+///   silently drops its destination write.
+/// - `destination_key_override` — the storage-side key the destination
+///   bucket should write under. For an unversioned source this is
+///   `None` and the dispatcher falls back to the source's logical key
+///   (= the AWS-default behaviour). For a **versioning-Enabled**
+///   source the caller passes `Some(versioned_shadow_key(key, vid))`
+///   so the destination's version chain receives the new version
+///   under the same shadow path the source uses (= a `?versionId=`
+///   GET on the destination resolves through the same shadow-key
+///   lookup as the source).
+// 9 args is the post-#61 wire-shape: rule + (source_bucket, source_key,
+// body, metadata) + do_put + manager + (generation, dest_override). A
+// shape struct would split the call site without buying anything; the
+// caller (`spawn_replication_if_matched`) constructs every field
+// inline, so the indirection is pure noise.
+#[allow(clippy::too_many_arguments)]
 pub async fn replicate_object<F, Fut>(
     rule: ReplicationRule,
     source_bucket: String,
@@ -362,6 +572,8 @@ pub async fn replicate_object<F, Fut>(
     metadata: Option<HashMap<String, String>>,
     do_put: F,
     manager: Arc<ReplicationManager>,
+    generation: u64,
+    destination_key_override: Option<String>,
 ) where
     F: Fn(String, String, bytes::Bytes, Option<HashMap<String, String>>) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
@@ -380,27 +592,81 @@ pub async fn replicate_object<F, Fut>(
     }
 
     let dest_bucket = rule.destination_bucket.clone();
+    // v0.8.2 #61: when the source PUT was a versioned write, the
+    // override carries the storage-side shadow key
+    // (`<key>.__s4ver__/<vid>`); otherwise we use the logical key.
+    let dest_key = destination_key_override.unwrap_or_else(|| source_key.clone());
     for attempt in 0..RETRY_ATTEMPTS {
+        // v0.8.2 #61 C-3: pre-PUT generation check. If a newer
+        // generation has already stamped a terminal status on this
+        // (bucket, key), our retry is stale — silently drop the
+        // destination write so we don't roll the destination back to
+        // older bytes. We use `record_status_if_newer` with the
+        // **current** entry's status as a no-op when we're not stale,
+        // but the cheap path is to peek and bail.
+        if let Some(entry) = manager
+            .statuses
+            .read()
+            .expect("replication state RwLock poisoned")
+            .get(&(source_bucket.clone(), source_key.clone()))
+            .cloned()
+            && entry.generation > generation
+        {
+            tracing::debug!(
+                source_bucket = %source_bucket,
+                source_key = %source_key,
+                dest_bucket = %dest_bucket,
+                rule_id = %rule.id,
+                generation,
+                stored_generation = entry.generation,
+                "S4 replication: stale generation, dropping destination PUT"
+            );
+            return;
+        }
         let result = do_put(
             dest_bucket.clone(),
-            source_key.clone(),
+            dest_key.clone(),
             body.clone(),
             Some(replica_meta.clone()),
         )
         .await;
         match result {
             Ok(()) => {
-                manager.record_status(
+                let accepted = manager.record_status_if_newer(
                     &source_bucket,
                     &source_key,
+                    generation,
                     ReplicationStatus::Completed,
                 );
+                if !accepted {
+                    // v0.8.2 #61 C-3: the destination PUT raced — a
+                    // newer generation stamped between our pre-check
+                    // and our `do_put.await`. The destination now
+                    // *might* hold our stale bytes (the newer PUT
+                    // could have landed after ours) but we stop
+                    // re-stamping and let the newer task overwrite on
+                    // its own success. Bumps the metric so operators
+                    // see the race surfaced.
+                    crate::metrics::record_replication_drop(&source_bucket);
+                    manager.dropped_total.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        source_bucket = %source_bucket,
+                        source_key = %source_key,
+                        dest_bucket = %dest_bucket,
+                        rule_id = %rule.id,
+                        generation,
+                        "S4 replication: completed but a newer generation has won; \
+                         status not stamped"
+                    );
+                    return;
+                }
                 crate::metrics::record_replication_replicated(&source_bucket, &dest_bucket);
                 tracing::debug!(
                     source_bucket = %source_bucket,
                     source_key = %source_key,
                     dest_bucket = %dest_bucket,
                     rule_id = %rule.id,
+                    generation,
                     "S4 replication: COMPLETED"
                 );
                 return;
@@ -413,15 +679,19 @@ pub async fn replicate_object<F, Fut>(
                         source_key = %source_key,
                         dest_bucket = %dest_bucket,
                         attempt = attempt + 1,
+                        generation,
                         error = %e,
                         "S4 replication: attempt failed, retrying"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     continue;
                 }
-                manager.record_status(
+                // CAS the terminal Failed too — a newer generation that
+                // succeeded must not be rolled back to Failed.
+                let accepted = manager.record_status_if_newer(
                     &source_bucket,
                     &source_key,
+                    generation,
                     ReplicationStatus::Failed,
                 );
                 manager.dropped_total.fetch_add(1, Ordering::Relaxed);
@@ -431,7 +701,9 @@ pub async fn replicate_object<F, Fut>(
                     source_key = %source_key,
                     dest_bucket = %dest_bucket,
                     rule_id = %rule.id,
+                    generation,
                     error = %e,
+                    accepted_failed_stamp = accepted,
                     "S4 replication: FAILED after {RETRY_ATTEMPTS} attempts (drop counter bumped)"
                 );
                 return;
@@ -697,6 +969,8 @@ mod tests {
             Some(HashMap::from([("content-type".into(), "text/plain".into())])),
             do_put,
             Arc::clone(&mgr),
+            mgr.next_generation(),
+            None,
         )
         .await;
 
@@ -744,6 +1018,8 @@ mod tests {
             None,
             do_put,
             Arc::clone(&mgr),
+            mgr.next_generation(),
+            None,
         )
         .await;
 
@@ -769,5 +1045,122 @@ mod tests {
         assert_eq!(ReplicationStatus::Completed.as_aws_str(), "COMPLETED");
         assert_eq!(ReplicationStatus::Failed.as_aws_str(), "FAILED");
         assert_eq!(ReplicationStatus::Replica.as_aws_str(), "REPLICA");
+    }
+
+    // ----- v0.8.2 #61: generation token CAS unit tests -----
+
+    #[test]
+    fn record_status_if_newer_accepts_higher_generation() {
+        let mgr = ReplicationManager::new();
+        // First stamp at gen=5 — no prior entry, accepted.
+        assert!(mgr.record_status_if_newer(
+            "b",
+            "k",
+            5,
+            ReplicationStatus::Pending,
+        ));
+        // Higher generation overrides.
+        assert!(mgr.record_status_if_newer(
+            "b",
+            "k",
+            7,
+            ReplicationStatus::Completed,
+        ));
+        assert_eq!(
+            mgr.lookup_status("b", "k"),
+            Some(ReplicationStatus::Completed)
+        );
+    }
+
+    #[test]
+    fn record_status_if_newer_rejects_stale_generation() {
+        let mgr = ReplicationManager::new();
+        // Newer PUT lands first.
+        assert!(mgr.record_status_if_newer(
+            "b",
+            "k",
+            10,
+            ReplicationStatus::Completed,
+        ));
+        // Older retry must be rejected — destination must not roll
+        // back to "alpha" once "beta" has stamped Completed.
+        let accepted = mgr.record_status_if_newer(
+            "b",
+            "k",
+            3,
+            ReplicationStatus::Completed,
+        );
+        assert!(!accepted, "stale generation must be rejected");
+        // Stored entry stays at the newer generation's terminal state.
+        assert_eq!(
+            mgr.lookup_status("b", "k"),
+            Some(ReplicationStatus::Completed)
+        );
+    }
+
+    #[test]
+    fn record_status_if_newer_accepts_equal_generation() {
+        // Same generation may legitimately re-stamp (Pending →
+        // Completed transition on the same task). The CAS is `>=`
+        // not `>`.
+        let mgr = ReplicationManager::new();
+        assert!(mgr.record_status_if_newer(
+            "b",
+            "k",
+            42,
+            ReplicationStatus::Pending,
+        ));
+        assert!(mgr.record_status_if_newer(
+            "b",
+            "k",
+            42,
+            ReplicationStatus::Completed,
+        ));
+        assert_eq!(
+            mgr.lookup_status("b", "k"),
+            Some(ReplicationStatus::Completed)
+        );
+    }
+
+    #[test]
+    fn next_generation_is_monotonic() {
+        let mgr = ReplicationManager::new();
+        let g1 = mgr.next_generation();
+        let g2 = mgr.next_generation();
+        let g3 = mgr.next_generation();
+        assert!(g2 > g1, "g2={g2} must exceed g1={g1}");
+        assert!(g3 > g2, "g3={g3} must exceed g2={g2}");
+        assert_eq!(g2, g1 + 1);
+        assert_eq!(g3, g2 + 1);
+    }
+
+    #[test]
+    fn snapshot_pre_61_format_loads_with_zero_generation() {
+        // Pre-v0.8.2 #61 snapshot shape: bare `ReplicationStatus`,
+        // no `next_generation` field. The `untagged` enum + serde
+        // default must round-trip lossily into the new shape, with
+        // `generation = 0` (= guaranteed loseable to next real PUT).
+        let pre_61_json = r#"{
+            "by_bucket": {},
+            "statuses": [
+                [["src", "k"], "Completed"]
+            ]
+        }"#;
+        let mgr = ReplicationManager::from_json(pre_61_json)
+            .expect("pre-#61 snapshot must deserialise");
+        assert_eq!(
+            mgr.lookup_status("src", "k"),
+            Some(ReplicationStatus::Completed)
+        );
+        // First mint after restore is `1` (max(0, 1)).
+        assert_eq!(mgr.next_generation(), 1);
+        // The `generation = 0` legacy entry is overridable by any
+        // real PUT (= a generation >= 1).
+        assert!(mgr.record_status_if_newer(
+            "src",
+            "k",
+            1,
+            ReplicationStatus::Pending,
+        ));
     }
 }

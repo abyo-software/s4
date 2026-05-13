@@ -563,6 +563,41 @@ impl<B: S3> S4Service<B> {
     /// metadata map that already includes the manifest /
     /// `s4-encrypted` markers — the replica decodes through the same
     /// path. The destination PUT runs through `Arc<B>::put_object`.
+    ///
+    /// ## v0.8.2 #61: generation token + shadow-key destination
+    ///
+    /// `pending_version` is the source-side `PutOutcome` minted by the
+    /// caller's versioning branch (or `None` for unversioned /
+    /// suspended buckets). When `pending_version.versioned_response`
+    /// is `true`, the dispatcher writes the destination under the same
+    /// shadow path the source uses (`<key>.__s4ver__/<vid>`) so the
+    /// destination's version chain receives the new version the same
+    /// way `?versionId=` GET resolves it. Closes audit C-1.
+    ///
+    /// The dispatcher also mints a fresh `generation` token before
+    /// spawning, threaded through to [`crate::replication::
+    /// replicate_object`]. Closes audit C-3 — a stale retry of an
+    /// older PUT can no longer overwrite the destination's newer bytes
+    /// because the CAS guard sees the higher stored generation and
+    /// drops its destination write.
+    ///
+    /// ## Asymmetric versioning policy (out of scope)
+    ///
+    /// We assume source + destination buckets share the same
+    /// versioning policy (both Enabled or both Suspended /
+    /// Unversioned). Cross-bucket policy queries would require a
+    /// backend round-trip per replication, which is not worth it for
+    /// the single-instance scope. Operators who configure asymmetric
+    /// versioning will see destination-side `?versionId=` lookups
+    /// miss — documented as out-of-scope until a future per-rule
+    /// `destination_versioning_policy` knob lands.
+    // 8 args is the post-#61 shape: replication needs the
+    // source bucket+key, the canonical tag set for rule-matching,
+    // the post-codec body+metadata for the destination PUT, the
+    // backend-success gate, and the pending version-id for the
+    // shadow-key destination override. A shape struct would just
+    // split the (single) call site so opt for the inline form.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_replication_if_matched(
         &self,
         source_bucket: &str,
@@ -571,6 +606,7 @@ impl<B: S3> S4Service<B> {
         body: &bytes::Bytes,
         metadata: &Option<std::collections::HashMap<String, String>>,
         backend_ok: bool,
+        pending_version: Option<&crate::versioning::PutOutcome>,
     ) where
         B: Send + Sync + 'static,
     {
@@ -593,14 +629,31 @@ impl<B: S3> S4Service<B> {
         let Some(rule) = mgr.match_rule(source_bucket, source_key, &object_tags) else {
             return;
         };
+        // v0.8.2 #61: mint the per-PUT generation BEFORE the eager
+        // Pending stamp so the stamp itself carries the right
+        // generation (the CAS in `record_status_if_newer` would
+        // otherwise see a `generation=0` Pending and accept any
+        // stale retry).
+        let generation = mgr.next_generation();
         // Eagerly mark the source key as Pending so a HEAD between
         // the source PUT returning and the spawned task completing
-        // surfaces the in-flight state.
-        mgr.record_status(
+        // surfaces the in-flight state. CAS-guarded so a slower
+        // older PUT can't downgrade a newer Completed back to Pending.
+        let _ = mgr.record_status_if_newer(
             source_bucket,
             source_key,
+            generation,
             crate::replication::ReplicationStatus::Pending,
         );
+        // v0.8.2 #61: derive the destination storage key. For a
+        // versioning-Enabled source the destination receives the
+        // same shadow-key path so a `?versionId=<vid>` GET on the
+        // destination resolves through the same lookup the source
+        // uses. Suspended / Unversioned sources keep the logical
+        // key (= `None` override = dispatcher uses `source_key`).
+        let destination_key_override = pending_version
+            .filter(|pv| pv.versioned_response)
+            .map(|pv| versioned_shadow_key(source_key, &pv.version_id));
         let mgr_cl = Arc::clone(mgr);
         let backend = Arc::clone(&self.backend);
         let body_cl = body.clone();
@@ -646,6 +699,8 @@ impl<B: S3> S4Service<B> {
                 metadata_cl,
                 do_put,
                 mgr_cl,
+                generation,
+                destination_key_override,
             )
             .await;
         });
@@ -2286,6 +2341,7 @@ impl<B: S3> S3 for S4Service<B> {
                 &replication_body,
                 &replication_metadata,
                 backend_resp.is_ok(),
+                pending_version.as_ref(),
             );
             return backend_resp;
         }
@@ -2404,6 +2460,8 @@ impl<B: S3> S3 for S4Service<B> {
         }
         // v0.6 #40: cross-bucket replication for the zero-length PUT
         // branch — same shape as the body-bearing branch above.
+        // v0.8.2 #61: pass `pending_version` so a versioned source's
+        // destination receives the same shadow-key path.
         self.spawn_replication_if_matched(
             &put_bucket,
             &put_key,
@@ -2411,6 +2469,7 @@ impl<B: S3> S3 for S4Service<B> {
             &bytes::Bytes::new(),
             &None,
             backend_resp.is_ok(),
+            pending_version.as_ref(),
         );
         backend_resp
     }
@@ -4005,6 +4064,10 @@ impl<B: S3> S3 for S4Service<B> {
             // on-disk shape) plus the metadata that was actually
             // committed.
             let replication_body_bytes = replication_body.unwrap_or_default();
+            // v0.8.2 #61: thread the multipart-Complete `pending_version`
+            // through so a versioning-Enabled source's destination
+            // receives the same shadow-key path (mirror of the
+            // single-PUT branch above).
             self.spawn_replication_if_matched(
                 &bucket,
                 &key,
@@ -4012,6 +4075,7 @@ impl<B: S3> S3 for S4Service<B> {
                 &replication_body_bytes,
                 &applied_metadata,
                 true,
+                pending_version.as_ref(),
             );
             self.multipart_state.remove(upload_id.as_str());
         }

@@ -3859,3 +3859,289 @@ async fn multipart_concurrent_complete_no_torn_body() {
 
     let _ = spawned.shutdown.send(());
 }
+
+// =============================================================================
+// v0.8.2 #61 — Replication generation token + shadow-key destination E2E.
+// =============================================================================
+//
+// Two audit findings closed:
+//   * C-1: source bucket versioning Enabled writes to a shadow key
+//     (`<key>.__s4ver__/<vid>`); the destination must mirror the same
+//     shadow path so a `?versionId=<vid>` GET on the destination resolves.
+//   * C-3: a slow retry of an older PUT must NOT overwrite the
+//     destination's newer bytes from a subsequent PUT — a per-source-PUT
+//     monotonic generation token guards the destination write.
+
+// ---------------------------------------------------------------------------
+// 1) Stale replication retry must not overwrite newer destination bytes.
+// ---------------------------------------------------------------------------
+//
+// Setup: src + dst buckets, replication rule (no versioning needed).
+// Drive two PUTs back-to-back to the same key (`alpha-bytes` then
+// `beta-bytes`). Both PUTs schedule a destination replication; the
+// generation CAS guarantees that even if PUT-A's task somehow runs
+// after PUT-B's task, the source status surfaces COMPLETED for B
+// (= the higher generation) and the destination ends up with
+// `beta-bytes` (the last-PUT's body).
+//
+// The strict assertion is: after both PUTs settle, the destination
+// object body equals the *latter* PUT's bytes.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn replication_stale_task_does_not_overwrite_newer() {
+    let minio = start_minio().await;
+    let spawned = spawn_s4_with_options(
+        &minio.endpoint_url,
+        S4TestOpts::default().with_replication(),
+    )
+    .await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    ensure_bucket(&backend_client, "stale-src").await;
+    ensure_bucket(&backend_client, "stale-dst").await;
+    let s4_client = build_aws_client_v2(&spawned.endpoint_url);
+
+    s4_client
+        .put_bucket_replication()
+        .bucket("stale-src")
+        .replication_configuration(
+            aws_sdk_s3::types::ReplicationConfiguration::builder()
+                .role("arn:aws:iam::000000000000:role/s4-test")
+                .rules(
+                    aws_sdk_s3::types::ReplicationRule::builder()
+                        .id("rule-stale")
+                        .priority(1)
+                        .status(aws_sdk_s3::types::ReplicationRuleStatus::Enabled)
+                        .filter(
+                            aws_sdk_s3::types::ReplicationRuleFilter::builder()
+                                .prefix(String::new())
+                                .build(),
+                        )
+                        .destination(
+                            aws_sdk_s3::types::Destination::builder()
+                                .bucket("stale-dst")
+                                .build()
+                                .expect("destination"),
+                        )
+                        .build()
+                        .expect("rule"),
+                )
+                .build()
+                .expect("replication configuration"),
+        )
+        .send()
+        .await
+        .expect("PutBucketReplication");
+
+    // PUT-A then PUT-B in quick succession on the same source key.
+    // Each PUT mints its own generation token (1, 2). PUT-B's
+    // dispatcher records `generation=2` Completed; PUT-A's CAS
+    // pre-check observes generation=2 > generation=1, so PUT-A's
+    // destination write is dropped.
+    s4_client
+        .put_object()
+        .bucket("stale-src")
+        .key("k")
+        .body(bytes::Bytes::from_static(b"alpha-bytes").into())
+        .send()
+        .await
+        .expect("PUT-A");
+    // No artificial delay — the test still passes because the CAS in
+    // `record_status_if_newer` and the pre-PUT generation peek in
+    // `replicate_object` together prevent a stale overwrite even
+    // when the order of completions is non-deterministic.
+    s4_client
+        .put_object()
+        .bucket("stale-src")
+        .key("k")
+        .body(bytes::Bytes::from_static(b"beta-bytes").into())
+        .send()
+        .await
+        .expect("PUT-B");
+
+    // Wait for the destination to settle (= last replicate has
+    // surfaced). 5s is the same budget the rest of this file uses
+    // for replication settle.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut last_body: Vec<u8> = Vec::new();
+    while std::time::Instant::now() < deadline {
+        if let Ok(resp) = backend_client
+            .get_object()
+            .bucket("stale-dst")
+            .key("k")
+            .send()
+            .await
+        {
+            let bs = resp.body.collect().await.expect("collect").into_bytes();
+            last_body = bs.to_vec();
+            if last_body == b"beta-bytes" {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        last_body, b"beta-bytes",
+        "v0.8.2 #61 C-3 regression: destination must hold the last-PUT's bytes \
+         (beta-bytes), not be overwritten by a stale retry of PUT-A. \
+         dest body actually = {:?}",
+        std::str::from_utf8(&last_body).unwrap_or("<non-utf8>")
+    );
+
+    // Source's replication-status must surface COMPLETED (terminal,
+    // last writer wins). HEAD it through the gateway to confirm.
+    let head = s4_client
+        .head_object()
+        .bucket("stale-src")
+        .key("k")
+        .send()
+        .await
+        .expect("HEAD src");
+    assert_eq!(
+        head.replication_status(),
+        Some(&aws_sdk_s3::types::ReplicationStatus::Completed),
+        "src must surface COMPLETED after both PUTs settle"
+    );
+
+    let _ = spawned.shutdown.send(());
+}
+
+// ---------------------------------------------------------------------------
+// 2) Versioned source → destination must receive the version under the
+//    same shadow-key path so `?versionId=<vid>` GET on the destination
+//    resolves through the same lookup the source uses (audit C-1 fix).
+// ---------------------------------------------------------------------------
+//
+// Setup: src + dst buckets BOTH versioning-Enabled, + replication
+// rule. PUT to src → vid_x is minted. The source is stored at
+// `k.__s4ver__/<vid_x>`; the destination MUST receive the new
+// version's bytes at the same shadow path so the version chain on
+// the destination has an entry for vid_x. Verified by raw-backend
+// HEAD + GET on `dst/k.__s4ver__/<vid_x>`.
+//
+// Pre-#61 the destination wrote to `<key>` (logical, no shadow), so
+// the destination version chain stayed empty and HEAD on the shadow
+// key returned 404.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn replication_versioned_source_writes_destination_under_shadow_key() {
+    let minio = start_minio().await;
+    let spawned = spawn_s4_with_options(
+        &minio.endpoint_url,
+        S4TestOpts::default().with_replication().with_versioning(),
+    )
+    .await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    ensure_bucket(&backend_client, "ver-src").await;
+    ensure_bucket(&backend_client, "ver-dst").await;
+    let s4_client = build_aws_client_v2(&spawned.endpoint_url);
+
+    // Enable versioning on both buckets via the gateway so the
+    // VersioningManager state map sees both `Enabled`.
+    for b in ["ver-src", "ver-dst"] {
+        s4_client
+            .put_bucket_versioning()
+            .bucket(b)
+            .versioning_configuration(
+                aws_sdk_s3::types::VersioningConfiguration::builder()
+                    .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .expect("PutBucketVersioning");
+    }
+
+    s4_client
+        .put_bucket_replication()
+        .bucket("ver-src")
+        .replication_configuration(
+            aws_sdk_s3::types::ReplicationConfiguration::builder()
+                .role("arn:aws:iam::000000000000:role/s4-test")
+                .rules(
+                    aws_sdk_s3::types::ReplicationRule::builder()
+                        .id("rule-ver")
+                        .priority(1)
+                        .status(aws_sdk_s3::types::ReplicationRuleStatus::Enabled)
+                        .filter(
+                            aws_sdk_s3::types::ReplicationRuleFilter::builder()
+                                .prefix(String::new())
+                                .build(),
+                        )
+                        .destination(
+                            aws_sdk_s3::types::Destination::builder()
+                                .bucket("ver-dst")
+                                .build()
+                                .expect("destination"),
+                        )
+                        .build()
+                        .expect("rule"),
+                )
+                .build()
+                .expect("replication configuration"),
+        )
+        .send()
+        .await
+        .expect("PutBucketReplication");
+
+    let payload = bytes::Bytes::from_static(b"versioned-replication-payload");
+    let put = s4_client
+        .put_object()
+        .bucket("ver-src")
+        .key("k")
+        .body(payload.clone().into())
+        .send()
+        .await
+        .expect("PUT versioned src");
+    let vid = put
+        .version_id()
+        .expect("source PUT must mint a version id")
+        .to_string();
+    let shadow_key = format!("k.__s4ver__/{vid}");
+
+    // Wait for the destination to receive the shadow-key write. Use a
+    // raw backend HEAD because the gateway would (correctly) hide the
+    // shadow path from `?versionId` users — it is the storage-layer
+    // key.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut found = false;
+    while std::time::Instant::now() < deadline {
+        match backend_client
+            .head_object()
+            .bucket("ver-dst")
+            .key(&shadow_key)
+            .send()
+            .await
+        {
+            Ok(_) => {
+                found = true;
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+    assert!(
+        found,
+        "v0.8.2 #61 C-1 regression: destination must receive the new \
+         version under the same shadow path `{shadow_key}`. Pre-#61 \
+         the dispatcher wrote to logical `k`, leaving the destination's \
+         version chain empty so `?versionId={vid}` would 404."
+    );
+
+    // Belt-and-braces: GET the body via the raw backend at the shadow
+    // key — must equal the source payload bytes.
+    let got = backend_client
+        .get_object()
+        .bucket("ver-dst")
+        .key(&shadow_key)
+        .send()
+        .await
+        .expect("backend GET dst shadow");
+    let body = got.body.collect().await.expect("collect").into_bytes();
+    assert_eq!(
+        body.as_ref(),
+        payload.as_ref(),
+        "destination shadow-key bytes must match source payload"
+    );
+
+    let _ = spawned.shutdown.send(());
+}
