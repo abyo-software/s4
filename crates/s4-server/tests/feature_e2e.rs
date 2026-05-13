@@ -4497,3 +4497,148 @@ async fn audit_log_e2e_eof_hmac_round_trip() {
         }
     }
 }
+
+// ===========================================================================
+// v0.8.3 #65 (audit C-2) — Lifecycle scanner consults Object Lock + bumps
+// the `skipped_locked` metric end-to-end against the MinIO container backend.
+// ===========================================================================
+//
+// Boots MinIO, points an `S4Service<s3s_aws::Proxy>` at it with BOTH a
+// `LifecycleManager` (rule = expire_after_days(0), so every object
+// matches) AND an `ObjectLockManager` attached. Three objects are PUT
+// through the raw aws-sdk-s3 client; the middle one is locked
+// Compliance-mode until `now + 1 day` directly in the in-process
+// `ObjectLockManager` (we drive the manager directly rather than the
+// `PutObjectRetention` wire path so the test stays focused on the
+// scanner's lock-veto behaviour, which is the audit C-2 fix point).
+//
+// The v0.7 #45 scanner walked `list_objects_v2` and called
+// `delete_object` for every match — including locked keys. The v0.8.3
+// #65 fix consults `object_lock_manager().get(...).is_locked(now)`
+// before issuing the backend DELETE: locked objects are skipped, the
+// in-report `skipped_locked` counter bumps, and a
+// `s4_lifecycle_actions_total{action="skipped_locked", bucket=...}`
+// sample is emitted so operator dashboards can alert on the
+// "lifecycle wanted to act but Object Lock vetoed" path.
+//
+// E2E proves the wire-side behaviour: the backend HEAD against the
+// middle key still returns 200 after the scan, while the outer two
+// keys return NoSuchKey.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn lifecycle_skips_object_lock_compliance_via_minio() {
+    use s4_server::lifecycle::{
+        LifecycleConfig, LifecycleManager, LifecycleRule, run_scan_once,
+    };
+    use s4_server::object_lock::{LockMode, ObjectLockManager, ObjectLockState};
+
+    let minio = start_minio().await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    let bucket = "s4-lc-lock-65";
+    ensure_bucket(&backend_client, bucket).await;
+
+    // Three objects; the middle one ("middle.bin") will be locked.
+    for (key, body) in [
+        ("outer-a.bin", b"a" as &[u8]),
+        ("middle.bin", b"m" as &[u8]),
+        ("outer-c.bin", b"c" as &[u8]),
+    ] {
+        backend_client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(bytes::Bytes::copy_from_slice(body).into())
+            .send()
+            .await
+            .expect("seed PUT to MinIO");
+    }
+
+    // Build the S4Service with BOTH lifecycle + object_lock managers
+    // attached. Lifecycle rule expires every object (age >= 0d).
+    let proxy = s3s_aws::Proxy::from(backend_client.clone());
+    let lifecycle_mgr = std::sync::Arc::new(LifecycleManager::new());
+    lifecycle_mgr.put(
+        bucket,
+        LifecycleConfig {
+            rules: vec![LifecycleRule::expire_after_days("e2e-lock", 0)],
+        },
+    );
+    let lock_mgr = std::sync::Arc::new(ObjectLockManager::new());
+    // Per audit C-2 spec: middle key locked Compliance until +1day
+    // (using a far-future stamp would also work; +1day is what the
+    // issue prompt names).
+    let retain_until = chrono::Utc::now() + chrono::Duration::days(1);
+    lock_mgr.set(
+        bucket,
+        "middle.bin",
+        ObjectLockState {
+            mode: Some(LockMode::Compliance),
+            retain_until: Some(retain_until),
+            legal_hold_on: false,
+        },
+    );
+
+    let registry = std::sync::Arc::new(
+        CodecRegistry::new(CodecKind::Passthrough)
+            .with(std::sync::Arc::new(Passthrough)),
+    );
+    let dispatcher = std::sync::Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
+    let s4 = std::sync::Arc::new(
+        S4Service::new(proxy, registry, dispatcher)
+            .with_lifecycle(std::sync::Arc::clone(&lifecycle_mgr))
+            .with_object_lock(std::sync::Arc::clone(&lock_mgr)),
+    );
+
+    // Drive the v0.7 #45 scanner — now consulting the Object Lock per
+    // audit C-2 fix.
+    let report = run_scan_once(&s4).await.expect("scan");
+    eprintln!("v0.8.3 #65 E2E scan report: {report:?}");
+    assert_eq!(report.buckets_scanned, 1);
+    assert_eq!(report.objects_evaluated, 3);
+    assert_eq!(
+        report.expired, 2,
+        "outer-a + outer-c must be DELETEd; got {report:?}"
+    );
+    assert_eq!(
+        report.skipped_locked, 1,
+        "middle.bin is Compliance-locked → scanner must skip; got {report:?}"
+    );
+    assert_eq!(report.action_errors, 0);
+
+    // Backend post-condition: outer-a / outer-c must be gone (HEAD
+    // returns NoSuchKey), middle.bin must survive (HEAD returns 200).
+    for gone in ["outer-a.bin", "outer-c.bin"] {
+        let res = backend_client
+            .head_object()
+            .bucket(bucket)
+            .key(gone)
+            .send()
+            .await;
+        assert!(
+            res.is_err(),
+            "{gone} should be DELETEd from MinIO after lifecycle scan; got {res:?}"
+        );
+    }
+    let kept = backend_client
+        .head_object()
+        .bucket(bucket)
+        .key("middle.bin")
+        .send()
+        .await;
+    assert!(
+        kept.is_ok(),
+        "middle.bin must survive — Object Lock Compliance vetoes Lifecycle Expiration; \
+         got {kept:?}"
+    );
+
+    // The lifecycle manager's per-bucket counter records 2 expires
+    // (the locked path doesn't bump `actions_snapshot()` — that
+    // counter is for actually-executed actions; `skipped_locked` is
+    // the Prometheus-only signal).
+    let snap = lifecycle_mgr.actions_snapshot();
+    assert_eq!(
+        snap.get(&(bucket.into(), "expire".into())).copied(),
+        Some(2),
+        "two outer expires must be counted in the in-process snapshot"
+    );
+}

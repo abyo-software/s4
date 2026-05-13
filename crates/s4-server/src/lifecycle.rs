@@ -748,11 +748,22 @@ async fn scan_bucket<B: S3 + Send + Sync + 'static>(
             // backend-mutating call. Lock wins over Lifecycle, full
             // stop — matches AWS behaviour where an Expiration on a
             // locked object is dropped, not retried.
+            //
+            // v0.8.3 #65 (audit C-2): in addition to bumping the
+            // in-report counter, emit a Prometheus
+            // `s4_lifecycle_actions_total{action="skipped_locked"}`
+            // sample so operator dashboards can alert on the
+            // "lifecycle wanted to act but Object Lock vetoed" path
+            // (previously a silent skip — the scanner's
+            // `list_objects_v2` walked the key and `evaluate(...)`
+            // returned an action, but no observable signal fired
+            // when the backend would have refused the DELETE).
             if let Some(lock_mgr) = s4.as_ref().object_lock_manager()
                 && let Some(state) = lock_mgr.get(bucket, key)
                 && state.is_locked(now)
             {
                 report.skipped_locked = report.skipped_locked.saturating_add(1);
+                crate::metrics::record_lifecycle_action(bucket, "skipped_locked");
                 continue;
             }
             match action {
@@ -1489,6 +1500,139 @@ mod tests {
         assert_eq!(report.expired, 1, "free.log should have been expired");
         assert_eq!(report.skipped_locked, 1, "locked.log must be skipped");
         assert_eq!(report.action_errors, 0);
+    }
+
+    /// v0.8.3 #65 (audit C-2): full scanner walk with a mix of free
+    /// and locked objects must (a) leave outer/free objects expired,
+    /// (b) skip the middle locked object, (c) bump
+    /// `ScanReport::skipped_locked`, and (d) emit a Prometheus
+    /// `s4_lifecycle_actions_total{action="skipped_locked"}` sample.
+    /// Previously (v0.7 #45) the skip path bumped only the in-report
+    /// counter — operator dashboards saw no signal when Object Lock
+    /// vetoed a Lifecycle Expiration, which is the silent-failure
+    /// observability gap audit C-2 called out.
+    #[tokio::test]
+    async fn scan_one_config_skips_locked_objects_and_bumps_metric() {
+        // The Prometheus recorder is a process-global slot. Multiple
+        // tests in the same binary race on `install_recorder()`, so
+        // we route through `crate::metrics::test_metrics_handle()`
+        // which is OnceLock-guarded and shared with the
+        // `metrics::tests::install_and_render_basic_counters` test.
+        // Use a unique bucket label so this test's sample line is
+        // identifiable even when other tests in the binary also bump
+        // the lifecycle counter under different bucket labels.
+        let metrics_handle = crate::metrics::test_metrics_handle();
+
+        let bucket = "lc-locked-metric-65";
+        let backend = ScannerMemBackend::default();
+        // Three objects; the middle one ("middle.log") will be
+        // Object-Lock-Compliance-locked until 2099. The two outer
+        // objects ("outer-a.log", "outer-c.log") have no lock state
+        // attached, so the aggressive `expire_after_days(0)` rule
+        // matches and the scanner's `delete_object` actually fires.
+        backend.put_now(bucket, "outer-a.log", Bytes::from_static(b"a"));
+        backend.put_now(bucket, "middle.log", Bytes::from_static(b"m"));
+        backend.put_now(bucket, "outer-c.log", Bytes::from_static(b"c"));
+
+        let registry = Arc::new(
+            CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)),
+        );
+        let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
+        let mgr = Arc::new(LifecycleManager::new());
+        mgr.put(
+            bucket,
+            LifecycleConfig {
+                rules: vec![LifecycleRule::expire_after_days("r", 1)],
+            },
+        );
+        // Object-Lock Compliance retain until far in the future (2099).
+        // `is_locked(now)` then returns `true` regardless of when the
+        // test actually runs.
+        let lock_mgr = Arc::new(ObjectLockManager::new());
+        let retain_until = chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
+            .expect("parse retain_until")
+            .with_timezone(&Utc);
+        lock_mgr.set(
+            bucket,
+            "middle.log",
+            ObjectLockState {
+                mode: Some(LockMode::Compliance),
+                retain_until: Some(retain_until),
+                legal_hold_on: false,
+            },
+        );
+        let s4 = Arc::new(
+            S4Service::new(backend, registry, dispatcher)
+                .with_lifecycle(Arc::clone(&mgr))
+                .with_object_lock(Arc::clone(&lock_mgr)),
+        );
+
+        // The objects above were `put_now(...)` with `last_modified =
+        // SystemTime::now()`, so their computed `age` is roughly zero
+        // and the `expire_after_days(1)` rule alone would NOT match.
+        // Force the rule threshold down to zero days so all three
+        // objects qualify for Expiration — the test is about the Lock
+        // veto, not the age math.
+        mgr.put(
+            bucket,
+            LifecycleConfig {
+                rules: vec![LifecycleRule::expire_after_days("r", 0)],
+            },
+        );
+
+        let report = run_scan_once(&s4).await.expect("scan");
+        assert_eq!(report.buckets_scanned, 1);
+        assert_eq!(report.objects_evaluated, 3);
+        assert_eq!(
+            report.expired, 2,
+            "outer-a.log + outer-c.log must be DELETEd; got {report:?}"
+        );
+        assert_eq!(
+            report.skipped_locked, 1,
+            "middle.log is Compliance-locked → scanner must skip; got {report:?}"
+        );
+        assert_eq!(report.transitioned, 0);
+        assert_eq!(report.action_errors, 0);
+
+        // Render the Prometheus exporter and assert that a sample line
+        // for `s4_lifecycle_actions_total{...action="skipped_locked",
+        // bucket="lc-locked-metric-65"...}` is present with value >= 1.
+        // The metrics-exporter-prometheus crate sorts labels
+        // alphabetically (`bucket` appears before `action` in the
+        // rendered output), so we substring-match both label fragments
+        // rather than rely on a fixed ordering. We use `>=` (not
+        // `==`) because the recorder is process-global and a parallel
+        // run of the same test in a future session could legitimately
+        // bump it again — but since the bucket label embeds an
+        // issue-unique suffix, no other test in this binary touches
+        // this specific (action, bucket) pair.
+        let rendered = metrics_handle.render();
+        let bucket_frag = format!("bucket=\"{bucket}\"");
+        let action_frag = "action=\"skipped_locked\"";
+        let line = rendered
+            .lines()
+            .find(|l| {
+                l.starts_with("s4_lifecycle_actions_total{")
+                    && l.contains(&bucket_frag)
+                    && l.contains(action_frag)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "Prometheus output missing skipped_locked sample for {bucket}; \
+                     full render:\n{rendered}"
+                )
+            });
+        // Parse the trailing counter value (whitespace-separated).
+        let value: u64 = line
+            .split_whitespace()
+            .next_back()
+            .expect("counter value column")
+            .parse()
+            .expect("counter value is u64");
+        assert!(
+            value >= 1,
+            "skipped_locked counter must be >= 1 after scan; line: {line}"
+        );
     }
 
 }

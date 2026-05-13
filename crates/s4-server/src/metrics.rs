@@ -423,7 +423,12 @@ mod tests {
         // single recorder install covers all metric families. Splitting
         // these into separate `#[test]` fns would race on the global
         // `PrometheusBuilder::install_recorder()` slot.
-        let handle = install();
+        // v0.8.3 #65: go through `test_metrics_handle()` so other
+        // tests in the same binary (notably
+        // `lifecycle::tests::scan_one_config_skips_locked_objects_and_bumps_metric`)
+        // that also need the recorder cooperate via the shared
+        // `OnceLock` instead of fighting over the global slot.
+        let handle = test_metrics_handle();
         record_put("cpu-zstd", 1000, 100, 0.05, true);
         record_get("cpu-zstd", 100, 1000, 0.02, true);
 
