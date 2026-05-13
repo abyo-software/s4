@@ -7,9 +7,27 @@
 use crate::CodecKind;
 
 /// PUT body の先頭 sample から codec を選ぶ trait。
+///
+/// v0.8 #56: 呼び出し側が `Content-Length` を知っている場合 (chunked transfer
+/// でない通常 PUT)、`pick_with_size_hint` 経由で total body size を渡せる。
+/// `SamplingDispatcher` は GPU upload overhead が compress 時間を上回る小オブ
+/// ジェクトで CPU codec を選び、十分大きい (>= `gpu_min_bytes`) ものでだけ
+/// GPU codec へ昇格させる。size hint が `None` (chunked transfer) の場合は
+/// 保守的に CPU 側に倒す。
+///
+/// 既定実装は `pick_with_size_hint(sample, None)` を `pick(sample)` に委譲する
+/// — 既存 implementor は `pick` だけ実装すれば従来通り動く。
 #[async_trait::async_trait]
 pub trait CodecDispatcher: Send + Sync {
     async fn pick(&self, sample: &[u8]) -> CodecKind;
+
+    /// v0.8 #56: size-hint aware pick. 既定実装は `pick(sample)` に委譲する
+    /// ので、追加情報を活用する dispatcher (`SamplingDispatcher`) のみ override
+    /// すればよい。`total_size = None` は「chunked transfer で content-length
+    /// が無い」ケースを表す。
+    async fn pick_with_size_hint(&self, sample: &[u8], _total_size: Option<u64>) -> CodecKind {
+        self.pick(sample).await
+    }
 }
 
 /// 常に同じ kind を返す dispatcher (固定 codec 運用)。
@@ -35,26 +53,66 @@ impl CodecDispatcher for AlwaysDispatcher {
 ///
 /// Phase 1 では `default = CpuZstd` 想定。Phase 1 後半で integer-column 検出を加え、
 /// `default` 分岐を「数値列なら NvcompBitcomp、そうでなければ CpuZstd」に拡張する。
+///
+/// ## v0.8 #56: GPU auto-detect at boot
+///
+/// `with_gpu_preference(true, gpu_min_bytes)` を呼ぶと、boot 時に
+/// `s4_codec::nvcomp::is_gpu_available()` が true を返した場合に限り、
+/// 「default が `CpuZstd` でかつ total size >= `gpu_min_bytes` の object」を
+/// `NvcompZstd` に昇格させる。size hint が `None` (chunked transfer)、
+/// または閾値未満の小オブジェクトでは GPU upload overhead を避けるため
+/// CPU codec のままにする。
+///
+/// `nvcomp-gpu` feature が build-time で off の場合、`NvcompZstd` への昇格は
+/// 行わない (registry に居ない codec を指すと dispatch 時に
+/// `UnregisteredCodec` で fail するため)。orchestrator は main.rs 側で
+/// `prefer_gpu = false` を強制することでこれを担保する。
 #[derive(Debug, Clone)]
 pub struct SamplingDispatcher {
     pub default: CodecKind,
     pub entropy_threshold: f64,
+    /// v0.8 #56: when set, route large `CpuZstd` picks through `NvcompZstd`.
+    pub prefer_gpu: bool,
+    /// v0.8 #56: GPU promotion only fires when the caller can prove
+    /// `total_size >= gpu_min_bytes` via `pick_with_size_hint`. Below this
+    /// threshold the GPU upload overhead exceeds the compress time so CPU
+    /// wins; the default 1 MiB is the empirical break-even point on common
+    /// text / log payloads with PCIe 4.0 + an A10G-class GPU.
+    pub gpu_min_bytes: usize,
 }
 
 impl SamplingDispatcher {
     pub const DEFAULT_ENTROPY_THRESHOLD: f64 = 7.5;
     pub const MIN_SAMPLE_BYTES: usize = 128;
+    /// v0.8 #56: 1 MiB. The empirical break-even point — below this, the
+    /// PCIe upload + kernel launch overhead dominates the GPU's compress
+    /// throughput advantage.
+    pub const DEFAULT_GPU_MIN_BYTES: usize = 1_048_576;
 
     pub fn new(default: CodecKind) -> Self {
         Self {
             default,
             entropy_threshold: Self::DEFAULT_ENTROPY_THRESHOLD,
+            prefer_gpu: false,
+            gpu_min_bytes: Self::DEFAULT_GPU_MIN_BYTES,
         }
     }
 
     #[must_use]
     pub fn with_entropy_threshold(mut self, t: f64) -> Self {
         self.entropy_threshold = t;
+        self
+    }
+
+    /// v0.8 #56: enable GPU promotion. When `prefer_gpu = true`, a `CpuZstd`
+    /// pick on a body whose `total_size >= gpu_min_bytes` is rewritten to
+    /// `NvcompZstd`. Pass `prefer_gpu = false` (the default) to disable.
+    /// The threshold is in bytes; `1_048_576` (1 MiB) is the recommended
+    /// default for PCIe 4.0 hosts.
+    #[must_use]
+    pub fn with_gpu_preference(mut self, prefer_gpu: bool, gpu_min_bytes: usize) -> Self {
+        self.prefer_gpu = prefer_gpu;
+        self.gpu_min_bytes = gpu_min_bytes;
         self
     }
 }
@@ -133,9 +191,11 @@ fn looks_already_compressed(sample: &[u8]) -> bool {
     false
 }
 
-#[async_trait::async_trait]
-impl CodecDispatcher for SamplingDispatcher {
-    async fn pick(&self, sample: &[u8]) -> CodecKind {
+impl SamplingDispatcher {
+    /// Core sample-only decision shared by `pick` and `pick_with_size_hint`.
+    /// Returns the pre-GPU-promotion choice; the size-hint-aware caller may
+    /// rewrite a `CpuZstd` result to `NvcompZstd` when the body is big enough.
+    fn pick_from_sample(&self, sample: &[u8]) -> CodecKind {
         if sample.len() < Self::MIN_SAMPLE_BYTES {
             return self.default;
         }
@@ -147,6 +207,40 @@ impl CodecDispatcher for SamplingDispatcher {
         }
         self.default
     }
+
+    /// v0.8 #56: rewrite a `CpuZstd` pick to `NvcompZstd` when (a) GPU
+    /// preference is on, (b) the caller could prove a total body size >=
+    /// `gpu_min_bytes`. Passthrough / non-CpuZstd picks are left alone —
+    /// already-compressed bodies don't benefit from GPU compression, and
+    /// other CPU codecs (CpuGzip) imply the operator wants wire-compatible
+    /// output that NvcompZstd can't provide.
+    fn maybe_promote_to_gpu(&self, chosen: CodecKind, total_size: Option<u64>) -> CodecKind {
+        if !self.prefer_gpu {
+            return chosen;
+        }
+        if chosen != CodecKind::CpuZstd {
+            return chosen;
+        }
+        match total_size {
+            Some(n) if n >= self.gpu_min_bytes as u64 => CodecKind::NvcompZstd,
+            // No size hint (chunked transfer) → conservative, keep CpuZstd.
+            // Below threshold → GPU upload overhead exceeds compress gain.
+            _ => chosen,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CodecDispatcher for SamplingDispatcher {
+    async fn pick(&self, sample: &[u8]) -> CodecKind {
+        // No size hint available → never promote to GPU.
+        self.pick_from_sample(sample)
+    }
+
+    async fn pick_with_size_hint(&self, sample: &[u8], total_size: Option<u64>) -> CodecKind {
+        let chosen = self.pick_from_sample(sample);
+        self.maybe_promote_to_gpu(chosen, total_size)
+    }
 }
 
 /// `Box<dyn CodecDispatcher>` からも `CodecDispatcher` として使えるようにする blanket impl
@@ -155,12 +249,20 @@ impl<T: CodecDispatcher + ?Sized> CodecDispatcher for Box<T> {
     async fn pick(&self, sample: &[u8]) -> CodecKind {
         (**self).pick(sample).await
     }
+
+    async fn pick_with_size_hint(&self, sample: &[u8], total_size: Option<u64>) -> CodecKind {
+        (**self).pick_with_size_hint(sample, total_size).await
+    }
 }
 
 #[async_trait::async_trait]
 impl<T: CodecDispatcher + ?Sized> CodecDispatcher for std::sync::Arc<T> {
     async fn pick(&self, sample: &[u8]) -> CodecKind {
         (**self).pick(sample).await
+    }
+
+    async fn pick_with_size_hint(&self, sample: &[u8], total_size: Option<u64>) -> CodecKind {
+        (**self).pick_with_size_hint(sample, total_size).await
     }
 }
 
@@ -245,6 +347,89 @@ mod tests {
     fn entropy_zero_for_uniform() {
         let zeros = vec![0u8; 1024];
         assert_eq!(shannon_entropy(&zeros), 0.0);
+    }
+
+    // ===========================================================
+    // v0.8 #56: GPU auto-detect / size-hint promotion
+    // ===========================================================
+
+    /// Build a 1 KiB low-entropy text sample (repeats a sentence) — the
+    /// post-magic-byte / post-entropy decision falls through to `default`,
+    /// which the v0.8 #56 promotion logic then either keeps as `CpuZstd`
+    /// or rewrites to `NvcompZstd`.
+    fn text_sample() -> Vec<u8> {
+        "the quick brown fox jumps over the lazy dog. "
+            .repeat(30)
+            .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn gpu_pref_promotes_large_text_to_nvcomp_zstd() {
+        let d = SamplingDispatcher::new(CodecKind::CpuZstd)
+            .with_gpu_preference(true, 1_048_576);
+        let sample = text_sample();
+        // 2 MiB total body — past the 1 MiB threshold → GPU promotion.
+        let kind = d
+            .pick_with_size_hint(&sample, Some(2 * 1024 * 1024))
+            .await;
+        assert_eq!(kind, CodecKind::NvcompZstd);
+    }
+
+    #[tokio::test]
+    async fn gpu_pref_keeps_small_object_on_cpu() {
+        let d = SamplingDispatcher::new(CodecKind::CpuZstd)
+            .with_gpu_preference(true, 1_048_576);
+        let sample = text_sample();
+        // 100 KiB total body — under the 1 MiB threshold → GPU upload
+        // overhead would exceed compress savings, stay on CPU.
+        let kind = d
+            .pick_with_size_hint(&sample, Some(100 * 1024))
+            .await;
+        assert_eq!(kind, CodecKind::CpuZstd);
+    }
+
+    #[tokio::test]
+    async fn gpu_pref_off_keeps_cpu_even_for_large_object() {
+        // Default — no `with_gpu_preference` call → prefer_gpu = false.
+        let d = SamplingDispatcher::new(CodecKind::CpuZstd);
+        let sample = text_sample();
+        let kind = d
+            .pick_with_size_hint(&sample, Some(10 * 1024 * 1024))
+            .await;
+        assert_eq!(kind, CodecKind::CpuZstd);
+    }
+
+    #[tokio::test]
+    async fn gpu_pref_does_not_override_passthrough_on_high_entropy() {
+        let d = SamplingDispatcher::new(CodecKind::CpuZstd)
+            .with_gpu_preference(true, 1_048_576);
+        // High-entropy pseudo-random payload → entropy filter wins,
+        // returns Passthrough; GPU promotion is skipped because
+        // already-compressed data won't compress further on GPU either.
+        let mut state: u64 = 0xfeed_beef_dead_c0de;
+        let mut payload = Vec::with_capacity(4096);
+        for _ in 0..4096 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            payload.push((state & 0xff) as u8);
+        }
+        let kind = d
+            .pick_with_size_hint(&payload, Some(8 * 1024 * 1024))
+            .await;
+        assert_eq!(kind, CodecKind::Passthrough);
+    }
+
+    #[tokio::test]
+    async fn gpu_pref_with_no_size_hint_stays_conservative() {
+        let d = SamplingDispatcher::new(CodecKind::CpuZstd)
+            .with_gpu_preference(true, 1_048_576);
+        let sample = text_sample();
+        // Chunked transfer: caller has no Content-Length, so total_size =
+        // None. We can't safely commit to GPU because the body might be
+        // tiny — stay on CPU.
+        let kind = d.pick_with_size_hint(&sample, None).await;
+        assert_eq!(kind, CodecKind::CpuZstd);
     }
 
     #[test]

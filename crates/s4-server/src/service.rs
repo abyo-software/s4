@@ -1753,7 +1753,14 @@ impl<B: S3> S3 for S4Service<B> {
                 .await
                 .map_err(internal("peek put sample"))?;
             let sample_len = sample.len().min(SAMPLE_BYTES);
-            let kind = self.dispatcher.pick(&sample[..sample_len]).await;
+            // v0.8 #56: pass the request's Content-Length (when present) so
+            // the sampling dispatcher can promote large objects to a GPU
+            // codec. Chunked transfers (no Content-Length) keep CPU.
+            let total_size_hint = req.input.content_length.and_then(|n| u64::try_from(n).ok());
+            let kind = self
+                .dispatcher
+                .pick_with_size_hint(&sample[..sample_len], total_size_hint)
+                .await;
 
             // Passthrough buys nothing from S4F2 wrapping (no compression =
             // no per-chunk frame to skip past) and the +28-byte header
@@ -3378,7 +3385,13 @@ impl<B: S3> S3 for S4Service<B> {
                 .await
                 .map_err(internal("collect upload_part body"))?;
             let sample_len = bytes.len().min(SAMPLE_BYTES);
-            let codec_kind = self.dispatcher.pick(&bytes[..sample_len]).await;
+            // v0.8 #56: full part body is already in memory here; use its
+            // length as the size hint so the dispatcher can promote to GPU
+            // if it's big enough.
+            let codec_kind = self
+                .dispatcher
+                .pick_with_size_hint(&bytes[..sample_len], Some(bytes.len() as u64))
+                .await;
             let original_size = bytes.len() as u64;
             // v0.8 #55: telemetry-returning compress (GPU metrics stamp).
             let (compress_res, tel) = self
@@ -4031,7 +4044,11 @@ impl<B: S3> S3 for S4Service<B> {
 
         // Compress + frame as a fresh part (mirrors upload_part path).
         let sample_len = bytes.len().min(SAMPLE_BYTES);
-        let codec_kind = self.dispatcher.pick(&bytes[..sample_len]).await;
+        // v0.8 #56: same size-hint promotion as the upload_part path.
+        let codec_kind = self
+            .dispatcher
+            .pick_with_size_hint(&bytes[..sample_len], Some(bytes.len() as u64))
+            .await;
         let original_size = bytes.len() as u64;
         // v0.8 #55: telemetry-returning compress (GPU metrics stamp).
         let (compress_res, tel) = self

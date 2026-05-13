@@ -3333,3 +3333,161 @@ async fn gpu_metrics_scrape_after_put() {
 
     let _ = shutdown_tx.send(());
 }
+
+// =============================================================================
+// v0.8 #56 — GPU auto-detect at boot routes large PUTs through nvcomp-zstd.
+// =============================================================================
+//
+// Boots an `S4Service` with a `SamplingDispatcher` whose
+// `with_gpu_preference(true, 1 MiB)` mirrors the production path that
+// `main.rs` takes after `is_gpu_available()` returns `true`. We then PUT
+// a 5 MiB compressible payload (well past the 1 MiB GPU promotion
+// threshold) through the regular aws-sdk-s3 client and assert that
+// HEAD-after-PUT echoes `s4-codec: nvcomp-zstd` — proof the dispatcher
+// promoted CpuZstd → NvcompZstd, the registry actually compressed via
+// the GPU codec, and the metadata stamp survived the round-trip.
+//
+// ## Runtime gating
+//
+// `#[cfg(feature = "nvcomp-gpu")]` covers compile time. At runtime the
+// test self-skips with `eprintln!` if `is_gpu_available()` returns false
+// (no CUDA driver loadable / no visible device) so the test stays green
+// on CPU-only CI hosts that nonetheless build with the feature for
+// type-check coverage.
+#[cfg(feature = "nvcomp-gpu")]
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container + CUDA-capable GPU"]
+async fn gpu_auto_detect_picks_nvcomp_for_large_object() {
+    use s4_codec::dispatcher::SamplingDispatcher;
+    use s4_codec::nvcomp::{NvcompZstdCodec, is_gpu_available};
+
+    if !is_gpu_available() {
+        eprintln!(
+            "gpu_auto_detect_picks_nvcomp_for_large_object: skipping \
+             (no CUDA-capable GPU detected at runtime)"
+        );
+        return;
+    }
+
+    let minio = start_minio().await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+
+    // Build the S4 stack manually so we can attach NvcompZstd as the
+    // promotion target + a sampling dispatcher with GPU preference on.
+    // CpuZstd default keeps the dispatcher on CPU for sub-1-MiB bodies;
+    // the 5 MiB PUT below crosses the threshold so it gets routed to
+    // NvcompZstd.
+    let proxy = s3s_aws::Proxy::from(backend_client.clone());
+    let nvcomp = NvcompZstdCodec::new()
+        .expect("NvcompZstdCodec init (GPU available, driver loaded above)");
+    let registry = std::sync::Arc::new(
+        CodecRegistry::new(CodecKind::CpuZstd)
+            .with(std::sync::Arc::new(Passthrough))
+            .with(std::sync::Arc::new(s4_codec::cpu_zstd::CpuZstd::default()))
+            .with(std::sync::Arc::new(nvcomp)),
+    );
+    // 1 MiB threshold matches the production default (--gpu-min-bytes
+    // 1_048_576). prefer_gpu=true mirrors the boot-detect branch in
+    // main.rs that fires when is_gpu_available() returns true.
+    let dispatcher = std::sync::Arc::new(
+        SamplingDispatcher::new(CodecKind::CpuZstd).with_gpu_preference(true, 1_048_576),
+    );
+    let s4 = S4Service::new(proxy, registry, dispatcher);
+
+    let mut svc = S3ServiceBuilder::new(s4);
+    svc.set_auth(SimpleAuth::from_single(MINIO_USER, MINIO_PASS));
+    let service = svc.build();
+    let router = HealthRouterV2::new(service, None);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let local = listener.local_addr().expect("local addr");
+    let endpoint_url = format!("http://{local}");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let http_server = ConnBuilderV2::new(TokioExecV2::new());
+        let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+        let mut shutdown_rx = std::pin::pin!(shutdown_rx);
+        loop {
+            tokio::select! {
+                accept = listener.accept() => match accept {
+                    Ok((socket, _)) => {
+                        let conn = http_server
+                            .serve_connection(TokioIoV2::new(socket), router.clone());
+                        let conn = graceful.watch(conn.into_owned());
+                        tokio::spawn(async move { let _ = conn.await; });
+                    }
+                    Err(e) => { eprintln!("accept: {e}"); continue; }
+                },
+                _ = shutdown_rx.as_mut() => break,
+            }
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), graceful.shutdown()).await;
+    });
+
+    let s4_client = build_aws_client_v2(&endpoint_url);
+    ensure_bucket(&backend_client, "gpu-auto-detect-e2e").await;
+
+    // 5 MiB low-entropy payload: repeating "the quick brown fox..."
+    // → entropy < 7.5, magic-byte-clean → SamplingDispatcher returns
+    // CpuZstd, which `with_gpu_preference(true, 1 MiB)` then promotes
+    // to NvcompZstd because total_size = 5 MiB >= 1 MiB threshold.
+    let target_size = 5 * 1024 * 1024;
+    let mut payload = Vec::with_capacity(target_size + 1024);
+    let chunk = b"the quick brown fox jumps over the lazy dog. ";
+    while payload.len() < target_size {
+        payload.extend_from_slice(chunk);
+    }
+    payload.truncate(target_size);
+    s4_client
+        .put_object()
+        .bucket("gpu-auto-detect-e2e")
+        .key("big.txt")
+        .body(bytes::Bytes::from(payload.clone()).into())
+        .send()
+        .await
+        .expect("PUT 5 MiB compressible body");
+
+    // HEAD via the BACKEND client (raw MinIO) so we see the gateway-
+    // stamped `s4-codec` metadata on the stored object — the S4 GET
+    // path strips/reads it during decompression, which would mask the
+    // codec used.
+    let head = backend_client
+        .head_object()
+        .bucket("gpu-auto-detect-e2e")
+        .key("big.txt")
+        .send()
+        .await
+        .expect("HEAD via backend");
+    let metadata = head
+        .metadata
+        .expect("backend object should carry s4-* metadata");
+    let codec = metadata
+        .get("s4-codec")
+        .expect("s4-codec metadata key must be present");
+    assert_eq!(
+        codec, "nvcomp-zstd",
+        "v0.8 #56 GPU auto-detect should route a 5 MiB compressible PUT \
+         through nvcomp-zstd, got `{codec}`"
+    );
+
+    // Sanity: round-trip GET through S4 returns the original bytes.
+    let got = s4_client
+        .get_object()
+        .bucket("gpu-auto-detect-e2e")
+        .key("big.txt")
+        .send()
+        .await
+        .expect("GET via S4");
+    let got_bytes = got
+        .body
+        .collect()
+        .await
+        .expect("collect GET body")
+        .into_bytes();
+    assert_eq!(got_bytes.len(), payload.len(), "GET length must match PUT");
+    assert_eq!(&got_bytes[..], &payload[..], "GET body must round-trip");
+
+    let _ = shutdown_tx.send(());
+}

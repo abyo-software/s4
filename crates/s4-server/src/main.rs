@@ -119,6 +119,15 @@ struct Opt {
     #[clap(long, value_enum, default_value = "sampling")]
     dispatcher: DispatcherChoice,
 
+    /// v0.8 #56: minimum body size (bytes) at which the sampling dispatcher
+    /// prefers a GPU codec over CPU. Below this threshold the GPU upload
+    /// overhead exceeds the compress time, so CPU wins. Default 1 MiB. Has
+    /// no effect when no CUDA-capable GPU is detected at boot, when the
+    /// `nvcomp-gpu` feature is not compiled in, or when `--dispatcher always`
+    /// is selected.
+    #[clap(long, default_value_t = 1_048_576)]
+    gpu_min_bytes: usize,
+
     /// ログ出力形式 (pretty / json)。production では json 推奨
     #[clap(long, value_enum, default_value = "pretty")]
     log_format: LogFormat,
@@ -607,10 +616,21 @@ fn build_registry(default: CodecKind, zstd_level: i32) -> Arc<CodecRegistry> {
     Arc::new(reg)
 }
 
-fn build_dispatcher(choice: DispatcherChoice, default: CodecKind) -> Arc<dyn CodecDispatcher> {
+/// v0.8 #56: build the configured dispatcher and, for the sampling variant,
+/// optionally enable GPU promotion (`with_gpu_preference`). `prefer_gpu` is
+/// the boot-time GPU probe result from `s4_codec::nvcomp::is_gpu_available()`;
+/// `gpu_min_bytes` is the operator-tuned threshold below which CPU wins.
+fn build_dispatcher(
+    choice: DispatcherChoice,
+    default: CodecKind,
+    prefer_gpu: bool,
+    gpu_min_bytes: usize,
+) -> Arc<dyn CodecDispatcher> {
     match choice {
         DispatcherChoice::Always => Arc::new(AlwaysDispatcher(default)),
-        DispatcherChoice::Sampling => Arc::new(SamplingDispatcher::new(default)),
+        DispatcherChoice::Sampling => Arc::new(
+            SamplingDispatcher::new(default).with_gpu_preference(prefer_gpu, gpu_min_bytes),
+        ),
     }
 }
 
@@ -724,10 +744,38 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
 
     let default_kind = opt.codec.as_kind();
     let registry = build_registry(default_kind, opt.zstd_level);
-    let dispatcher = build_dispatcher(opt.dispatcher, default_kind);
+
+    // v0.8 #56: GPU auto-detect at boot. When the `nvcomp-gpu` feature is
+    // compiled in AND a CUDA-capable GPU is visible at runtime, the
+    // sampling dispatcher promotes large `CpuZstd` picks to `NvcompZstd`.
+    // Without GPU (no driver / no device / feature off) we fall through to
+    // pure CPU codecs — same behaviour as before this commit.
+    #[cfg(feature = "nvcomp-gpu")]
+    let prefer_gpu = {
+        let avail = s4_codec::nvcomp::is_gpu_available();
+        if avail {
+            info!(
+                "GPU detected, sampling dispatcher will prefer nvcomp-zstd over cpu-zstd \
+                 for objects >= {} bytes",
+                opt.gpu_min_bytes
+            );
+        } else {
+            info!(
+                "nvcomp-gpu feature compiled in but no CUDA-capable GPU at runtime — \
+                 using cpu-zstd"
+            );
+        }
+        avail
+    };
+    #[cfg(not(feature = "nvcomp-gpu"))]
+    let prefer_gpu = false;
+
+    let dispatcher = build_dispatcher(opt.dispatcher, default_kind, prefer_gpu, opt.gpu_min_bytes);
     info!(
         codec = ?opt.codec,
         dispatcher = ?opt.dispatcher,
+        prefer_gpu,
+        gpu_min_bytes = opt.gpu_min_bytes,
         registered = ?registry.kinds().collect::<Vec<_>>(),
         "S4 codec registry built"
     );
