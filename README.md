@@ -12,13 +12,15 @@
 [日本語版 README → `README.ja.md`](README.ja.md)
 
 **Headline numbers** (RTX 4070 Ti SUPER + Ryzen 9 9950X, single-pass roundtrip
-through `s4-codec`; full table + reproduction recipe below):
+through `s4-codec`, last benchmarked 2026-05-13 on nvCOMP 5.2.0.10 / CUDA
+13.2 driver 595.58.03; full table + reproduction recipe below):
 
 | Workload | Best ratio | Best compress throughput |
 |---|---:|---:|
 | nginx access log (256 MiB)   | **155×** (cpu-zstd-3) | 3.7 GB/s (cpu-zstd-3) |
-| Parquet-like mixed (256 MiB) | **1.94×** (nvcomp-zstd) | 1.4 GB/s (nvcomp-zstd) |
-| Already-compressed (64 MiB)  | 1.00× (no harm done) | 2.1 GB/s (cpu-zstd-3) |
+| Parquet-like mixed (256 MiB) | **2.09×** (nvcomp-bitcomp) | 1.5 GB/s (nvcomp-bitcomp) |
+| Postings (u32, 64 MiB)       | **11.9×** (nvcomp-bitcomp) | 1.6 GB/s (nvcomp-bitcomp) |
+| Already-compressed (64 MiB)  | 1.00× (no harm done) | 2.2 GB/s (cpu-zstd-3) |
 
 Translated to AWS S3 Standard at $0.023/GB/month: **1 TiB of nginx log
 data → ~6.6 GiB stored → $0.15/month vs $23.55/month uncompressed (99%
@@ -195,34 +197,51 @@ target/release/s4 --endpoint-url https://s3.us-east-1.amazonaws.com \
 
 ## Benchmarks
 
-Single-pass roundtrip through `s4-codec`. Hardware: RTX 4070 Ti SUPER +
-nvCOMP 5.x + Ryzen 9 9950X. Throughput is reported as **uncompressed bytes
-per second** (the convention nvCOMP / lz4 / zstd publish).
+Single-pass roundtrip through `s4-codec`. Hardware: RTX 4070 Ti SUPER 16 GB
++ nvCOMP 5.2.0.10 + CUDA 13.2 driver 595.58.03 + Ryzen 9 9950X. Throughput
+is reported as **uncompressed bytes per second** (the convention nvCOMP /
+lz4 / zstd publish). Last benchmarked 2026-05-13 (v0.8 #53,
+`crates/s4-codec/examples/bench_codecs.rs`).
+
+![v0.8 perf chart](docs/perf-v0.8.png)
 
 | Workload | Codec | Original | Compressed | Ratio | Compress | Decompress |
 |---|---|---:|---:|---:|---:|---:|
-| nginx access log (256 MiB) | cpu-zstd-3 | 256 MiB | 1 MiB | **155.01×** | 2.72 GB/s | 2.26 GB/s |
-| nginx access log (256 MiB) | nvcomp-zstd | 256 MiB | 2 MiB | 95.60× | 1.27 GB/s | 2.06 GB/s |
-| nginx access log (256 MiB) | nvcomp-gdeflate | 256 MiB | 169 MiB | 1.51× | 0.79 GB/s | 1.98 GB/s |
-| Parquet-like mixed (256 MiB) | cpu-zstd-3 | 256 MiB | 133 MiB | 1.92× | 0.55 GB/s | 1.38 GB/s |
-| Parquet-like mixed (256 MiB) | nvcomp-zstd | 256 MiB | 131 MiB | 1.94× | 1.06 GB/s | 2.07 GB/s |
-| Parquet-like mixed (256 MiB) | nvcomp-gdeflate | 256 MiB | 183 MiB | 1.40× | 0.79 GB/s | 1.93 GB/s |
-| Parquet-like mixed (256 MiB) | nvcomp-bitcomp | 256 MiB | 122 MiB | **2.09×** | 1.20 GB/s | 1.08 GB/s |
-| Postings (u32, 64 MiB) | cpu-zstd-3 | 64 MiB | 43 MiB | 1.48× | 1.03 GB/s | 1.47 GB/s |
-| Postings (u32, 64 MiB) | nvcomp-zstd | 64 MiB | 42 MiB | 1.52× | 0.92 GB/s | 2.23 GB/s |
-| Postings (u32, 64 MiB) | nvcomp-gdeflate | 64 MiB | 42 MiB | 1.51× | 0.67 GB/s | 1.97 GB/s |
-| Postings (u32, 64 MiB) | nvcomp-bitcomp | 64 MiB | 5 MiB | **11.93×** | 1.09 GB/s | 1.27 GB/s |
-| Timestamps (i64, 64 MiB) | cpu-zstd-3 | 64 MiB | 24 MiB | 2.63× | 0.25 GB/s | 0.79 GB/s |
-| Timestamps (i64, 64 MiB) | nvcomp-zstd | 64 MiB | 24 MiB | 2.61× | 0.95 GB/s | 1.97 GB/s |
-| Timestamps (i64, 64 MiB) | nvcomp-gdeflate | 64 MiB | 48 MiB | 1.32× | 0.69 GB/s | 1.95 GB/s |
-| Timestamps (i64, 64 MiB) | nvcomp-bitcomp | 64 MiB | 21 MiB | **2.95×** | 1.20 GB/s | 1.04 GB/s |
-| doc_values (i64, 64 MiB) | cpu-zstd-3 | 64 MiB | 44 MiB | 1.45× | 0.23 GB/s | 0.89 GB/s |
-| doc_values (i64, 64 MiB) | nvcomp-zstd | 64 MiB | 34 MiB | **1.86×** | 0.80 GB/s | 2.28 GB/s |
-| doc_values (i64, 64 MiB) | nvcomp-gdeflate | 64 MiB | 48 MiB | 1.33× | 0.60 GB/s | 1.88 GB/s |
-| doc_values (i64, 64 MiB) | nvcomp-bitcomp | 64 MiB | 37 MiB | 1.72× | 0.85 GB/s | 1.08 GB/s |
-| Already-compressed (64 MiB) | cpu-zstd-3 | 64 MiB | 64 MiB | 1.00× | 1.45 GB/s | 2.21 GB/s |
-| Already-compressed (64 MiB) | nvcomp-zstd | 64 MiB | 64 MiB | 1.00× | 0.69 GB/s | 1.97 GB/s |
-| Already-compressed (64 MiB) | nvcomp-gdeflate | 64 MiB | 64 MiB | 1.00× | 0.62 GB/s | 1.77 GB/s |
+| nginx access log (256 MiB) | cpu-zstd-3 | 256 MiB | 1 MiB | **155.01×** | 3.71 GB/s | 3.27 GB/s |
+| nginx access log (256 MiB) | nvcomp-zstd | 256 MiB | 2 MiB | 95.60× | 1.70 GB/s | 2.86 GB/s |
+| nginx access log (256 MiB) | nvcomp-gdeflate | 256 MiB | 169 MiB | 1.51× | 1.07 GB/s | 2.51 GB/s |
+| Parquet-like mixed (256 MiB) | cpu-zstd-3 | 256 MiB | 133 MiB | 1.92× | 0.75 GB/s | 1.89 GB/s |
+| Parquet-like mixed (256 MiB) | nvcomp-zstd | 256 MiB | 131 MiB | 1.94× | 1.44 GB/s | 2.62 GB/s |
+| Parquet-like mixed (256 MiB) | nvcomp-gdeflate | 256 MiB | 183 MiB | 1.40× | 1.05 GB/s | 2.62 GB/s |
+| Parquet-like mixed (256 MiB) | nvcomp-bitcomp | 256 MiB | 122 MiB | **2.09×** | 1.49 GB/s | 1.44 GB/s |
+| Postings (u32, 64 MiB) | cpu-zstd-3 | 64 MiB | 43 MiB | 1.48× | 1.22 GB/s | 1.65 GB/s |
+| Postings (u32, 64 MiB) | nvcomp-zstd | 64 MiB | 42 MiB | 1.52× | 1.29 GB/s | 2.52 GB/s |
+| Postings (u32, 64 MiB) | nvcomp-gdeflate | 64 MiB | 42 MiB | 1.51× | 1.06 GB/s | 2.44 GB/s |
+| Postings (u32, 64 MiB) | nvcomp-bitcomp | 64 MiB | 5 MiB | **11.93×** | 1.61 GB/s | 1.50 GB/s |
+| Timestamps (i64, 64 MiB) | cpu-zstd-3 | 64 MiB | 24 MiB | 2.63× | 0.35 GB/s | 0.92 GB/s |
+| Timestamps (i64, 64 MiB) | nvcomp-zstd | 64 MiB | 24 MiB | 2.61× | 1.14 GB/s | 2.70 GB/s |
+| Timestamps (i64, 64 MiB) | nvcomp-gdeflate | 64 MiB | 48 MiB | 1.32× | 0.89 GB/s | 2.26 GB/s |
+| Timestamps (i64, 64 MiB) | nvcomp-bitcomp | 64 MiB | 21 MiB | **2.95×** | 1.45 GB/s | 1.39 GB/s |
+| doc_values (i64, 64 MiB) | cpu-zstd-3 | 64 MiB | 44 MiB | 1.45× | 0.26 GB/s | 1.01 GB/s |
+| doc_values (i64, 64 MiB) | nvcomp-zstd | 64 MiB | 34 MiB | **1.86×** | 1.04 GB/s | 2.59 GB/s |
+| doc_values (i64, 64 MiB) | nvcomp-gdeflate | 64 MiB | 48 MiB | 1.33× | 0.96 GB/s | 2.54 GB/s |
+| doc_values (i64, 64 MiB) | nvcomp-bitcomp | 64 MiB | 37 MiB | 1.72× | 1.41 GB/s | 1.48 GB/s |
+| Already-compressed (64 MiB) | cpu-zstd-3 | 64 MiB | 64 MiB | 1.00× | 2.23 GB/s | 3.15 GB/s |
+| Already-compressed (64 MiB) | nvcomp-zstd | 64 MiB | 64 MiB | 1.00× | 0.83 GB/s | 2.37 GB/s |
+| Already-compressed (64 MiB) | nvcomp-gdeflate | 64 MiB | 64 MiB | 1.00× | 0.92 GB/s | 2.39 GB/s |
+
+**v0.3 → v0.8 throughput delta** (compress GB/s on the same hardware,
+nvCOMP 5.0.x → 5.2.0.10, no source-code changes — pure runtime / driver gains):
+
+| Workload | Codec | v0.3 (2026-04) | v0.8 (2026-05-13) | Delta |
+|---|---|---:|---:|---:|
+| nginx (256 MiB) | cpu-zstd-3 | 2.72 GB/s | **3.71 GB/s** | +36% |
+| nginx (256 MiB) | nvcomp-zstd | 1.27 GB/s | **1.70 GB/s** | +34% |
+| parquet (256 MiB) | nvcomp-zstd | 1.06 GB/s | **1.44 GB/s** | +36% |
+| parquet (256 MiB) | nvcomp-bitcomp | 1.20 GB/s | **1.49 GB/s** | +24% |
+| timestamps (64 MiB) | nvcomp-zstd | 0.95 GB/s | **1.14 GB/s** | +20% |
+| timestamps (64 MiB) | nvcomp-bitcomp | 1.20 GB/s | **1.45 GB/s** | +21% |
+| doc_values (64 MiB) | nvcomp-zstd | 0.80 GB/s | **1.04 GB/s** | +30% |
 
 **Reading the table:**
 
@@ -247,7 +266,22 @@ input cases. Production deployments using larger chunks via
 `streaming_compress_to_frames` (v0.2 #1) push GPU compress >5 GB/s on
 highly compressible inputs. The full head-to-head bench vs MinIO S2 /
 Garage zstd is tracked in
-[issue #14](https://github.com/abyo-software/s4/issues/14).
+[issue #14](https://github.com/abyo-software/s4/issues/14); the latest CSV
+captured on 2026-05-13 lives at
+[`benches/comparison/result-2026-05-13.csv`](benches/comparison/result-2026-05-13.csv)
+(MinIO + s4-cpu only; Garage's auto-issued keys and the s4-gpu image
+require manual setup outside the driver script).
+
+**Multipart streaming note** (v0.2 #1, surfaced again by the v0.8 #53
+comparison run): per-part S4F2 framing (4 MiB chunks) means a 64 MiB
+nginx-log multipart upload reports ~1.6× ratio at the storage layer
+instead of the 155× single-pass ratio above — each chunk is too small
+for zstd's longest-match window to amortize across the whole object.
+Ratio scales back to single-pass numbers once `cargo install` users
+configure larger multipart chunk sizes via the AWS SDK
+`multipart_chunksize` knob (S4 itself stays at the 4 MiB default for
+Range-GET granularity). The CSV captures end-to-end PUT/GET wall-clock
+including framing overhead.
 
 **Reproducing locally** (requires CUDA + nvCOMP):
 
@@ -255,6 +289,17 @@ Garage zstd is tracked in
 NVCOMP_HOME=/opt/nvcomp LD_LIBRARY_PATH=/opt/nvcomp/lib \
   cargo run --release --example bench_codecs \
     -p s4-codec --features nvcomp-gpu
+
+# Streaming pipeline bench (1 GiB highly-compressible, in-flight chunks):
+NVCOMP_HOME=/opt/nvcomp LD_LIBRARY_PATH=/opt/nvcomp/lib \
+  cargo run --release --example bench_pipeline \
+    -p s4-server --features nvcomp-gpu
+
+# Comparison vs MinIO / Garage (Docker required):
+docker compose -f benches/comparison/docker-compose.yml up -d
+AWS_REQUEST_CHECKSUM_CALCULATION=when_required \
+AWS_RESPONSE_CHECKSUM_VALIDATION=when_required \
+  ./benches/comparison/run.sh benches/comparison/result-$(date +%F).csv
 ```
 
 ## Cost savings — does S4 make sense for your bill?

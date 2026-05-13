@@ -1,0 +1,7 @@
+workload,system,original_bytes,stored_bytes,ratio,put_secs,get_secs,peak_rss_mb
+nginx-log,minio,67108884,67108884,1.00,0.512276,0.44517,
+nginx-log,s4-cpu,67108884,41943097,1.60,0.496261,0.433295,
+parquet-like,minio,67111424,67111424,1.00,0.426951,0.416357,
+parquet-like,s4-cpu,67111424,41943942,1.60,0.523442,0.454124,
+random-bytes,minio,16777216,16777216,1.00,0.397571,0.401985,
+random-bytes,s4-cpu,16777216,16777674,1.00,0.515241,0.387828,
