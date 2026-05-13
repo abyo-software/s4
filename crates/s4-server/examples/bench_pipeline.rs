@@ -69,10 +69,19 @@ async fn measure(
 ) -> (f64, u64) {
     let t0 = Instant::now();
     let blob = make_blob(data.clone(), 64 * 1024);
-    let (out, _) =
-        streaming_compress_to_frames_with(blob, Arc::clone(&registry), codec, chunk_size, inflight)
-            .await
-            .unwrap();
+    // v0.8.4 #73 M2: pass `None` because the bench doesn't simulate a
+    // truncating client — we want the streaming path to consume whatever
+    // synthetic stream the harness yielded.
+    let (out, _) = streaming_compress_to_frames_with(
+        blob,
+        Arc::clone(&registry),
+        codec,
+        chunk_size,
+        inflight,
+        None,
+    )
+    .await
+    .unwrap();
     let secs = t0.elapsed().as_secs_f64();
     (secs, out.len() as u64)
 }

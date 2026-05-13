@@ -91,11 +91,14 @@ async fn main() {
 
         // S4F2 framed single-PUT output (the v0.2 #4 path).
         let blob = make_blob(data.clone());
+        // v0.8.4 #73 M2: bench harness controls the input stream end-to-end
+        // (it isn't a truncating client) so pass `None` for `expected_size`.
         let (framed, _manifest) = streaming_compress_to_frames(
             blob,
             Arc::clone(&registry),
             CodecKind::CpuZstd,
             DEFAULT_S4F2_CHUNK_SIZE,
+            None,
         )
         .await
         .expect("framed compress");

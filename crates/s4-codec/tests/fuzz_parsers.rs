@@ -183,6 +183,11 @@ fn arb_frame_index(max_entries: usize) -> impl Strategy<Value = FrameIndex> {
             FrameIndex {
                 total_padded_size: comp_off,
                 entries,
+                // v0.8.4 #73 H-2: fuzz harness doesn't exercise the version-
+                // binding fields; default-construct to None so the existing
+                // adversarial coverage is unchanged.
+                source_etag: None,
+                source_compressed_size: None,
             }
         })
 }

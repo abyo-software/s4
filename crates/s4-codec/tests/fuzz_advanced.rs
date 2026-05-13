@@ -138,7 +138,13 @@ proptest! {
             orig_off += orig;
             comp_off += comp + 16;
         }
-        let idx = FrameIndex { total_padded_size: comp_off, entries };
+        // v0.8.4 #73 H-2: fuzz harness doesn't exercise version binding.
+        let idx = FrameIndex {
+            total_padded_size: comp_off,
+            entries,
+            source_etag: None,
+            source_compressed_size: None,
+        };
         let mut bytes = encode_index(&idx).to_vec();
         if !bytes.is_empty() {
             let i = flip_idx % bytes.len();

@@ -234,6 +234,15 @@ pub enum CodecError {
 
     #[error("codec {0:?} is not registered in this CodecRegistry")]
     UnregisteredCodec(CodecKind),
+
+    /// v0.8.4 #73 M2: streaming compress consumed fewer input bytes than the
+    /// caller advertised (typically a client disconnect mid-PUT). Surfaced
+    /// from `streaming::streaming_compress_to_frames` when its
+    /// `expected_size = Some(n)` argument is supplied; the s4-server PUT
+    /// handler maps this to a 400 BadRequest so the client cannot rely on
+    /// silent success of a half-uploaded body.
+    #[error("streaming compress truncated: expected {expected} input bytes, got {got}")]
+    TruncatedStream { expected: u64, got: u64 },
 }
 
 /// pluggable な圧縮 backend trait。

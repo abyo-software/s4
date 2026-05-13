@@ -106,10 +106,18 @@ async fn assert_roundtrip(codec: CodecKind, size: usize) {
     let registry = build_registry(codec);
 
     let blob = make_blob_chunked(original.clone(), 64 * 1024);
-    let (framed, manifest) =
-        streaming_compress_to_frames(blob, Arc::clone(&registry), codec, DEFAULT_S4F2_CHUNK_SIZE)
-            .await
-            .expect("streaming_compress_to_frames");
+    // v0.8.4 #73 M2: pass `Some(original.len())` so the truncation guard
+    // would catch a regression where the synthetic input stream returned
+    // EOF early (the rest of the test still asserts byte-equal round-trip).
+    let (framed, manifest) = streaming_compress_to_frames(
+        blob,
+        Arc::clone(&registry),
+        codec,
+        DEFAULT_S4F2_CHUNK_SIZE,
+        Some(original.len() as u64),
+    )
+    .await
+    .expect("streaming_compress_to_frames");
 
     assert_eq!(manifest.codec, codec);
     assert_eq!(manifest.original_size, original.len() as u64);

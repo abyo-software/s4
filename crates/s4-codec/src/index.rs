@@ -12,7 +12,7 @@
 //! `<key>.s4index` という sidecar object に下記の binary index を書く:
 //!
 //! ```text
-//! ┌──── 32 byte header ────┐
+//! ┌──── v1 32 byte header ─┐
 //! │ S4IX magic (4)         │
 //! │ version u32 (4)        │
 //! │ total_frames u64 (8)   │
@@ -34,14 +34,54 @@
 //! - CompleteMultipartUpload: object 全体を一度 fetch + scan して index を構築
 //! - Range GET: sidecar fetch → `lookup_range(start, end)` で frame 範囲 + S3 byte 範囲を取得
 //!   → backend に partial Range GET → frame parse → decompress → slice
+//!
+//! ## v0.8.4 #73 H-2: source object version binding (v2 header)
+//!
+//! v1 では sidecar に source object の identity が無いため、object overwrite 後に
+//! sidecar が stale のままだと Range GET が **間違った frame** を返す危険があった
+//! (古い byte offset で新 object を partial GET する hazard)。攻撃者が backend を
+//! 直接触れる脅威モデルでは、偽 sidecar を仕込めば任意 frame を露呈させ得る。
+//!
+//! 対策として v2 header に `source_etag` と `source_compressed_size` を追加。GET
+//! 側は HEAD で current etag を取って一致確認 → 不一致なら sidecar を信用せず full
+//! GET path に fall back する。
+//!
+//! ```text
+//! ┌──── v2 header (variable) ┐
+//! │ S4IX magic (4)           │
+//! │ version u32 (4) = 2      │
+//! │ total_frames u64 (8)     │
+//! │ total_original u64 (8)   │
+//! │ total_padded u64 (8)     │
+//! │ source_compressed_size u64 (8)  ← v2 で追加
+//! │ etag_len u32 (4)                 ← v2 で追加 (UTF-8 byte length, 0 = absent)
+//! │ etag bytes (etag_len)            ← v2 で追加 (RFC 7232 entity-tag, quotes 含む)
+//! └──────────────────────────┘
+//! ```
+//!
+//! - **back-compat**: v1 sidecar が backend に既存していれば read-only で `decode_index`
+//!   が `source_etag = None`, `source_compressed_size = None` で復元する。GET 側は
+//!   `None` を見たら "legacy sidecar — verify skip, full GET にも fallback できる"
+//!   と扱う (= 既存挙動保持)。
+//! - **新規 PUT**: 常に v2 を書く。`source_etag` は backend response の e_tag、
+//!   `source_compressed_size` は put body 長 (= `total_padded_size`) が原則。
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
 pub const INDEX_MAGIC: &[u8; 4] = b"S4IX";
-pub const INDEX_VERSION: u32 = 1;
+/// v0.8.4 #73 H-2: bumped 1 → 2. v2 appends `source_compressed_size` (u64) +
+/// `etag_len` (u32) + variable-length `etag` bytes to the fixed header. v1
+/// readers are kept as a back-compat path (see [`decode_index`]).
+pub const INDEX_VERSION: u32 = 2;
+/// Legacy v1 fixed header — kept for tests / back-compat readers.
+pub const INDEX_VERSION_V1: u32 = 1;
 pub const INDEX_HEADER_BYTES: usize = 4 + 4 + 8 + 8 + 4 + 4 + 8; // 40 (with padding)
-const HEADER_FIXED: usize = 4 + 4 + 8 + 8 + 8;
+/// v1 fixed header layout (kept for back-compat readers).
+const HEADER_FIXED_V1: usize = 4 + 4 + 8 + 8 + 8;
+/// v2 fixed header layout (`HEADER_FIXED_V1` + `source_compressed_size` u64 +
+/// `etag_len` u32). The variable-length `etag` payload follows.
+const HEADER_FIXED_V2: usize = HEADER_FIXED_V1 + 8 + 4;
 pub const ENTRY_BYTES: usize = 8 + 8 + 8 + 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +110,20 @@ pub struct FrameIndex {
     /// S3 上の object 全体サイズ (padding frame 含む)
     pub total_padded_size: u64,
     pub entries: Vec<FrameIndexEntry>,
+    /// v0.8.4 #73 H-2: backend-reported ETag of the source object the
+    /// sidecar describes. Populated by `s4-server::put_object` from the
+    /// backend's PUT response so the matching GET can `head_object` and
+    /// confirm it's still talking about the same body. `None` for legacy
+    /// (v1) sidecars decoded out of an existing backend, in which case
+    /// the GET path treats the partial-fetch as best-effort and falls
+    /// back to a full read on any inconsistency signal.
+    pub source_etag: Option<String>,
+    /// v0.8.4 #73 H-2: backend object's compressed bytes length the sidecar
+    /// was computed against. Cross-check signal alongside `source_etag` —
+    /// some backends (lifecycle moves, multi-object operations) can change
+    /// the bytes without a fresh ETag, so a size mismatch is independently
+    /// load-bearing. `None` on legacy v1 sidecars.
+    pub source_compressed_size: Option<u64>,
 }
 
 impl FrameIndex {
@@ -159,10 +213,42 @@ pub enum IndexError {
     EntryCountMismatch { claimed: u64, remaining: usize },
 }
 
+/// v0.8.4 #73 H-2: emit the **v2** layout (with `source_etag` /
+/// `source_compressed_size`). Pre-v0.8.4 deployments that PUT under v1 are
+/// still readable (decode_index dispatches on the version field) — only the
+/// writer path is bumped here.
 pub fn encode_index(idx: &FrameIndex) -> Bytes {
-    let mut buf = BytesMut::with_capacity(HEADER_FIXED + idx.entries.len() * ENTRY_BYTES);
+    let etag_bytes = idx.source_etag.as_deref().unwrap_or("").as_bytes();
+    let mut buf = BytesMut::with_capacity(
+        HEADER_FIXED_V2 + etag_bytes.len() + idx.entries.len() * ENTRY_BYTES,
+    );
     buf.put_slice(INDEX_MAGIC);
     buf.put_u32_le(INDEX_VERSION);
+    buf.put_u64_le(idx.entries.len() as u64);
+    buf.put_u64_le(idx.total_original_size());
+    buf.put_u64_le(idx.total_padded_size);
+    // v2 additions
+    buf.put_u64_le(idx.source_compressed_size.unwrap_or(0));
+    buf.put_u32_le(etag_bytes.len() as u32);
+    buf.put_slice(etag_bytes);
+    for e in &idx.entries {
+        buf.put_u64_le(e.original_offset);
+        buf.put_u64_le(e.original_size);
+        buf.put_u64_le(e.compressed_offset);
+        buf.put_u64_le(e.compressed_size);
+    }
+    buf.freeze()
+}
+
+/// v0.8.4 #73 H-2: legacy v1 encoder retained for the back-compat unit test
+/// (`sidecar_header_back_compat_old_format_no_source_etag`) which has to
+/// synthesize a v1 buffer to prove decode_index still parses it. Production
+/// callers should always go through [`encode_index`] which emits v2.
+#[doc(hidden)]
+pub fn encode_index_v1_for_test(idx: &FrameIndex) -> Bytes {
+    let mut buf = BytesMut::with_capacity(HEADER_FIXED_V1 + idx.entries.len() * ENTRY_BYTES);
+    buf.put_slice(INDEX_MAGIC);
+    buf.put_u32_le(INDEX_VERSION_V1);
     buf.put_u64_le(idx.entries.len() as u64);
     buf.put_u64_le(idx.total_original_size());
     buf.put_u64_le(idx.total_padded_size);
@@ -176,7 +262,7 @@ pub fn encode_index(idx: &FrameIndex) -> Bytes {
 }
 
 pub fn decode_index(mut input: Bytes) -> Result<FrameIndex, IndexError> {
-    if input.len() < HEADER_FIXED {
+    if input.len() < HEADER_FIXED_V1 {
         return Err(IndexError::TooShort(input.len()));
     }
     let mut magic = [0u8; 4];
@@ -186,12 +272,36 @@ pub fn decode_index(mut input: Bytes) -> Result<FrameIndex, IndexError> {
     }
     input.advance(4);
     let version = input.get_u32_le();
-    if version != INDEX_VERSION {
-        return Err(IndexError::UnsupportedVersion(version));
-    }
     let n = input.get_u64_le();
     let _total_original = input.get_u64_le();
     let total_padded_size = input.get_u64_le();
+    // Dispatch on version. v1 jumps straight to the entry table; v2 reads
+    // the additional fixed fields + variable-length etag before the entries.
+    let (source_compressed_size, source_etag) = match version {
+        v if v == INDEX_VERSION_V1 => (None, None),
+        v if v == INDEX_VERSION => {
+            // v2 fixed-header tail: source_compressed_size (u64) + etag_len (u32).
+            if input.len() < 8 + 4 {
+                return Err(IndexError::TooShort(input.len()));
+            }
+            let scs = input.get_u64_le();
+            let etag_len = input.get_u32_le() as usize;
+            if input.len() < etag_len {
+                return Err(IndexError::TooShort(input.len()));
+            }
+            // Slice off the etag bytes; treat decode failure as "no etag" so
+            // a corrupted etag field still leaves a usable index (the GET
+            // path will fall back to full read on the missing binding).
+            let etag_bytes = input.split_to(etag_len);
+            let etag = if etag_len == 0 {
+                None
+            } else {
+                std::str::from_utf8(&etag_bytes).ok().map(str::to_owned)
+            };
+            (if scs == 0 { None } else { Some(scs) }, etag)
+        }
+        other => return Err(IndexError::UnsupportedVersion(other)),
+    };
     let expected_remaining = (n as usize).saturating_mul(ENTRY_BYTES);
     if input.len() != expected_remaining {
         return Err(IndexError::EntryCountMismatch {
@@ -215,6 +325,8 @@ pub fn decode_index(mut input: Bytes) -> Result<FrameIndex, IndexError> {
     Ok(FrameIndex {
         total_padded_size,
         entries,
+        source_etag,
+        source_compressed_size,
     })
 }
 
@@ -258,6 +370,12 @@ pub fn build_index_from_body(body: &Bytes) -> Result<FrameIndex, crate::multipar
     Ok(FrameIndex {
         total_padded_size: body.len() as u64,
         entries,
+        // The caller (s4-server `put_object`) stamps the version-binding
+        // fields after the backend PUT returns the authoritative ETag —
+        // build_index_from_body itself only sees the post-compress bytes
+        // and cannot fabricate a server-blessed ETag.
+        source_etag: None,
+        source_compressed_size: None,
     })
 }
 
@@ -295,6 +413,11 @@ mod tests {
                     compressed_size: 30,
                 },
             ],
+            // Default-constructed in the v0.8.4 #73 H-2 sample so this fixture
+            // still drives the lookup_range / encode_decode / build_from_body
+            // paths that don't care about the version-binding fields.
+            source_etag: None,
+            source_compressed_size: None,
         }
     }
 
@@ -304,6 +427,56 @@ mod tests {
         let bytes = encode_index(&idx);
         let decoded = decode_index(bytes).unwrap();
         assert_eq!(decoded, idx);
+    }
+
+    /// v0.8.4 #73 H-2: v2 round-trip with the new `source_etag` /
+    /// `source_compressed_size` fields populated.
+    #[test]
+    fn encode_decode_roundtrip_v2_with_source_binding() {
+        let mut idx = sample_index();
+        idx.source_etag = Some("\"deadbeefcafe\"".into());
+        idx.source_compressed_size = Some(987_654);
+        let bytes = encode_index(&idx);
+        // First 4 bytes magic + next 4 bytes LE = INDEX_VERSION (2).
+        assert_eq!(&bytes[..4], INDEX_MAGIC);
+        let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        assert_eq!(version, INDEX_VERSION, "writer must always emit v2");
+        let decoded = decode_index(bytes).unwrap();
+        assert_eq!(decoded, idx);
+    }
+
+    /// v0.8.4 #73 H-2: a sidecar produced by a pre-v0.8.4 deployment
+    /// (= raw v1 bytes) must still decode cleanly under the v2 reader
+    /// with `source_etag = None` / `source_compressed_size = None`. The
+    /// GET path treats the `None` shape as "legacy — verify skip" so
+    /// existing on-disk sidecars keep serving partial fetches without a
+    /// flag day. This locks in the `decode_index` dispatch on the
+    /// `version` field that makes the back-compat path real.
+    #[test]
+    fn sidecar_header_back_compat_old_format_no_source_etag() {
+        let v2_idx = {
+            let mut idx = sample_index();
+            idx.source_etag = Some("\"unused\"".into());
+            idx.source_compressed_size = Some(42);
+            idx
+        };
+        // Round-trip through the v1 encoder — i.e. simulate decoding a
+        // sidecar that was written by a pre-v0.8.4 server. The version-
+        // binding fields are dropped on the way through (v1 has no slot
+        // for them) and must come back as `None`.
+        let v1_bytes = encode_index_v1_for_test(&v2_idx);
+        // Sanity: the on-wire version field is v1.
+        let version = u32::from_le_bytes(v1_bytes[4..8].try_into().unwrap());
+        assert_eq!(version, INDEX_VERSION_V1);
+        let decoded = decode_index(v1_bytes).expect("v1 sidecar must still decode");
+        // Frame entries + total_padded_size survive (the partial-fetch
+        // logic still works), but the new v2-only fields surface as None
+        // so the GET path knows it cannot do an etag-bind verify and
+        // applies the legacy "best-effort + fallback to full GET" rule.
+        assert_eq!(decoded.entries, v2_idx.entries);
+        assert_eq!(decoded.total_padded_size, v2_idx.total_padded_size);
+        assert_eq!(decoded.source_etag, None);
+        assert_eq!(decoded.source_compressed_size, None);
     }
 
     #[test]

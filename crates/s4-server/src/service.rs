@@ -47,8 +47,9 @@ use crate::blob::{
     bytes_to_blob, chain_sample_with_rest, collect_blob, collect_with_sample, peek_sample,
 };
 use crate::streaming::{
-    cpu_zstd_decompress_stream, pick_chunk_size, streaming_compress_to_frames,
-    supports_streaming_compress, supports_streaming_decompress,
+    Crc32cVerifyingReader, async_read_to_blob, blob_to_async_read, cpu_zstd_decompress_stream,
+    pick_chunk_size, streaming_compress_to_frames, supports_streaming_compress,
+    supports_streaming_decompress,
 };
 
 /// PUT body の先頭 sampling で渡す最大 byte 数。
@@ -1373,6 +1374,94 @@ impl<B: S3> S4Service<B> {
         }
     }
 
+    /// v0.8.4 #73 H-2: confirm that the sidecar we just decoded still
+    /// describes the current backend object before we trust its frame
+    /// offsets for a partial Range GET. The sidecar carries the source
+    /// `etag` and `compressed_size` that were observed at PUT time; we
+    /// HEAD the backend object and compare.
+    ///
+    /// Decision matrix:
+    /// - sidecar `source_etag = None` (legacy v1 / build_index_from_body
+    ///   that wasn't stamped) → return `true` (best-effort, preserves
+    ///   pre-v0.8.4 behaviour for existing on-disk sidecars).
+    /// - HEAD fails → return `false` (we can't tell either way; full GET
+    ///   path will surface the real backend error to the client).
+    /// - HEAD ETag matches → `true`.
+    /// - HEAD ETag differs OR HEAD size differs from
+    ///   `source_compressed_size` → `false` (sidecar stale or attacker-
+    ///   written; fall back to full GET).
+    async fn sidecar_version_binding_ok(
+        &self,
+        bucket: &str,
+        key: &str,
+        index: &FrameIndex,
+    ) -> bool {
+        let Some(ref expected_etag) = index.source_etag else {
+            // Legacy sidecar without the v0.8.4 #73 H-2 binding —
+            // back-compat: trust it (the partial fetch is the same
+            // best-effort path that v0.8.3 and earlier shipped).
+            return true;
+        };
+        let head_input = HeadObjectInput {
+            bucket: bucket.into(),
+            key: key.into(),
+            ..Default::default()
+        };
+        let uri = match safe_object_uri(bucket, key) {
+            Ok(u) => u,
+            Err(_) => return false,
+        };
+        let head_req = S3Request {
+            input: head_input,
+            method: http::Method::HEAD,
+            uri,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let head = match self.backend.head_object(head_req).await {
+            Ok(r) => r.output,
+            Err(e) => {
+                tracing::debug!(
+                    bucket,
+                    key,
+                    "S4 sidecar version-binding HEAD failed, falling back to full GET: {e}"
+                );
+                return false;
+            }
+        };
+        // ETag is a strong-vs-weak enum; we compare on the unwrapped string
+        // form (matches what the PUT path stamped — see below).
+        let live_etag = head.e_tag.as_ref().map(|t| t.value());
+        if live_etag != Some(expected_etag.as_str()) {
+            tracing::debug!(
+                bucket,
+                key,
+                "sidecar stale (ETag mismatch), falling back to full GET (sidecar={:?}, live={:?})",
+                expected_etag,
+                live_etag,
+            );
+            return false;
+        }
+        if let Some(expected_size) = index.source_compressed_size
+            && let Some(live_size) = head.content_length
+            && live_size as u64 != expected_size
+        {
+            tracing::debug!(
+                bucket,
+                key,
+                "sidecar stale (size mismatch), falling back to full GET (sidecar={}, live={})",
+                expected_size,
+                live_size,
+            );
+            return false;
+        }
+        true
+    }
+
     /// `<key>.s4index` sidecar を backend から読み出す。なければ None。
     async fn read_sidecar(&self, bucket: &str, key: &str) -> Option<FrameIndex> {
         let sidecar = sidecar_key(key);
@@ -1930,14 +2019,39 @@ impl<B: S3> S3 for S4Service<B> {
                 // Content-Length when known, falling back to the 4 MiB
                 // default for chunked transfers.
                 let chunk_size = pick_chunk_size(req.input.content_length.map(|n| n as u64));
+                // v0.8.4 #73 M2: pass the request's Content-Length so
+                // streaming_compress_to_frames can fail-fast on a mid-PUT
+                // truncation (client disconnect after sending half the
+                // body). `None` is the chunked-Transfer-Encoding case
+                // where the upstream genuinely doesn't know the size and
+                // the backend's framing layer is the only truncation
+                // signal we have.
+                let expected_input_size =
+                    req.input.content_length.and_then(|n| u64::try_from(n).ok());
                 let (body, manifest) = streaming_compress_to_frames(
                     chained,
                     Arc::clone(&self.registry),
                     kind,
                     chunk_size,
+                    expected_input_size,
                 )
                 .await
-                .map_err(internal("streaming framed compress"))?;
+                .map_err(|e| match e {
+                    s4_codec::CodecError::TruncatedStream { expected, got } => {
+                        // 400 IncompleteBody: client advertised N bytes
+                        // but disconnected after `got`. Mirrors AWS S3's
+                        // canonical error code for the same shape so SDK
+                        // retries kick in instead of treating the PUT as
+                        // a successful upload of a half-body.
+                        S3Error::with_message(
+                            S3ErrorCode::IncompleteBody,
+                            format!(
+                                "PUT body truncated: expected {expected} bytes, got {got}"
+                            ),
+                        )
+                    }
+                    other => internal("streaming framed compress")(other),
+                })?;
                 (body, manifest, true)
             } else {
                 // GPU codec 等で streaming-aware でないものは bytes-buffered path
@@ -2218,9 +2332,15 @@ impl<B: S3> S3 for S4Service<B> {
             {
                 req.input.key = versioned_shadow_key(&put_key, &pv.version_id);
             }
+            // v0.8.4 #73 H-2: capture the to-be-stored body length BEFORE
+            // the move into `req.input` is consumed by the backend call.
+            // The sidecar's `source_compressed_size` is checked against
+            // the live HEAD `Content-Length` on Range GET to detect a
+            // backend-side mutation.
+            let backend_object_size = req.input.content_length.and_then(|n| u64::try_from(n).ok());
             let mut backend_resp = self.backend.put_object(req).await;
-            if let Some(idx) = sidecar_index
-                && backend_resp.is_ok()
+            if let Some(mut idx) = sidecar_index
+                && let Ok(ref resp) = backend_resp
                 && idx.entries.len() > 1
             {
                 // 1 chunk しかない (small object) なら sidecar は意味がない (=
@@ -2228,6 +2348,22 @@ impl<B: S3> S3 for S4Service<B> {
                 // Sidecar は user-visible key で書く (latest version の
                 // partial fetch path 用)。Old versions の Range GET は今 task
                 // の scope 外 (full read fallback でも意味的には正しい)。
+                //
+                // v0.8.4 #73 H-2: stamp the version-binding fields the
+                // GET path needs to detect a stale / attacker-written
+                // sidecar. ETag comes from the backend's PUT response —
+                // when missing (some backends don't return an ETag) we
+                // synthesize a CRC-derived stable identifier so the
+                // sidecar still binds to *something*; the GET HEAD will
+                // see the same backend ETag (None vs None) and treat the
+                // pair as consistent.
+                let source_etag = resp
+                    .output
+                    .e_tag
+                    .as_ref()
+                    .map(|t| t.value().to_string());
+                idx.source_etag = source_etag;
+                idx.source_compressed_size = backend_object_size;
                 self.write_sidecar(&put_bucket, &put_key, &idx).await;
             }
             // v0.5 #34: commit the new version into the manager only on
@@ -2615,8 +2751,26 @@ impl<B: S3> S3 for S4Service<B> {
         // ====== Range GET の partial-fetch fast path (sidecar index 利用) ======
         // sidecar `<key>.s4index` が存在し、multipart-framed object であれば
         // 必要 frame だけを backend に Range GET し帯域節約する。
+        //
+        // v0.8.4 #73 H-2: BEFORE trusting the sidecar's frame offsets,
+        // verify the source object hasn't been overwritten / mutated since
+        // the sidecar was stamped. The sidecar carries the backend ETag
+        // captured at PUT time (`source_etag`); a HEAD against the current
+        // backend object tells us the live ETag. If they disagree we treat
+        // the sidecar as stale and fall through to the full-GET path —
+        // returning the wrong frames for a Range request would surface as
+        // a CRC mismatch deeper in the stack but would also potentially
+        // disclose unrelated frames if a hostile operator wrote the
+        // sidecar themselves. Fail-open to "full read" is the safe default.
+        //
+        // Legacy v1 sidecars (no `source_etag` populated) keep the old
+        // best-effort behaviour so existing on-disk indexes don't suddenly
+        // start missing the partial-fetch path.
         if let Some(ref r) = range_request
             && let Some(index) = self.read_sidecar(&req.input.bucket, &req.input.key).await
+            && self
+                .sidecar_version_binding_ok(&req.input.bucket, &req.input.key, &index)
+                .await
         {
             let total = index.total_original_size();
             let (start, end_exclusive) = match resolve_range(r, total) {
@@ -2823,7 +2977,22 @@ impl<B: S3> S3 for S4Service<B> {
                 && supports_streaming_decompress(m.codec)
                 && m.codec == CodecKind::CpuZstd
             {
+                // v0.8.4 #73 H-1: wrap the decompressor output in a
+                // rolling-CRC32C verifier so a tampered ciphertext (or a
+                // backend-side corruption that the zstd decoder happens
+                // to "successfully" decode into wrong bytes) surfaces as
+                // a streaming error tail at EOF instead of silently
+                // delivering corrupt plaintext to the client. The wrap
+                // is a pure pass-through during the body — no extra
+                // buffering, TTFB unaffected — and the integrity
+                // decision lands at the last chunk.
                 let decompressed_blob = cpu_zstd_decompress_stream(blob);
+                let verified_reader = Crc32cVerifyingReader::new(
+                    blob_to_async_read(decompressed_blob),
+                    m.crc32c,
+                    m.original_size,
+                );
+                let verified_blob = async_read_to_blob(verified_reader);
                 resp.output.content_length = Some(m.original_size as i64);
                 resp.output.checksum_crc32 = None;
                 resp.output.checksum_crc32c = None;
@@ -2831,7 +3000,7 @@ impl<B: S3> S3 for S4Service<B> {
                 resp.output.checksum_sha1 = None;
                 resp.output.checksum_sha256 = None;
                 resp.output.e_tag = None;
-                resp.output.body = Some(decompressed_blob);
+                resp.output.body = Some(verified_blob);
                 let elapsed = get_start.elapsed();
                 crate::metrics::record_get(
                     m.codec.as_str(),

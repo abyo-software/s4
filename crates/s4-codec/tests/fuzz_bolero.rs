@@ -175,6 +175,11 @@ fn index_roundtrip_bolero() {
             let idx = FrameIndex {
                 total_padded_size: comp_off,
                 entries,
+                // v0.8.4 #73 H-2: bolero harness doesn't fuzz the version
+                // binding fields; default-construct so the roundtrip
+                // assertion below covers the (entries, padded_size) shape.
+                source_etag: None,
+                source_compressed_size: None,
             };
             let bytes = encode_index(&idx);
             let decoded = decode_index(bytes).expect("encoded index must decode");

@@ -34,7 +34,7 @@ use s3s::stream::{ByteStream, RemainingLength};
 use s4_codec::multipart::{FrameHeader, write_frame};
 use s4_codec::{ChunkManifest, CodecError, CodecKind, CodecRegistry};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadBuf};
 use tokio_util::io::{ReaderStream, StreamReader};
 
 /// `StreamingBlob` を AsyncRead として扱えるラッパ。
@@ -43,7 +43,9 @@ use tokio_util::io::{ReaderStream, StreamReader};
 /// なので、`tokio_util::io::StreamReader` を使うと `tokio::io::AsyncRead` に変換できる。
 /// ただし StreamReader は `std::io::Error` を期待するので、StdError → io::Error への
 /// 変換層を挟む必要がある。
-pub fn blob_to_async_read(blob: StreamingBlob) -> impl AsyncRead + Unpin + Send + Sync {
+pub fn blob_to_async_read(
+    blob: StreamingBlob,
+) -> impl AsyncRead + Unpin + Send + Sync + 'static {
     let mapped = blob.map(|chunk| chunk.map_err(|e| io::Error::other(e.to_string())));
     StreamReader::new(mapped)
 }
@@ -99,6 +101,126 @@ pub fn cpu_zstd_decompress_stream(body: StreamingBlob) -> StreamingBlob {
     let mut decoder = ZstdDecoder::new(BufReader::new(read));
     decoder.multiple_members(true);
     async_read_to_blob(decoder)
+}
+
+/// v0.8.4 #73 H-1: streaming GET integrity guard. Wraps an inner `AsyncRead`
+/// (typically the output of [`cpu_zstd_decompress_stream`]) and computes a
+/// rolling CRC32C as bytes flow through. On EOF the rolling CRC and the
+/// observed byte count are compared against the manifest-declared values; a
+/// mismatch surfaces as `io::ErrorKind::InvalidData` so the HTTP body stream
+/// fails — the client sees a truncated / aborted response rather than silent
+/// corruption.
+///
+/// The wrapper is **bytes-pass-through**: the entire payload reaches the
+/// client as soon as each chunk is produced (no buffering of the plaintext),
+/// preserving the streaming TTFB property that the unwrapped CpuZstd path
+/// already has. The integrity decision lands at EOF, which on a corrupted
+/// body shows up as a streaming error tail (HTTP/1.1 chunked: an aborted
+/// final chunk; HTTP/2: RST_STREAM with INTERNAL_ERROR).
+///
+/// Why a custom wrapper instead of, say, a `tokio_util` adapter: the rolling
+/// CRC needs both the per-chunk bytes (to fold into the running checksum)
+/// and the EOF signal (to issue the final compare); the existing wrappers
+/// in `tokio-util` (`StreamReader`, `InspectReader`) only expose pre-EOF
+/// byte hooks and would require a separate end-of-stream reactor.
+pub struct Crc32cVerifyingReader<R> {
+    inner: R,
+    expected_crc: u32,
+    expected_size: u64,
+    rolling_crc: u32,
+    bytes_read: u64,
+    /// Once a verify-failure has been emitted we keep returning EOF on
+    /// subsequent polls so callers that don't immediately stop after the
+    /// error don't get a fresh CRC value (which would be the rolling CRC
+    /// from a partial stream — meaningless after the failure was reported).
+    failed: bool,
+}
+
+impl<R> Crc32cVerifyingReader<R> {
+    pub fn new(inner: R, expected_crc: u32, expected_size: u64) -> Self {
+        Self {
+            inner,
+            expected_crc,
+            expected_size,
+            rolling_crc: 0,
+            bytes_read: 0,
+            failed: false,
+        }
+    }
+
+    /// Test-only inspection of the rolling CRC at the current point in the
+    /// stream. Useful from unit tests that drive the reader manually.
+    #[cfg(test)]
+    pub fn rolling_crc(&self) -> u32 {
+        self.rolling_crc
+    }
+
+    #[cfg(test)]
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+}
+
+impl<R> AsyncRead for Crc32cVerifyingReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.failed {
+            // Once we've reported the corruption, behave like a closed
+            // stream — no further bytes, no further error. (Re-issuing
+            // the error on every poll would also be defensible; we pick
+            // "EOF after error" so callers that loop on `Ok(0)` cleanly
+            // exit instead of spinning on `Err`.)
+            return Poll::Ready(Ok(()));
+        }
+        let pre_filled = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {
+                let new_filled = buf.filled().len();
+                if new_filled > pre_filled {
+                    let chunk = &buf.filled()[pre_filled..new_filled];
+                    self.rolling_crc = crc32c::crc32c_append(self.rolling_crc, chunk);
+                    self.bytes_read = self.bytes_read.saturating_add(chunk.len() as u64);
+                    Poll::Ready(Ok(()))
+                } else {
+                    // EOF — verify both invariants. Size mismatch comes
+                    // first because a short stream often signals the same
+                    // root cause (truncation) more clearly than the CRC
+                    // mismatch derived from partial bytes.
+                    if self.bytes_read != self.expected_size {
+                        self.failed = true;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "S4 streaming GET size mismatch: \
+                                 expected {} bytes, got {}",
+                                self.expected_size, self.bytes_read
+                            ),
+                        )));
+                    }
+                    if self.rolling_crc != self.expected_crc {
+                        self.failed = true;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "S4 streaming GET crc32c mismatch: \
+                                 expected {:#010x}, got {:#010x}",
+                                self.expected_crc, self.rolling_crc
+                            ),
+                        )));
+                    }
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+    }
 }
 
 /// codec が streaming-aware かを判定 (S4Service 側で fast path 分岐に使う)。
@@ -236,11 +358,22 @@ pub const DEFAULT_S4F2_INFLIGHT: usize = 3;
 /// `compressed_size` (output buffer accumulating)。
 /// 入力 5 GB を 200 MB に圧縮する case で peak ≈ 12 MiB + 200 MB = ~212 MB
 /// (vs sequential `chunk_size + compressed_size` = ~204 MB)。
+/// `expected_size`: v0.8.4 #73 M2 — when the caller knows how many input
+/// bytes the body is supposed to deliver (e.g. an HTTP `Content-Length`),
+/// pass `Some(n)` and the function fails fast with [`CodecError::TruncatedStream`]
+/// if the input stream returns EOF before `n` bytes were consumed. Without
+/// this guard, a mid-chunk client disconnect would silently turn into a
+/// "successful" PUT of a truncated payload — the rolling CRC would be
+/// computed against the partial input and the GET would happily return the
+/// truncated body. Pass `None` for chunked Transfer-Encoding requests where
+/// the size is genuinely unknown (the upstream backend will still reject a
+/// short chunked body via its own framing).
 pub async fn streaming_compress_to_frames(
     body: StreamingBlob,
     registry: Arc<CodecRegistry>,
     codec_kind: CodecKind,
     chunk_size: usize,
+    expected_size: Option<u64>,
 ) -> Result<(Bytes, ChunkManifest), CodecError> {
     streaming_compress_to_frames_with(
         body,
@@ -248,6 +381,7 @@ pub async fn streaming_compress_to_frames(
         codec_kind,
         chunk_size,
         DEFAULT_S4F2_INFLIGHT,
+        expected_size,
     )
     .await
 }
@@ -262,6 +396,7 @@ pub async fn streaming_compress_to_frames_with(
     codec_kind: CodecKind,
     chunk_size: usize,
     inflight: usize,
+    expected_size: Option<u64>,
 ) -> Result<(Bytes, ChunkManifest), CodecError> {
     use bytes::BytesMut;
     use futures::StreamExt as _;
@@ -330,6 +465,23 @@ pub async fn streaming_compress_to_frames_with(
             Some(Err(e)) => return Err(e),
             None => break,
         }
+    }
+
+    // v0.8.4 #73 M2: truncation guard. We're about to declare the produced
+    // bytes as the canonical compressed object — if the caller advertised a
+    // Content-Length and we got fewer bytes (mid-chunk client disconnect,
+    // half-uploaded body, etc.), surface the truncation NOW so the caller
+    // can return 400 to the client. Without this branch, the rolling CRC
+    // would be computed against the partial input, the manifest would
+    // look internally consistent, and a future GET would happily return
+    // the truncated body — silent data loss.
+    if let Some(expected) = expected_size
+        && total_in < expected
+    {
+        return Err(CodecError::TruncatedStream {
+            expected,
+            got: total_in,
+        });
     }
 
     let total_framed = framed.len() as u64;
@@ -601,5 +753,96 @@ mod tests {
         assert_eq!(manifest.original_size, original.len() as u64);
         assert_eq!(manifest.compressed_size, original.len() as u64);
         assert_eq!(manifest.crc32c, crc32c::crc32c(&original));
+    }
+
+    // =================================================================
+    // v0.8.4 #73 H-1 + M2 unit coverage.
+    // =================================================================
+
+    /// v0.8.4 #73 H-1: a verifier wrapped around a clean stream must
+    /// emit exactly the inner bytes and report success at EOF.
+    #[tokio::test]
+    async fn crc32c_verifying_reader_passes_correct_crc() {
+        use tokio::io::AsyncReadExt as _;
+        let original = Bytes::from(vec![0xa3u8; 17_000]);
+        let crc = crc32c::crc32c(&original);
+        let inner = blob_to_async_read(make_blob(original.clone()));
+        let mut verifier = Crc32cVerifyingReader::new(inner, crc, original.len() as u64);
+        let mut out = Vec::new();
+        verifier
+            .read_to_end(&mut out)
+            .await
+            .expect("clean stream must read cleanly");
+        assert_eq!(out, original.as_ref());
+        // Post-condition: rolling CRC + bytes_read agree with manifest.
+        assert_eq!(verifier.rolling_crc(), crc);
+        assert_eq!(verifier.bytes_read(), original.len() as u64);
+    }
+
+    /// v0.8.4 #73 H-1: a verifier that sees corruption (rolling CRC
+    /// differs from the manifest's CRC at EOF) must surface an
+    /// `InvalidData` io error to the consumer instead of returning the
+    /// bytes silently. This is the streaming-GET integrity guarantee.
+    #[tokio::test]
+    async fn crc32c_verifying_reader_detects_corruption() {
+        use tokio::io::AsyncReadExt as _;
+        let original = Bytes::from_static(b"clean payload bytes");
+        let real_crc = crc32c::crc32c(&original);
+        // Wrap the *same* bytes but tell the verifier to expect a
+        // *different* CRC — equivalent to the upstream having tampered
+        // with the body (or a back-end corruption that the zstd decoder
+        // happened to silently decode into different bytes).
+        let bogus_expected_crc = real_crc.wrapping_add(1);
+        let inner = blob_to_async_read(make_blob(original.clone()));
+        let mut verifier =
+            Crc32cVerifyingReader::new(inner, bogus_expected_crc, original.len() as u64);
+        let mut out = Vec::new();
+        let err = verifier
+            .read_to_end(&mut out)
+            .await
+            .expect_err("CRC mismatch must surface as io::Error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("crc32c mismatch"),
+            "error must mention CRC mismatch, got `{msg}`"
+        );
+        // The bytes ARE delivered before the EOF verify (streaming is
+        // pass-through); the integrity decision lands at EOF.
+        assert_eq!(out, original.as_ref());
+    }
+
+    /// v0.8.4 #73 M2: `streaming_compress_to_frames` must reject a body
+    /// whose stream produces fewer bytes than `expected_size` (mid-PUT
+    /// truncation / client disconnect) with `TruncatedStream`.
+    #[tokio::test]
+    async fn streaming_compress_truncated_input_returns_truncated_stream_error() {
+        use s4_codec::cpu_zstd::CpuZstd;
+        let registry = Arc::new(
+            CodecRegistry::new(CodecKind::CpuZstd)
+                .with(Arc::new(CpuZstd::default())),
+        );
+        // The synthetic body yields exactly 4 KiB but the caller
+        // *advertises* 16 KiB — the same shape as a client that
+        // disconnected after 25% of the upload.
+        let actual = Bytes::from(vec![b'z'; 4096]);
+        let advertised: u64 = 16 * 1024;
+        let blob = make_blob(actual.clone());
+        let err = streaming_compress_to_frames(
+            blob,
+            registry,
+            CodecKind::CpuZstd,
+            1024,
+            Some(advertised),
+        )
+        .await
+        .expect_err("truncated stream must error");
+        match err {
+            CodecError::TruncatedStream { expected, got } => {
+                assert_eq!(expected, advertised);
+                assert_eq!(got, actual.len() as u64);
+            }
+            other => panic!("expected TruncatedStream, got {other:?}"),
+        }
     }
 }
