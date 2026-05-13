@@ -3871,7 +3871,55 @@ impl<B: S3> S3 for S4Service<B> {
                         Some(blob) => collect_blob(blob, self.max_body_bytes).await.ok(),
                         None => None,
                     },
-                    Err(_) => None,
+                    Err(e) => {
+                        // v0.8.4 #71 (C-1 audit fix): a silent
+                        // `Err(_) => None` here is a SSE plaintext
+                        // leak. The post-processing block below only
+                        // runs the SSE re-encrypt branch when
+                        // `assembled_body.is_some()`, so swallowing a
+                        // backend error skipped the encrypt step and
+                        // left the multipart object on disk as
+                        // plaintext, even on SSE-S4 / SSE-C / SSE-KMS
+                        // configured buckets. Same root-cause family
+                        // as v0.8 BUG-5; this branch closes the
+                        // remaining read-side window.
+                        //
+                        // We distinguish two cases:
+                        //  - `NoSuchKey`: the object is genuinely
+                        //    missing post-Complete. This is rare and
+                        //    typically races with a concurrent
+                        //    DeleteObject; there is nothing to re-
+                        //    encrypt and no SSE markers to honour, so
+                        //    falling through to the legacy
+                        //    `assembled_body = None` path is safe.
+                        //  - everything else (5xx, network, auth,
+                        //    etc.): we must FAIL the Complete so the
+                        //    client can retry. Returning Ok with
+                        //    `assembled_body = None` would silently
+                        //    skip the SSE re-encrypt and leave the
+                        //    backend bytes plaintext.
+                        if matches!(e.code(), &S3ErrorCode::NoSuchKey) {
+                            tracing::warn!(
+                                bucket = %bucket,
+                                key = %key,
+                                "multipart Complete: backend GET returned NoSuchKey; \
+                                 skipping post-processing (object likely raced with DeleteObject)"
+                            );
+                            None
+                        } else {
+                            tracing::error!(
+                                bucket = %bucket,
+                                key = %key,
+                                error = %e,
+                                "multipart Complete: backend GET failed; failing the Complete \
+                                 so the client retries (silent fall-through would skip SSE \
+                                 re-encrypt and store plaintext)"
+                            );
+                            return Err(internal(
+                                "multipart Complete: backend body fetch failed",
+                            )(e));
+                        }
+                    }
                 }
             } else {
                 None
@@ -4250,8 +4298,22 @@ impl<B: S3> S3 for S4Service<B> {
         // v0.8 #54: drop the per-upload state (SSE-C key bytes / tag
         // set) promptly so an aborted upload doesn't leak the
         // customer's key into a long-running gateway's RSS.
-        self.multipart_state.remove(req.input.upload_id.as_str());
-        self.backend.abort_multipart_upload(req).await
+        //
+        // v0.8.4 #71 (H-7 audit fix): backend.abort_multipart_upload
+        // FIRST, then drop in-process state ONLY on success. The
+        // previous order ("remove → call backend") meant a transient
+        // backend abort failure (5xx, network) wiped the SSE-C key
+        // bytes locally while leaving the parts on the backend, so a
+        // client retry would have to re-validate the SSE-C key against
+        // a context the gateway no longer has — and the retried abort
+        // would still hit the unaborted backend parts. Calling the
+        // backend first lets the failure propagate to the client with
+        // state intact for a clean retry; only on success do we wipe
+        // the local state.
+        let upload_id = req.input.upload_id.as_str().to_owned();
+        let resp = self.backend.abort_multipart_upload(req).await?;
+        self.multipart_state.remove(&upload_id);
+        Ok(resp)
     }
     async fn list_multipart_uploads(
         &self,
