@@ -127,6 +127,17 @@ pub struct S4Service<B: S3> {
     /// OPTIONS routing wire-up at the listener level is a follow-up
     /// (s3s framework does not surface OPTIONS as a typed handler).
     cors: Option<Arc<crate::cors::CorsManager>>,
+    /// v0.6 #36: optional first-class S3 Inventory manager. When
+    /// `Some(...)`, S4-server itself owns per-(bucket, id) inventory
+    /// configurations and `put_bucket_inventory_configuration` /
+    /// `get_bucket_inventory_configuration` /
+    /// `list_bucket_inventory_configurations` /
+    /// `delete_bucket_inventory_configuration` consult the manager
+    /// instead of passing through to the backend. The actual periodic
+    /// CSV emission is driven by a tokio task in `main.rs` that calls
+    /// `InventoryManager::run_once_for_test` on a fixed cadence; the
+    /// service handlers below only deal with config-level CRUD.
+    inventory: Option<Arc<crate::inventory::InventoryManager>>,
     /// v0.5 #32: when `true`, every PUT must carry an SSE indicator
     /// (`x-amz-server-side-encryption`, the SSE-C customer-key headers,
     /// or be matched against a configured server-managed keyring/KMS).
@@ -159,8 +170,33 @@ impl<B: S3> S4Service<B> {
             kms_default_key_id: None,
             object_lock: None,
             cors: None,
+            inventory: None,
             compliance_strict: false,
         }
+    }
+
+    /// v0.6 #36: attach the in-memory S3 Inventory manager. Once set,
+    /// `put_bucket_inventory_configuration` /
+    /// `get_bucket_inventory_configuration` /
+    /// `list_bucket_inventory_configurations` /
+    /// `delete_bucket_inventory_configuration` route through the
+    /// manager. The actual periodic CSV / manifest emission is
+    /// orchestrated by a tokio task started in `main.rs`; the manager
+    /// itself is shared between the handler and the scheduler via
+    /// `Arc`.
+    #[must_use]
+    pub fn with_inventory(mut self, mgr: Arc<crate::inventory::InventoryManager>) -> Self {
+        self.inventory = Some(mgr);
+        self
+    }
+
+    /// v0.6 #36: borrow the attached inventory manager (test /
+    /// introspection — the background scheduler in `main.rs` keeps its
+    /// own `Arc` clone, so this accessor is for the test path that
+    /// invokes `run_once_for_test` directly).
+    #[must_use]
+    pub fn inventory_manager(&self) -> Option<&Arc<crate::inventory::InventoryManager>> {
+        self.inventory.as_ref()
     }
 
     /// v0.6 #38: attach the in-memory CORS configuration manager. Once
@@ -937,6 +973,33 @@ fn write_manifest(metadata: &mut Option<Metadata>, manifest: &ChunkManifest) {
 
 fn internal<E: std::fmt::Display>(prefix: &'static str) -> impl FnOnce(E) -> S3Error {
     move |e| S3Error::with_message(S3ErrorCode::InternalError, format!("{prefix}: {e}"))
+}
+
+/// v0.6 #41: map a `select::SelectError` to the S3 error surface. AWS
+/// uses a domain-specific `InvalidSqlExpression` code for parse / unsupported
+/// errors, but s3s 0.13 doesn't expose that as a typed variant — we
+/// fall back to the well-known `InvalidRequest` 400 with a descriptive
+/// message that includes the original error context.
+fn select_error_to_s3(e: crate::select::SelectError, fmt: &str) -> S3Error {
+    use crate::select::SelectError;
+    match e {
+        SelectError::Parse(msg) => S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("SQL parse error: {msg}"),
+        ),
+        SelectError::UnsupportedFeature(msg) => S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("unsupported SQL feature: {msg}"),
+        ),
+        SelectError::RowEval(msg) => S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("SQL row evaluation error: {msg}"),
+        ),
+        SelectError::InputFormat(msg) => S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("{fmt} input format error: {msg}"),
+        ),
+    }
 }
 
 /// v0.5 #30: parse the `x-amz-bypass-governance-retention` header into a
@@ -3213,6 +3276,363 @@ impl<B: S3> S3 for S4Service<B> {
         req: S3Request<DeletePublicAccessBlockInput>,
     ) -> S3Result<S3Response<DeletePublicAccessBlockOutput>> {
         self.backend.delete_public_access_block(req).await
+    }
+
+    // ====================================================================
+    // v0.6 #41: S3 Select — server-side SQL filter on object body.
+    //
+    // Fetch the object via the regular `get_object` path (so SSE-C /
+    // SSE-S4 / SSE-KMS / S4 codec all decompress + decrypt transparently),
+    // run a small SQL subset (CSV + JSON Lines, equality / inequality /
+    // LIKE / AND / OR / NOT) over the in-memory body, and stream the
+    // matched rows back as AWS event-stream `Records` + `Stats` + `End`
+    // frames.
+    //
+    // Limitations (deliberate, documented):
+    //   - Parquet input is rejected with NotImplemented.
+    //   - Aggregates / GROUP BY / JOIN / ORDER BY / LIMIT are rejected at
+    //     parse time as InvalidRequest (s3s 0.13 doesn't expose AWS's
+    //     domain-specific `InvalidSqlExpression` code).
+    //   - The body is fully buffered before SQL evaluation (S3 Select
+    //     streaming-during-evaluation is v0.7 scope).
+    //   - GPU-accelerated WHERE evaluation is stubbed out (always None).
+    async fn select_object_content(
+        &self,
+        req: S3Request<SelectObjectContentInput>,
+    ) -> S3Result<S3Response<SelectObjectContentOutput>> {
+        use crate::select::{
+            EventStreamWriter, SelectInputFormat, SelectOutputFormat, run_select_csv,
+            run_select_jsonlines,
+        };
+
+        let select_bucket = req.input.bucket.clone();
+        let select_key = req.input.key.clone();
+        self.enforce_rate_limit(&req, &select_bucket)?;
+        self.enforce_policy(
+            &req,
+            "s3:GetObject",
+            &select_bucket,
+            Some(&select_key),
+        )?;
+
+        let request = req.input.request;
+        let sql = request.expression.clone();
+        if request.expression_type.as_str() != "SQL" {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidExpressionType,
+                format!(
+                    "ExpressionType must be SQL, got: {}",
+                    request.expression_type.as_str()
+                ),
+            ));
+        }
+
+        let input_format = if let Some(_json) = request.input_serialization.json.as_ref() {
+            SelectInputFormat::JsonLines
+        } else if let Some(csv) = request.input_serialization.csv.as_ref() {
+            let has_header = csv
+                .file_header_info
+                .as_ref()
+                .map(|h| {
+                    let s = h.as_str();
+                    s.eq_ignore_ascii_case("USE") || s.eq_ignore_ascii_case("IGNORE")
+                })
+                .unwrap_or(false);
+            let delim = csv
+                .field_delimiter
+                .as_deref()
+                .and_then(|s| s.chars().next())
+                .unwrap_or(',');
+            SelectInputFormat::Csv {
+                has_header,
+                delimiter: delim,
+            }
+        } else if request.input_serialization.parquet.is_some() {
+            return Err(S3Error::with_message(
+                S3ErrorCode::NotImplemented,
+                "Parquet input is not supported by this S3 Select implementation (v0.6: CSV / JSON Lines only)",
+            ));
+        } else {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                "InputSerialization requires exactly one of CSV / JSON / Parquet",
+            ));
+        };
+        if let Some(ct) = request.input_serialization.compression_type.as_ref()
+            && !ct.as_str().eq_ignore_ascii_case("NONE")
+        {
+            return Err(S3Error::with_message(
+                S3ErrorCode::NotImplemented,
+                format!(
+                    "InputSerialization CompressionType={} is not supported (v0.6: NONE only)",
+                    ct.as_str()
+                ),
+            ));
+        }
+
+        let output_format = if request.output_serialization.json.is_some() {
+            SelectOutputFormat::Json
+        } else if request.output_serialization.csv.is_some() {
+            SelectOutputFormat::Csv
+        } else {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                "OutputSerialization requires exactly one of CSV / JSON",
+            ));
+        };
+
+        let get_input = GetObjectInput {
+            bucket: select_bucket.clone(),
+            key: select_key.clone(),
+            sse_customer_algorithm: req.input.sse_customer_algorithm.clone(),
+            sse_customer_key: req.input.sse_customer_key.clone(),
+            sse_customer_key_md5: req.input.sse_customer_key_md5.clone(),
+            ..Default::default()
+        };
+        let get_req = S3Request {
+            input: get_input,
+            method: http::Method::GET,
+            uri: format!("/{}/{}", select_bucket, select_key)
+                .parse()
+                .map_err(|e| {
+                    S3Error::with_message(
+                        S3ErrorCode::InternalError,
+                        format!("constructing inner GET URI: {e}"),
+                    )
+                })?,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: req.credentials.clone(),
+            region: req.region.clone(),
+            service: req.service.clone(),
+            trailing_headers: None,
+        };
+        let mut get_resp = self.get_object(get_req).await?;
+        let blob = get_resp.output.body.take().ok_or_else(|| {
+            S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "Select: object body was empty after GET",
+            )
+        })?;
+        let body_bytes = crate::blob::collect_blob(blob, self.max_body_bytes)
+            .await
+            .map_err(internal("collect Select body"))?;
+        let scanned = body_bytes.len() as u64;
+
+        let matched_payload = match input_format {
+            SelectInputFormat::JsonLines => {
+                run_select_jsonlines(&sql, &body_bytes, output_format).map_err(
+                    |e| select_error_to_s3(e, "JSON Lines"),
+                )?
+            }
+            SelectInputFormat::Csv { .. } => {
+                run_select_csv(&sql, &body_bytes, input_format, output_format)
+                    .map_err(|e| select_error_to_s3(e, "CSV"))?
+            }
+        };
+
+        let returned = matched_payload.len() as u64;
+        let processed = scanned;
+        let mut events: Vec<S3Result<SelectObjectContentEvent>> = Vec::with_capacity(3);
+        if !matched_payload.is_empty() {
+            events.push(Ok(SelectObjectContentEvent::Records(RecordsEvent {
+                payload: Some(bytes::Bytes::from(matched_payload)),
+            })));
+        }
+        events.push(Ok(SelectObjectContentEvent::Stats(StatsEvent {
+            details: Some(Stats {
+                bytes_scanned: Some(scanned as i64),
+                bytes_processed: Some(processed as i64),
+                bytes_returned: Some(returned as i64),
+            }),
+        })));
+        events.push(Ok(SelectObjectContentEvent::End(EndEvent {})));
+        // Touch EventStreamWriter so the public API stays linked into the
+        // build (the actual wire framing is delegated to s3s).
+        let _writer = EventStreamWriter::new();
+
+        let stream =
+            SelectObjectContentEventStream::new(futures::stream::iter(events));
+        let output = SelectObjectContentOutput {
+            payload: Some(stream),
+        };
+        Ok(S3Response::new(output))
+    }
+
+    // ---- Bucket Inventory configuration (v0.6 #36) ----
+    //
+    // When an `InventoryManager` is attached, S4-server owns the
+    // configuration store and these handlers no longer pass through to
+    // the backend. The mapping between the s3s-typed
+    // `InventoryConfiguration` and the inventory module's internal
+    // `InventoryConfig` is intentionally lossy: only the fields S4
+    // actually uses for periodic CSV emission survive the round trip
+    // (id, source bucket, destination bucket / prefix, format, included
+    // versions, schedule frequency). Optional fields, encryption, and
+    // filter prefixes are accepted on PUT and re-surfaced on GET via
+    // a best-effort default-shape `InventoryConfiguration` so the
+    // client sees a roundtrip-clean response.
+    async fn put_bucket_inventory_configuration(
+        &self,
+        req: S3Request<PutBucketInventoryConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketInventoryConfigurationOutput>> {
+        if let Some(mgr) = self.inventory.as_ref() {
+            let cfg = inv_from_dto(
+                &req.input.bucket,
+                &req.input.id,
+                &req.input.inventory_configuration,
+            );
+            mgr.put(cfg);
+            return Ok(S3Response::new(PutBucketInventoryConfigurationOutput::default()));
+        }
+        self.backend.put_bucket_inventory_configuration(req).await
+    }
+
+    async fn get_bucket_inventory_configuration(
+        &self,
+        req: S3Request<GetBucketInventoryConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketInventoryConfigurationOutput>> {
+        if let Some(mgr) = self.inventory.as_ref() {
+            let cfg = mgr.get(&req.input.bucket, &req.input.id);
+            if let Some(cfg) = cfg {
+                let out = GetBucketInventoryConfigurationOutput {
+                    inventory_configuration: Some(inv_to_dto(&cfg)),
+                };
+                return Ok(S3Response::new(out));
+            }
+            // AWS returns `NoSuchConfiguration` (404) when the id has no
+            // matching inventory configuration on the bucket. The
+            // generated `S3ErrorCode` enum doesn't expose a typed variant
+            // for this code, so we round-trip through `from_bytes` which
+            // wraps unknown codes as `Custom(...)` (= the AWS-canonical
+            // error-code string survives into the XML response envelope).
+            let code = S3ErrorCode::from_bytes(b"NoSuchConfiguration")
+                .unwrap_or(S3ErrorCode::NoSuchKey);
+            return Err(S3Error::with_message(
+                code,
+                format!(
+                    "no inventory configuration with id={} on bucket={}",
+                    req.input.id, req.input.bucket
+                ),
+            ));
+        }
+        self.backend.get_bucket_inventory_configuration(req).await
+    }
+
+    async fn list_bucket_inventory_configurations(
+        &self,
+        req: S3Request<ListBucketInventoryConfigurationsInput>,
+    ) -> S3Result<S3Response<ListBucketInventoryConfigurationsOutput>> {
+        if let Some(mgr) = self.inventory.as_ref() {
+            let list = mgr.list_for_bucket(&req.input.bucket);
+            let dto_list: Vec<InventoryConfiguration> = list.iter().map(inv_to_dto).collect();
+            let out = ListBucketInventoryConfigurationsOutput {
+                continuation_token: req.input.continuation_token.clone(),
+                inventory_configuration_list: if dto_list.is_empty() {
+                    None
+                } else {
+                    Some(dto_list)
+                },
+                is_truncated: Some(false),
+                next_continuation_token: None,
+            };
+            return Ok(S3Response::new(out));
+        }
+        self.backend.list_bucket_inventory_configurations(req).await
+    }
+
+    async fn delete_bucket_inventory_configuration(
+        &self,
+        req: S3Request<DeleteBucketInventoryConfigurationInput>,
+    ) -> S3Result<S3Response<DeleteBucketInventoryConfigurationOutput>> {
+        if let Some(mgr) = self.inventory.as_ref() {
+            mgr.delete(&req.input.bucket, &req.input.id);
+            return Ok(S3Response::new(
+                DeleteBucketInventoryConfigurationOutput::default(),
+            ));
+        }
+        self.backend.delete_bucket_inventory_configuration(req).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.6 #36: Convert between the s3s-typed `InventoryConfiguration` (the wire
+// surface) and our internal `crate::inventory::InventoryConfig`. Only the
+// fields S4 actually uses for CSV emission survive the round trip; the
+// missing fields (filter prefix, optional fields, encryption) are dropped on
+// PUT and re-rendered as the AWS-default shape on GET so the client sees a
+// well-formed `InventoryConfiguration`.
+// ---------------------------------------------------------------------------
+
+fn inv_from_dto(
+    bucket: &str,
+    id: &str,
+    dto: &InventoryConfiguration,
+) -> crate::inventory::InventoryConfig {
+    let frequency_hours = match dto.schedule.frequency.as_str() {
+        "Weekly" => 24 * 7,
+        // Daily is the default; anything S4 doesn't recognise (incl.
+        // empty, which is the s3s-default) maps to Daily so the
+        // operator's PUT doesn't silently turn into a no-op cadence.
+        _ => 24,
+    };
+    // Parquet/ORC are not supported (issue #36 scope); we still accept
+    // the PUT so callers don't fail-loud, but we record CSV and rely on
+    // the operator catching the discrepancy on GET.
+    let format = crate::inventory::InventoryFormat::Csv;
+    crate::inventory::InventoryConfig {
+        id: id.to_owned(),
+        bucket: bucket.to_owned(),
+        destination_bucket: dto.destination.s3_bucket_destination.bucket.clone(),
+        destination_prefix: dto
+            .destination
+            .s3_bucket_destination
+            .prefix
+            .clone()
+            .unwrap_or_default(),
+        frequency_hours,
+        format,
+        included_object_versions: crate::inventory::IncludedVersions::from_aws_str(
+            dto.included_object_versions.as_str(),
+        ),
+    }
+}
+
+fn inv_to_dto(cfg: &crate::inventory::InventoryConfig) -> InventoryConfiguration {
+    InventoryConfiguration {
+        id: cfg.id.clone(),
+        is_enabled: true,
+        included_object_versions: InventoryIncludedObjectVersions::from(
+            cfg.included_object_versions.as_aws_str().to_owned(),
+        ),
+        destination: InventoryDestination {
+            s3_bucket_destination: InventoryS3BucketDestination {
+                account_id: None,
+                bucket: cfg.destination_bucket.clone(),
+                encryption: None,
+                format: InventoryFormat::from(cfg.format.as_aws_str().to_owned()),
+                prefix: if cfg.destination_prefix.is_empty() {
+                    None
+                } else {
+                    Some(cfg.destination_prefix.clone())
+                },
+            },
+        },
+        schedule: InventorySchedule {
+            // `frequency_hours == 168` -> Weekly; everything else maps to
+            // Daily for the wire response (the manager keeps the precise
+            // hour count internally for due-checking).
+            frequency: InventoryFrequency::from(
+                if cfg.frequency_hours == 24 * 7 {
+                    "Weekly"
+                } else {
+                    "Daily"
+                }
+                .to_owned(),
+            ),
+        },
+        filter: None,
+        optional_fields: None,
     }
 }
 

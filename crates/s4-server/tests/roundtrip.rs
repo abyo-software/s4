@@ -2264,3 +2264,134 @@ async fn cors_preflight_match_returns_correct_headers() {
         "no manager attached → preflight is a no-op"
     );
 }
+
+// =====================================================================
+// v0.6 #41: S3 Select end-to-end — PUT a 100-row CSV via S4 (so it
+// passes through the codec / framing path), then SelectObjectContent
+// with a WHERE filter and confirm the matched-rows-only payload comes
+// back inside the AWS event-stream `Records` frame (followed by Stats +
+// End sentinel events).
+// =====================================================================
+#[tokio::test]
+async fn s3_select_csv_filter_e2e() {
+    use futures::StreamExt as _;
+
+    let backend = MemoryBackend::new();
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    );
+
+    let mut csv_body = String::from("name,age\n");
+    for i in 0..100 {
+        csv_body.push_str(&format!("user{i},{i}\n"));
+    }
+    s4.put_object(put_request(
+        "selbucket",
+        "people.csv",
+        Bytes::from(csv_body.into_bytes()),
+    ))
+    .await
+    .expect("PUT 100-row CSV");
+
+    let select_input = SelectObjectContentInput {
+        bucket: "selbucket".into(),
+        key: "people.csv".into(),
+        expected_bucket_owner: None,
+        sse_customer_algorithm: None,
+        sse_customer_key: None,
+        sse_customer_key_md5: None,
+        request: SelectObjectContentRequest {
+            expression: "SELECT name, age FROM s3object WHERE age > 90".into(),
+            expression_type: ExpressionType::from_static(ExpressionType::SQL),
+            input_serialization: InputSerialization {
+                csv: Some(CSVInput {
+                    file_header_info: Some(FileHeaderInfo::from_static(FileHeaderInfo::USE)),
+                    field_delimiter: Some(",".into()),
+                    ..Default::default()
+                }),
+                compression_type: None,
+                json: None,
+                parquet: None,
+            },
+            output_serialization: OutputSerialization {
+                csv: Some(CSVOutput::default()),
+                json: None,
+            },
+            request_progress: None,
+            scan_range: None,
+        },
+    };
+    let req = S3Request {
+        input: select_input,
+        method: http::Method::POST,
+        uri: "/selbucket/people.csv?select&select-type=2".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let resp = s4
+        .select_object_content(req)
+        .await
+        .expect("SelectObjectContent should succeed");
+
+    let mut stream = resp.output.payload.expect("payload event stream");
+    let mut records_payload: Vec<u8> = Vec::new();
+    let mut saw_end = false;
+    let mut saw_stats = false;
+    while let Some(item) = stream.next().await {
+        let ev = item.expect("event-stream items must not be Err");
+        match ev {
+            SelectObjectContentEvent::Records(r) => {
+                if let Some(p) = r.payload {
+                    records_payload.extend_from_slice(&p);
+                }
+            }
+            SelectObjectContentEvent::Stats(s) => {
+                saw_stats = true;
+                let stats = s.details.expect("Stats.details");
+                assert!(stats.bytes_scanned.unwrap_or(0) > 100);
+                assert!(stats.bytes_returned.unwrap_or(0) > 0);
+            }
+            SelectObjectContentEvent::End(_) => {
+                saw_end = true;
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert!(saw_stats, "Stats event missing from stream");
+    assert!(saw_end, "End sentinel missing from stream");
+
+    let payload_str = std::str::from_utf8(&records_payload)
+        .expect("Records payload must be UTF-8 CSV");
+    let rows: Vec<&str> = payload_str
+        .split("\r\n")
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        rows.len(),
+        9,
+        "WHERE age > 90 expects rows 91..=99 = 9 rows, got: {rows:?}"
+    );
+    assert!(rows.iter().any(|r| r.starts_with("user91,91")));
+    assert!(rows.iter().any(|r| r.starts_with("user99,99")));
+    assert!(!rows.iter().any(|r| r.starts_with("user90,90")));
+    assert!(!rows.iter().any(|r| r.starts_with("user50,50")));
+
+    assert!(
+        s4_server::select::select_gpu(
+            "SELECT * FROM s3object",
+            b"",
+            &s4_server::select::SelectInputFormat::Csv {
+                has_header: true,
+                delimiter: ',',
+            },
+        )
+        .is_none(),
+        "GPU select stub must return None for v0.6"
+    );
+}
