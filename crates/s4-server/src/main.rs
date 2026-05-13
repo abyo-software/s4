@@ -291,6 +291,41 @@ struct Opt {
     #[clap(long, value_name = "PATH")]
     cors_state_file: Option<std::path::PathBuf>,
 
+    /// v0.6 #36: enable the in-memory S3 Inventory manager
+    /// (`InventoryManager`). When set, S4-server owns per-(bucket, id)
+    /// inventory configurations — `PutBucketInventoryConfiguration` /
+    /// `GetBucketInventoryConfiguration` /
+    /// `ListBucketInventoryConfigurations` /
+    /// `DeleteBucketInventoryConfiguration` route through the manager
+    /// (replacing the previous backend-passthrough behaviour). A
+    /// background tokio task wakes every
+    /// `--inventory-scan-interval-hours` to log the set of currently-
+    /// due inventories. Pass `--inventory-state-file ""` (empty path)
+    /// to enable the manager with no snapshot to load. The optional
+    /// path argument names a JSON snapshot file produced previously by
+    /// `InventoryManager::to_json`.
+    ///
+    /// **Note (v0.6 #36 scope):** the background scheduler currently
+    /// only logs and stamps `mark_run` for each due config. Walking the
+    /// source bucket and writing the CSV / manifest to the destination
+    /// bucket happens via `InventoryManager::run_once_for_test`, which
+    /// is the path the unit + E2E tests exercise; wiring the scheduler
+    /// to walk a real bucket end-to-end is deferred to a follow-up
+    /// because it requires a back-reference from the scheduler into
+    /// `S4Service` for the `list_objects_v2` walk and that reshuffle
+    /// is out of scope for this issue.
+    #[clap(long, value_name = "PATH")]
+    inventory_state_file: Option<std::path::PathBuf>,
+
+    /// v0.6 #36: cadence (in hours) at which the background inventory
+    /// scheduler wakes to check which configurations are due. Defaults
+    /// to 1 (= once an hour). Independent of any individual config's
+    /// `frequency_hours`; the scheduler only triggers a config when its
+    /// own `due()` predicate returns `true`. No effect when
+    /// `--inventory-state-file` is not supplied.
+    #[clap(long, value_name = "N", default_value_t = 1)]
+    inventory_scan_interval_hours: u32,
+
     /// v0.5 #32: regulated-industry posture switch. `strict` enforces
     /// at boot the presence of TLS (--tls-cert/--tls-key OR --acme,
     /// forced to TLS 1.3-only), --access-log + --audit-log-hmac-key
@@ -707,6 +742,96 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             "S4 CORS manager attached (in-memory; v0.6 #38 single-instance scope; OPTIONS routing follow-up)"
         );
         s4 = s4.with_cors(std::sync::Arc::new(mgr));
+    }
+    // v0.6 #36: wire the in-memory S3 Inventory manager when
+    // --inventory-state-file is supplied. Empty / missing path starts
+    // a fresh manager, populated path is loaded as a JSON snapshot
+    // produced previously by `InventoryManager::to_json`. The matching
+    // background scheduler (one tokio task per process) wakes every
+    // `--inventory-scan-interval-hours` to log the set of currently-
+    // due configurations and stamp `mark_run`. Walking the source
+    // bucket and writing the CSV / manifest end-to-end through the
+    // attached backend is intentionally deferred: it requires a
+    // back-reference from the scheduler into `S4Service` for
+    // `list_objects_v2`, and the test path
+    // (`InventoryManager::run_once_for_test`) already covers the CSV /
+    // manifest emission shape so this scheduler skeleton is enough to
+    // ship the configuration-management half of v0.6 #36 without
+    // putting a half-wired bucket-walk in front of users.
+    if let Some(ref path) = opt.inventory_state_file {
+        let mgr = if path.as_os_str().is_empty() || !path.exists() {
+            s4_server::inventory::InventoryManager::new()
+        } else {
+            let raw = std::fs::read_to_string(path).map_err(|e| {
+                format!("--inventory-state-file {}: read failed: {e}", path.display())
+            })?;
+            s4_server::inventory::InventoryManager::from_json(&raw).map_err(|e| {
+                format!(
+                    "--inventory-state-file {}: parse failed: {e}",
+                    path.display()
+                )
+            })?
+        };
+        let mgr = std::sync::Arc::new(mgr);
+        info!(
+            path = %path.display(),
+            interval_hours = opt.inventory_scan_interval_hours,
+            "S4 inventory manager attached (in-memory; v0.6 #36 single-instance scope; bucket-walk wiring deferred)"
+        );
+        // Spawn the cadence loop. It owns an `Arc` clone of the
+        // manager (the `S4Service` keeps the other clone via
+        // `with_inventory`). On every tick it iterates all attached
+        // configs and, for each one whose `due()` returns true, logs
+        // the trigger and stamps `mark_run` so the next tick doesn't
+        // re-fire. Real bucket walking is the deferred follow-up
+        // described above.
+        let scheduler_mgr = std::sync::Arc::clone(&mgr);
+        let interval_hours = u64::from(opt.inventory_scan_interval_hours.max(1));
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(interval_hours * 3600));
+            // Skip the first immediate tick — the CLI already logged
+            // "manager attached" so we don't want a duplicate "tick"
+            // line in the same millisecond.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let now = chrono::Utc::now();
+                // Snapshot the set of (bucket, id) keys via the JSON
+                // serialiser so we don't hold the manager's RwLock
+                // across `due()` / `mark_run()` calls below (each of
+                // those takes its own short-lived lock).
+                let due_pairs: Vec<(String, String)> = scheduler_mgr
+                    .to_json()
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .as_ref()
+                    .and_then(|v| v.get("configs"))
+                    .and_then(|c| c.as_object())
+                    .map(|o| {
+                        o.keys()
+                            .filter_map(|k| {
+                                let mut parts = k.splitn(2, '\u{1F}');
+                                let b = parts.next()?.to_owned();
+                                let i = parts.next()?.to_owned();
+                                Some((b, i))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (bucket, id) in due_pairs {
+                    if scheduler_mgr.due(&bucket, &id, now) {
+                        tracing::info!(
+                            bucket = %bucket,
+                            id = %id,
+                            "S4 inventory: configuration due (bucket walk + CSV write deferred — call run_once_for_test in tests)"
+                        );
+                        scheduler_mgr.mark_run(&bucket, &id, now);
+                    }
+                }
+            }
+        });
+        s4 = s4.with_inventory(mgr);
     }
     if matches!(opt.compliance_mode, Some(ComplianceMode::Strict)) {
         s4 = s4.with_compliance_strict(true);

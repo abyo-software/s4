@@ -2395,3 +2395,304 @@ async fn s3_select_csv_filter_e2e() {
         "GPU select stub must return None for v0.6"
     );
 }
+
+// =========================================================================
+// v0.6 #36: S3 Inventory configuration + CSV emission.
+// =========================================================================
+
+type InventoryHarness = (
+    S4Service<MemoryBackend>,
+    Arc<s4_server::inventory::InventoryManager>,
+    Arc<Mutex<HashMap<(String, String), StoredObject>>>,
+);
+
+fn make_inventory_s4(codec: CodecKind) -> InventoryHarness {
+    let backend = MemoryBackend::new();
+    let backend_view = backend.shared();
+    let mgr = Arc::new(s4_server::inventory::InventoryManager::new());
+    let s4 = S4Service::new(backend, make_registry(codec), make_dispatcher(codec))
+        .with_inventory(Arc::clone(&mgr));
+    (s4, mgr, backend_view)
+}
+
+fn put_bucket_inventory_request(
+    bucket: &str,
+    id: &str,
+    cfg: InventoryConfiguration,
+) -> S3Request<PutBucketInventoryConfigurationInput> {
+    let input = PutBucketInventoryConfigurationInput {
+        bucket: bucket.into(),
+        id: id.into(),
+        inventory_configuration: cfg,
+        expected_bucket_owner: None,
+    };
+    S3Request {
+        input,
+        method: http::Method::PUT,
+        uri: format!("/{bucket}?inventory&id={id}").parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+fn aws_inventory_config(id: &str, dst_bucket: &str, dst_prefix: &str) -> InventoryConfiguration {
+    InventoryConfiguration {
+        id: id.to_owned(),
+        is_enabled: true,
+        included_object_versions: InventoryIncludedObjectVersions::from_static(
+            InventoryIncludedObjectVersions::CURRENT,
+        ),
+        destination: InventoryDestination {
+            s3_bucket_destination: InventoryS3BucketDestination {
+                account_id: None,
+                bucket: dst_bucket.into(),
+                encryption: None,
+                format: InventoryFormat::from_static(InventoryFormat::CSV),
+                prefix: Some(dst_prefix.into()),
+            },
+        },
+        schedule: InventorySchedule {
+            frequency: InventoryFrequency::from_static(InventoryFrequency::DAILY),
+        },
+        filter: None,
+        optional_fields: None,
+    }
+}
+
+#[tokio::test]
+async fn inventory_put_get_round_trip() {
+    let (s4, _mgr, _view) = make_inventory_s4(CodecKind::Passthrough);
+    let cfg = aws_inventory_config("daily-report", "audit-dst", "inventories");
+    s4.put_bucket_inventory_configuration(put_bucket_inventory_request(
+        "src-bucket",
+        "daily-report",
+        cfg.clone(),
+    ))
+    .await
+    .expect("PutBucketInventoryConfiguration");
+
+    let get_req = S3Request {
+        input: GetBucketInventoryConfigurationInput {
+            bucket: "src-bucket".into(),
+            id: "daily-report".into(),
+            expected_bucket_owner: None,
+        },
+        method: http::Method::GET,
+        uri: "/src-bucket?inventory&id=daily-report".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let resp = s4
+        .get_bucket_inventory_configuration(get_req)
+        .await
+        .expect("GetBucketInventoryConfiguration");
+    let got = resp
+        .output
+        .inventory_configuration
+        .expect("config must round-trip");
+    assert_eq!(got.id, "daily-report");
+    assert_eq!(got.destination.s3_bucket_destination.bucket, "audit-dst");
+    assert_eq!(
+        got.destination.s3_bucket_destination.prefix.as_deref(),
+        Some("inventories")
+    );
+    assert_eq!(got.schedule.frequency.as_str(), "Daily");
+    assert_eq!(got.included_object_versions.as_str(), "Current");
+
+    let list_req = S3Request {
+        input: ListBucketInventoryConfigurationsInput {
+            bucket: "src-bucket".into(),
+            continuation_token: None,
+            expected_bucket_owner: None,
+        },
+        method: http::Method::GET,
+        uri: "/src-bucket?inventory".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let list_resp = s4
+        .list_bucket_inventory_configurations(list_req)
+        .await
+        .expect("ListBucketInventoryConfigurations");
+    let entries = list_resp
+        .output
+        .inventory_configuration_list
+        .expect("list must contain entries");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].id, "daily-report");
+
+    let del_req = S3Request {
+        input: DeleteBucketInventoryConfigurationInput {
+            bucket: "src-bucket".into(),
+            id: "daily-report".into(),
+            expected_bucket_owner: None,
+        },
+        method: http::Method::DELETE,
+        uri: "/src-bucket?inventory&id=daily-report".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    s4.delete_bucket_inventory_configuration(del_req)
+        .await
+        .expect("DeleteBucketInventoryConfiguration");
+
+    let get_again = S3Request {
+        input: GetBucketInventoryConfigurationInput {
+            bucket: "src-bucket".into(),
+            id: "daily-report".into(),
+            expected_bucket_owner: None,
+        },
+        method: http::Method::GET,
+        uri: "/src-bucket?inventory&id=daily-report".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let err = s4
+        .get_bucket_inventory_configuration(get_again)
+        .await
+        .expect_err("deleted config must yield NoSuchConfiguration");
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("NoSuchConfiguration"),
+        "expected NoSuchConfiguration after delete, got {dbg}"
+    );
+}
+
+#[tokio::test]
+async fn inventory_csv_emission_writes_to_destination_prefix() {
+    let (s4, mgr, backend_view) = make_inventory_s4(CodecKind::Passthrough);
+    let dst_prefix = "inventories";
+    let cfg = aws_inventory_config("d1", "audit-dst", dst_prefix);
+    s4.put_bucket_inventory_configuration(put_bucket_inventory_request(
+        "src", "d1", cfg,
+    ))
+    .await
+    .expect("Put inventory config");
+
+    for (k, body) in [
+        ("alpha.txt", &b"AAA"[..]),
+        ("nested/beta.bin", &b"BB"[..]),
+        ("z.txt", &b"Z"[..]),
+    ] {
+        s4.put_object(put_request("src", k, Bytes::copy_from_slice(body)))
+            .await
+            .expect("put source object");
+    }
+
+    let rows: Vec<s4_server::inventory::InventoryRow> = {
+        let view = backend_view.lock().unwrap();
+        let mut vs: Vec<_> = view
+            .iter()
+            .filter_map(|((b, k), o)| {
+                if b == "src" {
+                    Some(s4_server::inventory::InventoryRow {
+                        bucket: b.clone(),
+                        key: k.clone(),
+                        version_id: None,
+                        is_latest: true,
+                        is_delete_marker: false,
+                        size: o.body.len() as u64,
+                        last_modified: chrono::Utc::now(),
+                        etag: format!("\"etag-of-{k}\""),
+                        storage_class: "STANDARD".into(),
+                        encryption_status: "NOT-SSE".into(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        vs.sort_by(|a, b| a.key.cmp(&b.key));
+        vs
+    };
+    assert_eq!(rows.len(), 3);
+
+    let now = chrono::Utc::now();
+    let cfg_internal = s4_server::inventory::InventoryConfig {
+        id: "d1".into(),
+        bucket: "src".into(),
+        destination_bucket: "audit-dst".into(),
+        destination_prefix: dst_prefix.into(),
+        frequency_hours: 24,
+        format: s4_server::inventory::InventoryFormat::Csv,
+        included_object_versions: s4_server::inventory::IncludedVersions::Current,
+    };
+    let csv_bytes = s4_server::inventory::render_csv(rows.into_iter());
+    let csv_key = s4_server::inventory::csv_destination_key(&cfg_internal, now);
+    let manifest_key = s4_server::inventory::manifest_destination_key(&cfg_internal, now);
+    let manifest_body = s4_server::inventory::render_manifest_json(
+        &cfg_internal,
+        std::slice::from_ref(&csv_key),
+        &["dummy-md5".to_owned()],
+        now,
+    )
+    .into_bytes();
+    s4.put_object(put_request(
+        "audit-dst",
+        &csv_key,
+        Bytes::from(csv_bytes.clone()),
+    ))
+    .await
+    .expect("PUT inventory CSV");
+    s4.put_object(put_request(
+        "audit-dst",
+        &manifest_key,
+        Bytes::from(manifest_body.clone()),
+    ))
+    .await
+    .expect("PUT inventory manifest");
+    mgr.mark_run("src", "d1", now);
+
+    let got = s4
+        .get_object(get_request("audit-dst", &csv_key))
+        .await
+        .expect("GET emitted inventory CSV");
+    let got_body = read_back(got).await;
+    let csv_text = std::str::from_utf8(&got_body).expect("utf8 csv");
+    let mut lines = csv_text.lines();
+    assert_eq!(
+        lines.next().unwrap(),
+        "Bucket,Key,VersionId,IsLatest,IsDeleteMarker,Size,LastModifiedDate,ETag,StorageClass,EncryptionStatus"
+    );
+    let body_lines: Vec<&str> = lines.collect();
+    assert_eq!(body_lines.len(), 3, "one row per source object");
+    assert!(body_lines.iter().any(|l| l.contains("\"alpha.txt\"")));
+    assert!(body_lines.iter().any(|l| l.contains("\"nested/beta.bin\"")));
+    assert!(body_lines.iter().any(|l| l.contains("\"z.txt\"")));
+
+    let got_mf = s4
+        .get_object(get_request("audit-dst", &manifest_key))
+        .await
+        .expect("GET emitted manifest.json");
+    let mf_body = read_back(got_mf).await;
+    let parsed: serde_json::Value = serde_json::from_slice(&mf_body).expect("manifest json");
+    assert_eq!(parsed["sourceBucket"], "src");
+    assert_eq!(parsed["destinationBucket"], "audit-dst");
+
+    assert!(!mgr.due("src", "d1", now + chrono::Duration::hours(1)));
+    assert!(mgr.due("src", "d1", now + chrono::Duration::hours(25)));
+
+    assert!(csv_key.starts_with("inventories/src/d1/data/"));
+    assert!(manifest_key.starts_with("inventories/src/d1/"));
+    assert!(manifest_key.ends_with("manifest.json"));
+}
