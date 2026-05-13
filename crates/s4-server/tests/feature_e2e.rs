@@ -202,3 +202,254 @@ async fn lifecycle_evaluate_batch_logic_against_minio_backed_service() {
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].0, "tagged.log");
 }
+
+// ===========================================================================
+// v0.7 #47 — SigV4a verify gate end-to-end against a real hyper listener.
+// ===========================================================================
+//
+// This test stands up a `HealthRouter` wrapped around a tiny "echo OK"
+// inner service and binds it to a 127.0.0.1:0 socket. We then issue
+// raw HTTP requests via reqwest:
+//
+// - One signed with a SigV4a-shaped Authorization header whose
+//   ECDSA-P-256 signature is valid → 200.
+// - The same request with one byte of the signature flipped → 403
+//   `SignatureDoesNotMatch`.
+//
+// Unlike the lifecycle tests above, no MinIO container is required — the
+// SigV4a gate sits at the HTTP layer in front of the s3s framework, so
+// we can swap in a noop inner service without losing test coverage of
+// the wire path. The signing logic uses our own
+// `build_canonical_request_bytes` helper because no AWS SDK currently
+// supports SigV4a request signing for S3 outside of MRAP / EventBridge,
+// and reproducing the AWS-exact canonical-request byte sequence from
+// scratch (URI percent-encoding edge cases, query-string sorting,
+// multi-value header collation) would be a feature in its own right.
+
+use bytes::Bytes;
+use http::Method as HttpMethod;
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::Service;
+use hyper_util::rt::TokioIo;
+use p256::ecdsa::SigningKey;
+use p256::ecdsa::signature::Signer;
+use rand::rngs::OsRng;
+use s4_server::routing::HealthRouter;
+use s4_server::service::SigV4aGate;
+use s4_server::sigv4a::{REGION_SET_HEADER, SigV4aCredentialStore};
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::pin::Pin;
+use tokio::net::TcpListener;
+
+/// Minimal inner service that returns a fixed 200 OK for any request.
+/// Used only by the SigV4a E2E test below — keeps the test focused on
+/// the verify gate path without dragging in `s3s_aws::Proxy` + a backend
+/// container.
+#[derive(Clone)]
+struct AlwaysOk;
+
+impl Service<http::Request<Incoming>> for AlwaysOk {
+    type Response = http::Response<s3s::Body>;
+    type Error = s3s::HttpError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn call(&self, _req: http::Request<Incoming>) -> Self::Future {
+        Box::pin(async move {
+            let body = Bytes::from_static(b"inner-ok");
+            Ok(http::Response::builder()
+                .status(200)
+                .header("content-length", body.len().to_string())
+                .body(s3s::Body::http_body(http_body_util::BodyExt::map_err(
+                    Full::new(body),
+                    |never: Infallible| match never {},
+                )))
+                .expect("ok response"))
+        })
+    }
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Reproduce the SigV4 canonical-request format the routing-layer
+/// middleware expects (lifted byte-for-byte from
+/// `routing::build_canonical_request_bytes`). Kept here as a tiny copy
+/// rather than re-exposing the helper publicly because it is only ever
+/// useful in this end-to-end shape test.
+fn canonical_request(
+    method: &str,
+    path: &str,
+    query: &str,
+    signed_headers: &[(&str, &str)],
+    payload_hash: &str,
+) -> Vec<u8> {
+    let mut buf = String::new();
+    buf.push_str(method);
+    buf.push('\n');
+    buf.push_str(path);
+    buf.push('\n');
+    if query.is_empty() {
+        buf.push('\n');
+    } else {
+        let mut pairs: Vec<(&str, &str)> = query
+            .split('&')
+            .filter(|s| !s.is_empty())
+            .map(|kv| kv.split_once('=').unwrap_or((kv, "")))
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)));
+        for (i, (k, v)) in pairs.iter().enumerate() {
+            if i > 0 {
+                buf.push('&');
+            }
+            buf.push_str(k);
+            buf.push('=');
+            buf.push_str(v);
+        }
+        buf.push('\n');
+    }
+    for (name, value) in signed_headers {
+        buf.push_str(name);
+        buf.push(':');
+        buf.push_str(value.trim());
+        buf.push('\n');
+    }
+    buf.push('\n');
+    let names: Vec<&str> = signed_headers.iter().map(|(n, _)| *n).collect();
+    buf.push_str(&names.join(";"));
+    buf.push('\n');
+    buf.push_str(payload_hash);
+    buf.into_bytes()
+}
+
+#[tokio::test]
+async fn sigv4a_verify_real_listener_e2e() {
+    // Boot the SigV4a gate with a fresh keypair under access-key-id
+    // "AKIAE2E", wrap a `HealthRouter` around a noop inner service,
+    // and bind to a random port.
+    let signing = SigningKey::random(&mut OsRng);
+    let verifying = p256::ecdsa::VerifyingKey::from(&signing);
+    let mut keys = HashMap::new();
+    keys.insert("AKIAE2E".to_string(), verifying);
+    let store = std::sync::Arc::new(SigV4aCredentialStore::from_map(keys));
+    let gate = std::sync::Arc::new(SigV4aGate::new(store));
+
+    let router = HealthRouter::new(AlwaysOk, None)
+        .with_sigv4a_gate(std::sync::Arc::clone(&gate))
+        .with_region("us-east-1");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let local_addr = listener.local_addr().expect("local addr");
+    let server_router = router.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { break };
+            let io = TokioIo::new(stream);
+            let svc = server_router.clone();
+            tokio::spawn(async move {
+                let _ = http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        hyper::service::service_fn(move |req| {
+                            let svc = svc.clone();
+                            async move { svc.call(req).await }
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+
+    // Build the canonical bytes the same way the middleware will, then
+    // sign over them.
+    let host = format!("127.0.0.1:{}", local_addr.port());
+    let signed_headers = [
+        ("host", host.as_str()),
+        (
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        ("x-amz-date", "20260513T120000Z"),
+        (REGION_SET_HEADER, "us-east-1"),
+    ];
+    let canonical = canonical_request(
+        "GET",
+        "/test-bucket/key",
+        "",
+        &signed_headers,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    );
+    let sig: p256::ecdsa::Signature = signing.sign(&canonical);
+    let sig_hex = lower_hex(sig.to_der().as_bytes());
+
+    let names: Vec<&str> = signed_headers.iter().map(|(n, _)| *n).collect();
+    let auth = format!(
+        "AWS4-ECDSA-P256-SHA256 \
+         Credential=AKIAE2E/20260513/s3/aws4_request, \
+         SignedHeaders={}, \
+         Signature={sig_hex}",
+        names.join(";")
+    );
+
+    let client = reqwest::Client::builder()
+        .build()
+        .expect("reqwest client");
+    let url = format!("http://{host}/test-bucket/key");
+
+    // Happy path: valid signature → 200 from the inner AlwaysOk.
+    let resp = client
+        .request(HttpMethod::GET, &url)
+        .header(
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .header("x-amz-date", "20260513T120000Z")
+        .header(REGION_SET_HEADER, "us-east-1")
+        .header("authorization", &auth)
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "valid SigV4a signature must reach inner service: body={:?}",
+        resp.text().await.ok()
+    );
+
+    // Tamper path: flip one signature hex char → 403
+    // `SignatureDoesNotMatch` from the gate, inner service must NOT see
+    // the request.
+    let mut chars: Vec<char> = auth.chars().collect();
+    let last = chars.len() - 1;
+    chars[last] = if chars[last] == '0' { '1' } else { '0' };
+    let tampered_auth: String = chars.into_iter().collect();
+    let resp = client
+        .request(HttpMethod::GET, &url)
+        .header(
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .header("x-amz-date", "20260513T120000Z")
+        .header(REGION_SET_HEADER, "us-east-1")
+        .header("authorization", &tampered_auth)
+        .send()
+        .await
+        .expect("send tampered");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "tampered SigV4a signature must be rejected by the gate"
+    );
+    let body = resp.text().await.expect("body");
+    assert!(
+        body.contains("<Code>SignatureDoesNotMatch</Code>"),
+        "403 body must surface SignatureDoesNotMatch: {body}"
+    );
+}

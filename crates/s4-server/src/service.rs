@@ -268,6 +268,16 @@ pub struct S4Service<B: S3> {
     /// Set by `--compliance-mode strict` after the boot-time
     /// prerequisite check passes.
     compliance_strict: bool,
+    /// v0.7 #47: optional SigV4a (asymmetric ECDSA-P256-SHA256) verify
+    /// gate. When `Some(...)`, the listener-side middleware (see
+    /// [`crate::routing::try_sigv4a_verify`]) inspects every incoming
+    /// request and short-circuits SigV4a-signed ones — verifying the
+    /// signature against the credential store and returning 403
+    /// `SignatureDoesNotMatch` / `InvalidAccessKeyId` on failure. Plain
+    /// SigV4 (HMAC-SHA256) requests pass through to s3s untouched. When
+    /// `None`, the middleware is a no-op so the existing SigV4 path is
+    /// unaffected (operators opt in via `--sigv4a-credentials <DIR>`).
+    sigv4a_gate: Option<Arc<SigV4aGate>>,
 }
 
 impl<B: S3> S4Service<B> {
@@ -301,7 +311,33 @@ impl<B: S3> S4Service<B> {
             replication: None,
             mfa_delete: None,
             compliance_strict: false,
+            sigv4a_gate: None,
         }
+    }
+
+    /// v0.7 #47: attach the SigV4a verify gate. Once set, the
+    /// listener-side middleware (`crate::routing::try_sigv4a_verify`)
+    /// short-circuits any incoming `AWS4-ECDSA-P256-SHA256` request,
+    /// verifying it against the supplied credential store and
+    /// returning 403 on failure. Plain SigV4 (HMAC-SHA256) requests
+    /// are unaffected. When the gate is unset (default), the
+    /// middleware skips entirely so existing SigV4 deployments keep
+    /// working.
+    #[must_use]
+    pub fn with_sigv4a_gate(mut self, gate: Arc<SigV4aGate>) -> Self {
+        self.sigv4a_gate = Some(gate);
+        self
+    }
+
+    /// v0.7 #47: borrow the attached SigV4a gate. Used by `main.rs`
+    /// to snapshot the gate `Arc` before the s3s `ServiceBuilder`
+    /// consumes the `S4Service` (the listener-side middleware needs
+    /// the same `Arc` because s3s' SigV4 verifier rejects SigV4a
+    /// algorithm tokens with "unknown algorithm" — match has to
+    /// happen at the hyper layer instead).
+    #[must_use]
+    pub fn sigv4a_gate(&self) -> Option<&Arc<SigV4aGate>> {
+        self.sigv4a_gate.as_ref()
     }
 
     /// v0.6 #39: attach the in-memory object + bucket Tagging manager.

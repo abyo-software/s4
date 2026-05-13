@@ -743,12 +743,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             keys = store.len(),
             "S4 SigV4a credential store loaded (verification gate)"
         );
-        // Note: integration into the request gate requires plumbing the
-        // canonicalised request bytes from the s3s framework. That hook
-        // is the follow-up to v0.5 #33; the store is loaded here so an
-        // operator-visible startup-time error catches a bad PEM dir
-        // ahead of the next deploy iteration that wires the gate up.
-        let _ = store;
+        // v0.7 #47: wrap the credential store in a SigV4aGate and attach
+        // it to the service. The listener-side middleware (registered
+        // below in `run_server` via `HealthRouter::with_sigv4a_gate`)
+        // pulls the gate back off the service and runs verification at
+        // the HTTP layer — s3s' SigV4 verifier would otherwise reject
+        // every `AWS4-ECDSA-P256-SHA256` request as "unknown algorithm".
+        let gate = std::sync::Arc::new(s4_server::service::SigV4aGate::new(
+            std::sync::Arc::new(store),
+        ));
+        s4 = s4.with_sigv4a_gate(gate);
     }
     if let Some(ref kek_dir) = opt.kms_local_dir {
         let kms = s4_server::kms::LocalKms::open(kek_dir.clone())
@@ -1157,6 +1161,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // OPTIONS as a typed S3 handler — match has to happen at the hyper
     // layer instead.
     let cors_manager = s4.cors_manager().cloned();
+    // v0.7 #47: same shape — snapshot the optional SigV4a gate Arc so
+    // the listener-side verify middleware can be attached on the
+    // `HealthRouter` after the s3s `ServiceBuilder` has consumed `s4`.
+    let sigv4a_gate = s4.sigv4a_gate().cloned();
 
     // v0.7 #45: wrap `S4Service` in an Arc so the lifecycle scanner
     // (background tokio task) and the s3s service builder share the
@@ -1202,7 +1210,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     }
 
     let shared = s4_server::service_arc::SharedService::new(s4_arc);
-    run_server(shared, &sdk_conf, &opt, ready_client, cors_manager).await
+    run_server(
+        shared,
+        &sdk_conf,
+        &opt,
+        ready_client,
+        cors_manager,
+        sigv4a_gate,
+    )
+    .await
 }
 
 /// v0.5 #32: enforce compliance-mode prerequisites at boot. Each
@@ -1310,6 +1326,7 @@ async fn run_server<S>(
     opt: &Opt,
     ready_client: aws_sdk_s3::Client,
     cors_manager: Option<Arc<s4_server::cors::CorsManager>>,
+    sigv4a_gate: Option<Arc<s4_server::service::SigV4aGate>>,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>>
 where
     S: S3 + Send + Sync + 'static,
@@ -1338,6 +1355,20 @@ where
         // v0.7 #44: install the CORS manager so OPTIONS preflight is
         // handled at the HTTP layer (Allow-* headers / 403 deny).
         routed_service = routed_service.with_cors_manager(mgr);
+    }
+    if let Some(gate) = sigv4a_gate {
+        // v0.7 #47: install the SigV4a verify gate so
+        // `AWS4-ECDSA-P256-SHA256` requests are verified before they
+        // reach s3s (which would otherwise reject them as "unknown
+        // algorithm"). Plain SigV4 (HMAC) requests are unaffected.
+        routed_service = routed_service.with_sigv4a_gate(gate);
+        // The SigV4a region check uses the listener's served region —
+        // pulled from the AWS SDK config (the same source the rest of
+        // the server uses to talk to its backend). Falls back to the
+        // `HealthRouter` default ("us-east-1") when unset.
+        if let Some(region) = sdk_conf.region() {
+            routed_service = routed_service.with_region(region.as_ref());
+        }
     }
 
     let listener = TcpListener::bind((opt.host.as_str(), opt.port)).await?;
