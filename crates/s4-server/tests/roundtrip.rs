@@ -2028,3 +2028,239 @@ async fn compliance_strict_accepts_put_with_keyring_configured() {
         .await
         .expect("strict PUT must succeed when SSE-S4 keyring is configured");
 }
+
+
+// ---- v0.6 #38: CORS bucket configuration + preflight ----
+
+fn put_bucket_cors_request(
+    bucket: &str,
+    rules: Vec<CORSRule>,
+) -> S3Request<PutBucketCorsInput> {
+    let input = PutBucketCorsInput {
+        bucket: bucket.into(),
+        cors_configuration: CORSConfiguration { cors_rules: rules },
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+    };
+    S3Request {
+        input,
+        method: http::Method::PUT,
+        uri: format!("/{bucket}?cors").parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+fn get_bucket_cors_request(bucket: &str) -> S3Request<GetBucketCorsInput> {
+    let input = GetBucketCorsInput {
+        bucket: bucket.into(),
+        expected_bucket_owner: None,
+    };
+    S3Request {
+        input,
+        method: http::Method::GET,
+        uri: format!("/{bucket}?cors").parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+#[tokio::test]
+async fn cors_put_get_round_trip() {
+    use std::sync::Arc;
+    let backend = MemoryBackend::new();
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::Passthrough),
+        make_dispatcher(CodecKind::Passthrough),
+    )
+    .with_cors(Arc::new(s4_server::cors::CorsManager::new()));
+
+    let rules = vec![
+        CORSRule {
+            allowed_origins: vec!["https://app.example.com".into()],
+            allowed_methods: vec!["GET".into(), "PUT".into()],
+            allowed_headers: Some(vec!["Content-Type".into(), "X-Amz-Date".into()]),
+            expose_headers: Some(vec!["ETag".into()]),
+            id: Some("rule-1".into()),
+            max_age_seconds: Some(3600),
+        },
+        CORSRule {
+            allowed_origins: vec!["*".into()],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: None,
+            expose_headers: None,
+            id: None,
+            max_age_seconds: None,
+        },
+    ];
+
+    s4.put_bucket_cors(put_bucket_cors_request("b", rules.clone()))
+        .await
+        .expect("PutBucketCors");
+
+    let resp = s4
+        .get_bucket_cors(get_bucket_cors_request("b"))
+        .await
+        .expect("GetBucketCors");
+    let got = resp.output.cors_rules.expect("rules present");
+    assert_eq!(got.len(), 2, "two rules round-trip");
+
+    // Rule 1 — explicit headers / expose / id / max-age preserved.
+    assert_eq!(
+        got[0].allowed_origins,
+        vec!["https://app.example.com".to_string()]
+    );
+    assert_eq!(
+        got[0].allowed_methods,
+        vec!["GET".to_string(), "PUT".to_string()]
+    );
+    assert_eq!(
+        got[0].allowed_headers.as_ref().expect("allowed_headers"),
+        &vec!["Content-Type".to_string(), "X-Amz-Date".to_string()]
+    );
+    assert_eq!(
+        got[0].expose_headers.as_ref().expect("expose_headers"),
+        &vec!["ETag".to_string()]
+    );
+    assert_eq!(got[0].id.as_deref(), Some("rule-1"));
+    assert_eq!(got[0].max_age_seconds, Some(3600));
+
+    // Rule 2 — empty optional fields collapse back to None.
+    assert_eq!(got[1].allowed_origins, vec!["*".to_string()]);
+    assert_eq!(got[1].allowed_methods, vec!["GET".to_string()]);
+    assert!(got[1].allowed_headers.is_none());
+    assert!(got[1].expose_headers.is_none());
+    assert_eq!(got[1].max_age_seconds, None);
+
+    // Sanity: GET on bucket with no config → NoSuchCORSConfiguration 404.
+    let err = s4
+        .get_bucket_cors(get_bucket_cors_request("ghost"))
+        .await
+        .expect_err("missing config must error");
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("NoSuchCORSConfiguration"),
+        "expected NoSuchCORSConfiguration, got {dbg}"
+    );
+}
+
+#[tokio::test]
+async fn cors_preflight_match_returns_correct_headers() {
+    use std::sync::Arc;
+    let backend = MemoryBackend::new();
+    let cors = Arc::new(s4_server::cors::CorsManager::new());
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::Passthrough),
+        make_dispatcher(CodecKind::Passthrough),
+    )
+    .with_cors(Arc::clone(&cors));
+
+    // Seed a rule via PutBucketCors so we exercise the same wire path
+    // an SDK client would use.
+    s4.put_bucket_cors(put_bucket_cors_request(
+        "b",
+        vec![CORSRule {
+            allowed_origins: vec!["https://app.example.com".into()],
+            allowed_methods: vec!["GET".into(), "PUT".into(), "POST".into()],
+            allowed_headers: Some(vec!["Content-Type".into(), "X-Amz-Date".into()]),
+            expose_headers: Some(vec!["ETag".into(), "X-Amz-Request-Id".into()]),
+            id: Some("explicit-origin".into()),
+            max_age_seconds: Some(600),
+        }],
+    ))
+    .await
+    .expect("PutBucketCors");
+
+    // Matching preflight — mixed-case header to confirm CI matching.
+    let headers = s4
+        .handle_preflight(
+            "b",
+            "https://app.example.com",
+            "PUT",
+            &["content-type".to_owned()],
+        )
+        .expect("preflight should match");
+    assert_eq!(
+        headers.get("Access-Control-Allow-Origin").map(String::as_str),
+        Some("https://app.example.com"),
+        "explicit origin echoed back verbatim"
+    );
+    assert_eq!(
+        headers.get("Access-Control-Allow-Methods").map(String::as_str),
+        Some("GET, PUT, POST")
+    );
+    assert_eq!(
+        headers.get("Access-Control-Allow-Headers").map(String::as_str),
+        Some("Content-Type, X-Amz-Date")
+    );
+    assert_eq!(
+        headers.get("Access-Control-Max-Age").map(String::as_str),
+        Some("600")
+    );
+    assert_eq!(
+        headers
+            .get("Access-Control-Expose-Headers")
+            .map(String::as_str),
+        Some("ETag, X-Amz-Request-Id")
+    );
+
+    // Non-matching method must return None (caller turns into 403).
+    assert!(
+        s4.handle_preflight(
+            "b",
+            "https://app.example.com",
+            "DELETE",
+            &["content-type".to_owned()],
+        )
+        .is_none(),
+        "method outside rule must miss"
+    );
+
+    // Wildcard origin — replace config and confirm "*" echoes back as "*".
+    s4.put_bucket_cors(put_bucket_cors_request(
+        "b",
+        vec![CORSRule {
+            allowed_origins: vec!["*".into()],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: Some(vec!["*".into()]),
+            expose_headers: None,
+            id: None,
+            max_age_seconds: Some(60),
+        }],
+    ))
+    .await
+    .expect("PutBucketCors (wildcard)");
+    let headers = s4
+        .handle_preflight("b", "https://anything", "GET", &["X-Custom".to_owned()])
+        .expect("wildcard preflight");
+    assert_eq!(
+        headers.get("Access-Control-Allow-Origin").map(String::as_str),
+        Some("*"),
+        "wildcard rule echoes Access-Control-Allow-Origin: *"
+    );
+
+    // Sanity: handle_preflight without a manager returns None.
+    let backend2 = MemoryBackend::new();
+    let plain = S4Service::new(
+        backend2,
+        make_registry(CodecKind::Passthrough),
+        make_dispatcher(CodecKind::Passthrough),
+    );
+    assert!(
+        plain
+            .handle_preflight("b", "https://x", "GET", &[])
+            .is_none(),
+        "no manager attached → preflight is a no-op"
+    );
+}

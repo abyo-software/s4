@@ -276,6 +276,21 @@ struct Opt {
     #[clap(long, value_name = "PATH")]
     object_lock_state_file: Option<std::path::PathBuf>,
 
+    /// v0.6 #38: enable the in-memory CORS bucket-configuration manager
+    /// (`CorsManager`). When set, S4-server itself owns per-bucket CORS
+    /// rules — `PutBucketCors` / `GetBucketCors` / `DeleteBucketCors`
+    /// route through the manager (replacing the previous
+    /// backend-passthrough behaviour). The optional path argument names
+    /// a JSON snapshot file that's loaded at startup if present;
+    /// SIGUSR1-triggered dump-back is a future hook (see
+    /// `CorsManager::to_json` / `from_json`). Pass
+    /// `--cors-state-file ""` (empty path) to enable the manager with no
+    /// snapshot to load. **Note:** OPTIONS preflight HTTP routing is
+    /// not yet wired at the listener level; this flag enables only the
+    /// configuration-management half of v0.6 #38.
+    #[clap(long, value_name = "PATH")]
+    cors_state_file: Option<std::path::PathBuf>,
+
     /// v0.5 #32: regulated-industry posture switch. `strict` enforces
     /// at boot the presence of TLS (--tls-cert/--tls-key OR --acme,
     /// forced to TLS 1.3-only), --access-log + --audit-log-hmac-key
@@ -670,6 +685,28 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             "S4 Object Lock manager attached (in-memory; v0.5 #30 single-instance scope)"
         );
         s4 = s4.with_object_lock(std::sync::Arc::new(mgr));
+    }
+    // v0.6 #38: wire the in-memory CORS bucket-configuration manager
+    // when --cors-state-file is supplied. Same shape as the versioning /
+    // object-lock flags: empty / missing path starts a fresh manager,
+    // populated path is loaded as a JSON snapshot (produced by
+    // `CorsManager::to_json`).
+    if let Some(ref path) = opt.cors_state_file {
+        let mgr = if path.as_os_str().is_empty() || !path.exists() {
+            s4_server::cors::CorsManager::new()
+        } else {
+            let raw = std::fs::read_to_string(path).map_err(|e| {
+                format!("--cors-state-file {}: read failed: {e}", path.display())
+            })?;
+            s4_server::cors::CorsManager::from_json(&raw).map_err(|e| {
+                format!("--cors-state-file {}: parse failed: {e}", path.display())
+            })?
+        };
+        info!(
+            path = %path.display(),
+            "S4 CORS manager attached (in-memory; v0.6 #38 single-instance scope; OPTIONS routing follow-up)"
+        );
+        s4 = s4.with_cors(std::sync::Arc::new(mgr));
     }
     if matches!(opt.compliance_mode, Some(ComplianceMode::Strict)) {
         s4 = s4.with_compliance_strict(true);

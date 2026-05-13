@@ -118,6 +118,15 @@ pub struct S4Service<B: S3> {
     /// existing v0.4 deployments are unaffected until they explicitly
     /// call `with_object_lock(...)`.
     object_lock: Option<Arc<crate::object_lock::ObjectLockManager>>,
+    /// v0.6 #38: optional first-class CORS bucket configuration manager.
+    /// When `Some(...)`, S4-server itself owns per-bucket CORS rules and
+    /// `put_bucket_cors` / `get_bucket_cors` / `delete_bucket_cors`
+    /// consult the manager instead of passing through to the backend.
+    /// `handle_preflight` (public method on `S4Service`) routes OPTIONS-
+    /// style preflight matching through the same store; the actual HTTP
+    /// OPTIONS routing wire-up at the listener level is a follow-up
+    /// (s3s framework does not surface OPTIONS as a typed handler).
+    cors: Option<Arc<crate::cors::CorsManager>>,
     /// v0.5 #32: when `true`, every PUT must carry an SSE indicator
     /// (`x-amz-server-side-encryption`, the SSE-C customer-key headers,
     /// or be matched against a configured server-managed keyring/KMS).
@@ -149,8 +158,88 @@ impl<B: S3> S4Service<B> {
             kms: None,
             kms_default_key_id: None,
             object_lock: None,
+            cors: None,
             compliance_strict: false,
         }
+    }
+
+    /// v0.6 #38: attach the in-memory CORS configuration manager. Once
+    /// set, `put_bucket_cors` / `get_bucket_cors` / `delete_bucket_cors`
+    /// route through the manager instead of forwarding to the backend,
+    /// and [`Self::handle_preflight`] becomes useful for the (future)
+    /// listener-side OPTIONS interceptor.
+    #[must_use]
+    pub fn with_cors(mut self, mgr: Arc<crate::cors::CorsManager>) -> Self {
+        self.cors = Some(mgr);
+        self
+    }
+
+    /// v0.6 #38: Borrow the attached CORS manager (test / introspection).
+    #[must_use]
+    pub fn cors_manager(&self) -> Option<&Arc<crate::cors::CorsManager>> {
+        self.cors.as_ref()
+    }
+
+    /// v0.6 #38: evaluate a CORS preflight request against the bucket's
+    /// configured rules and, if a rule matches, return the headers that
+    /// the (future) listener-side OPTIONS interceptor must put on the
+    /// 200 response: `Access-Control-Allow-Origin`, `Access-Control-
+    /// Allow-Methods`, `Access-Control-Allow-Headers`, optionally
+    /// `Access-Control-Max-Age` and `Access-Control-Expose-Headers`.
+    ///
+    /// Returns `None` when no manager is attached, no config is
+    /// registered for the bucket, or no rule matches the (origin,
+    /// method, headers) triple. The caller is responsible for turning
+    /// `None` into the appropriate 403 response.
+    ///
+    /// **Note:** the OPTIONS routing itself (i.e. wiring this method
+    /// into the hyper-util listener path) is a follow-up — s3s does not
+    /// surface OPTIONS as a typed S3 handler, so this method is
+    /// currently call-able only from inside other handlers and tests.
+    #[must_use]
+    pub fn handle_preflight(
+        &self,
+        bucket: &str,
+        origin: &str,
+        method: &str,
+        request_headers: &[String],
+    ) -> Option<std::collections::HashMap<String, String>> {
+        let mgr = self.cors.as_ref()?;
+        let rule = mgr.match_preflight(bucket, origin, method, request_headers)?;
+        let mut h = std::collections::HashMap::new();
+        // Echo the matched origin back. If the rule used "*" we still
+        // echo "*" (S3 spec — the spec does not require us to echo the
+        // *requesting* origin when the wildcard matched).
+        let allow_origin = if rule.allowed_origins.iter().any(|o| o == "*") {
+            "*".to_string()
+        } else {
+            origin.to_string()
+        };
+        h.insert("Access-Control-Allow-Origin".to_string(), allow_origin);
+        h.insert(
+            "Access-Control-Allow-Methods".to_string(),
+            rule.allowed_methods.join(", "),
+        );
+        if !rule.allowed_headers.is_empty() {
+            // For the Allow-Headers response, echo back the rule's
+            // pattern list verbatim (S3 echoes the configured list,
+            // including "*" if present). Browsers honour exact-match
+            // rules.
+            h.insert(
+                "Access-Control-Allow-Headers".to_string(),
+                rule.allowed_headers.join(", "),
+            );
+        }
+        if let Some(secs) = rule.max_age_seconds {
+            h.insert("Access-Control-Max-Age".to_string(), secs.to_string());
+        }
+        if !rule.expose_headers.is_empty() {
+            h.insert(
+                "Access-Control-Expose-Headers".to_string(),
+                rule.expose_headers.join(", "),
+            );
+        }
+        Some(h)
     }
 
     /// v0.5 #32: enable strict compliance mode. Every PUT must carry an
@@ -2849,23 +2938,80 @@ impl<B: S3> S3 for S4Service<B> {
         self.backend.put_bucket_acl(req).await
     }
 
-    // ---- Bucket CORS ----
+    // ---- Bucket CORS (v0.6 #38) ----
     async fn get_bucket_cors(
         &self,
         req: S3Request<GetBucketCorsInput>,
     ) -> S3Result<S3Response<GetBucketCorsOutput>> {
+        if let Some(mgr) = self.cors.as_ref() {
+            let cfg = mgr.get(&req.input.bucket).ok_or_else(|| {
+                S3Error::with_message(
+                    S3ErrorCode::NoSuchCORSConfiguration,
+                    "The CORS configuration does not exist".to_string(),
+                )
+            })?;
+            let rules: Vec<CORSRule> = cfg
+                .rules
+                .into_iter()
+                .map(|r| CORSRule {
+                    allowed_headers: if r.allowed_headers.is_empty() {
+                        None
+                    } else {
+                        Some(r.allowed_headers)
+                    },
+                    allowed_methods: r.allowed_methods,
+                    allowed_origins: r.allowed_origins,
+                    expose_headers: if r.expose_headers.is_empty() {
+                        None
+                    } else {
+                        Some(r.expose_headers)
+                    },
+                    id: r.id,
+                    max_age_seconds: r.max_age_seconds.map(|s| s as i32),
+                })
+                .collect();
+            return Ok(S3Response::new(GetBucketCorsOutput {
+                cors_rules: Some(rules),
+            }));
+        }
         self.backend.get_bucket_cors(req).await
     }
     async fn put_bucket_cors(
         &self,
         req: S3Request<PutBucketCorsInput>,
     ) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        if let Some(mgr) = self.cors.as_ref() {
+            let cfg = crate::cors::CorsConfig {
+                rules: req
+                    .input
+                    .cors_configuration
+                    .cors_rules
+                    .into_iter()
+                    .map(|r| crate::cors::CorsRule {
+                        allowed_origins: r.allowed_origins,
+                        allowed_methods: r.allowed_methods,
+                        allowed_headers: r.allowed_headers.unwrap_or_default(),
+                        expose_headers: r.expose_headers.unwrap_or_default(),
+                        max_age_seconds: r.max_age_seconds.and_then(|s| {
+                            if s < 0 { None } else { Some(s as u32) }
+                        }),
+                        id: r.id,
+                    })
+                    .collect(),
+            };
+            mgr.put(&req.input.bucket, cfg);
+            return Ok(S3Response::new(PutBucketCorsOutput::default()));
+        }
         self.backend.put_bucket_cors(req).await
     }
     async fn delete_bucket_cors(
         &self,
         req: S3Request<DeleteBucketCorsInput>,
     ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        if let Some(mgr) = self.cors.as_ref() {
+            mgr.delete(&req.input.bucket);
+            return Ok(S3Response::new(DeleteBucketCorsOutput::default()));
+        }
         self.backend.delete_bucket_cors(req).await
     }
 
