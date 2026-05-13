@@ -1650,3 +1650,336 @@ async fn sse_kms_roundtrip_with_local_kms() {
         "expected KMS-required error, got {dbg}"
     );
 }
+
+// =========================================================================
+// v0.5 #30: Object Lock (WORM) enforcement integration tests.
+//
+// All four E2E tests build an `S4Service` with `with_object_lock(...)`
+// attached, drive PUT / DELETE / put_object_retention /
+// put_object_legal_hold / put_object_lock_configuration through the
+// public S3 trait, and assert that the lock manager refuses the
+// operation with HTTP 403 `AccessDenied` while a lock is in effect (or
+// permits it once the lock has expired or been explicitly bypassed).
+// =========================================================================
+
+fn make_object_locked_s4(
+    codec: CodecKind,
+) -> (
+    S4Service<MemoryBackend>,
+    Arc<s4_server::object_lock::ObjectLockManager>,
+) {
+    let backend = MemoryBackend::new();
+    let mgr = Arc::new(s4_server::object_lock::ObjectLockManager::new());
+    let s4 = S4Service::new(backend, make_registry(codec), make_dispatcher(codec))
+        .with_object_lock(Arc::clone(&mgr));
+    (s4, mgr)
+}
+
+fn delete_request_with_bypass(
+    bucket: &str,
+    key: &str,
+    bypass: bool,
+) -> S3Request<DeleteObjectInput> {
+    let input = DeleteObjectInput {
+        bucket: bucket.into(),
+        key: key.into(),
+        bypass_governance_retention: Some(bypass),
+        ..Default::default()
+    };
+    S3Request {
+        input,
+        method: http::Method::DELETE,
+        uri: format!("/{bucket}/{key}").parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+#[tokio::test]
+async fn object_lock_compliance_mode_blocks_delete_until_expiry() {
+    use chrono::{Duration as ChronoDuration, Utc};
+    use s4_server::object_lock::{LockMode, ObjectLockState};
+
+    let (s4, mgr) = make_object_locked_s4(CodecKind::CpuZstd);
+    let payload = Bytes::from_static(b"locked-compliance");
+    s4.put_object(put_request("bucket", "obj", payload.clone()))
+        .await
+        .expect("put");
+    // Arm a Compliance-mode retention 1 day in the future.
+    mgr.set(
+        "bucket",
+        "obj",
+        ObjectLockState {
+            mode: Some(LockMode::Compliance),
+            retain_until: Some(Utc::now() + ChronoDuration::days(1)),
+            legal_hold_on: false,
+        },
+    );
+
+    // DELETE without bypass → 403 AccessDenied.
+    let err = s4
+        .delete_object(delete_request("bucket", "obj"))
+        .await
+        .expect_err("Compliance must block delete");
+    assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+    // DELETE WITH bypass=true → still 403 (Compliance is never bypassable).
+    let err = s4
+        .delete_object(delete_request_with_bypass("bucket", "obj", true))
+        .await
+        .expect_err("Compliance must reject bypass header");
+    assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+    // Once retention has expired, DELETE succeeds.
+    mgr.set(
+        "bucket",
+        "obj",
+        ObjectLockState {
+            mode: Some(LockMode::Compliance),
+            retain_until: Some(Utc::now() - ChronoDuration::seconds(1)),
+            legal_hold_on: false,
+        },
+    );
+    s4.delete_object(delete_request("bucket", "obj"))
+        .await
+        .expect("expired Compliance lock must permit delete");
+    // After delete the per-object lock state is cleared so the freed key
+    // can be re-armed by a future PUT under the bucket default.
+    assert!(mgr.get("bucket", "obj").is_none());
+}
+
+#[tokio::test]
+async fn object_lock_governance_mode_allows_delete_with_bypass_header() {
+    use chrono::{Duration as ChronoDuration, Utc};
+    use s4_server::object_lock::{LockMode, ObjectLockState};
+
+    let (s4, mgr) = make_object_locked_s4(CodecKind::CpuZstd);
+    let payload = Bytes::from_static(b"locked-governance");
+    s4.put_object(put_request("bucket", "gov", payload.clone()))
+        .await
+        .expect("put");
+    mgr.set(
+        "bucket",
+        "gov",
+        ObjectLockState {
+            mode: Some(LockMode::Governance),
+            retain_until: Some(Utc::now() + ChronoDuration::days(7)),
+            legal_hold_on: false,
+        },
+    );
+
+    // Without bypass header → AccessDenied.
+    let err = s4
+        .delete_object(delete_request("bucket", "gov"))
+        .await
+        .expect_err("Governance without bypass must be denied");
+    assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+    // With bypass=true → permitted.
+    s4.delete_object(delete_request_with_bypass("bucket", "gov", true))
+        .await
+        .expect("Governance + bypass must permit delete");
+    // Re-arm via per-object retention is cleared after the permitted
+    // delete (so a subsequent PUT can pick up bucket-default retention).
+    assert!(mgr.get("bucket", "gov").is_none());
+}
+
+#[tokio::test]
+async fn object_lock_legal_hold_blocks_delete_independent_of_retention() {
+    use s4_server::object_lock::ObjectLockState;
+
+    let (s4, mgr) = make_object_locked_s4(CodecKind::CpuZstd);
+    let payload = Bytes::from_static(b"legal-hold-only");
+    s4.put_object(put_request("bucket", "lh", payload.clone()))
+        .await
+        .expect("put");
+    // No retention at all — pure legal hold.
+    mgr.set(
+        "bucket",
+        "lh",
+        ObjectLockState {
+            mode: None,
+            retain_until: None,
+            legal_hold_on: true,
+        },
+    );
+
+    // Bypass header is irrelevant; legal hold cannot be bypassed.
+    let err = s4
+        .delete_object(delete_request_with_bypass("bucket", "lh", true))
+        .await
+        .expect_err("legal hold must block delete even with bypass");
+    assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+    // Lifting the legal hold via the public API (PutObjectLegalHold)
+    // unblocks delete.
+    let put_lh = PutObjectLegalHoldInput {
+        bucket: "bucket".into(),
+        key: "lh".into(),
+        legal_hold: Some(ObjectLockLegalHold {
+            status: Some(ObjectLockLegalHoldStatus::from_static(
+                ObjectLockLegalHoldStatus::OFF,
+            )),
+        }),
+        ..Default::default()
+    };
+    let lh_req = S3Request {
+        input: put_lh,
+        method: http::Method::PUT,
+        uri: "/bucket/lh?legal-hold".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    s4.put_object_legal_hold(lh_req)
+        .await
+        .expect("toggle legal hold off");
+    // Confirm GET reflects OFF.
+    let get_lh = GetObjectLegalHoldInput {
+        bucket: "bucket".into(),
+        key: "lh".into(),
+        ..Default::default()
+    };
+    let get_req = S3Request {
+        input: get_lh,
+        method: http::Method::GET,
+        uri: "/bucket/lh?legal-hold".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let resp = s4
+        .get_object_legal_hold(get_req)
+        .await
+        .expect("get legal hold");
+    let status = resp
+        .output
+        .legal_hold
+        .as_ref()
+        .and_then(|h| h.status.as_ref())
+        .map(|s| s.as_str().to_owned())
+        .unwrap_or_default();
+    assert_eq!(status, "OFF");
+    // Now delete succeeds.
+    s4.delete_object(delete_request("bucket", "lh"))
+        .await
+        .expect("delete must succeed once legal hold is off");
+}
+
+#[tokio::test]
+async fn object_lock_bucket_default_auto_applies_on_put() {
+    use s4_server::object_lock::{BucketObjectLockDefault, LockMode};
+
+    let (s4, mgr) = make_object_locked_s4(CodecKind::CpuZstd);
+    // Install a 30-day Governance default via the public S3 API
+    // (PutObjectLockConfiguration).
+    let put_cfg_input = PutObjectLockConfigurationInput {
+        bucket: "bucket".into(),
+        object_lock_configuration: Some(ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(
+                ObjectLockEnabled::ENABLED,
+            )),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    days: Some(30),
+                    mode: Some(ObjectLockRetentionMode::from_static(
+                        ObjectLockRetentionMode::GOVERNANCE,
+                    )),
+                    years: None,
+                }),
+            }),
+        }),
+        ..Default::default()
+    };
+    let put_cfg_req = S3Request {
+        input: put_cfg_input,
+        method: http::Method::PUT,
+        uri: "/bucket?object-lock".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    s4.put_object_lock_configuration(put_cfg_req)
+        .await
+        .expect("put bucket lock config");
+    // Sanity: the manager now has a default.
+    let default = mgr.bucket_default("bucket").expect("default present");
+    assert_eq!(default.mode, LockMode::Governance);
+    assert_eq!(default.retention_days, 30);
+    assert_eq!(
+        default,
+        BucketObjectLockDefault {
+            mode: LockMode::Governance,
+            retention_days: 30,
+        }
+    );
+
+    // Read-back via the public S3 API also surfaces it.
+    let get_cfg_req = S3Request {
+        input: GetObjectLockConfigurationInput {
+            bucket: "bucket".into(),
+            ..Default::default()
+        },
+        method: http::Method::GET,
+        uri: "/bucket?object-lock".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let cfg_resp = s4
+        .get_object_lock_configuration(get_cfg_req)
+        .await
+        .expect("get bucket lock config");
+    let days = cfg_resp
+        .output
+        .object_lock_configuration
+        .as_ref()
+        .and_then(|c| c.rule.as_ref())
+        .and_then(|r| r.default_retention.as_ref())
+        .and_then(|d| d.days);
+    assert_eq!(days, Some(30));
+
+    // PUT a new object — bucket-default retention auto-applies.
+    let payload = Bytes::from_static(b"auto-locked");
+    s4.put_object(put_request("bucket", "auto", payload.clone()))
+        .await
+        .expect("put");
+    let state = mgr.get("bucket", "auto").expect("auto-applied state");
+    assert_eq!(state.mode, Some(LockMode::Governance));
+    let until = state.retain_until.expect("retain_until set");
+    let now = chrono::Utc::now();
+    let secs = (until - now).num_seconds();
+    // 30 days ± 5 seconds slack.
+    assert!(
+        (30 * 86400 - 5..=30 * 86400 + 5).contains(&secs),
+        "retain_until off: {secs} seconds from now (expected ~30 days)"
+    );
+
+    // DELETE without bypass → AccessDenied (Governance applies).
+    let err = s4
+        .delete_object(delete_request("bucket", "auto"))
+        .await
+        .expect_err("auto-applied Governance must block delete");
+    assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+    // DELETE with bypass=true → permitted.
+    s4.delete_object(delete_request_with_bypass("bucket", "auto", true))
+        .await
+        .expect("bypass permits delete");
+}

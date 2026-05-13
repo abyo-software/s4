@@ -256,6 +256,19 @@ struct Opt {
     #[clap(long, value_name = "PATH")]
     versioning_state_file: Option<std::path::PathBuf>,
 
+    /// v0.5 #30: enable the in-memory Object Lock (WORM) enforcement
+    /// manager. When set, S4-server refuses DELETE / overwrite on
+    /// objects covered by an active retention or legal hold (HTTP 403
+    /// `AccessDenied`), and auto-applies any per-bucket default
+    /// retention to new PUTs. The optional path argument names a JSON
+    /// snapshot file that's loaded at startup if present; SIGUSR1-
+    /// driven dump-back-to-file is a future hook (see
+    /// `ObjectLockManager::to_json` / `from_json` — not yet wired in
+    /// v0.5 #30's scope). Pass `--object-lock-state-file ""` (empty
+    /// path) to enable the manager with no snapshot to load.
+    #[clap(long, value_name = "PATH")]
+    object_lock_state_file: Option<std::path::PathBuf>,
+
     /// v0.5 #31: optional subcommand. When omitted, runs the gateway
     /// (existing v0.4 behaviour). Available subcommands:
     /// `verify-audit-log <FILE> --hmac-key <SPEC>` walks an audit-log
@@ -604,6 +617,33 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             "S4 versioning state machine attached (in-memory; v0.5 #34 single-instance scope)"
         );
         s4 = s4.with_versioning(std::sync::Arc::new(mgr));
+    }
+    // v0.5 #30: same shape as the versioning flag above. An empty /
+    // missing path starts a fresh manager; a populated path is loaded
+    // as a JSON snapshot (produced previously by
+    // `ObjectLockManager::to_json`).
+    if let Some(ref path) = opt.object_lock_state_file {
+        let mgr = if path.as_os_str().is_empty() || !path.exists() {
+            s4_server::object_lock::ObjectLockManager::new()
+        } else {
+            let raw = std::fs::read_to_string(path).map_err(|e| {
+                format!(
+                    "--object-lock-state-file {}: read failed: {e}",
+                    path.display()
+                )
+            })?;
+            s4_server::object_lock::ObjectLockManager::from_json(&raw).map_err(|e| {
+                format!(
+                    "--object-lock-state-file {}: parse failed: {e}",
+                    path.display()
+                )
+            })?
+        };
+        info!(
+            path = %path.display(),
+            "S4 Object Lock manager attached (in-memory; v0.5 #30 single-instance scope)"
+        );
+        s4 = s4.with_object_lock(std::sync::Arc::new(mgr));
     }
     run_server(s4, &sdk_conf, &opt, ready_client).await
 }

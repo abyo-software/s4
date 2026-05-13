@@ -6,6 +6,7 @@ pub mod audit_log;
 pub mod blob;
 pub mod kms;
 pub mod metrics;
+pub mod object_lock;
 pub mod policy;
 pub mod rate_limit;
 pub mod routing;

@@ -107,6 +107,17 @@ pub struct S4Service<B: S3> {
     /// bucket-default behaviour).
     kms: Option<Arc<dyn crate::kms::KmsBackend>>,
     kms_default_key_id: Option<String>,
+    /// v0.5 #30: optional Object Lock (WORM) enforcement layer. When
+    /// `Some(...)`, `delete_object` and overwrite-style `put_object`
+    /// consult the manager and refuse the operation with HTTP 403
+    /// `AccessDenied` while the object is locked (Compliance until
+    /// expiry, Governance unless the bypass header is set, or any time
+    /// a legal hold is on). PUT also auto-applies the bucket-default
+    /// retention to brand-new objects when configured. When `None`
+    /// (default), the legacy backend-passthrough behaviour applies, so
+    /// existing v0.4 deployments are unaffected until they explicitly
+    /// call `with_object_lock(...)`.
+    object_lock: Option<Arc<crate::object_lock::ObjectLockManager>>,
 }
 
 impl<B: S3> S4Service<B> {
@@ -131,7 +142,22 @@ impl<B: S3> S4Service<B> {
             versioning: None,
             kms: None,
             kms_default_key_id: None,
+            object_lock: None,
         }
+    }
+
+    /// v0.5 #30: attach the in-memory Object Lock (WORM) enforcement
+    /// manager. Once set, `delete_object` and overwrite-path
+    /// `put_object` refuse operations on locked keys with HTTP 403
+    /// `AccessDenied`; new PUTs to a bucket with a default retention
+    /// policy auto-create per-object lock state.
+    #[must_use]
+    pub fn with_object_lock(
+        mut self,
+        mgr: Arc<crate::object_lock::ObjectLockManager>,
+    ) -> Self {
+        self.object_lock = Some(mgr);
+        self
     }
 
     /// v0.5 #28: attach an SSE-KMS backend. `default_key_id` is used
@@ -805,6 +831,42 @@ fn internal<E: std::fmt::Display>(prefix: &'static str) -> impl FnOnce(E) -> S3E
     move |e| S3Error::with_message(S3ErrorCode::InternalError, format!("{prefix}: {e}"))
 }
 
+/// v0.5 #30: parse the `x-amz-bypass-governance-retention` header into a
+/// boolean flag. AWS S3 accepts `true` (case-insensitive); any other value
+/// (including missing) is treated as `false`.
+fn parse_bypass_governance_header(headers: &http::HeaderMap) -> bool {
+    headers
+        .get("x-amz-bypass-governance-retention")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Convert s3s `Timestamp` into a `chrono::DateTime<Utc>` by formatting it
+/// as an RFC3339 string and re-parsing through `chrono`. The string format
+/// avoids pulling the `time` crate (transitive dep of s3s, not declared by
+/// s4-server) into our direct deps. Returns `None` if the format/parse fails
+/// or the value is outside `chrono`'s supported range.
+fn timestamp_to_chrono_utc(ts: &Timestamp) -> Option<chrono::DateTime<chrono::Utc>> {
+    let mut buf = Vec::new();
+    ts.format(s3s::dto::TimestampFormat::DateTime, &mut buf).ok()?;
+    let s = std::str::from_utf8(&buf).ok()?;
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+/// Inverse of [`timestamp_to_chrono_utc`] — emit RFC3339 (the s3s
+/// `DateTime` wire format) and re-parse via `Timestamp::parse`.
+fn chrono_utc_to_timestamp(dt: chrono::DateTime<chrono::Utc>) -> Timestamp {
+    // chrono's RFC3339 output format matches s3s' parser ("...Z" with
+    // optional sub-second precision). Fall back to UNIX_EPOCH if anything
+    // unexpected happens — we never produce malformed strings, so this
+    // branch is unreachable in practice.
+    let s = dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    Timestamp::parse(s3s::dto::TimestampFormat::DateTime, &s).unwrap_or_default()
+}
+
 /// `Range` request を decompressed object サイズ `total` に適用して `(start, end_exclusive)`
 /// を返す。`Range::Int { first, last }` は `bytes=first-last` (last は inclusive)、
 /// `Range::Suffix { length }` は末尾 `length` byte。S3 仕様に準拠。
@@ -852,6 +914,53 @@ impl<B: S3> S3 for S4Service<B> {
         let access_preamble = self.access_log_preamble(&req);
         self.enforce_rate_limit(&req, &put_bucket)?;
         self.enforce_policy(&req, "s3:PutObject", &put_bucket, Some(&put_key))?;
+        // v0.5 #30: an Object Lock-protected key cannot be overwritten by
+        // a non-versioned PUT (Suspended / Unversioned bucket). Enabled
+        // bucket PUTs are exempt because they materialise a fresh
+        // version under a shadow key (`<key>.__s4ver__/<vid>`) — the
+        // locked version's bytes are untouched. The check mirrors the
+        // delete path (Compliance never bypassable, Governance via the
+        // bypass header, legal hold never).
+        if let Some(mgr) = self.object_lock.as_ref()
+            && let Some(state) = mgr.get(&put_bucket, &put_key)
+        {
+            let bucket_versioned_enabled = self
+                .versioning
+                .as_ref()
+                .map(|v| v.state(&put_bucket) == crate::versioning::VersioningState::Enabled)
+                .unwrap_or(false);
+            if !bucket_versioned_enabled {
+                let bypass = parse_bypass_governance_header(&req.headers);
+                let now = chrono::Utc::now();
+                if !state.can_delete(now, bypass) {
+                    crate::metrics::record_policy_denial("s3:PutObject", &put_bucket);
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::AccessDenied,
+                        "Access Denied because object protected by object lock",
+                    ));
+                }
+            }
+        }
+        // v0.5 #30: per-PUT explicit retention / legal hold (S3
+        // `x-amz-object-lock-mode`, `x-amz-object-lock-retain-until-date`,
+        // `x-amz-object-lock-legal-hold`). Captured before the body
+        // moves into the backend; persisted into the manager only on
+        // backend success below.
+        let explicit_lock_mode: Option<crate::object_lock::LockMode> = req
+            .input
+            .object_lock_mode
+            .as_ref()
+            .and_then(|m| crate::object_lock::LockMode::from_aws_str(m.as_str()));
+        let explicit_retain_until: Option<chrono::DateTime<chrono::Utc>> = req
+            .input
+            .object_lock_retain_until_date
+            .as_ref()
+            .and_then(timestamp_to_chrono_utc);
+        let explicit_legal_hold_on: Option<bool> = req
+            .input
+            .object_lock_legal_hold_status
+            .as_ref()
+            .map(|s| s.as_str().eq_ignore_ascii_case("ON"));
         if let Some(blob) = req.input.body.take() {
             // Sample 4 KiB から codec を決定。streaming-aware codec なら streaming
             // compress fast path、そうでなければ従来の collect-then-compress。
@@ -1124,6 +1233,30 @@ impl<B: S3> S3 for S4Service<B> {
                     Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS));
                 resp.output.ssekms_key_id = Some(wrapped.key_id.clone());
             }
+            // v0.5 #30: persist any per-PUT explicit retention / legal
+            // hold the client supplied, then auto-apply the bucket
+            // default (no-op when state is already populated). The
+            // explicit fields take precedence — the bucket-default
+            // helper bails out as soon as it sees any retention.
+            if let (Some(mgr), Ok(_)) = (self.object_lock.as_ref(), backend_resp.as_ref()) {
+                if explicit_lock_mode.is_some()
+                    || explicit_retain_until.is_some()
+                    || explicit_legal_hold_on.is_some()
+                {
+                    let mut state = mgr.get(&put_bucket, &put_key).unwrap_or_default();
+                    if let Some(m) = explicit_lock_mode {
+                        state.mode = Some(m);
+                    }
+                    if let Some(u) = explicit_retain_until {
+                        state.retain_until = Some(u);
+                    }
+                    if let Some(lh) = explicit_legal_hold_on {
+                        state.legal_hold_on = lh;
+                    }
+                    mgr.set(&put_bucket, &put_key, state);
+                }
+                mgr.apply_default_on_put(&put_bucket, &put_key, chrono::Utc::now());
+            }
             let _ = (original_size, compressed_size); // mute unused warnings
             let elapsed = put_start.elapsed();
             crate::metrics::record_put(
@@ -1212,6 +1345,28 @@ impl<B: S3> S3 for S4Service<B> {
             if pv.versioned_response {
                 resp.output.version_id = Some(pv.version_id.clone());
             }
+        }
+        // v0.5 #30: same explicit-then-default lock-state commit as the
+        // body-bearing branch above, so a zero-length PUT also picks up
+        // bucket-default retention.
+        if let (Some(mgr), Ok(_)) = (self.object_lock.as_ref(), backend_resp.as_ref()) {
+            if explicit_lock_mode.is_some()
+                || explicit_retain_until.is_some()
+                || explicit_legal_hold_on.is_some()
+            {
+                let mut state = mgr.get(&put_bucket, &put_key).unwrap_or_default();
+                if let Some(m) = explicit_lock_mode {
+                    state.mode = Some(m);
+                }
+                if let Some(u) = explicit_retain_until {
+                    state.retain_until = Some(u);
+                }
+                if let Some(lh) = explicit_legal_hold_on {
+                    state.legal_hold_on = lh;
+                }
+                mgr.set(&put_bucket, &put_key, state);
+            }
+            mgr.apply_default_on_put(&put_bucket, &put_key, chrono::Utc::now());
         }
         backend_resp
     }
@@ -1608,6 +1763,26 @@ impl<B: S3> S3 for S4Service<B> {
         let key = req.input.key.clone();
         self.enforce_rate_limit(&req, &bucket)?;
         self.enforce_policy(&req, "s3:DeleteObject", &bucket, Some(&key))?;
+        // v0.5 #30: refuse the delete while a WORM lock is in effect.
+        // Compliance can never be bypassed; Governance can be overridden
+        // via `x-amz-bypass-governance-retention: true`; legal hold
+        // never. The check happens before the versioning router so a
+        // locked object can't be soft-deleted (delete-marker push) on an
+        // Enabled bucket either — S3 spec says lock applies to all
+        // delete forms.
+        if let Some(mgr) = self.object_lock.as_ref()
+            && let Some(state) = mgr.get(&bucket, &key)
+        {
+            let bypass = req.input.bypass_governance_retention.unwrap_or(false);
+            let now = chrono::Utc::now();
+            if !state.can_delete(now, bypass) {
+                crate::metrics::record_policy_denial("s3:DeleteObject", &bucket);
+                return Err(S3Error::with_message(
+                    S3ErrorCode::AccessDenied,
+                    "Access Denied because object protected by object lock",
+                ));
+            }
+        }
         // v0.5 #34: route DELETE through the VersioningManager when the
         // bucket is in a versioning-aware state.
         //
@@ -1708,6 +1883,13 @@ impl<B: S3> S3 for S4Service<B> {
         // Legacy / Unversioned path: physical delete on the backend +
         // best-effort sidecar cleanup (mirrors v0.4 behaviour).
         let resp = self.backend.delete_object(req).await?;
+        // v0.5 #30: drop any per-object lock state once the delete has
+        // succeeded so the freed key can be re-armed by a future PUT
+        // under the bucket default. Reaching here implies the lock had
+        // already passed `can_delete` above, so this is purely cleanup.
+        if let Some(mgr) = self.object_lock.as_ref() {
+            mgr.clear(&bucket, &key);
+        }
         let sidecar_input = DeleteObjectInput {
             bucket: bucket.clone(),
             key: sidecar_key(&key),
@@ -2291,41 +2473,233 @@ impl<B: S3> S3 for S4Service<B> {
         Ok(S3Response::new(copy_output))
     }
 
-    // ---- Object lock / retention / legal hold ----
+    // ---- Object lock / retention / legal hold (v0.5 #30) ----
+    //
+    // When an `ObjectLockManager` is attached the configuration / per-object
+    // state lives in the manager and these handlers serve directly from it;
+    // when no manager is attached they fall back to the backend (legacy
+    // passthrough so v0.4 deployments are unaffected).
     async fn get_object_lock_configuration(
         &self,
         req: S3Request<GetObjectLockConfigurationInput>,
     ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
+        if let Some(mgr) = self.object_lock.as_ref() {
+            let cfg = mgr.bucket_default(&req.input.bucket).map(|d| {
+                ObjectLockConfiguration {
+                    object_lock_enabled: Some(ObjectLockEnabled::from_static(
+                        ObjectLockEnabled::ENABLED,
+                    )),
+                    rule: Some(ObjectLockRule {
+                        default_retention: Some(DefaultRetention {
+                            days: Some(d.retention_days as i32),
+                            mode: Some(ObjectLockRetentionMode::from_static(
+                                match d.mode {
+                                    crate::object_lock::LockMode::Governance => {
+                                        ObjectLockRetentionMode::GOVERNANCE
+                                    }
+                                    crate::object_lock::LockMode::Compliance => {
+                                        ObjectLockRetentionMode::COMPLIANCE
+                                    }
+                                },
+                            )),
+                            years: None,
+                        }),
+                    }),
+                }
+            });
+            let output = GetObjectLockConfigurationOutput {
+                object_lock_configuration: cfg,
+            };
+            return Ok(S3Response::new(output));
+        }
         self.backend.get_object_lock_configuration(req).await
     }
     async fn put_object_lock_configuration(
         &self,
         req: S3Request<PutObjectLockConfigurationInput>,
     ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
+        if let Some(mgr) = self.object_lock.as_ref() {
+            let bucket = req.input.bucket.clone();
+            if let Some(cfg) = req.input.object_lock_configuration.as_ref()
+                && let Some(rule) = cfg.rule.as_ref()
+                && let Some(d) = rule.default_retention.as_ref()
+            {
+                let mode = d
+                    .mode
+                    .as_ref()
+                    .and_then(|m| crate::object_lock::LockMode::from_aws_str(m.as_str()))
+                    .ok_or_else(|| {
+                        S3Error::with_message(
+                            S3ErrorCode::InvalidRequest,
+                            "Object Lock default retention requires a valid Mode (GOVERNANCE | COMPLIANCE)",
+                        )
+                    })?;
+                // S3 spec: exactly one of Days / Years (we accept Days
+                // outright and convert Years → Days for storage; Years
+                // is just a UX shorthand on the wire).
+                let days: u32 = match (d.days, d.years) {
+                    (Some(d), None) if d > 0 => d as u32,
+                    (None, Some(y)) if y > 0 => (y as u32).saturating_mul(365),
+                    _ => {
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InvalidRequest,
+                            "Object Lock default retention requires exactly one of Days or Years (positive integer)",
+                        ));
+                    }
+                };
+                mgr.set_bucket_default(
+                    &bucket,
+                    crate::object_lock::BucketObjectLockDefault {
+                        mode,
+                        retention_days: days,
+                    },
+                );
+            }
+            return Ok(S3Response::new(PutObjectLockConfigurationOutput::default()));
+        }
         self.backend.put_object_lock_configuration(req).await
     }
     async fn get_object_legal_hold(
         &self,
         req: S3Request<GetObjectLegalHoldInput>,
     ) -> S3Result<S3Response<GetObjectLegalHoldOutput>> {
+        if let Some(mgr) = self.object_lock.as_ref() {
+            let on = mgr
+                .get(&req.input.bucket, &req.input.key)
+                .map(|s| s.legal_hold_on)
+                .unwrap_or(false);
+            let status = ObjectLockLegalHoldStatus::from_static(if on {
+                ObjectLockLegalHoldStatus::ON
+            } else {
+                ObjectLockLegalHoldStatus::OFF
+            });
+            let output = GetObjectLegalHoldOutput {
+                legal_hold: Some(ObjectLockLegalHold {
+                    status: Some(status),
+                }),
+            };
+            return Ok(S3Response::new(output));
+        }
         self.backend.get_object_legal_hold(req).await
     }
     async fn put_object_legal_hold(
         &self,
         req: S3Request<PutObjectLegalHoldInput>,
     ) -> S3Result<S3Response<PutObjectLegalHoldOutput>> {
+        if let Some(mgr) = self.object_lock.as_ref() {
+            let on = req
+                .input
+                .legal_hold
+                .as_ref()
+                .and_then(|h| h.status.as_ref())
+                .map(|s| s.as_str().eq_ignore_ascii_case("ON"))
+                .unwrap_or(false);
+            mgr.set_legal_hold(&req.input.bucket, &req.input.key, on);
+            return Ok(S3Response::new(PutObjectLegalHoldOutput::default()));
+        }
         self.backend.put_object_legal_hold(req).await
     }
     async fn get_object_retention(
         &self,
         req: S3Request<GetObjectRetentionInput>,
     ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
+        if let Some(mgr) = self.object_lock.as_ref() {
+            let retention = mgr
+                .get(&req.input.bucket, &req.input.key)
+                .filter(|s| s.mode.is_some() || s.retain_until.is_some())
+                .map(|s| {
+                    let mode = s.mode.map(|m| {
+                        ObjectLockRetentionMode::from_static(match m {
+                            crate::object_lock::LockMode::Governance => {
+                                ObjectLockRetentionMode::GOVERNANCE
+                            }
+                            crate::object_lock::LockMode::Compliance => {
+                                ObjectLockRetentionMode::COMPLIANCE
+                            }
+                        })
+                    });
+                    let until = s.retain_until.map(chrono_utc_to_timestamp);
+                    ObjectLockRetention {
+                        mode,
+                        retain_until_date: until,
+                    }
+                });
+            let output = GetObjectRetentionOutput { retention };
+            return Ok(S3Response::new(output));
+        }
         self.backend.get_object_retention(req).await
     }
     async fn put_object_retention(
         &self,
         req: S3Request<PutObjectRetentionInput>,
     ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
+        if let Some(mgr) = self.object_lock.as_ref() {
+            let bucket = req.input.bucket.clone();
+            let key = req.input.key.clone();
+            let bypass = req.input.bypass_governance_retention.unwrap_or(false);
+            let retention = req.input.retention.as_ref().ok_or_else(|| {
+                S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    "PutObjectRetention requires a Retention element",
+                )
+            })?;
+            let new_mode = retention
+                .mode
+                .as_ref()
+                .and_then(|m| crate::object_lock::LockMode::from_aws_str(m.as_str()));
+            let new_until = retention
+                .retain_until_date
+                .as_ref()
+                .map(timestamp_to_chrono_utc)
+                .unwrap_or(None);
+            let now = chrono::Utc::now();
+            let existing = mgr.get(&bucket, &key).unwrap_or_default();
+            // S3 immutability rules:
+            //   - Compliance is one-way: once set, mode cannot move to
+            //     Governance, and retain-until cannot be shortened.
+            //   - Governance can be lengthened freely; shortened only
+            //     with bypass=true.
+            if let Some(existing_mode) = existing.mode
+                && existing_mode == crate::object_lock::LockMode::Compliance
+                && existing.is_locked(now)
+            {
+                if matches!(new_mode, Some(crate::object_lock::LockMode::Governance)) {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::AccessDenied,
+                        "Cannot downgrade Compliance retention to Governance while lock is active",
+                    ));
+                }
+                if let (Some(prev), Some(next)) = (existing.retain_until, new_until)
+                    && next < prev
+                {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::AccessDenied,
+                        "Cannot shorten Compliance retention while lock is active",
+                    ));
+                }
+            }
+            if let Some(existing_mode) = existing.mode
+                && existing_mode == crate::object_lock::LockMode::Governance
+                && existing.is_locked(now)
+                && !bypass
+                && let (Some(prev), Some(next)) = (existing.retain_until, new_until)
+                && next < prev
+            {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::AccessDenied,
+                    "Shortening Governance retention requires x-amz-bypass-governance-retention: true",
+                ));
+            }
+            let mut state = existing;
+            if new_mode.is_some() {
+                state.mode = new_mode;
+            }
+            if new_until.is_some() {
+                state.retain_until = new_until;
+            }
+            mgr.set(&bucket, &key, state);
+            return Ok(S3Response::new(PutObjectRetentionOutput::default()));
+        }
         self.backend.put_object_retention(req).await
     }
 
