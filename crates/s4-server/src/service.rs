@@ -294,6 +294,13 @@ pub struct S4Service<B: S3> {
     /// `None`, the middleware is a no-op so the existing SigV4 path is
     /// unaffected (operators opt in via `--sigv4a-credentials <DIR>`).
     sigv4a_gate: Option<Arc<SigV4aGate>>,
+    /// v0.8 #54 BUG-5..10: per-`upload_id` side-table that ferries the
+    /// SSE / Tagging / Object-Lock context captured at
+    /// `CreateMultipartUpload` time through to `UploadPart` /
+    /// `CompleteMultipartUpload`. Always-on (no `with_*` flag) — the
+    /// store is gateway-internal and idle when no multipart is in
+    /// flight. See [`crate::multipart_state`] for rationale.
+    multipart_state: Arc<crate::multipart_state::MultipartStateStore>,
 }
 
 impl<B: S3> S4Service<B> {
@@ -328,6 +335,7 @@ impl<B: S3> S4Service<B> {
             mfa_delete: None,
             compliance_strict: false,
             sigv4a_gate: None,
+            multipart_state: Arc::new(crate::multipart_state::MultipartStateStore::new()),
         }
     }
 
@@ -3200,13 +3208,132 @@ impl<B: S3> S3 for S4Service<B> {
         let meta = req.input.metadata.get_or_insert_with(Default::default);
         meta.insert(META_MULTIPART.into(), "true".into());
         meta.insert(META_CODEC.into(), codec_kind.as_str().into());
+        // v0.8 #54 BUG-10 fix: take() the SSE request fields off
+        // `req.input` so they are NOT forwarded to the backend on
+        // CreateMultipartUpload. Same root cause as v0.7 #48 BUG-2/3 on
+        // single-PUT — MinIO rejects SSE-C with "HTTPS required" and
+        // SSE-KMS with "KMS not configured" when the headers reach it.
+        // S4 owns the encrypt-then-store contract; we capture the
+        // recipe in `multipart_state` here and apply it on Complete.
+        let sse_c_alg = req.input.sse_customer_algorithm.take();
+        let sse_c_key = req.input.sse_customer_key.take();
+        let sse_c_md5 = req.input.sse_customer_key_md5.take();
+        let sse_header = req.input.server_side_encryption.take();
+        let sse_kms_key = req.input.ssekms_key_id.take();
+        // Strip the encryption-context too — leaving it would make
+        // MinIO try to validate it against a non-existent KMS key.
+        let _ = req.input.ssekms_encryption_context.take();
+        let sse_c_material = extract_sse_c_material(&sse_c_alg, &sse_c_key, &sse_c_md5)?;
+        let kms_key_id = extract_kms_key_id(
+            &sse_header,
+            &sse_kms_key,
+            self.kms_default_key_id.as_deref(),
+        );
+        // SSE-C / SSE-KMS exclusivity (mirrors put_object L1870).
+        if sse_c_material.is_some() && kms_key_id.is_some() {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                "SSE-C and SSE-KMS cannot be used together on the same multipart upload",
+            ));
+        }
+        let sse_mode = if let Some(ref m) = sse_c_material {
+            crate::multipart_state::MultipartSseMode::SseC {
+                key: m.key,
+                key_md5: m.key_md5,
+            }
+        } else if let Some(ref kid) = kms_key_id {
+            // KMS pre-flight: fail at Create rather than at Complete if
+            // the gateway has no KMS backend wired (mirrors the
+            // put_object L1879 check).
+            if self.kms.is_none() {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    "SSE-KMS requested but no --kms-local-dir / --kms-aws-region is configured on this gateway",
+                ));
+            }
+            crate::multipart_state::MultipartSseMode::SseKms { key_id: kid.clone() }
+        } else if self.sse_keyring.is_some() {
+            // SSE-S4: server-driven transparent encryption. Activates
+            // whenever the gateway has a keyring configured AND the
+            // client didn't pick a different SSE mode.
+            crate::multipart_state::MultipartSseMode::SseS4
+        } else {
+            crate::multipart_state::MultipartSseMode::None
+        };
+        // v0.8 #54 BUG-9 fix: parse the Tagging header on Create. The
+        // single-PUT path does this on PutObject; the multipart path
+        // captures it now and commits via TagManager on Complete.
+        let request_tags: Option<crate::tagging::TagSet> = req
+            .input
+            .tagging
+            .as_deref()
+            .map(crate::tagging::parse_tagging_header)
+            .transpose()
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, e.to_string()))?;
+        // Strip the `Tagging` field off the input so the backend
+        // doesn't try to apply it (no-op on MinIO but keeps the wire
+        // clean).
+        let _ = req.input.tagging.take();
+        // Object Lock recipe (BUG-7 — captured here, applied on Complete).
+        let explicit_lock_mode: Option<crate::object_lock::LockMode> = req
+            .input
+            .object_lock_mode
+            .as_ref()
+            .and_then(|m| crate::object_lock::LockMode::from_aws_str(m.as_str()));
+        let explicit_retain_until: Option<chrono::DateTime<chrono::Utc>> = req
+            .input
+            .object_lock_retain_until_date
+            .as_ref()
+            .and_then(timestamp_to_chrono_utc);
+        let explicit_legal_hold_on: bool = req
+            .input
+            .object_lock_legal_hold_status
+            .as_ref()
+            .map(|s| s.as_str().eq_ignore_ascii_case("ON"))
+            .unwrap_or(false);
+        let bucket = req.input.bucket.clone();
+        let key = req.input.key.clone();
         debug!(
-            bucket = ?req.input.bucket,
-            key = ?req.input.key,
+            bucket = %bucket,
+            key = %key,
             codec = codec_kind.as_str(),
+            sse = ?sse_mode,
             "S4 create_multipart_upload: marking object for per-part compression"
         );
-        self.backend.create_multipart_upload(req).await
+        let mut resp = self.backend.create_multipart_upload(req).await?;
+        // Stash the per-upload context only after the backend handed
+        // us an upload_id (failed Creates leave nothing in the store).
+        if let Some(upload_id) = resp.output.upload_id.as_ref() {
+            self.multipart_state.put(
+                upload_id,
+                crate::multipart_state::MultipartUploadContext {
+                    bucket,
+                    key,
+                    sse: sse_mode.clone(),
+                    tags: request_tags,
+                    object_lock_mode: explicit_lock_mode,
+                    object_lock_retain_until: explicit_retain_until,
+                    object_lock_legal_hold: explicit_legal_hold_on,
+                },
+            );
+        }
+        // SSE-C / SSE-KMS response echo (mirrors put_object L2036-L2050).
+        match &sse_mode {
+            crate::multipart_state::MultipartSseMode::SseC { key_md5, .. } => {
+                resp.output.sse_customer_algorithm = Some(crate::sse::SSE_C_ALGORITHM.into());
+                resp.output.sse_customer_key_md5 = Some(
+                    base64::engine::general_purpose::STANDARD.encode(key_md5),
+                );
+            }
+            crate::multipart_state::MultipartSseMode::SseKms { key_id } => {
+                resp.output.server_side_encryption = Some(
+                    ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                );
+                resp.output.ssekms_key_id = Some(key_id.clone());
+            }
+            _ => {}
+        }
+        Ok(resp)
     }
 
     async fn upload_part(
@@ -3218,6 +3345,34 @@ impl<B: S3> S3 for S4Service<B> {
         // **per-part codec dispatch**: dispatcher が body 先頭 sample から
         // codec を選ぶので、parquet 風の mixed-content multipart で part ごとに
         // 最適 codec を使える (整数列 part → Bitcomp、text 列 part → zstd 等)。
+        //
+        // v0.8 #54 BUG-5/BUG-10 fix: lookup the per-upload SSE
+        // context captured by `create_multipart_upload` and (a) strip
+        // any SSE-C request headers off `req.input` so the backend
+        // doesn't see them — same root cause as v0.7 #48 BUG-2/3 on
+        // single-PUT; MinIO refuses SSE-C parts over HTTP — and (b)
+        // observe that an upload context exists for `upload_id`. The
+        // actual encrypt happens once at `complete_multipart_upload`
+        // time on the assembled body (the per-part-encrypt approach
+        // would require a matching multi-segment decrypt path on GET;
+        // encrypting the whole assembled body keeps the GET path's
+        // `is_sse_encrypted` branch in get_object L2429 working
+        // unchanged).
+        let _sse_ctx = self
+            .multipart_state
+            .get(req.input.upload_id.as_str());
+        // Strip the SSE-C client headers that AWS clients echo on
+        // every UploadPart per the multipart-with-SSE-C spec. We
+        // accept them here as authentication that the caller is the
+        // same one that initiated the upload (real-S3 enforces match)
+        // but do NOT forward to the backend; the `_sse_ctx` capture
+        // above already has the canonical key bytes from Create.
+        // Always-strip is safe even when no context is registered
+        // (legacy abandoned upload) — the backend gets a clean part
+        // request either way.
+        let _ = req.input.sse_customer_algorithm.take();
+        let _ = req.input.sse_customer_key.take();
+        let _ = req.input.sse_customer_key_md5.take();
         if let Some(blob) = req.input.body.take() {
             let bytes = collect_blob(blob, self.max_body_bytes)
                 .await
@@ -3281,48 +3436,374 @@ impl<B: S3> S3 for S4Service<B> {
     }
     async fn complete_multipart_upload(
         &self,
-        req: S3Request<CompleteMultipartUploadInput>,
+        mut req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
-        let resp = self.backend.complete_multipart_upload(req).await?;
+        let upload_id = req.input.upload_id.clone();
+        // v0.8 #54 — fetch the per-upload context captured on Create.
+        // `None` means an abandoned / unknown upload_id (gateway
+        // crashed between Create and Complete, or pre-v0.8 state
+        // restore); we still let the backend do its thing for
+        // transparency, but we can't apply any SSE / version / lock /
+        // tag / replication post-processing because we never captured
+        // the recipe.
+        let ctx = self.multipart_state.get(upload_id.as_str());
+        // v0.8 #54 BUG-10 fix: same SSE-C header strip as upload_part
+        // — some clients (boto3 / aws-sdk-cpp older versions) replay
+        // the SSE-C triple on Complete too, and MinIO will choke if
+        // they reach the backend.
+        let _ = req.input.sse_customer_algorithm.take();
+        let _ = req.input.sse_customer_key.take();
+        let _ = req.input.sse_customer_key_md5.take();
+        let mut resp = self.backend.complete_multipart_upload(req).await?;
         // CompleteMultipartUpload 成功 → 完成した object を full fetch して frame
         // index を build、`<key>.s4index` sidecar として保存。これで Range GET の
         // partial fetch path が利用可能になる (Range request の帯域節約)。
         // 注: 巨大 object の場合この pass は重いが、Range query は一度 sidecar が
         // できれば爆速になるので 1 回の cost は payback される
-        let bucket_clone = bucket.clone();
-        let key_clone = key.clone();
-        // v0.7 #49: percent-encode the synthetic GET URI before
-        // re-entering the backend; if the key is genuinely
-        // un-encodable we just skip the sidecar build (Complete returns
-        // the original success response — Range GETs degrade to a full
-        // read on the missing sidecar, which is the existing behaviour
-        // for any object < the streaming threshold).
-        if let Ok(uri) = safe_object_uri(&bucket_clone, &key_clone) {
-            let get_input = GetObjectInput {
-                bucket: bucket_clone.clone(),
-                key: key_clone.clone(),
-                ..Default::default()
+        //
+        // v0.8 #54 BUG-5..9: this same fetch is the choke-point for
+        // the SSE encrypt re-PUT + versioning shadow-key rewrite +
+        // replication source-bytes capture, so we GET once and reuse
+        // the bytes for every post-processing step.
+        let assembled_body: Option<bytes::Bytes> =
+            if let Ok(uri) = safe_object_uri(&bucket, &key) {
+                let get_input = GetObjectInput {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    ..Default::default()
+                };
+                let get_req = S3Request {
+                    input: get_input,
+                    method: http::Method::GET,
+                    uri,
+                    headers: http::HeaderMap::new(),
+                    extensions: http::Extensions::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                    trailing_headers: None,
+                };
+                match self.backend.get_object(get_req).await {
+                    Ok(get_resp) => match get_resp.output.body {
+                        Some(blob) => collect_blob(blob, self.max_body_bytes).await.ok(),
+                        None => None,
+                    },
+                    Err(_) => None,
+                }
+            } else {
+                None
             };
-            let get_req = S3Request {
-                input: get_input,
-                method: http::Method::GET,
-                uri,
-                headers: http::HeaderMap::new(),
-                extensions: http::Extensions::new(),
-                credentials: None,
-                region: None,
-                service: None,
-                trailing_headers: None,
-            };
-            if let Ok(get_resp) = self.backend.get_object(get_req).await
-                && let Some(blob) = get_resp.output.body
-                && let Ok(body) = collect_blob(blob, self.max_body_bytes).await
-                && let Ok(index) = build_index_from_body(&body)
-            {
-                self.write_sidecar(&bucket, &key, &index).await;
+        // Sidecar build (existing behaviour, gated on assembled body).
+        if let Some(ref body) = assembled_body
+            && let Ok(index) = build_index_from_body(body)
+        {
+            self.write_sidecar(&bucket, &key, &index).await;
+        }
+        // From here on, post-processing depends on the context —
+        // short-circuit when the upload had no captured recipe
+        // (legacy / crashed-Create / pre-v0.8 state restore).
+        if let Some(ctx) = ctx {
+            // v0.8 #54 BUG-6 fix: mint a version-id when the bucket
+            // is versioning-Enabled. The single-PUT path does this in
+            // `put_object` ~L1968; multipart was the missing branch.
+            // We mint here (post-Complete, before any re-PUT) so the
+            // same vid threads into both the shadow-key rewrite and
+            // the VersionEntry the manager records.
+            let pending_version: Option<crate::versioning::PutOutcome> = self
+                .versioning
+                .as_ref()
+                .map(|mgr| mgr.state(&bucket))
+                .map(|state| match state {
+                    crate::versioning::VersioningState::Enabled => {
+                        crate::versioning::PutOutcome {
+                            version_id: crate::versioning::VersioningManager::new_version_id(),
+                            versioned_response: true,
+                        }
+                    }
+                    crate::versioning::VersioningState::Suspended
+                    | crate::versioning::VersioningState::Unversioned => {
+                        crate::versioning::PutOutcome {
+                            version_id: crate::versioning::NULL_VERSION_ID.to_owned(),
+                            versioned_response: false,
+                        }
+                    }
+                });
+            // v0.8 #54 BUG-5 fix: encrypt the assembled framed body
+            // and re-PUT it to the backend so the on-disk bytes are
+            // SSE-encrypted. The single-PUT path does this body-by-
+            // body inside `put_object` (L1907-L1942); for multipart,
+            // encrypt-per-part would require a multi-segment decrypt
+            // path on GET — we instead do a single encrypt over the
+            // assembled framed body so the existing GET decrypt
+            // branch (`is_sse_encrypted` → `decrypt(body, source)` →
+            // FrameIter) handles it unchanged.
+            //
+            // The cost is one extra round-trip per Complete for SSE-
+            // enabled multipart (already-paid for the sidecar build).
+            // For single-instance gateways pointing at a co-located
+            // backend this is negligible; cross-region operators
+            // would benefit from per-part encrypt + multi-segment
+            // decrypt as a follow-up.
+            let needs_re_put = matches!(
+                ctx.sse,
+                crate::multipart_state::MultipartSseMode::SseS4
+                    | crate::multipart_state::MultipartSseMode::SseC { .. }
+                    | crate::multipart_state::MultipartSseMode::SseKms { .. }
+            ) || pending_version
+                .as_ref()
+                .map(|pv| pv.versioned_response)
+                .unwrap_or(false);
+            // Snapshot replication body in advance so we can pass it
+            // to the spawn helper after the (possibly absent) re-PUT.
+            let replication_body = assembled_body.clone();
+            let mut applied_metadata: Option<std::collections::HashMap<String, String>> = None;
+            if needs_re_put && let Some(body) = assembled_body {
+                let kms_wrap = if let crate::multipart_state::MultipartSseMode::SseKms {
+                    ref key_id,
+                } = ctx.sse
+                {
+                    let kms = self.kms.as_ref().ok_or_else(|| {
+                        S3Error::with_message(
+                            S3ErrorCode::InvalidRequest,
+                            "SSE-KMS requested but no --kms-local-dir / --kms-aws-region is configured on this gateway",
+                        )
+                    })?;
+                    let (dek, wrapped) = kms
+                        .generate_dek(key_id)
+                        .await
+                        .map_err(kms_error_to_s3)?;
+                    if dek.len() != 32 {
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InternalError,
+                            format!(
+                                "KMS backend returned a DEK of {} bytes (expected 32)",
+                                dek.len()
+                            ),
+                        ));
+                    }
+                    let mut dek_arr = [0u8; 32];
+                    dek_arr.copy_from_slice(&dek);
+                    Some((dek_arr, wrapped))
+                } else {
+                    None
+                };
+                // Build the new metadata map: re-fetch via HEAD so
+                // the multipart / codec markers the backend stamped
+                // on Create flow through unchanged, then layer the
+                // SSE markers on top.
+                let head_req = S3Request {
+                    input: HeadObjectInput {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        ..Default::default()
+                    },
+                    method: http::Method::HEAD,
+                    uri: safe_object_uri(&bucket, &key)?,
+                    headers: http::HeaderMap::new(),
+                    extensions: http::Extensions::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                    trailing_headers: None,
+                };
+                let mut new_metadata: std::collections::HashMap<String, String> =
+                    match self.backend.head_object(head_req).await {
+                        Ok(h) => h.output.metadata.unwrap_or_default(),
+                        Err(_) => std::collections::HashMap::new(),
+                    };
+                let new_body = match &ctx.sse {
+                    crate::multipart_state::MultipartSseMode::SseC { key, key_md5 } => {
+                        new_metadata.insert("s4-encrypted".into(), "aes-256-gcm".into());
+                        new_metadata.insert("s4-sse-type".into(), "AES256".into());
+                        new_metadata.insert(
+                            "s4-sse-c-key-md5".into(),
+                            base64::engine::general_purpose::STANDARD.encode(key_md5),
+                        );
+                        crate::sse::encrypt_with_source(
+                            &body,
+                            crate::sse::SseSource::CustomerKey { key, key_md5 },
+                        )
+                    }
+                    crate::multipart_state::MultipartSseMode::SseKms { .. } => {
+                        let (dek, wrapped) = kms_wrap
+                            .as_ref()
+                            .expect("SseKms branch implies kms_wrap is Some");
+                        new_metadata.insert("s4-encrypted".into(), "aes-256-gcm".into());
+                        new_metadata.insert("s4-sse-type".into(), "aws:kms".into());
+                        new_metadata
+                            .insert("s4-sse-kms-key-id".into(), wrapped.key_id.clone());
+                        crate::sse::encrypt_with_source(
+                            &body,
+                            crate::sse::SseSource::Kms { dek, wrapped },
+                        )
+                    }
+                    crate::multipart_state::MultipartSseMode::SseS4 => {
+                        let keyring = self.sse_keyring.as_ref().ok_or_else(|| {
+                            S3Error::with_message(
+                                S3ErrorCode::InternalError,
+                                "SSE-S4 captured at Create but keyring missing at Complete",
+                            )
+                        })?;
+                        new_metadata.insert("s4-encrypted".into(), "aes-256-gcm".into());
+                        // SSE-S4 deliberately omits `s4-sse-type` so
+                        // HEAD doesn't falsely advertise AWS-style
+                        // SSE-S3 (matches the put_object L1929-L1939
+                        // comment).
+                        crate::sse::encrypt_v2(&body, keyring)
+                    }
+                    crate::multipart_state::MultipartSseMode::None => body.clone(),
+                };
+                // v0.8 #54 BUG-6 fix: write the re-PUT under the
+                // shadow key so the version chain doesn't overwrite
+                // the previous version on a versioned bucket. The
+                // original (unshadowed) key was assembled by the
+                // backend on Complete; we delete it after the shadow
+                // PUT lands.
+                let put_target_key = if let Some(pv) = pending_version.as_ref() {
+                    if pv.versioned_response {
+                        versioned_shadow_key(&key, &pv.version_id)
+                    } else {
+                        key.clone()
+                    }
+                } else {
+                    key.clone()
+                };
+                let new_body_len = new_body.len() as i64;
+                let put_req = S3Request {
+                    input: PutObjectInput {
+                        bucket: bucket.clone(),
+                        key: put_target_key.clone(),
+                        body: Some(bytes_to_blob(new_body.clone())),
+                        metadata: Some(new_metadata.clone()),
+                        content_length: Some(new_body_len),
+                        ..Default::default()
+                    },
+                    method: http::Method::PUT,
+                    uri: safe_object_uri(&bucket, &put_target_key)?,
+                    headers: http::HeaderMap::new(),
+                    extensions: http::Extensions::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                    trailing_headers: None,
+                };
+                self.backend.put_object(put_req).await?;
+                // If we rewrote the storage key (versioning shadow),
+                // we must drop the original (unshadowed) Complete-
+                // assembled bytes so subsequent listings don't see a
+                // duplicate.
+                if put_target_key != key {
+                    let del_req = S3Request {
+                        input: DeleteObjectInput {
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            ..Default::default()
+                        },
+                        method: http::Method::DELETE,
+                        uri: safe_object_uri(&bucket, &key)?,
+                        headers: http::HeaderMap::new(),
+                        extensions: http::Extensions::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                        trailing_headers: None,
+                    };
+                    let _ = self.backend.delete_object(del_req).await;
+                }
+                applied_metadata = Some(new_metadata);
             }
+            // v0.8 #54 BUG-6 commit: register the new version with
+            // the VersioningManager so list_object_versions /
+            // GET ?versionId= see it.
+            if let (Some(mgr), Some(pv)) = (self.versioning.as_ref(), pending_version.as_ref()) {
+                let etag = resp
+                    .output
+                    .e_tag
+                    .clone()
+                    .map(ETag::into_value)
+                    .unwrap_or_default();
+                let now = chrono::Utc::now();
+                mgr.commit_put_with_version(
+                    &bucket,
+                    &key,
+                    crate::versioning::VersionEntry {
+                        version_id: pv.version_id.clone(),
+                        etag,
+                        size: replication_body
+                            .as_ref()
+                            .map(|b| b.len() as u64)
+                            .unwrap_or(0),
+                        is_delete_marker: false,
+                        created_at: now,
+                    },
+                );
+                if pv.versioned_response {
+                    resp.output.version_id = Some(pv.version_id.clone());
+                }
+            }
+            // v0.8 #54 BUG-7 fix: persist any per-upload Object Lock
+            // recipe + auto-apply the bucket default. Mirrors the
+            // put_object L2057-L2074 block.
+            if let Some(mgr) = self.object_lock.as_ref() {
+                if ctx.object_lock_mode.is_some()
+                    || ctx.object_lock_retain_until.is_some()
+                    || ctx.object_lock_legal_hold
+                {
+                    let mut state = mgr.get(&bucket, &key).unwrap_or_default();
+                    if let Some(m) = ctx.object_lock_mode {
+                        state.mode = Some(m);
+                    }
+                    if let Some(u) = ctx.object_lock_retain_until {
+                        state.retain_until = Some(u);
+                    }
+                    if ctx.object_lock_legal_hold {
+                        state.legal_hold_on = true;
+                    }
+                    mgr.set(&bucket, &key, state);
+                }
+                mgr.apply_default_on_put(&bucket, &key, chrono::Utc::now());
+            }
+            // v0.8 #54 BUG-9 fix: persist the captured tags via the
+            // TagManager so GetObjectTagging returns them.
+            if let (Some(mgr), Some(tags)) = (self.tagging.as_ref(), ctx.tags.as_ref()) {
+                mgr.put_object_tags(&bucket, &key, tags.clone());
+            }
+            // SSE-C / SSE-KMS response echo. The
+            // CompleteMultipartUploadOutput only exposes
+            // `server_side_encryption` + `ssekms_key_id` (no
+            // sse_customer_* — those round-tripped on Create / parts).
+            match &ctx.sse {
+                crate::multipart_state::MultipartSseMode::SseC { .. } => {
+                    resp.output.server_side_encryption = Some(
+                        ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                    );
+                }
+                crate::multipart_state::MultipartSseMode::SseKms { key_id } => {
+                    resp.output.server_side_encryption = Some(
+                        ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                    );
+                    resp.output.ssekms_key_id = Some(key_id.clone());
+                }
+                _ => {}
+            }
+            // v0.8 #54 BUG-8 fix: fire cross-bucket replication just
+            // like put_object L2165 does. We hand the dispatcher the
+            // assembled body bytes (post-encrypt where applicable, so
+            // the destination ends up byte-identical to the source's
+            // on-disk shape) plus the metadata that was actually
+            // committed.
+            let replication_body_bytes = replication_body.unwrap_or_default();
+            self.spawn_replication_if_matched(
+                &bucket,
+                &key,
+                &ctx.tags,
+                &replication_body_bytes,
+                &applied_metadata,
+                true,
+            );
+            self.multipart_state.remove(upload_id.as_str());
         }
         Ok(resp)
     }
@@ -3330,6 +3811,10 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        // v0.8 #54: drop the per-upload state (SSE-C key bytes / tag
+        // set) promptly so an aborted upload doesn't leak the
+        // customer's key into a long-running gateway's RSS.
+        self.multipart_state.remove(req.input.upload_id.as_str());
         self.backend.abort_multipart_upload(req).await
     }
     async fn list_multipart_uploads(

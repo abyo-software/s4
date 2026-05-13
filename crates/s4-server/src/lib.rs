@@ -10,6 +10,7 @@ pub mod kms;
 pub mod lifecycle;
 pub mod metrics;
 pub mod mfa;
+pub mod multipart_state;
 pub mod notifications;
 pub mod object_lock;
 pub mod policy;
