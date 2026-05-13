@@ -95,20 +95,44 @@ impl TagSet {
         self.0.is_empty()
     }
 
-    /// Enforce the AWS S3 size limits (count ≤ 10, key ≤ 128 B,
-    /// value ≤ 256 B). Called by [`Self::from_pairs`]; can also be
-    /// called directly when constructing a `TagSet` from external
-    /// input that wasn't validated yet.
+    /// Enforce the AWS S3 spec: count ≤ 10, key ≤ 128 B, value ≤ 256 B,
+    /// keys must be non-empty, and keys must be unique within the set.
+    /// Called by [`Self::from_pairs`]; can also be called directly when
+    /// constructing a `TagSet` from external input that wasn't validated
+    /// yet.
+    ///
+    /// v0.8.4 #79: empty-key + duplicate-key rejection added so the
+    /// `x-amz-tagging` header path and the `PutObjectTagging` XML body
+    /// path both surface 400 InvalidArgument (matching AWS S3) instead
+    /// of silently last-wins-collapsing duplicates.
     pub fn validate(&self) -> Result<(), TagError> {
         if self.0.len() > MAX_TAGS_PER_OBJECT {
-            return Err(TagError::TooMany { got: self.0.len() });
+            return Err(TagError::TooManyTags {
+                got: self.0.len(),
+                max: MAX_TAGS_PER_OBJECT,
+            });
         }
+        let mut seen: std::collections::HashSet<&str> =
+            std::collections::HashSet::with_capacity(self.0.len());
         for (k, v) in &self.0 {
+            if k.is_empty() {
+                return Err(TagError::EmptyKey);
+            }
             if k.len() > MAX_TAG_KEY_BYTES {
-                return Err(TagError::KeyTooLong { len: k.len() });
+                return Err(TagError::KeyTooLong {
+                    len: k.len(),
+                    max: MAX_TAG_KEY_BYTES,
+                });
             }
             if v.len() > MAX_TAG_VALUE_BYTES {
-                return Err(TagError::ValueTooLong { len: v.len() });
+                return Err(TagError::ValueTooLong {
+                    key: k.clone(),
+                    len: v.len(),
+                    max: MAX_TAG_VALUE_BYTES,
+                });
+            }
+            if !seen.insert(k.as_str()) {
+                return Err(TagError::DuplicateKey { key: k.clone() });
             }
         }
         Ok(())
@@ -116,14 +140,26 @@ impl TagSet {
 }
 
 /// Error class for tag-set construction / parse.
+///
+/// v0.8.4 #79: `EmptyKey` / `DuplicateKey` added, and the size-bound
+/// variants now carry the configured `max` (and the offending key for
+/// `ValueTooLong`) so the error surface is self-describing on the wire.
 #[derive(Debug, thiserror::Error)]
 pub enum TagError {
-    #[error("too many tags: {got} (max {})", MAX_TAGS_PER_OBJECT)]
-    TooMany { got: usize },
-    #[error("tag key too long: {len} bytes (max {})", MAX_TAG_KEY_BYTES)]
-    KeyTooLong { len: usize },
-    #[error("tag value too long: {len} bytes (max {})", MAX_TAG_VALUE_BYTES)]
-    ValueTooLong { len: usize },
+    #[error("too many tags: {got} (max {max} per object/bucket)")]
+    TooManyTags { got: usize, max: usize },
+    #[error("tag key must not be empty")]
+    EmptyKey,
+    #[error("tag key too long: {len} bytes (max {max})")]
+    KeyTooLong { len: usize, max: usize },
+    #[error("tag value too long: key {key:?} value is {len} bytes (max {max})")]
+    ValueTooLong {
+        key: String,
+        len: usize,
+        max: usize,
+    },
+    #[error("duplicate tag key: {key:?}")]
+    DuplicateKey { key: String },
     #[error("invalid tag header (URL-encoded): {0}")]
     InvalidHeader(String),
 }
@@ -248,7 +284,10 @@ impl TagManager {
 /// resolves to an empty `TagSet`. Keys without `=` are treated as
 /// `(key, "")` (matches `serde_urlencoded` / browser form-encode).
 ///
-/// The parsed result is validated against the AWS S3 size limits.
+/// v0.8.4 #79: the parsed result is validated against the full AWS S3
+/// spec — count ≤ 10, key non-empty + ≤ 128 B, value ≤ 256 B, keys
+/// unique within the set. Any violation is returned as a `TagError`
+/// variant (the caller maps these to 400 `InvalidArgument`).
 pub fn parse_tagging_header(header: &str) -> Result<TagSet, TagError> {
     let trimmed = header.trim();
     if trimmed.is_empty() {
@@ -362,25 +401,41 @@ mod tests {
 
     #[test]
     fn from_pairs_too_many_rejected() {
+        // Use distinct keys so the duplicate-key check (also enforced
+        // by validate) doesn't fire first — we want to assert the
+        // count guard specifically.
         let pairs: Vec<(String, String)> = (0..11)
             .map(|i| (format!("k{i}"), format!("v{i}")))
             .collect();
         let err = TagSet::from_pairs(pairs).expect_err("must reject 11 pairs");
-        assert!(matches!(err, TagError::TooMany { got: 11 }));
+        assert!(
+            matches!(err, TagError::TooManyTags { got: 11, max: MAX_TAGS_PER_OBJECT }),
+            "got: {err:?}"
+        );
     }
 
     #[test]
     fn from_pairs_long_key_rejected() {
         let pairs = vec![("k".repeat(129), "v".into())];
         let err = TagSet::from_pairs(pairs).expect_err("must reject 129-byte key");
-        assert!(matches!(err, TagError::KeyTooLong { len: 129 }));
+        assert!(
+            matches!(err, TagError::KeyTooLong { len: 129, max: MAX_TAG_KEY_BYTES }),
+            "got: {err:?}"
+        );
     }
 
     #[test]
     fn from_pairs_long_value_rejected() {
         let pairs = vec![("k".into(), "v".repeat(257))];
         let err = TagSet::from_pairs(pairs).expect_err("must reject 257-byte value");
-        assert!(matches!(err, TagError::ValueTooLong { len: 257 }));
+        assert!(
+            matches!(
+                err,
+                TagError::ValueTooLong { ref key, len: 257, max: MAX_TAG_VALUE_BYTES }
+                    if key == "k"
+            ),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -535,8 +590,79 @@ mod tests {
 
     #[test]
     fn tag_set_get_last_wins_on_duplicate_keys() {
-        // AWS x-amz-tagging "K=A&K=B" → look-up returns "B".
-        let s = parse_tagging_header("K=A&K=B").expect("parse");
+        // The `get` lookup is documented as last-wins on duplicates so
+        // that callers who pre-populate a `TagSet` from an unvalidated
+        // source still observe a deterministic value. Post-v0.8.4 #79
+        // the public `parse_tagging_header` / `from_pairs` paths reject
+        // duplicates outright, so we construct the dup-bearing set
+        // directly to exercise the lookup contract.
+        let s = TagSet(vec![
+            ("K".into(), "A".into()),
+            ("K".into(), "B".into()),
+        ]);
         assert_eq!(s.get("K"), Some("B"));
+    }
+
+    // --- v0.8.4 #79: AWS S3 spec validation on the header parse path ---
+
+    #[test]
+    fn parse_tagging_header_empty_key_rejected() {
+        // `=value` decodes to (key="", value="value"); AWS S3 returns
+        // 400 InvalidArgument. Pre-#79 we accepted and stored the empty
+        // key.
+        let err = parse_tagging_header("=value").expect_err("empty key");
+        assert!(matches!(err, TagError::EmptyKey), "got: {err:?}");
+    }
+
+    #[test]
+    fn parse_tagging_header_long_key_rejected() {
+        // 129-byte key (one over the 128-byte limit) → KeyTooLong.
+        let header = format!("{}=v", "k".repeat(129));
+        let err = parse_tagging_header(&header).expect_err("129-byte key");
+        assert!(
+            matches!(err, TagError::KeyTooLong { len: 129, max: MAX_TAG_KEY_BYTES }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_tagging_header_long_value_rejected() {
+        // 257-byte value (one over the 256-byte limit) → ValueTooLong,
+        // and the variant carries the offending key for diagnostics.
+        let header = format!("k={}", "v".repeat(257));
+        let err = parse_tagging_header(&header).expect_err("257-byte value");
+        assert!(
+            matches!(
+                err,
+                TagError::ValueTooLong { ref key, len: 257, max: MAX_TAG_VALUE_BYTES }
+                    if key == "k"
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_tagging_header_duplicate_key_rejected() {
+        // `K=A&K=B` — AWS S3 returns 400 InvalidArgument; pre-#79 S4
+        // collapsed silently to the last value (B).
+        let err = parse_tagging_header("K=A&K=B").expect_err("dup key");
+        assert!(
+            matches!(err, TagError::DuplicateKey { ref key } if key == "K"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_tagging_header_too_many_tags_rejected() {
+        // 11 unique tags (one over the 10-per-object cap) → TooManyTags.
+        let header: String = (0..11)
+            .map(|i| format!("k{i}=v{i}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let err = parse_tagging_header(&header).expect_err("11 tags");
+        assert!(
+            matches!(err, TagError::TooManyTags { got: 11, max: MAX_TAGS_PER_OBJECT }),
+            "got: {err:?}"
+        );
     }
 }

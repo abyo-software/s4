@@ -5368,3 +5368,44 @@ async fn replication_propagates_compliance_lock_to_destination() {
 
     let _ = spawned.shutdown.send(());
 }
+
+// ---------------------------------------------------------------------------
+// v0.8.4 #79 — `x-amz-tagging` header validation rejects empty key.
+// ---------------------------------------------------------------------------
+//
+// AWS S3 spec: `x-amz-tagging` with an empty key (e.g. the wire string
+// `=V&K=V2`) returns 400 InvalidArgument; pre-#79 S4 silently accepted
+// and stored the (empty-key, "V") pair. This test PUTs an object whose
+// `x-amz-tagging` header opens with `=V&K=V2` and asserts the SDK
+// surfaces an error (400 InvalidArgument from the `parse_tagging_header`
+// → `S3ErrorCode::InvalidArgument` map at service.rs L1837).
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn tagging_header_validation_rejects_empty_key() {
+    let minio = start_minio().await;
+    let spawned =
+        spawn_s4_with_options(&minio.endpoint_url, S4TestOpts::default().with_tagging()).await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    ensure_bucket(&backend_client, "tag-validate-e2e").await;
+    let s4_client = build_aws_client_v2(&spawned.endpoint_url);
+
+    let res = s4_client
+        .put_object()
+        .bucket("tag-validate-e2e")
+        .key("rejected")
+        .tagging("=V&K=V2")
+        .body(bytes::Bytes::from_static(b"body").into())
+        .send()
+        .await;
+    let err = res.expect_err(
+        "v0.8.4 #79: PUT with `x-amz-tagging: =V&K=V2` (empty key) must \
+         reject with 400 InvalidArgument; got Ok (silent accept)",
+    );
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("InvalidArgument") || dbg.contains("400"),
+        "expected 400 InvalidArgument for empty-key x-amz-tagging; got: {dbg}"
+    );
+
+    let _ = spawned.shutdown.send(());
+}
