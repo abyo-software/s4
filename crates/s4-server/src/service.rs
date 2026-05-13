@@ -292,7 +292,7 @@ impl<B: S3> S4Service<B> {
     pub fn run_lifecycle_once_for_test(
         &self,
         bucket: &str,
-        objects: &[(String, chrono::Duration, u64, Vec<(String, String)>)],
+        objects: &[crate::lifecycle::EvaluateBatchEntry],
     ) -> Vec<(String, crate::lifecycle::LifecycleAction)> {
         let Some(mgr) = self.lifecycle.as_ref() else {
             return Vec::new();

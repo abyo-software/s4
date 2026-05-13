@@ -2967,3 +2967,246 @@ async fn tagging_x_amz_tagging_header_on_put_persists_tags() {
     assert_eq!(stored.get("Project"), Some("Phoenix"));
     assert_eq!(stored.get("Env"), Some("prod west"));
 }
+
+// =========================================================================
+// v0.6 #37: S3 Lifecycle configuration + evaluator end-to-end.
+// =========================================================================
+
+type LifecycleHarness = (
+    S4Service<MemoryBackend>,
+    Arc<s4_server::lifecycle::LifecycleManager>,
+);
+
+fn make_lifecycle_s4(codec: CodecKind) -> LifecycleHarness {
+    let backend = MemoryBackend::new();
+    let mgr = Arc::new(s4_server::lifecycle::LifecycleManager::new());
+    let s4 = S4Service::new(backend, make_registry(codec), make_dispatcher(codec))
+        .with_lifecycle(Arc::clone(&mgr));
+    (s4, mgr)
+}
+
+fn put_bucket_lifecycle_request(
+    bucket: &str,
+    cfg: BucketLifecycleConfiguration,
+) -> S3Request<PutBucketLifecycleConfigurationInput> {
+    let input = PutBucketLifecycleConfigurationInput {
+        bucket: bucket.into(),
+        checksum_algorithm: None,
+        expected_bucket_owner: None,
+        lifecycle_configuration: Some(cfg),
+        transition_default_minimum_object_size: None,
+    };
+    S3Request {
+        input,
+        method: http::Method::PUT,
+        uri: format!("/{bucket}?lifecycle").parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+fn get_bucket_lifecycle_request(
+    bucket: &str,
+) -> S3Request<GetBucketLifecycleConfigurationInput> {
+    S3Request {
+        input: GetBucketLifecycleConfigurationInput {
+            bucket: bucket.into(),
+            expected_bucket_owner: None,
+        },
+        method: http::Method::GET,
+        uri: format!("/{bucket}?lifecycle").parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+fn delete_bucket_lifecycle_request(bucket: &str) -> S3Request<DeleteBucketLifecycleInput> {
+    S3Request {
+        input: DeleteBucketLifecycleInput {
+            bucket: bucket.into(),
+            expected_bucket_owner: None,
+        },
+        method: http::Method::DELETE,
+        uri: format!("/{bucket}?lifecycle").parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+fn aws_lifecycle_simple_expire(id: &str, prefix: &str, days: i32) -> BucketLifecycleConfiguration {
+    BucketLifecycleConfiguration {
+        rules: vec![LifecycleRule {
+            abort_incomplete_multipart_upload: None,
+            expiration: Some(LifecycleExpiration {
+                date: None,
+                days: Some(days),
+                expired_object_delete_marker: None,
+            }),
+            filter: Some(LifecycleRuleFilter {
+                and: None,
+                object_size_greater_than: None,
+                object_size_less_than: None,
+                prefix: Some(prefix.into()),
+                tag: None,
+            }),
+            id: Some(id.into()),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            prefix: None,
+            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            transitions: None,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_put_get_round_trip() {
+    let (s4, _mgr) = make_lifecycle_s4(CodecKind::Passthrough);
+    // PUT a configuration with one Expiration-only rule, prefix-filtered.
+    let cfg = aws_lifecycle_simple_expire("expire-logs", "logs/", 30);
+    s4.put_bucket_lifecycle_configuration(put_bucket_lifecycle_request("src-bucket", cfg))
+        .await
+        .expect("PutBucketLifecycleConfiguration");
+
+    // GET should return the same rule shape.
+    let resp = s4
+        .get_bucket_lifecycle_configuration(get_bucket_lifecycle_request("src-bucket"))
+        .await
+        .expect("GetBucketLifecycleConfiguration");
+    let rules = resp.output.rules.expect("rules must round-trip");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].id.as_deref(), Some("expire-logs"));
+    assert_eq!(rules[0].status.as_str(), ExpirationStatus::ENABLED);
+    let exp = rules[0].expiration.as_ref().expect("expiration round-trips");
+    assert_eq!(exp.days, Some(30));
+    let filter = rules[0].filter.as_ref().expect("filter round-trips");
+    assert_eq!(filter.prefix.as_deref(), Some("logs/"));
+    assert!(filter.tag.is_none());
+    assert!(filter.and.is_none());
+
+    // DELETE should clear the configuration.
+    s4.delete_bucket_lifecycle(delete_bucket_lifecycle_request("src-bucket"))
+        .await
+        .expect("DeleteBucketLifecycle");
+
+    // A subsequent GET must surface the AWS-canonical
+    // `NoSuchLifecycleConfiguration` error.
+    let err = s4
+        .get_bucket_lifecycle_configuration(get_bucket_lifecycle_request("src-bucket"))
+        .await
+        .expect_err("GET after DELETE must error");
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("NoSuchLifecycleConfiguration"),
+        "expected NoSuchLifecycleConfiguration after delete, got {dbg}"
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_evaluate_via_run_lifecycle_once_for_test() {
+    let (s4, _mgr) = make_lifecycle_s4(CodecKind::Passthrough);
+    // PUT a configuration covering Expiration (60d) + Transition (30d),
+    // prefix-filtered to `data/`. Three mock objects of distinct ages
+    // exercise the three possible outcomes (no-op / transition /
+    // outside-prefix).
+    let cfg = BucketLifecycleConfiguration {
+        rules: vec![LifecycleRule {
+            abort_incomplete_multipart_upload: None,
+            expiration: Some(LifecycleExpiration {
+                date: None,
+                days: Some(60),
+                expired_object_delete_marker: None,
+            }),
+            filter: Some(LifecycleRuleFilter {
+                and: None,
+                object_size_greater_than: None,
+                object_size_less_than: None,
+                prefix: Some("data/".into()),
+                tag: None,
+            }),
+            id: Some("data-tier".into()),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            prefix: None,
+            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            transitions: Some(vec![Transition {
+                date: None,
+                days: Some(30),
+                storage_class: Some(TransitionStorageClass::from_static(
+                    TransitionStorageClass::GLACIER_IR,
+                )),
+            }]),
+        }],
+    };
+    s4.put_bucket_lifecycle_configuration(put_bucket_lifecycle_request("src", cfg))
+        .await
+        .expect("PutBucketLifecycleConfiguration");
+
+    // Three mock objects — two under `data/` (one young, one old) plus
+    // one outside the prefix that must never fire.
+    let objects = vec![
+        (
+            "data/young.bin".to_string(),
+            chrono::Duration::days(5),
+            1u64,
+            vec![],
+        ),
+        (
+            "data/middle.bin".to_string(),
+            chrono::Duration::days(40),
+            1u64,
+            vec![],
+        ),
+        (
+            "logs/keep.log".to_string(),
+            chrono::Duration::days(365),
+            1u64,
+            vec![],
+        ),
+    ];
+    let actions = s4.run_lifecycle_once_for_test("src", &objects);
+    // Expect a single Transition for `data/middle.bin` (age 40 > 30 trans
+    // threshold; expiration at 60 not yet hit, so transition wins). The
+    // young object is below both thresholds; the logs/ object is outside
+    // the prefix filter.
+    assert_eq!(actions.len(), 1, "got {actions:?}");
+    assert_eq!(actions[0].0, "data/middle.bin");
+    if let s4_server::lifecycle::LifecycleAction::Transition { storage_class } = &actions[0].1 {
+        assert_eq!(storage_class, "GLACIER_IR");
+    } else {
+        panic!(
+            "expected Transition for data/middle.bin, got {:?}",
+            actions[0].1
+        );
+    }
+
+    // Re-run with a 90-day-old object: now both thresholds are met. The
+    // evaluator's conflict resolver picks the transition (exp_days=60 >
+    // trans_days=30, so the rule wants to transition first then expire
+    // later — the *next* scanner pass on the freshly-transitioned object
+    // would invoke expire).
+    let later = vec![(
+        "data/aged.bin".to_string(),
+        chrono::Duration::days(90),
+        1u64,
+        vec![],
+    )];
+    let actions = s4.run_lifecycle_once_for_test("src", &later);
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(
+        actions[0].1,
+        s4_server::lifecycle::LifecycleAction::Transition { .. }
+    ));
+}
