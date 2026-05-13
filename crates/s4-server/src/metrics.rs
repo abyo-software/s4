@@ -387,11 +387,26 @@ pub fn record_tls_cert_reload(ok: bool) {
 }
 
 /// v0.3 #11: bumped each time rustls-acme triggers a renewal cycle (success
-/// or failure). Labels: `result` (= "ok" | "err"). Operators alert on this
-/// counter to catch a stuck renewal before the cert expires.
-pub fn record_acme_renewal(ok: bool) {
-    let result = if ok { "ok" } else { "err" };
+/// or failure). Labels: `result` (= "ok" | "err" | "timeout"). Operators alert
+/// on this counter to catch a stuck renewal before the cert expires.
+///
+/// v0.8.4 #80: signature widened from `bool` → `&'static str` so the
+/// background renewal driver can also surface the new "timeout" outcome
+/// (poll wedged on a hung Let's Encrypt API call). Use
+/// [`record_acme_renewal_timeout`] for that case to keep the label
+/// vocabulary centralised.
+pub fn record_acme_renewal(result: &'static str) {
     metrics::counter!(names::ACME_RENEWAL_TOTAL, "result" => result).increment(1);
+}
+
+/// v0.8.4 #80: convenience wrapper for the renewal-poll-timeout case.
+/// Emits the same `s4_acme_renewal_total` counter with `result="timeout"`
+/// so dashboards can split "LE-rejected our renewal" from "LE never
+/// answered" — the latter implies an outbound network problem the
+/// operator needs to investigate before the cert ages out (90-day
+/// Let's Encrypt lifetime).
+pub fn record_acme_renewal_timeout() {
+    record_acme_renewal("timeout");
 }
 
 /// v0.3 #11: gauge of seconds until the active ACME cert expires. Operators
@@ -471,6 +486,14 @@ mod tests {
         record_sse_aes_backend("aes-ni");
         record_sse_aes_backend("software");
 
+        // v0.8.4 #80: ACME renewal counter now accepts "ok" / "err" /
+        // "timeout" via the widened `&'static str` signature. Drive
+        // all three so the render assertion below can confirm the
+        // new label is reachable.
+        record_acme_renewal("ok");
+        record_acme_renewal("err");
+        record_acme_renewal_timeout();
+
         let rendered = handle.render();
         // Pre-existing assertions.
         assert!(rendered.contains("s4_requests_total"));
@@ -517,6 +540,27 @@ mod tests {
         );
         assert!(rendered.contains("kind=\"aes-ni\""));
         assert!(rendered.contains("kind=\"software\""));
+
+        // v0.8.4 #80: ACME renewal counter exposes all three result
+        // labels ("ok" / "err" / "timeout"). The "timeout" label is
+        // the new arm — operators alert on its rate to catch a hung
+        // Let's Encrypt API before the cert ages out.
+        assert!(
+            rendered.contains("s4_acme_renewal_total"),
+            "missing ACME renewal counter in: {rendered}"
+        );
+        assert!(
+            rendered.contains("result=\"ok\""),
+            "missing result=ok label (ACME) in: {rendered}"
+        );
+        assert!(
+            rendered.contains("result=\"err\""),
+            "missing result=err label (ACME) in: {rendered}"
+        );
+        assert!(
+            rendered.contains("result=\"timeout\""),
+            "missing result=timeout label (ACME, v0.8.4 #80) in: {rendered}"
+        );
     }
 
     /// v0.8 #55: throughput gauge math. 10 MiB in 10 ms ≈ 1.05 GB/s

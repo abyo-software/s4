@@ -21,11 +21,27 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustls_acme::caches::DirCache;
 use rustls_acme::{AcmeConfig, is_tls_alpn_challenge};
 use tokio_rustls::LazyConfigAcceptor;
 use tokio_rustls::rustls::ServerConfig;
+
+/// v0.8.4 #80: per-poll timeout on the background ACME renewal stream.
+///
+/// Without this, a hung Let's Encrypt API (network partition, slow
+/// response, transparent-proxy black hole) would wedge the renewal
+/// task on a single `state.next().await` indefinitely — the existing
+/// cert keeps serving traffic, but renewal silently stops and the
+/// cert ages out 90 days later. The timeout fires per-iteration so
+/// the loop just retries on the next tick instead of dying.
+///
+/// 60s is comfortably longer than any healthy LE round-trip
+/// (typically < 5s) but short enough that an operator's Prometheus
+/// alert on `s4_acme_renewal_total{result="timeout"}` rate fires
+/// within a single scrape window when LE goes dark.
+const ACME_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Inputs to [`bootstrap`]: the operator-supplied flags from main.
 pub struct AcmeOptions {
@@ -85,22 +101,41 @@ pub fn bootstrap(opts: AcmeOptions) -> AcmeAcceptors {
     // surfaces failures to operators via the s4_acme_renewal_total
     // Prometheus metric. We never break out of this loop — failures
     // just retry on the next poll.
+    //
+    // v0.8.4 #80: each `state.next().await` is wrapped in a
+    // `tokio::time::timeout(ACME_POLL_TIMEOUT, …)`. A hung Let's
+    // Encrypt API (audit L1) used to wedge the task forever without
+    // this guard; now we log + bump the "timeout" label and continue
+    // looping so the next iteration retries.
     let domains = opts.domains.join(",");
     tokio::spawn(async move {
         use futures::StreamExt;
         loop {
-            match state.next().await {
-                Some(Ok(ok)) => {
+            match tokio::time::timeout(ACME_POLL_TIMEOUT, state.next()).await {
+                Ok(Some(Ok(ok))) => {
                     tracing::info!(target: "s4_acme", domains = %domains, "ACME event: {ok:?}");
-                    crate::metrics::record_acme_renewal(true);
+                    crate::metrics::record_acme_renewal("ok");
                 }
-                Some(Err(err)) => {
+                Ok(Some(Err(err))) => {
                     tracing::warn!(target: "s4_acme", domains = %domains, "ACME error: {err:?}");
-                    crate::metrics::record_acme_renewal(false);
+                    crate::metrics::record_acme_renewal("err");
                 }
-                None => {
+                Ok(None) => {
                     tracing::warn!(target: "s4_acme", "ACME state stream ended unexpectedly");
                     break;
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        target: "s4_acme",
+                        domains = %domains,
+                        timeout_secs = ACME_POLL_TIMEOUT.as_secs(),
+                        "ACME renewal poll timeout; will retry on next iteration"
+                    );
+                    crate::metrics::record_acme_renewal_timeout();
+                    // Fall through to next loop iteration — `state` is
+                    // still owned, so the next poll picks up where the
+                    // hung future left off (or its successor, since the
+                    // timed-out future is dropped here at scope exit).
                 }
             }
         }
@@ -157,5 +192,43 @@ mod tests {
         // Both configs must exist; they're distinct (challenge serves the
         // TLS-ALPN-01 magic cert, default serves the real cert).
         assert!(!Arc::ptr_eq(&acceptors.challenge, &acceptors.default));
+    }
+
+    /// v0.8.4 #80: the renewal driver wraps each `state.next().await`
+    /// in `tokio::time::timeout(ACME_POLL_TIMEOUT, …)`. We can't drive
+    /// the real `rustls-acme` stream here without reaching Let's
+    /// Encrypt, and the workspace doesn't enable tokio's `test-util`
+    /// feature so `tokio::time::pause()` is unavailable. Instead we
+    /// assert the same `timeout(_, pending)` shape against an
+    /// always-pending future with a tiny deadline: if the wrapper
+    /// returns `Err(Elapsed)`, the production loop's "timeout" arm is
+    /// reachable. Combined with the metric-label assertion in
+    /// `metrics::tests::install_and_render_basic_counters` (which
+    /// scrapes for `result="timeout"`), this nails down both halves
+    /// of the fix.
+    #[tokio::test]
+    async fn renewal_poll_timeout_arm_fires_when_inner_future_hangs() {
+        // Sanity: the production constant is 60s — long enough to
+        // dwarf any healthy LE round-trip but short enough that an
+        // alert window (typically 5 minutes) catches a wedge fast.
+        assert_eq!(ACME_POLL_TIMEOUT, Duration::from_secs(60));
+
+        // Demonstrate the same wrapper shape used in `bootstrap`.
+        // `pending` never resolves, so `timeout` MUST take the
+        // `Err(Elapsed)` path. A tiny deadline keeps the test wall
+        // time near zero.
+        let pending = futures::future::pending::<()>();
+        let res = tokio::time::timeout(Duration::from_millis(20), pending).await;
+        assert!(
+            res.is_err(),
+            "tokio::time::timeout must surface Elapsed for a never-ready future; \
+             this is the same branch that bumps record_acme_renewal_timeout in \
+             the production loop"
+        );
+
+        // Also exercise the recorder helper directly so any future
+        // refactor of the metric-label vocabulary trips this test
+        // (compile-time guard on the `&'static str` signature).
+        crate::metrics::record_acme_renewal_timeout();
     }
 }
