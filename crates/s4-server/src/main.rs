@@ -258,8 +258,9 @@ struct Opt {
     /// loaded at startup if present; SIGUSR1-driven dump-back-to-file
     /// is a future hook (see `VersioningManager::to_json` /
     /// `from_json` — not yet wired into a signal handler in v0.5
-    /// #34's scope). Pass `--versioning-state-file ""` (empty path) to
-    /// enable the manager with no snapshot to load.
+    /// #34's scope). To enable the manager without restoring a
+    /// snapshot, pass any path whose file is missing or empty
+    /// (e.g. `--versioning-state-file /tmp/v.json`).
     #[clap(long, value_name = "PATH")]
     versioning_state_file: Option<std::path::PathBuf>,
 
@@ -271,8 +272,8 @@ struct Opt {
     /// snapshot file that's loaded at startup if present; SIGUSR1-
     /// driven dump-back-to-file is a future hook (see
     /// `ObjectLockManager::to_json` / `from_json` — not yet wired in
-    /// v0.5 #30's scope). Pass `--object-lock-state-file ""` (empty
-    /// path) to enable the manager with no snapshot to load.
+    /// v0.5 #30's scope). To enable without restoring, pass any path
+    /// whose file is missing or empty.
     #[clap(long, value_name = "PATH")]
     object_lock_state_file: Option<std::path::PathBuf>,
 
@@ -285,8 +286,8 @@ struct Opt {
     /// optional path argument names a JSON snapshot file that's loaded
     /// at startup if present (produced previously by
     /// `MfaDeleteManager::to_json`); SIGUSR1-driven dump-back is a
-    /// future hook. Pass `--mfa-delete-state-file ""` (empty path) to
-    /// enable the manager with no snapshot to load. Pair with
+    /// future hook. To enable without restoring, pass any path whose
+    /// file is missing or empty. Pair with
     /// `--mfa-default-secret-file <PATH>` to install a gateway-wide
     /// shared secret applied to every MFA-Delete-enabled bucket that
     /// lacks an explicit per-bucket override.
@@ -309,9 +310,9 @@ struct Opt {
     /// backend-passthrough behaviour). The optional path argument names
     /// a JSON snapshot file that's loaded at startup if present;
     /// SIGUSR1-triggered dump-back is a future hook (see
-    /// `CorsManager::to_json` / `from_json`). Pass
-    /// `--cors-state-file ""` (empty path) to enable the manager with no
-    /// snapshot to load. **Note:** OPTIONS preflight HTTP routing is
+    /// `CorsManager::to_json` / `from_json`). To enable without
+    /// restoring, pass any path whose file is missing or empty.
+    /// **Note:** OPTIONS preflight HTTP routing is
     /// not yet wired at the listener level; this flag enables only the
     /// configuration-management half of v0.6 #38.
     #[clap(long, value_name = "PATH")]
@@ -326,8 +327,8 @@ struct Opt {
     /// (replacing the previous backend-passthrough behaviour). A
     /// background tokio task wakes every
     /// `--inventory-scan-interval-hours` to log the set of currently-
-    /// due inventories. Pass `--inventory-state-file ""` (empty path)
-    /// to enable the manager with no snapshot to load. The optional
+    /// due inventories. To enable without restoring, pass any path
+    /// whose file is missing or empty. The optional
     /// path argument names a JSON snapshot file produced previously by
     /// `InventoryManager::to_json`.
     ///
@@ -363,9 +364,9 @@ struct Opt {
     /// after the configured retry budget). The optional path argument
     /// names a JSON snapshot file that's loaded at startup if present;
     /// SIGUSR1-driven dump-back is a future hook (see
-    /// `NotificationManager::to_json` / `from_json`). Pass
-    /// `--notifications-state-file ""` (empty path) to enable the manager
-    /// with no snapshot to load.
+    /// `NotificationManager::to_json` / `from_json`). To enable
+    /// without restoring, pass any path whose file is missing or
+    /// empty.
     ///
     /// **Note (v0.6 #35 scope):** the always-available destination is
     /// `Webhook { url }` (HTTP POST of the AWS-canonical event JSON). SQS
@@ -388,9 +389,9 @@ struct Opt {
     /// The optional path argument names a JSON snapshot file that's
     /// loaded at startup if present; SIGUSR1-driven dump-back-to-file
     /// is a future hook (see `TagManager::to_json` / `from_json` — not
-    /// yet wired into a signal handler in v0.6 #39's scope). Pass
-    /// `--tagging-state-file ""` (empty path) to enable the manager
-    /// with no snapshot to load.
+    /// yet wired into a signal handler in v0.6 #39's scope). To
+    /// enable without restoring, pass any path whose file is missing
+    /// or empty.
     #[clap(long, value_name = "PATH")]
     tagging_state_file: Option<std::path::PathBuf>,
 
@@ -407,8 +408,8 @@ struct Opt {
     /// budget). HEAD / GET on the source key echo the recorded status as
     /// `x-amz-replication-status`. The optional path argument names a
     /// JSON snapshot file (`ReplicationManager::to_json` /
-    /// `from_json`) — pass `--replication-state-file ""` (empty path) to
-    /// enable the manager with no snapshot to load.
+    /// `from_json`). To enable without restoring, pass any path
+    /// whose file is missing or empty.
     ///
     /// **Note (v0.6 #40 scope):** single-instance only — the source and
     /// destination buckets must live on the same `S4Service`. Real
@@ -427,9 +428,9 @@ struct Opt {
     /// every `--lifecycle-scan-interval-hours` to log the set of
     /// buckets with rules attached and stamp a "would-have-run"
     /// marker. The optional path argument names a JSON snapshot file
-    /// produced previously by `LifecycleManager::to_json`. Pass
-    /// `--lifecycle-state-file ""` (empty path) to enable the manager
-    /// with no snapshot to load.
+    /// produced previously by `LifecycleManager::to_json`. To
+    /// enable without restoring, pass any path whose file is missing
+    /// or empty.
     ///
     /// **Note (v0.6 #37 scope):** the background scheduler currently
     /// only logs the bucket list — actual list_objects_v2 walking +
@@ -650,6 +651,35 @@ fn parse_rotated_key_spec(
     Ok((id, path))
 }
 
+/// v0.7 dogfood follow-up: read a `--*-state-file <PATH>` snapshot,
+/// returning `Ok(None)` for the three "start fresh" cases and
+/// `Ok(Some(json))` for the actual restore-from-snapshot case:
+///
+/// 1. empty path (`--flag=`)
+/// 2. file doesn't exist
+/// 3. file exists but is empty / whitespace-only
+///
+/// The third case used to surface as a `from_json("")` parse error
+/// ("EOF while parsing"), which forced operators to hand-write a
+/// non-trivial empty-snapshot JSON before the manager would attach.
+/// `touch /tmp/foo.json && --flag /tmp/foo.json` is now equivalent to
+/// "fresh manager, dump snapshots back here" once the SIGUSR1 hook
+/// lands.
+fn read_state_file_or_fresh(
+    path: &std::path::Path,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync + 'static>> {
+    if path.as_os_str().is_empty() || !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("read failed for {}: {e}", path.display()))?;
+    if raw.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(raw))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     let opt = Opt::parse();
@@ -805,18 +835,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // for v0.5 #34 — operators can still snapshot manually via the
     // future API).
     if let Some(ref path) = opt.versioning_state_file {
-        let mgr = if path.as_os_str().is_empty() || !path.exists() {
-            s4_server::versioning::VersioningManager::new()
-        } else {
-            let raw = std::fs::read_to_string(path).map_err(|e| {
-                format!("--versioning-state-file {}: read failed: {e}", path.display())
-            })?;
+        let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
             s4_server::versioning::VersioningManager::from_json(&raw).map_err(|e| {
                 format!(
                     "--versioning-state-file {}: parse failed: {e}",
                     path.display()
                 )
             })?
+        } else {
+            s4_server::versioning::VersioningManager::new()
         };
         info!(
             path = %path.display(),
@@ -829,21 +856,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // as a JSON snapshot (produced previously by
     // `ObjectLockManager::to_json`).
     if let Some(ref path) = opt.object_lock_state_file {
-        let mgr = if path.as_os_str().is_empty() || !path.exists() {
-            s4_server::object_lock::ObjectLockManager::new()
-        } else {
-            let raw = std::fs::read_to_string(path).map_err(|e| {
-                format!(
-                    "--object-lock-state-file {}: read failed: {e}",
-                    path.display()
-                )
-            })?;
+        let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
             s4_server::object_lock::ObjectLockManager::from_json(&raw).map_err(|e| {
                 format!(
                     "--object-lock-state-file {}: parse failed: {e}",
                     path.display()
                 )
             })?
+        } else {
+            s4_server::object_lock::ObjectLockManager::new()
         };
         info!(
             path = %path.display(),
@@ -860,21 +881,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // wide default secret on top of (or in addition to) any per-bucket
     // overrides loaded from the JSON snapshot.
     if let Some(ref path) = opt.mfa_delete_state_file {
-        let mgr = if path.as_os_str().is_empty() || !path.exists() {
-            s4_server::mfa::MfaDeleteManager::new()
-        } else {
-            let raw = std::fs::read_to_string(path).map_err(|e| {
-                format!(
-                    "--mfa-delete-state-file {}: read failed: {e}",
-                    path.display()
-                )
-            })?;
+        let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
             s4_server::mfa::MfaDeleteManager::from_json(&raw).map_err(|e| {
                 format!(
                     "--mfa-delete-state-file {}: parse failed: {e}",
                     path.display()
                 )
             })?
+        } else {
+            s4_server::mfa::MfaDeleteManager::new()
         };
         if let Some(ref secret_path) = opt.mfa_default_secret_file {
             let raw = std::fs::read_to_string(secret_path).map_err(|e| {
@@ -915,15 +930,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // populated path is loaded as a JSON snapshot (produced by
     // `CorsManager::to_json`).
     if let Some(ref path) = opt.cors_state_file {
-        let mgr = if path.as_os_str().is_empty() || !path.exists() {
-            s4_server::cors::CorsManager::new()
-        } else {
-            let raw = std::fs::read_to_string(path).map_err(|e| {
-                format!("--cors-state-file {}: read failed: {e}", path.display())
-            })?;
+        let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
             s4_server::cors::CorsManager::from_json(&raw).map_err(|e| {
                 format!("--cors-state-file {}: parse failed: {e}", path.display())
             })?
+        } else {
+            s4_server::cors::CorsManager::new()
         };
         info!(
             path = %path.display(),
@@ -950,18 +962,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // v0.7 #45 lifecycle pattern below).
     let inventory_to_scan: Option<std::sync::Arc<s4_server::inventory::InventoryManager>> =
         if let Some(ref path) = opt.inventory_state_file {
-            let mgr = if path.as_os_str().is_empty() || !path.exists() {
-                s4_server::inventory::InventoryManager::new()
-            } else {
-                let raw = std::fs::read_to_string(path).map_err(|e| {
-                    format!("--inventory-state-file {}: read failed: {e}", path.display())
-                })?;
+            let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
                 s4_server::inventory::InventoryManager::from_json(&raw).map_err(|e| {
                     format!(
                         "--inventory-state-file {}: parse failed: {e}",
                         path.display()
                     )
                 })?
+            } else {
+                s4_server::inventory::InventoryManager::new()
             };
             let mgr = std::sync::Arc::new(mgr);
             info!(
@@ -983,21 +992,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // runs inside the request-path handlers (PUT / DELETE) on detached
     // tokio tasks, so no extra background scheduler is needed here.
     if let Some(ref path) = opt.notifications_state_file {
-        let mgr = if path.as_os_str().is_empty() || !path.exists() {
-            s4_server::notifications::NotificationManager::new()
-        } else {
-            let raw = std::fs::read_to_string(path).map_err(|e| {
-                format!(
-                    "--notifications-state-file {}: read failed: {e}",
-                    path.display()
-                )
-            })?;
+        let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
             s4_server::notifications::NotificationManager::from_json(&raw).map_err(|e| {
                 format!(
                     "--notifications-state-file {}: parse failed: {e}",
                     path.display()
                 )
             })?
+        } else {
+            s4_server::notifications::NotificationManager::new()
         };
         info!(
             path = %path.display(),
@@ -1011,18 +1014,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // starts a fresh manager, populated path is loaded as a JSON
     // snapshot produced previously by `TagManager::to_json`.
     if let Some(ref path) = opt.tagging_state_file {
-        let mgr = if path.as_os_str().is_empty() || !path.exists() {
-            s4_server::tagging::TagManager::new()
-        } else {
-            let raw = std::fs::read_to_string(path).map_err(|e| {
-                format!("--tagging-state-file {}: read failed: {e}", path.display())
-            })?;
+        let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
             s4_server::tagging::TagManager::from_json(&raw).map_err(|e| {
                 format!(
                     "--tagging-state-file {}: parse failed: {e}",
                     path.display()
                 )
             })?
+        } else {
+            s4_server::tagging::TagManager::new()
         };
         info!(
             path = %path.display(),
@@ -1039,21 +1039,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // runs inside `put_object` on detached tokio tasks, so no extra
     // background scheduler is needed here.
     if let Some(ref path) = opt.replication_state_file {
-        let mgr = if path.as_os_str().is_empty() || !path.exists() {
-            s4_server::replication::ReplicationManager::new()
-        } else {
-            let raw = std::fs::read_to_string(path).map_err(|e| {
-                format!(
-                    "--replication-state-file {}: read failed: {e}",
-                    path.display()
-                )
-            })?;
+        let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
             s4_server::replication::ReplicationManager::from_json(&raw).map_err(|e| {
                 format!(
                     "--replication-state-file {}: parse failed: {e}",
                     path.display()
                 )
             })?
+        } else {
+            s4_server::replication::ReplicationManager::new()
         };
         info!(
             path = %path.display(),
@@ -1079,18 +1073,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // versions are fully covered.
     let lifecycle_to_scan: Option<std::sync::Arc<s4_server::lifecycle::LifecycleManager>> =
         if let Some(ref path) = opt.lifecycle_state_file {
-            let mgr = if path.as_os_str().is_empty() || !path.exists() {
-                s4_server::lifecycle::LifecycleManager::new()
-            } else {
-                let raw = std::fs::read_to_string(path).map_err(|e| {
-                    format!("--lifecycle-state-file {}: read failed: {e}", path.display())
-                })?;
+            let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
                 s4_server::lifecycle::LifecycleManager::from_json(&raw).map_err(|e| {
                     format!(
                         "--lifecycle-state-file {}: parse failed: {e}",
                         path.display()
                     )
                 })?
+            } else {
+                s4_server::lifecycle::LifecycleManager::new()
             };
             let mgr = std::sync::Arc::new(mgr);
             info!(
