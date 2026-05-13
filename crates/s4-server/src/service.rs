@@ -30,6 +30,7 @@
 
 use std::sync::Arc;
 
+use base64::Engine as _;
 use bytes::BytesMut;
 use s3s::dto::*;
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
@@ -96,6 +97,16 @@ pub struct S4Service<B: S3> {
     /// deployments are unaffected until they explicitly call
     /// `with_versioning(...)`.
     versioning: Option<Arc<crate::versioning::VersioningManager>>,
+    /// v0.5 #28: optional SSE-KMS envelope-encryption backend. When
+    /// `Some(...)`, PUTs carrying `x-amz-server-side-encryption: aws:kms`
+    /// generate a fresh DEK via the backend, encrypt the body with it
+    /// (S4E4 frame), and persist only the wrapped DEK. GETs sniffing as
+    /// S4E4 unwrap the DEK through the same backend before decrypt.
+    /// `kms_default_key_id` is used when the request omits an explicit
+    /// `x-amz-server-side-encryption-aws-kms-key-id` (mirrors AWS S3
+    /// bucket-default behaviour).
+    kms: Option<Arc<dyn crate::kms::KmsBackend>>,
+    kms_default_key_id: Option<String>,
 }
 
 impl<B: S3> S4Service<B> {
@@ -118,7 +129,23 @@ impl<B: S3> S4Service<B> {
             access_log: None,
             sse_keyring: None,
             versioning: None,
+            kms: None,
+            kms_default_key_id: None,
         }
+    }
+
+    /// v0.5 #28: attach an SSE-KMS backend. `default_key_id` is used
+    /// when a PUT requests SSE-KMS without naming a specific KMS key
+    /// (operators set this to mirror AWS S3's bucket-default key).
+    #[must_use]
+    pub fn with_kms_backend(
+        mut self,
+        kms: Arc<dyn crate::kms::KmsBackend>,
+        default_key_id: Option<String>,
+    ) -> Self {
+        self.kms = Some(kms);
+        self.kms_default_key_id = default_key_id;
+        self
     }
 
     /// v0.5 #34: attach the first-class versioning state machine. Once
@@ -651,6 +678,99 @@ fn is_sse_encrypted(metadata: &Option<Metadata>) -> bool {
         .unwrap_or(false)
 }
 
+/// v0.5 #27: pull the three SSE-C headers off an input struct. The S3
+/// contract is "all three or none" — partial sets are a 400.
+///
+/// Returns `Ok(None)` when no SSE-C headers were sent (server-managed or
+/// no encryption), `Ok(Some(material))` on validated client key, and
+/// `Err` for malformed or partial inputs.
+fn extract_sse_c_material(
+    algorithm: &Option<String>,
+    key: &Option<String>,
+    md5: &Option<String>,
+) -> S3Result<Option<crate::sse::CustomerKeyMaterial>> {
+    match (algorithm, key, md5) {
+        (None, None, None) => Ok(None),
+        (Some(a), Some(k), Some(m)) => crate::sse::parse_customer_key_headers(a, k, m)
+            .map(Some)
+            .map_err(sse_c_error_to_s3),
+        _ => Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "SSE-C requires all three of: x-amz-server-side-encryption-customer-{algorithm,key,key-MD5}",
+        )),
+    }
+}
+
+/// v0.5 #28: detect SSE-KMS request — `x-amz-server-side-encryption: aws:kms`.
+/// Returns the key-id to wrap under, falling back to the gateway default.
+fn extract_kms_key_id(
+    sse: &Option<ServerSideEncryption>,
+    sse_kms_key_id: &Option<String>,
+    gateway_default: Option<&str>,
+) -> Option<String> {
+    let asks_for_kms = sse
+        .as_ref()
+        .map(|s| s.as_str() == ServerSideEncryption::AWS_KMS)
+        .unwrap_or(false);
+    if !asks_for_kms {
+        return None;
+    }
+    sse_kms_key_id
+        .clone()
+        .or_else(|| gateway_default.map(str::to_owned))
+}
+
+/// v0.5 #28: map kms module errors to AWS-shaped S3 error codes.
+/// `KeyNotFound` is operator misconfig (400); `BackendUnavailable` is a
+/// transient KMS outage (503). Other variants are 500 InternalError.
+fn kms_error_to_s3(e: crate::kms::KmsError) -> S3Error {
+    use crate::kms::KmsError as K;
+    match e {
+        K::KeyNotFound { key_id } => S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            format!("KMS key not found: {key_id}"),
+        ),
+        K::BackendUnavailable { message } => S3Error::with_message(
+            S3ErrorCode::ServiceUnavailable,
+            format!("KMS backend unavailable: {message}"),
+        ),
+        other => S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!("KMS error: {other}"),
+        ),
+    }
+}
+
+/// v0.5 #27: map sse module errors to AWS-shaped S3 error codes.
+/// `WrongCustomerKey` → 403 AccessDenied (matches AWS behaviour);
+/// `InvalidCustomerKey` / algorithm / required / unexpected → 400.
+fn sse_c_error_to_s3(e: crate::sse::SseError) -> S3Error {
+    use crate::sse::SseError as E;
+    match e {
+        E::WrongCustomerKey => S3Error::with_message(
+            S3ErrorCode::AccessDenied,
+            "SSE-C key does not match the key used at PUT time",
+        ),
+        E::InvalidCustomerKey { reason } => S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            format!("SSE-C: {reason}"),
+        ),
+        E::CustomerKeyAlgorithmUnsupported { algo } => S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            format!("SSE-C unsupported algorithm: {algo:?} (only AES256 is allowed)"),
+        ),
+        E::CustomerKeyRequired => S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "object is SSE-C encrypted; supply x-amz-server-side-encryption-customer-* headers",
+        ),
+        E::CustomerKeyUnexpected => S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "object is not SSE-C encrypted; do not send x-amz-server-side-encryption-customer-* headers",
+        ),
+        other => S3Error::with_message(S3ErrorCode::InternalError, format!("SSE error: {other}")),
+    }
+}
+
 fn extract_manifest(metadata: &Option<Metadata>) -> Option<ChunkManifest> {
     let m = metadata.as_ref()?;
     let codec = m
@@ -825,15 +945,83 @@ impl<B: S3> S3 for S4Service<B> {
             } else {
                 None
             };
-            // v0.4 #21 / v0.5 #29: encrypt-after-compress. Wraps the
-            // post-framing body with AES-256-GCM under the keyring's
-            // active key (S4E2 frame). The `s4-encrypted` metadata flag
-            // stays the same (`aes-256-gcm`) regardless of which frame
-            // version is in use — the wire frame's magic carries that
-            // detail. Sidecar is built from the *unencrypted* framed
-            // body so the S4F2 frame iterator can still parse it
-            // post-decrypt on GET.
-            let body_to_send = if let Some(keyring) = self.sse_keyring.as_ref() {
+            // v0.4 #21 / v0.5 #29 / v0.5 #27: encrypt-after-compress.
+            // Precedence:
+            //   - SSE-C headers present → per-request customer key (S4E3)
+            //   - server-managed keyring configured → active key (S4E2)
+            //   - neither → no encryption (raw compressed body)
+            // The `s4-encrypted: aes-256-gcm` metadata flag is set in
+            // both encrypted modes; the on-disk frame magic distinguishes
+            // S4E1 / S4E2 / S4E3 so GET picks the right decrypt path.
+            let sse_c_material = extract_sse_c_material(
+                &req.input.sse_customer_algorithm,
+                &req.input.sse_customer_key,
+                &req.input.sse_customer_key_md5,
+            )?;
+            // v0.5 #28: SSE-KMS request? Resolves to None unless the
+            // request asks for `aws:kms` AND a key id is available
+            // (explicit header or gateway default). When set, we'll
+            // generate a per-object DEK below.
+            let kms_key_id = extract_kms_key_id(
+                &req.input.server_side_encryption,
+                &req.input.ssekms_key_id,
+                self.kms_default_key_id.as_deref(),
+            );
+            // SSE-C and SSE-KMS are mutually exclusive on a single PUT
+            // (AWS S3 returns 400 InvalidArgument). SSE-C wins by spec.
+            if sse_c_material.is_some() && kms_key_id.is_some() {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "SSE-C and SSE-KMS cannot be used together on the same PUT",
+                ));
+            }
+            // KMS path needs to call generate_dek().await before the
+            // body_to_send branch; capture the result here.
+            let kms_wrap = if let Some(ref key_id) = kms_key_id {
+                let kms = self.kms.as_ref().ok_or_else(|| {
+                    S3Error::with_message(
+                        S3ErrorCode::InvalidRequest,
+                        "SSE-KMS requested but no --kms-local-dir / --kms-aws-region is configured on this gateway",
+                    )
+                })?;
+                let (dek, wrapped) = kms
+                    .generate_dek(key_id)
+                    .await
+                    .map_err(kms_error_to_s3)?;
+                if dek.len() != 32 {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InternalError,
+                        format!("KMS backend returned a DEK of {} bytes (expected 32)", dek.len()),
+                    ));
+                }
+                let mut dek_arr = [0u8; 32];
+                dek_arr.copy_from_slice(&dek);
+                Some((dek_arr, wrapped))
+            } else {
+                None
+            };
+            let body_to_send = if let Some(ref m) = sse_c_material {
+                req.input
+                    .metadata
+                    .get_or_insert_with(Default::default)
+                    .insert("s4-encrypted".into(), "aes-256-gcm".into());
+                crate::sse::encrypt_with_source(
+                    &compressed,
+                    crate::sse::SseSource::CustomerKey {
+                        key: &m.key,
+                        key_md5: &m.key_md5,
+                    },
+                )
+            } else if let Some((ref dek, ref wrapped)) = kms_wrap {
+                req.input
+                    .metadata
+                    .get_or_insert_with(Default::default)
+                    .insert("s4-encrypted".into(), "aes-256-gcm".into());
+                crate::sse::encrypt_with_source(
+                    &compressed,
+                    crate::sse::SseSource::Kms { dek, wrapped },
+                )
+            } else if let Some(keyring) = self.sse_keyring.as_ref() {
                 req.input
                     .metadata
                     .get_or_insert_with(Default::default)
@@ -916,6 +1104,25 @@ impl<B: S3> S3 for S4Service<B> {
                 if pv.versioned_response {
                     resp.output.version_id = Some(pv.version_id.clone());
                 }
+            }
+            // v0.5 #27: AWS S3 echoes the SSE-C headers back on success
+            // so the client knows the server actually applied the
+            // requested algorithm and which key fingerprint matched.
+            if let (Some(m), Ok(resp)) = (sse_c_material.as_ref(), backend_resp.as_mut()) {
+                resp.output.sse_customer_algorithm = Some(crate::sse::SSE_C_ALGORITHM.into());
+                resp.output.sse_customer_key_md5 = Some(
+                    base64::engine::general_purpose::STANDARD.encode(m.key_md5),
+                );
+            }
+            // v0.5 #28: SSE-KMS echo — `aws:kms` + the canonical key id
+            // the backend returned (AWS KMS returns the ARN even when
+            // the request used an alias).
+            if let (Some((_, wrapped)), Ok(resp)) =
+                (kms_wrap.as_ref(), backend_resp.as_mut())
+            {
+                resp.output.server_side_encryption =
+                    Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS));
+                resp.output.ssekms_key_id = Some(wrapped.key_id.clone());
             }
             let _ = (original_size, compressed_size); // mute unused warnings
             let elapsed = put_start.elapsed();
@@ -1026,6 +1233,16 @@ impl<B: S3> S3 for S4Service<B> {
         self.enforce_policy(&req, "s3:GetObject", &get_bucket, Some(&get_key))?;
         // Range request の事前検出 (decompress 後 slice する path に使う)。
         let range_request = req.input.range.take();
+        // v0.5 #27: pull SSE-C material from the input headers before
+        // the request is moved into the backend. A header parse error
+        // fails fast (no body fetch). The material is consumed below
+        // when decrypting an S4E3-framed body; the SSE-C headers on
+        // `req.input` are cleared so the backend doesn't see them.
+        let sse_c_alg = req.input.sse_customer_algorithm.take();
+        let sse_c_key = req.input.sse_customer_key.take();
+        let sse_c_md5 = req.input.sse_customer_key_md5.take();
+        let get_sse_c_material =
+            extract_sse_c_material(&sse_c_alg, &sse_c_key, &sse_c_md5)?;
 
         // v0.5 #34: route the GET through the VersioningManager when
         // attached AND the bucket is in a versioning-aware state.
@@ -1120,31 +1337,93 @@ impl<B: S3> S3 for S4Service<B> {
         }
 
         if let Some(blob) = resp.output.body.take() {
-            // v0.4 #21: if the object was stored under SSE-S4 (metadata
-            // flag `s4-encrypted: aes-256-gcm`), we MUST decrypt before
-            // any frame parse / streaming decompress. Encrypted bodies
-            // are opaque to the codec; this also forces the buffered
-            // path because AES-GCM needs the full body for tag verify.
+            // v0.4 #21 / v0.5 #27: if the object was stored under SSE
+            // (metadata flag `s4-encrypted: aes-256-gcm`), decrypt
+            // before any frame parse / streaming decompress. Encrypted
+            // bodies are opaque to the codec; this also forces the
+            // buffered path because AES-GCM needs the full body for tag
+            // verify. SSE-C uses the per-request customer key, SSE-S4
+            // falls back to the configured keyring.
             let blob = if is_sse_encrypted(&resp.output.metadata) {
-                let keyring = self.sse_keyring.as_ref().ok_or_else(|| {
-                    S3Error::with_message(
-                        S3ErrorCode::InvalidRequest,
-                        "object is SSE-S4 encrypted but no --sse-s4-key is configured on this gateway",
-                    )
-                })?;
                 let body = collect_blob(blob, self.max_body_bytes)
                     .await
                     .map_err(internal("collect SSE-encrypted body"))?;
-                let plain = crate::sse::decrypt(&body, keyring).map_err(|e| {
-                    S3Error::with_message(
-                        S3ErrorCode::InternalError,
-                        format!("SSE-S4 decrypt failed: {e}"),
-                    )
-                })?;
+                // v0.5 #28: peek the frame magic to route the right
+                // decrypt path. S4E4 means SSE-KMS — unwrap the DEK
+                // through the KMS backend (async). S4E1/E2/E3 take the
+                // sync path (keyring or customer key).
+                let plain = match crate::sse::peek_magic(&body) {
+                    Some("S4E4") => {
+                        let kms = self.kms.as_ref().ok_or_else(|| {
+                            S3Error::with_message(
+                                S3ErrorCode::InvalidRequest,
+                                "object is SSE-KMS encrypted but no --kms-local-dir / --kms-aws-region is configured on this gateway",
+                            )
+                        })?;
+                        let kms_ref: &dyn crate::kms::KmsBackend = kms.as_ref();
+                        crate::sse::decrypt_with_kms(&body, kms_ref)
+                            .await
+                            .map_err(|e| match e {
+                                crate::sse::SseError::KmsBackend(k) => kms_error_to_s3(k),
+                                other => S3Error::with_message(
+                                    S3ErrorCode::InternalError,
+                                    format!("SSE-KMS decrypt failed: {other}"),
+                                ),
+                            })?
+                    }
+                    _ => {
+                        if let Some(ref m) = get_sse_c_material {
+                            crate::sse::decrypt(
+                                &body,
+                                crate::sse::SseSource::CustomerKey {
+                                    key: &m.key,
+                                    key_md5: &m.key_md5,
+                                },
+                            )
+                            .map_err(sse_c_error_to_s3)?
+                        } else {
+                            let keyring = self.sse_keyring.as_ref().ok_or_else(|| {
+                                S3Error::with_message(
+                                    S3ErrorCode::InvalidRequest,
+                                    "object is SSE-S4 encrypted but no --sse-s4-key is configured on this gateway",
+                                )
+                            })?;
+                            crate::sse::decrypt(&body, keyring).map_err(|e| {
+                                S3Error::with_message(
+                                    S3ErrorCode::InternalError,
+                                    format!("SSE-S4 decrypt failed: {e}"),
+                                )
+                            })?
+                        }
+                    }
+                };
+                // v0.5 #28: parse out the on-disk wrapped DEK's key id
+                // so the GET response can echo `x-amz-server-side-encryption-aws-kms-key-id`.
+                if matches!(crate::sse::peek_magic(&body), Some("S4E4"))
+                    && let Ok(hdr) = crate::sse::parse_s4e4_header(&body)
+                {
+                    resp.output.server_side_encryption = Some(
+                        ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                    );
+                    resp.output.ssekms_key_id = Some(hdr.key_id.to_string());
+                }
                 bytes_to_blob(plain)
+            } else if let Some(ref m) = get_sse_c_material {
+                // Client sent SSE-C headers for an unencrypted object —
+                // mirror AWS S3's 400 InvalidRequest.
+                let _ = m;
+                return Err(sse_c_error_to_s3(crate::sse::SseError::CustomerKeyUnexpected));
             } else {
                 blob
             };
+            // v0.5 #27: SSE-C echo on success — algorithm + key MD5
+            // tell the client that the supplied key was the one used.
+            if let Some(ref m) = get_sse_c_material {
+                resp.output.sse_customer_algorithm = Some(crate::sse::SSE_C_ALGORITHM.into());
+                resp.output.sse_customer_key_md5 = Some(
+                    base64::engine::general_purpose::STANDARD.encode(m.key_md5),
+                );
+            }
             // ====== Streaming fast path (CpuZstd, non-multipart, codec supports it) ======
             // 大規模 object (e.g. 5 GB) を memory に collect すると OOM するので、
             // codec が streaming-aware なら body を chunk-by-chunk で decompress して

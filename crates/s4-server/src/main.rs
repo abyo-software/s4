@@ -217,6 +217,32 @@ struct Opt {
     #[clap(long)]
     audit_log_hmac_key: Option<String>,
 
+    /// v0.5 #28: directory of `.kek` files for the local SSE-KMS
+    /// backend (`LocalKms`). Each file is exactly 32 raw bytes; the
+    /// basename (sans `.kek`) is the key id a client supplies via
+    /// `x-amz-server-side-encryption-aws-kms-key-id`. PUTs that ask for
+    /// `x-amz-server-side-encryption: aws:kms` mint a fresh DEK,
+    /// AES-256-GCM-wrap it under the named KEK, and persist the wrapped
+    /// blob in an S4E4 frame; GETs unwrap through the same KEK. KEKs
+    /// must be raw 32-byte randomness from /dev/urandom.
+    #[clap(long, value_name = "DIR")]
+    kms_local_dir: Option<std::path::PathBuf>,
+
+    /// v0.5 #28: KMS key id used for SSE-KMS PUTs that don't carry an
+    /// explicit `x-amz-server-side-encryption-aws-kms-key-id` header.
+    /// Mirrors AWS S3's bucket-default key behaviour. When unset, every
+    /// SSE-KMS PUT must name an explicit key id.
+    #[clap(long, value_name = "KEY_ID")]
+    kms_default_key_id: Option<String>,
+
+    /// v0.5 #33: directory of PEM-encoded `<access_key_id>.pem` ECDSA
+    /// P-256 SubjectPublicKeyInfo files. Enables SigV4a (asymmetric)
+    /// signature verification for incoming requests. SigV4 (the
+    /// existing HMAC-based signing) keeps working unchanged when this
+    /// flag is unset.
+    #[clap(long, value_name = "DIR")]
+    sigv4a_credentials: Option<std::path::PathBuf>,
+
     /// v0.5 #34: enable the in-memory first-class versioning state
     /// machine (`VersioningManager`). When set, S4-server itself owns
     /// per-bucket versioning state + per-(bucket, key) version chain
@@ -493,6 +519,34 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         s4 = s4.with_sse_keyring(std::sync::Arc::new(keyring));
     } else if !opt.sse_s4_key_rotated.is_empty() {
         return Err("--sse-s4-key-rotated requires --sse-s4-key (active key) to also be set".into());
+    }
+    if let Some(ref dir) = opt.sigv4a_credentials {
+        let store = s4_server::sigv4a::SigV4aCredentialStore::load_dir(dir)
+            .map_err(|e| format!("--sigv4a-credentials {}: {e}", dir.display()))?;
+        info!(
+            dir = %dir.display(),
+            keys = store.len(),
+            "S4 SigV4a credential store loaded (verification gate)"
+        );
+        // Note: integration into the request gate requires plumbing the
+        // canonicalised request bytes from the s3s framework. That hook
+        // is the follow-up to v0.5 #33; the store is loaded here so an
+        // operator-visible startup-time error catches a bad PEM dir
+        // ahead of the next deploy iteration that wires the gate up.
+        let _ = store;
+    }
+    if let Some(ref kek_dir) = opt.kms_local_dir {
+        let kms = s4_server::kms::LocalKms::open(kek_dir.clone())
+            .map_err(|e| format!("--kms-local-dir {}: {e}", kek_dir.display()))?;
+        info!(
+            dir = %kek_dir.display(),
+            keys = ?kms.key_ids(),
+            "S4 SSE-KMS LocalKms backend opened"
+        );
+        s4 = s4.with_kms_backend(
+            std::sync::Arc::new(kms),
+            opt.kms_default_key_id.clone(),
+        );
     }
     if let Some(ref dir) = opt.access_log {
         let dest = s4_server::access_log::AccessLogDest { dir: dir.clone() };

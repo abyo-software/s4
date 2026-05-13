@@ -1479,3 +1479,174 @@ async fn versioning_list_versions_returns_chronological_history_with_is_latest_f
     assert_eq!(resp.output.is_truncated, Some(false));
 }
 
+
+// ------------------------------------------------------------------
+// v0.5 #27: SSE-C (customer-provided keys) end-to-end.
+// ------------------------------------------------------------------
+
+fn put_request_sse_c(
+    bucket: &str,
+    key: &str,
+    body: Bytes,
+    cust_key: &[u8; 32],
+) -> S3Request<PutObjectInput> {
+    use base64::Engine as _;
+    let mut req = put_request(bucket, key, body);
+    let key_b64 = base64::engine::general_purpose::STANDARD.encode(cust_key);
+    let md5 = s4_server::sse::compute_key_md5(cust_key);
+    let md5_b64 = base64::engine::general_purpose::STANDARD.encode(md5);
+    req.input.sse_customer_algorithm = Some(s4_server::sse::SSE_C_ALGORITHM.into());
+    req.input.sse_customer_key = Some(key_b64);
+    req.input.sse_customer_key_md5 = Some(md5_b64);
+    req
+}
+
+fn get_request_sse_c(bucket: &str, key: &str, cust_key: &[u8; 32]) -> S3Request<GetObjectInput> {
+    use base64::Engine as _;
+    let mut req = get_request(bucket, key);
+    let key_b64 = base64::engine::general_purpose::STANDARD.encode(cust_key);
+    let md5 = s4_server::sse::compute_key_md5(cust_key);
+    let md5_b64 = base64::engine::general_purpose::STANDARD.encode(md5);
+    req.input.sse_customer_algorithm = Some(s4_server::sse::SSE_C_ALGORITHM.into());
+    req.input.sse_customer_key = Some(key_b64);
+    req.input.sse_customer_key_md5 = Some(md5_b64);
+    req
+}
+
+#[tokio::test]
+async fn sse_c_roundtrip_and_wrong_key_fails() {
+    let backend = MemoryBackend::new();
+    let backend_view = backend.shared();
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    );
+    let cust_key = [0xa5u8; 32];
+    let payload = Bytes::from(b"customer-provided-key payload that the server never sees a copy of".repeat(40));
+
+    let put_resp = s4
+        .put_object(put_request_sse_c("bucket", "scc", payload.clone(), &cust_key))
+        .await
+        .expect("put");
+    // Echo: algorithm + key MD5 should be on the response (algorithm
+    // alone is enough to prove SSE-C was honored).
+    assert_eq!(
+        put_resp.output.sse_customer_algorithm.as_deref(),
+        Some(s4_server::sse::SSE_C_ALGORITHM)
+    );
+    assert!(put_resp.output.sse_customer_key_md5.is_some());
+
+    // Backend storage starts with the S4E3 magic — the key is not
+    // persisted, only the per-object MD5 fingerprint via the AAD.
+    {
+        let inner = backend_view.lock().unwrap();
+        let stored = inner.get(&("bucket".into(), "scc".into())).unwrap();
+        assert_eq!(&stored.body[..4], b"S4E3", "SSE-C body must start with S4E3 magic");
+    }
+
+    // Round-trip with the same key → original bytes.
+    let resp = s4
+        .get_object(get_request_sse_c("bucket", "scc", &cust_key))
+        .await
+        .expect("get");
+    assert_eq!(read_back(resp).await, payload);
+
+    // Wrong key → AccessDenied (matches AWS).
+    let wrong_key = [0xb6u8; 32];
+    let err = s4
+        .get_object(get_request_sse_c("bucket", "scc", &wrong_key))
+        .await
+        .expect_err("wrong key must fail");
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("AccessDenied"),
+        "expected AccessDenied for wrong SSE-C key, got {dbg}"
+    );
+
+    // GET without SSE-C headers on an SSE-C object → InvalidRequest.
+    let err = s4
+        .get_object(get_request("bucket", "scc"))
+        .await
+        .expect_err("no key must fail");
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("InvalidRequest") || dbg.contains("supply x-amz-server-side-encryption-customer"),
+        "expected SSE-C-required error, got {dbg}"
+    );
+}
+
+// ------------------------------------------------------------------
+// v0.5 #28: SSE-KMS (envelope-encrypted DEK) end-to-end with LocalKms.
+// ------------------------------------------------------------------
+
+#[tokio::test]
+async fn sse_kms_roundtrip_with_local_kms() {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let kek = [0x33u8; 32];
+    let mut keks = HashMap::new();
+    keks.insert("alpha".to_string(), kek);
+    let kms = Arc::new(s4_server::kms::LocalKms::from_keks(
+        std::env::temp_dir(),
+        keks,
+    )) as Arc<dyn s4_server::kms::KmsBackend>;
+
+    let backend = MemoryBackend::new();
+    let backend_view = backend.shared();
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    )
+    .with_kms_backend(kms, Some("alpha".into()));
+
+    let payload = Bytes::from(b"kms envelope-encrypted payload".repeat(80));
+    let mut put_req = put_request("bucket", "kms-obj", payload.clone());
+    put_req.input.server_side_encryption =
+        Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS));
+    put_req.input.ssekms_key_id = Some("alpha".into());
+    let put_resp = s4.put_object(put_req).await.expect("put");
+    // Echo: SSE + KMS key id in response.
+    assert_eq!(
+        put_resp.output.server_side_encryption.as_ref().map(|s| s.as_str().to_string()),
+        Some(ServerSideEncryption::AWS_KMS.to_string())
+    );
+    assert_eq!(put_resp.output.ssekms_key_id.as_deref(), Some("alpha"));
+
+    // Storage starts with S4E4 magic — DEK is wrapped, KEK never on disk.
+    {
+        let inner = backend_view.lock().unwrap();
+        let stored = inner.get(&("bucket".into(), "kms-obj".into())).unwrap();
+        assert_eq!(&stored.body[..4], b"S4E4", "SSE-KMS body must start with S4E4 magic");
+    }
+
+    // Round-trip via the same gateway.
+    let resp = s4
+        .get_object(get_request("bucket", "kms-obj"))
+        .await
+        .expect("get");
+    assert_eq!(read_back(resp).await, payload);
+
+    // GET via a fresh gateway with NO KMS configured → InvalidRequest.
+    // Build the no-KMS gateway over a backend that shares the same
+    // storage map as the original so the SSE-KMS object is visible.
+    let backend2 = MemoryBackend {
+        inner: Arc::clone(&backend_view),
+    };
+    let s4_no_kms = S4Service::new(
+        backend2,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    );
+    let err = s4_no_kms
+        .get_object(get_request("bucket", "kms-obj"))
+        .await
+        .expect_err("no kms must fail");
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("InvalidRequest") || dbg.contains("KMS"),
+        "expected KMS-required error, got {dbg}"
+    );
+}
