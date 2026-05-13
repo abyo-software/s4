@@ -131,9 +131,21 @@ pub struct RequestContext {
     pub user_agent: Option<String>,
     pub request_time: Option<SystemTime>,
     pub secure_transport: bool,
+    /// v0.6 #39: tags currently attached to the object the request
+    /// targets (resolved by the caller via `TagManager` ahead of
+    /// `evaluate_with`). Surfaced to policy via the
+    /// `s3:ExistingObjectTag/<key>` condition key. `None` here is
+    /// treated identically to "no tags exist" — every
+    /// `ExistingObjectTag` clause then fails.
+    pub existing_object_tags: Option<crate::tagging::TagSet>,
+    /// v0.6 #39: tags carried in the *request* itself (PutObject's
+    /// `x-amz-tagging` URL-encoded header, or PutObjectTagging's
+    /// `Tagging` body). Surfaced to policy via the
+    /// `s3:RequestObjectTag/<key>` condition key.
+    pub request_object_tags: Option<crate::tagging::TagSet>,
     /// Generic key → value map for any aws:* or s3:* context key not
-    /// covered by the typed fields above (keeps the door open for things
-    /// like `aws:RequestTag/*`, `s3:RequestObjectTag/*` later).
+    /// covered by the typed fields above (keeps the door open for any
+    /// key the caller wants to plumb without changing the struct).
     pub extra: HashMap<String, String>,
 }
 
@@ -460,14 +472,35 @@ fn condition_matches(c: &Condition, ctx: &RequestContext) -> bool {
 
 /// Resolve a Condition key against the request context. Handles the
 /// well-known `aws:SourceIp` / `aws:UserAgent` / `aws:CurrentTime` /
-/// `aws:SecureTransport` keys, plus any free-form key the caller stuffed
-/// into `ctx.extra`.
+/// `aws:SecureTransport` keys, the v0.6 #39 `s3:ExistingObjectTag/*` /
+/// `s3:RequestObjectTag/*` tag keys, plus any free-form key the caller
+/// stuffed into `ctx.extra`.
 fn context_value(key: &str, ctx: &RequestContext) -> Option<String> {
     match key {
         "aws:UserAgent" | "aws:userAgent" => ctx.user_agent.clone(),
         "aws:SourceIp" | "aws:sourceIp" => ctx.source_ip.map(|ip| ip.to_string()),
         "aws:SecureTransport" => Some(ctx.secure_transport.to_string()),
-        other => ctx.extra.get(other).cloned(),
+        other => {
+            // v0.6 #39: tag-based condition keys are slash-suffixed
+            // (`s3:ExistingObjectTag/<tag-key>` /
+            // `s3:RequestObjectTag/<tag-key>`). Resolve to the named
+            // tag's value if present in the relevant set; `None`
+            // otherwise — which makes the clause fail (statement
+            // skipped) for both `StringEquals` and `StringNotEquals`.
+            if let Some(tag_key) = other.strip_prefix("s3:ExistingObjectTag/") {
+                return ctx
+                    .existing_object_tags
+                    .as_ref()
+                    .and_then(|s| s.get(tag_key).map(str::to_owned));
+            }
+            if let Some(tag_key) = other.strip_prefix("s3:RequestObjectTag/") {
+                return ctx
+                    .request_object_tags
+                    .as_ref()
+                    .and_then(|s| s.get(tag_key).map(str::to_owned));
+            }
+            ctx.extra.get(other).cloned()
+        }
     }
 }
 
@@ -902,6 +935,120 @@ mod tests {
         .expect_err("should reject unsupported operator");
         assert!(err.contains("unsupported policy Condition operator"));
         assert!(err.contains("NumericGreaterThan"));
+    }
+
+    // ===== v0.6 #39 tag-based condition tests =====
+
+    #[test]
+    fn condition_existing_object_tag_matches_via_tagmanager_state() {
+        let pol = p(r#"{
+            "Statement": [{
+              "Effect": "Allow", "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::b/*",
+              "Condition": {
+                "StringEquals": {"s3:ExistingObjectTag/Project": ["Phoenix"]}
+              }
+            }]
+        }"#);
+        let with_tag = RequestContext {
+            existing_object_tags: Some(
+                crate::tagging::TagSet::from_pairs(vec![
+                    ("Project".into(), "Phoenix".into()),
+                    ("Env".into(), "prod".into()),
+                ])
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let other_tag = RequestContext {
+            existing_object_tags: Some(
+                crate::tagging::TagSet::from_pairs(vec![("Project".into(), "Other".into())])
+                    .unwrap(),
+            ),
+            ..Default::default()
+        };
+        // Tag matches → Allow.
+        assert!(
+            pol.evaluate_with("s3:GetObject", "b", Some("k"), None, &with_tag)
+                .allow
+        );
+        // Tag value mismatched → implicit deny.
+        assert!(
+            !pol.evaluate_with("s3:GetObject", "b", Some("k"), None, &other_tag)
+                .allow
+        );
+    }
+
+    #[test]
+    fn condition_request_object_tag_matches_via_x_amz_tagging() {
+        let pol = p(r#"{
+            "Statement": [{
+              "Effect": "Allow", "Action": "s3:PutObject",
+              "Resource": "arn:aws:s3:::b/*",
+              "Condition": {
+                "StringEquals": {"s3:RequestObjectTag/Env": ["prod", "staging"]}
+              }
+            }]
+        }"#);
+        let req_tags = |v: &str| RequestContext {
+            request_object_tags: Some(
+                crate::tagging::TagSet::from_pairs(vec![("Env".into(), v.into())]).unwrap(),
+            ),
+            ..Default::default()
+        };
+        assert!(
+            pol.evaluate_with("s3:PutObject", "b", Some("k"), None, &req_tags("prod"))
+                .allow
+        );
+        assert!(
+            pol.evaluate_with(
+                "s3:PutObject",
+                "b",
+                Some("k"),
+                None,
+                &req_tags("staging")
+            )
+            .allow
+        );
+        assert!(
+            !pol.evaluate_with("s3:PutObject", "b", Some("k"), None, &req_tags("dev"))
+                .allow
+        );
+    }
+
+    #[test]
+    fn condition_tag_not_present_fails_closed() {
+        // Statement gates on a tag the request doesn't carry → the
+        // clause must fail (not silently match), so the only Allow is
+        // skipped and we get implicit deny.
+        let pol = p(r#"{
+            "Statement": [{
+              "Effect": "Allow", "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::b/*",
+              "Condition": {
+                "StringEquals": {"s3:ExistingObjectTag/Owner": ["alice"]}
+              }
+            }]
+        }"#);
+        // No `existing_object_tags` at all → tag look-up returns None
+        // → clause fails → statement skipped.
+        let none_ctx = RequestContext::default();
+        assert!(
+            !pol.evaluate_with("s3:GetObject", "b", Some("k"), None, &none_ctx)
+                .allow
+        );
+        // Tag set exists but lacks the named key → also fails.
+        let other_only = RequestContext {
+            existing_object_tags: Some(
+                crate::tagging::TagSet::from_pairs(vec![("Project".into(), "X".into())])
+                    .unwrap(),
+            ),
+            ..Default::default()
+        };
+        assert!(
+            !pol.evaluate_with("s3:GetObject", "b", Some("k"), None, &other_only)
+                .allow
+        );
     }
 
     #[test]
