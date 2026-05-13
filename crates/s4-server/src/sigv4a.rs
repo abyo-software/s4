@@ -89,7 +89,10 @@ pub enum SigV4aError {
     /// (`--sigv4a-skew-tolerance-seconds`, default 900s = 15min).
     /// Maps to HTTP 403 `RequestTimeTooSkewed` per AWS S3 spec.
     #[error("request time too skewed: {drift_secs}s drift, tolerance {tolerance_secs}s")]
-    RequestTimeTooSkewed { drift_secs: i64, tolerance_secs: i64 },
+    RequestTimeTooSkewed {
+        drift_secs: i64,
+        tolerance_secs: i64,
+    },
     /// `x-amz-date` date portion (first 8 chars) does not match the
     /// date in the credential scope. Defends against replays whose
     /// scope and timestamp were mixed and matched.
@@ -192,9 +195,7 @@ pub fn parse_authorization_header(header: &str) -> Result<SigV4aAuth, SigV4aErro
     let rest = header
         .trim()
         .strip_prefix(SIGV4A_ALGORITHM)
-        .ok_or_else(|| {
-            SigV4aError::BadSignature("not a SigV4a Authorization header".into())
-        })?;
+        .ok_or_else(|| SigV4aError::BadSignature("not a SigV4a Authorization header".into()))?;
     let rest = rest.trim_start();
 
     let mut credential: Option<&str> = None;
@@ -212,8 +213,8 @@ pub fn parse_authorization_header(header: &str) -> Result<SigV4aAuth, SigV4aErro
         }
     }
 
-    let cred = credential
-        .ok_or_else(|| SigV4aError::BadSignature("missing Credential= field".into()))?;
+    let cred =
+        credential.ok_or_else(|| SigV4aError::BadSignature("missing Credential= field".into()))?;
     // SigV4a credential format: `<access-key>/<date>/<service>/aws4_request`
     // (4 slash-separated components). The region lives in the
     // `X-Amz-Region-Set` header, NOT in the credential scope, which is
@@ -238,10 +239,7 @@ pub fn parse_authorization_header(header: &str) -> Result<SigV4aAuth, SigV4aErro
     if terminator != "aws4_request" {
         return Err(SigV4aError::InvalidTerminator);
     }
-    let credential_scope: Vec<String> = scope_parts[1..]
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect();
+    let credential_scope: Vec<String> = scope_parts[1..].iter().map(|s| (*s).to_owned()).collect();
 
     let signed_headers_raw = signed_headers
         .ok_or_else(|| SigV4aError::BadSignature("missing SignedHeaders= field".into()))?;
@@ -251,11 +249,13 @@ pub fn parse_authorization_header(header: &str) -> Result<SigV4aAuth, SigV4aErro
         .filter(|s| !s.is_empty())
         .collect();
     if signed_headers.is_empty() {
-        return Err(SigV4aError::BadSignature("empty SignedHeaders= list".into()));
+        return Err(SigV4aError::BadSignature(
+            "empty SignedHeaders= list".into(),
+        ));
     }
 
-    let signature_hex = signature
-        .ok_or_else(|| SigV4aError::BadSignature("missing Signature= field".into()))?;
+    let signature_hex =
+        signature.ok_or_else(|| SigV4aError::BadSignature("missing Signature= field".into()))?;
     let signature_der = decode_hex(signature_hex)
         .ok_or_else(|| SigV4aError::BadSignature("non-hex Signature= value".into()))?;
 
@@ -279,7 +279,9 @@ pub fn parse_authorization_header(header: &str) -> Result<SigV4aAuth, SigV4aErro
 /// particular `hyper::body` flavor; the body bytes are not inspected.
 pub fn detect<B>(req: &http::Request<B>) -> bool {
     let h = req.headers();
-    if let Some(auth) = h.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+    if let Some(auth) = h
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
         && auth.trim_start().starts_with(SIGV4A_ALGORITHM)
     {
         return true;
@@ -316,8 +318,8 @@ pub fn verify(
             set: region_set.to_owned(),
         });
     }
-    let sig = Signature::from_der(signature)
-        .map_err(|e| SigV4aError::BadSignature(e.to_string()))?;
+    let sig =
+        Signature::from_der(signature).map_err(|e| SigV4aError::BadSignature(e.to_string()))?;
     pubkey
         .verify(request_bytes.as_bytes(), &sig)
         .map_err(|_| SigV4aError::VerificationFailed)
@@ -364,8 +366,7 @@ pub fn verify_request(
     skew_tolerance: chrono::Duration,
 ) -> Result<(), SigV4aError> {
     // (1) x-amz-date present?
-    let x_amz_date = lookup_header_ci(headers, "x-amz-date")
-        .ok_or(SigV4aError::MissingXAmzDate)?;
+    let x_amz_date = lookup_header_ci(headers, "x-amz-date").ok_or(SigV4aError::MissingXAmzDate)?;
     // (2) format check — AWS canonical: YYYYMMDDTHHMMSSZ (16 chars).
     if x_amz_date.len() != 16 || !x_amz_date.ends_with('Z') {
         return Err(SigV4aError::InvalidDateFormat);
@@ -415,10 +416,7 @@ pub fn verify_request(
 /// caller (the `routing` middleware lowercases all header names when
 /// it snapshots them); this helper exists so unit tests can pass an
 /// arbitrarily-cased map and still get a hit.
-fn lookup_header_ci<'a>(
-    headers: &'a HashMap<String, String>,
-    name: &str,
-) -> Option<&'a String> {
+fn lookup_header_ci<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a String> {
     let needle = name.to_ascii_lowercase();
     if let Some(v) = headers.get(&needle) {
         return Some(v);
@@ -518,12 +516,11 @@ impl SigV4aCredentialStore {
                 path: path.display().to_string(),
                 source,
             })?;
-            let key = parse_p256_public_key_pem(&pem).map_err(|reason| {
-                SigV4aError::BadPublicKey {
+            let key =
+                parse_p256_public_key_pem(&pem).map_err(|reason| SigV4aError::BadPublicKey {
                     path: path.display().to_string(),
                     reason,
-                }
-            })?;
+                })?;
             keys.insert(access_key_id, key);
         }
         Ok(Self {
@@ -905,12 +902,7 @@ mod tests {
     fn build_signed_request(
         x_amz_date: &str,
         scope_date: &str,
-    ) -> (
-        SigV4aAuth,
-        HashMap<String, String>,
-        Vec<u8>,
-        VerifyingKey,
-    ) {
+    ) -> (SigV4aAuth, HashMap<String, String>, Vec<u8>, VerifyingKey) {
         let signing = SigningKey::random(&mut OsRng);
         let verifying = VerifyingKey::from(&signing);
         let canonical = b"GET\n/bucket/key\n\nhost:s3.example.com\nx-amz-date:placeholder\n\nhost;x-amz-date\nUNSIGNED-PAYLOAD".to_vec();
@@ -955,8 +947,7 @@ mod tests {
     fn sigv4a_rejects_skew_beyond_15min_past() {
         // Request signed at 12:00:00, "now" is 12:16:00 — 16 min drift,
         // beyond the 15-min default tolerance.
-        let (parsed, headers, canonical, vk) =
-            build_signed_request("20260514T120000Z", "20260514");
+        let (parsed, headers, canonical, vk) = build_signed_request("20260514T120000Z", "20260514");
         let now = chrono::DateTime::parse_from_rfc3339("2026-05-14T12:16:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
@@ -987,8 +978,7 @@ mod tests {
     fn sigv4a_rejects_skew_beyond_15min_future() {
         // Request signed at 12:16:00, "now" is 12:00:00 — clock skew
         // 16 min into the future is equally rejected.
-        let (parsed, headers, canonical, vk) =
-            build_signed_request("20260514T121600Z", "20260514");
+        let (parsed, headers, canonical, vk) = build_signed_request("20260514T121600Z", "20260514");
         let now = chrono::DateTime::parse_from_rfc3339("2026-05-14T12:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
@@ -1045,8 +1035,7 @@ mod tests {
         // Request signed 14 min ago — inside the 15-min window, must
         // verify cleanly. Establishes that `verify_request` is not
         // accidentally rejecting fresh requests.
-        let (parsed, headers, canonical, vk) =
-            build_signed_request("20260514T120000Z", "20260514");
+        let (parsed, headers, canonical, vk) = build_signed_request("20260514T120000Z", "20260514");
         let now = chrono::DateTime::parse_from_rfc3339("2026-05-14T12:14:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
@@ -1117,8 +1106,7 @@ mod tests {
     /// portion (`20260514`) → mismatch.
     #[test]
     fn sigv4a_rejects_date_scope_mismatch() {
-        let (parsed, headers, canonical, vk) =
-            build_signed_request("20260514T120000Z", "20260101");
+        let (parsed, headers, canonical, vk) = build_signed_request("20260514T120000Z", "20260101");
         // now matches the x-amz-date so we get past the skew check.
         let now = chrono::DateTime::parse_from_rfc3339("2026-05-14T12:00:00Z")
             .unwrap()

@@ -492,10 +492,7 @@ mod tests {
         assert_ne!(p1.version_id, p2.version_id);
         assert!(p1.versioned_response);
         assert!(p2.versioned_response);
-        let chain_len = m
-            .list_versions("b", None, None, None, 100)
-            .versions
-            .len();
+        let chain_len = m.list_versions("b", None, None, None, 100).versions.len();
         assert_eq!(chain_len, 2);
     }
 

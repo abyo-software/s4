@@ -872,9 +872,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
                         .into(),
                 );
             }
-            let k = s4_server::sse::SseKey::from_path(&path).map_err(|e| {
-                format!("--sse-s4-key-rotated id={id} key {}: {e}", path.display())
-            })?;
+            let k = s4_server::sse::SseKey::from_path(&path)
+                .map_err(|e| format!("--sse-s4-key-rotated id={id} key {}: {e}", path.display()))?;
             info!(id, path = %path.display(), "S4 SSE-S4 retired key loaded");
             keyring.add(id, std::sync::Arc::new(k));
         }
@@ -891,12 +890,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             );
             s4 = s4.with_sse_chunk_size(opt.sse_chunk_size);
         } else {
-            info!(
-                "S4 SSE-S4 chunked frame (S4E5) disabled — using legacy buffered S4E2 frame"
-            );
+            info!("S4 SSE-S4 chunked frame (S4E5) disabled — using legacy buffered S4E2 frame");
         }
     } else if !opt.sse_s4_key_rotated.is_empty() {
-        return Err("--sse-s4-key-rotated requires --sse-s4-key (active key) to also be set".into());
+        return Err(
+            "--sse-s4-key-rotated requires --sse-s4-key (active key) to also be set".into(),
+        );
     }
     if let Some(ref dir) = opt.sigv4a_credentials {
         // v0.8.4 #76: validate the skew tolerance — 0 would reject every
@@ -944,10 +943,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             keys = ?kms.key_ids(),
             "S4 SSE-KMS LocalKms backend opened"
         );
-        s4 = s4.with_kms_backend(
-            std::sync::Arc::new(kms),
-            opt.kms_default_key_id.clone(),
-        );
+        s4 = s4.with_kms_backend(std::sync::Arc::new(kms), opt.kms_default_key_id.clone());
     }
     if let Some(ref dir) = opt.access_log {
         let dest = s4_server::access_log::AccessLogDest { dir: dir.clone() };
@@ -1349,8 +1345,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             // governs which entries are stale, the cadence governs
             // how often we look. Hourly is a safe upper bound on
             // sweep latency for the default 24 h TTL.
-            let mut ticker =
-                tokio::time::interval(std::time::Duration::from_secs(3600));
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
             // Skip the immediate tick — a freshly-booted process
             // can't have any abandoned uploads yet.
             ticker.tick().await;
@@ -1393,8 +1388,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
                 "S4 replication-status sweep active (hourly tick, TTL configurable via --replication-status-ttl-hours; Pending entries never swept)"
             );
             tokio::spawn(async move {
-                let mut ticker =
-                    tokio::time::interval(std::time::Duration::from_secs(3600));
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
                 // Skip the immediate tick — a freshly-booted process
                 // can't have any terminal entries past TTL yet (any
                 // restored snapshot entries got `recorded_at = now`
@@ -1615,7 +1609,11 @@ where
             aes_ni_available,
             "S4 AES-NI feature detection (x86_64 only; arm64 always uses NEON if available)"
         );
-        let kind = if aes_ni_available { "aes-ni" } else { "software" };
+        let kind = if aes_ni_available {
+            "aes-ni"
+        } else {
+            "software"
+        };
         s4_server::metrics::record_sse_aes_backend(kind);
     }
     #[cfg(target_arch = "aarch64")]

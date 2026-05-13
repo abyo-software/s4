@@ -314,21 +314,20 @@ pub fn try_sigv4a_verify_at<B>(
         .headers()
         .get(http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    let signed_headers: Vec<String> = match auth_hdr
-        .and_then(|hdr| crate::sigv4a::parse_authorization_header(hdr).ok())
-    {
-        Some(parsed) => parsed.signed_headers,
-        None => {
-            // No / unparseable Authorization header but `detect` flagged
-            // it as SigV4a-shaped (e.g. only the region-set header is
-            // present) — surface as SignatureDoesNotMatch directly.
-            return Some(Err(build_sigv4a_error_response(
-                StatusCode::FORBIDDEN,
-                "SignatureDoesNotMatch",
-                "missing or malformed Authorization header for SigV4a request",
-            )));
-        }
-    };
+    let signed_headers: Vec<String> =
+        match auth_hdr.and_then(|hdr| crate::sigv4a::parse_authorization_header(hdr).ok()) {
+            Some(parsed) => parsed.signed_headers,
+            None => {
+                // No / unparseable Authorization header but `detect` flagged
+                // it as SigV4a-shaped (e.g. only the region-set header is
+                // present) — surface as SignatureDoesNotMatch directly.
+                return Some(Err(build_sigv4a_error_response(
+                    StatusCode::FORBIDDEN,
+                    "SignatureDoesNotMatch",
+                    "missing or malformed Authorization header for SigV4a request",
+                )));
+            }
+        };
     let canonical = build_canonical_request_bytes(req, &signed_headers);
     match gate.pre_route_at(req, requested_region, &canonical, now) {
         Ok(()) => Some(Ok(())),
@@ -358,10 +357,7 @@ pub fn try_sigv4a_verify_at<B>(
 /// 5. signed headers list (lowercase names joined by `;`)
 /// 6. payload hash (value of `x-amz-content-sha256`, or `UNSIGNED-PAYLOAD`
 ///    if absent)
-fn build_canonical_request_bytes<B>(
-    req: &Request<B>,
-    signed_headers: &[String],
-) -> Vec<u8> {
+fn build_canonical_request_bytes<B>(req: &Request<B>, signed_headers: &[String]) -> Vec<u8> {
     let mut buf = String::with_capacity(512);
     buf.push_str(req.method().as_str());
     buf.push('\n');
@@ -476,7 +472,6 @@ fn build_sigv4a_error_response(
         .expect("sigv4a error response builder")
 }
 
-
 /// `/health` と `/ready` のレスポンス Body。
 /// inner S3Service の Body と互換する形にするために `s3s::Body` でラップ可能な
 /// `Full<Bytes>` を `s3s::Body::http_body` 経由で構築する。
@@ -537,9 +532,7 @@ where
         // otherwise reject the request as "unknown algorithm" before
         // any handler ran). Plain SigV4 (HMAC) requests return `None`
         // and fall through to the inner service untouched.
-        if let Some(result) =
-            try_sigv4a_verify(&req, self.sigv4a_gate.as_ref(), &self.region)
-        {
+        if let Some(result) = try_sigv4a_verify(&req, self.sigv4a_gate.as_ref(), &self.region) {
             match result {
                 Ok(()) => {
                     // verified — fall through to the path-routing logic
@@ -654,11 +647,7 @@ mod preflight_tests {
 
     /// Helper: build a `Request<()>` with the given method, path, and
     /// headers — body is ignored by the matcher.
-    fn req(
-        method: Method,
-        path: &str,
-        headers: &[(&str, &str)],
-    ) -> Request<()> {
+    fn req(method: Method, path: &str, headers: &[(&str, &str)]) -> Request<()> {
         let mut b = Request::builder().method(method).uri(path);
         for (k, v) in headers {
             b = b.header(*k, *v);
@@ -927,7 +916,12 @@ mod sigv4a_gate_tests {
     ) -> (Request<()>, p256::ecdsa::VerifyingKey) {
         let signing = SigningKey::random(&mut OsRng);
         let verifying = p256::ecdsa::VerifyingKey::from(&signing);
-        let signed_headers_list = ["host", "x-amz-content-sha256", "x-amz-date", REGION_SET_HEADER];
+        let signed_headers_list = [
+            "host",
+            "x-amz-content-sha256",
+            "x-amz-date",
+            REGION_SET_HEADER,
+        ];
         // Build the request first WITHOUT the Authorization header so we
         // can compute canonical bytes and sign them; then re-build the
         // request with the Authorization header attached.
@@ -943,8 +937,10 @@ mod sigv4a_gate_tests {
             .header(REGION_SET_HEADER, region_set)
             .body(())
             .expect("pre-request");
-        let signed_headers: Vec<String> =
-            signed_headers_list.iter().map(|s| (*s).to_string()).collect();
+        let signed_headers: Vec<String> = signed_headers_list
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         let canonical = build_canonical_request_bytes(&pre, &signed_headers);
         let sig: p256::ecdsa::Signature = signing.sign(&canonical);
         let sig_hex = lower_hex(sig.to_der().as_bytes());
@@ -1211,8 +1207,10 @@ mod sigv4a_gate_tests {
                 ("x-amz-date", "  20260513T120000Z  "),
             ],
         );
-        let signed: Vec<String> =
-            ["host", "x-amz-content-sha256", "x-amz-date"].iter().map(|s| (*s).into()).collect();
+        let signed: Vec<String> = ["host", "x-amz-content-sha256", "x-amz-date"]
+            .iter()
+            .map(|s| (*s).into())
+            .collect();
         let bytes = build_canonical_request_bytes(&r, &signed);
         let s = std::str::from_utf8(&bytes).expect("utf-8");
         let expected = "PUT\n\

@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4] — 2026-05-14
+
+Deep-audit 第二弾 sweep: **2 CRITICAL + 8 HIGH + 6 MEDIUM + 1 LOW**
+findings closed across **10 issues** (#71–#80) plus an operational fix
+for the CI gate that was silently red since v0.7.1. Same posture as
+v0.8.2: deploy if you use replication, multipart × SSE, audit logs as
+compliance evidence, IAM-style bucket policies, SigV4a, or any of the
+manager state-file flags.
+
+### Fixed (data integrity / silent corruption)
+
+- **Multipart Complete: backend body-fetch error must propagate**
+  (#71 / C-1) — the SSE re-encrypt branch silently used
+  `assembled_body = None` when `backend.get_object` failed, producing
+  a 200 OK with **plaintext bytes** persisted on the backend (same
+  class as v0.8 BUG-5, different code path). `NoSuchKey` is the only
+  failure now treated as benign; everything else returns InternalError
+  so the client retries. Abort cleanup order also reversed (audit H-7).
+- **upload_part_copy propagates source `version_id`** (#74 / H-3) —
+  was silently fetching the latest version when the client requested
+  a specific historical version-id (silent wrong content).
+- **Streaming GET CRC verify + Range GET sidecar etag binding**
+  (#73 / H-1 + H-2 + M2) — CpuZstd streaming GET path now ends with
+  a CRC check against the manifest. Range GET sidecars bumped to v2
+  with `source_etag` + `source_compressed_size`; mismatch with the
+  current object's HEAD falls back to a full GET. Streaming compress
+  requires the body to match `Content-Length` and returns 400
+  IncompleteBody on truncation.
+
+### Fixed (security)
+
+- **Policy: object/bucket ARN scoping + Principal validation** (#75 /
+  H-4 + H-5) — bucket-level ARNs no longer authorise object actions
+  (privilege escalation closed). `PrincipalSet::Wildcard` accepts only
+  literal `"*"`; unsupported principal types (Service / Federated /
+  CanonicalUser), empty AWS lists, and malformed shapes are rejected
+  at parse time instead of silently widening to anonymous-everyone.
+- **SigV4a: enforce `x-amz-date` freshness + scope shape** (#76 / H-6)
+  — captured SigV4a requests can no longer be replayed indefinitely.
+  `--sigv4a-skew-tolerance-seconds` (default 900) gates the timestamp;
+  `RequestTimeTooSkewed` (403) on out-of-window requests.
+
+### Fixed (operational resilience)
+
+- **Snapshot boot fault isolation** (#72 / C-2) — single corrupted
+  state file used to kill the boot. New `state_loader::load_or_fresh`
+  centralises the load path: read / parse failure logs WARN, bumps
+  `s4_state_file_load_failures_total{manager,reason}`, and returns a
+  fresh manager. Operator's snapshot file is left in place on disk for
+  inspection. Applied to all 9 state-file flags.
+- **RwLock / Mutex poison recovery in 10 managers** (#77 / H-8) — 75
+  `.expect("poisoned")` call sites swept into the new
+  `lock_recovery::{recover_read,recover_write,recover_mutex}` helpers.
+  A panic inside a write-guarded section no longer crashes the next
+  `to_json` (e.g., from a SIGUSR1 dump-back hook). New metric
+  `s4_lock_poison_recovery_total{lock,kind}` exposes recovery rate.
+- **Lifecycle pagination guards** (#78 / M3) — `is_truncated=true` with
+  `next_continuation_token=None` (malformed backend response) used to
+  loop forever. Both the object-walk and the multipart-uploads walk
+  break + WARN now.
+- **ACME renewal poll timeout** (#80 / L1) — 60s `tokio::time::timeout`
+  on `state.next()` so a hung Let's Encrypt API doesn't kill the
+  renewal task silently. New metric label
+  `s4_acme_renewal_total{result="timeout"}`.
+
+### Fixed (correctness)
+
+- **Tagging header validation per AWS S3 spec** (#79 / M5) — empty
+  key, duplicate keys, key > 128 bytes, value > 256 bytes, and > 10
+  tags per object now return `InvalidArgument` instead of being
+  silently accepted (or last-wins on duplicates).
+
+### CI
+
+- **CI workflow opens an issue on `main` push failure** — operators
+  get an email via the issue notification path so a fmt drift /
+  clippy regression / test failure on `main` is loud instead of
+  silent. The v0.7.1–v0.8.3 series silently ran with red CI for 20+
+  pushes (the release process didn't gate on `cargo fmt --check`);
+  fixed by adding the gate to the release routine and the workflow
+  itself.
+- **Workspace-wide `cargo fmt --all`** sweep applied. CI's
+  `cargo fmt --check` gate passes again.
+
 ## [0.8.3] — 2026-05-14
 
 Operational hardening + audit MEDIUM-class sweep. Six issues

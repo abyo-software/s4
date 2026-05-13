@@ -311,7 +311,10 @@ mod tests {
             retain_until: Some(now() + Duration::days(7)),
             legal_hold_on: false,
         };
-        assert!(s.can_delete(now(), true), "bypass=true should permit delete");
+        assert!(
+            s.can_delete(now(), true),
+            "bypass=true should permit delete"
+        );
         assert!(
             !s.can_delete(now(), false),
             "bypass=false should refuse delete"
@@ -457,7 +460,10 @@ mod tests {
             LockMode::from_aws_str(LockMode::Compliance.as_aws_str()),
             Some(LockMode::Compliance)
         );
-        assert_eq!(LockMode::from_aws_str("governance"), Some(LockMode::Governance));
+        assert_eq!(
+            LockMode::from_aws_str("governance"),
+            Some(LockMode::Governance)
+        );
         assert!(LockMode::from_aws_str("nope").is_none());
     }
 
@@ -501,7 +507,10 @@ mod tests {
             g.entry(("b".into(), "k2".into())).or_default();
             panic!("force-poison");
         }));
-        assert!(m.states.is_poisoned(), "write panic must poison states lock");
+        assert!(
+            m.states.is_poisoned(),
+            "write panic must poison states lock"
+        );
         let json = m.to_json().expect("to_json after poison must succeed");
         let m2 = ObjectLockManager::from_json(&json).expect("from_json");
         assert!(

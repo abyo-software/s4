@@ -177,10 +177,7 @@ pub enum ResourceArn {
     Bucket(String),
     /// `arn:aws:s3:::<bucket>/<key-pattern>` — matches object-level
     /// actions only. `key_pattern` may carry `*` / `?` glob characters.
-    Object {
-        bucket: String,
-        key_pattern: String,
-    },
+    Object { bucket: String, key_pattern: String },
 }
 
 /// v0.8.4 #75: which resource ARN shape an Action accepts.
@@ -202,9 +199,7 @@ enum ResourceKind {
 pub enum PolicyParseError {
     #[error("policy JSON parse error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error(
-        "Resource ARN must start with \"arn:aws:s3:::\" — got {0:?}"
-    )]
+    #[error("Resource ARN must start with \"arn:aws:s3:::\" — got {0:?}")]
     InvalidResourceArn(String),
     #[error("Resource ARN bucket name is empty: {0:?}")]
     EmptyBucketInArn(String),
@@ -1317,14 +1312,8 @@ mod tests {
                 .allow
         );
         assert!(
-            pol.evaluate_with(
-                "s3:PutObject",
-                "b",
-                Some("k"),
-                None,
-                &req_tags("staging")
-            )
-            .allow
+            pol.evaluate_with("s3:PutObject", "b", Some("k"), None, &req_tags("staging"))
+                .allow
         );
         assert!(
             !pol.evaluate_with("s3:PutObject", "b", Some("k"), None, &req_tags("dev"))
@@ -1356,8 +1345,7 @@ mod tests {
         // Tag set exists but lacks the named key → also fails.
         let other_only = RequestContext {
             existing_object_tags: Some(
-                crate::tagging::TagSet::from_pairs(vec![("Project".into(), "X".into())])
-                    .unwrap(),
+                crate::tagging::TagSet::from_pairs(vec![("Project".into(), "X".into())]).unwrap(),
             ),
             ..Default::default()
         };

@@ -810,8 +810,7 @@ async fn sse_s4_keyring_rotation_e2e() {
     )
     .with_sse_keyring(Arc::new(ring_v1));
 
-    let payload_a =
-        Bytes::from(b"object encrypted under active=2 (rotation wave 1)".repeat(20));
+    let payload_a = Bytes::from(b"object encrypted under active=2 (rotation wave 1)".repeat(20));
     s4_v1
         .put_object(put_request("bucket", "obj_a", payload_a.clone()))
         .await
@@ -962,10 +961,7 @@ async fn legacy_s4e1_object_decrypts_under_v05_keyring() {
         "s4-compressed-size".into(),
         raw_compressed.len().to_string(),
     );
-    meta.insert(
-        "s4-crc32c".into(),
-        crc32c::crc32c(&plaintext).to_string(),
-    );
+    meta.insert("s4-crc32c".into(), crc32c::crc32c(&plaintext).to_string());
     meta.insert("s4-encrypted".into(), "aes-256-gcm".into());
     backend_view.lock().unwrap().insert(
         ("bucket".into(), "legacy_enc".into()),
@@ -1134,7 +1130,11 @@ async fn enable_versioning_on(s4: &S4Service<MemoryBackend>, bucket: &str) {
         .expect("enable versioning");
 }
 
-fn get_request_with_version(bucket: &str, key: &str, version_id: &str) -> S3Request<GetObjectInput> {
+fn get_request_with_version(
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> S3Request<GetObjectInput> {
     let mut r = get_request(bucket, key);
     r.input.version_id = Some(version_id.to_owned());
     r
@@ -1396,7 +1396,11 @@ async fn versioning_delete_with_version_id_removes_specific_version_and_other_ve
     // Chain has 2 entries left.
     let page = mgr.list_versions("bucket", None, None, None, 100);
     assert_eq!(page.versions.len(), 2);
-    let vids: Vec<&str> = page.versions.iter().map(|e| e.version_id.as_str()).collect();
+    let vids: Vec<&str> = page
+        .versions
+        .iter()
+        .map(|e| e.version_id.as_str())
+        .collect();
     assert!(vids.contains(&v1.as_str()));
     assert!(vids.contains(&v3.as_str()));
     assert!(!vids.contains(&v2.as_str()));
@@ -1479,7 +1483,6 @@ async fn versioning_list_versions_returns_chronological_history_with_is_latest_f
     assert_eq!(resp.output.is_truncated, Some(false));
 }
 
-
 // ------------------------------------------------------------------
 // v0.5 #27: SSE-C (customer-provided keys) end-to-end.
 // ------------------------------------------------------------------
@@ -1523,10 +1526,17 @@ async fn sse_c_roundtrip_and_wrong_key_fails() {
         make_dispatcher(CodecKind::CpuZstd),
     );
     let cust_key = [0xa5u8; 32];
-    let payload = Bytes::from(b"customer-provided-key payload that the server never sees a copy of".repeat(40));
+    let payload = Bytes::from(
+        b"customer-provided-key payload that the server never sees a copy of".repeat(40),
+    );
 
     let put_resp = s4
-        .put_object(put_request_sse_c("bucket", "scc", payload.clone(), &cust_key))
+        .put_object(put_request_sse_c(
+            "bucket",
+            "scc",
+            payload.clone(),
+            &cust_key,
+        ))
         .await
         .expect("put");
     // Echo: algorithm + key MD5 should be on the response (algorithm
@@ -1542,7 +1552,11 @@ async fn sse_c_roundtrip_and_wrong_key_fails() {
     {
         let inner = backend_view.lock().unwrap();
         let stored = inner.get(&("bucket".into(), "scc".into())).unwrap();
-        assert_eq!(&stored.body[..4], b"S4E3", "SSE-C body must start with S4E3 magic");
+        assert_eq!(
+            &stored.body[..4],
+            b"S4E3",
+            "SSE-C body must start with S4E3 magic"
+        );
     }
 
     // Round-trip with the same key → original bytes.
@@ -1571,7 +1585,8 @@ async fn sse_c_roundtrip_and_wrong_key_fails() {
         .expect_err("no key must fail");
     let dbg = format!("{err:?}");
     assert!(
-        dbg.contains("InvalidRequest") || dbg.contains("supply x-amz-server-side-encryption-customer"),
+        dbg.contains("InvalidRequest")
+            || dbg.contains("supply x-amz-server-side-encryption-customer"),
         "expected SSE-C-required error, got {dbg}"
     );
 }
@@ -1604,13 +1619,18 @@ async fn sse_kms_roundtrip_with_local_kms() {
 
     let payload = Bytes::from(b"kms envelope-encrypted payload".repeat(80));
     let mut put_req = put_request("bucket", "kms-obj", payload.clone());
-    put_req.input.server_side_encryption =
-        Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS));
+    put_req.input.server_side_encryption = Some(ServerSideEncryption::from_static(
+        ServerSideEncryption::AWS_KMS,
+    ));
     put_req.input.ssekms_key_id = Some("alpha".into());
     let put_resp = s4.put_object(put_req).await.expect("put");
     // Echo: SSE + KMS key id in response.
     assert_eq!(
-        put_resp.output.server_side_encryption.as_ref().map(|s| s.as_str().to_string()),
+        put_resp
+            .output
+            .server_side_encryption
+            .as_ref()
+            .map(|s| s.as_str().to_string()),
         Some(ServerSideEncryption::AWS_KMS.to_string())
     );
     assert_eq!(put_resp.output.ssekms_key_id.as_deref(), Some("alpha"));
@@ -1619,7 +1639,11 @@ async fn sse_kms_roundtrip_with_local_kms() {
     {
         let inner = backend_view.lock().unwrap();
         let stored = inner.get(&("bucket".into(), "kms-obj".into())).unwrap();
-        assert_eq!(&stored.body[..4], b"S4E4", "SSE-KMS body must start with S4E4 magic");
+        assert_eq!(
+            &stored.body[..4],
+            b"S4E4",
+            "SSE-KMS body must start with S4E4 magic"
+        );
     }
 
     // Round-trip via the same gateway.
@@ -1886,9 +1910,7 @@ async fn object_lock_bucket_default_auto_applies_on_put() {
     let put_cfg_input = PutObjectLockConfigurationInput {
         bucket: "bucket".into(),
         object_lock_configuration: Some(ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(
-                ObjectLockEnabled::ENABLED,
-            )),
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
             rule: Some(ObjectLockRule {
                 default_retention: Some(DefaultRetention {
                     days: Some(30),
@@ -2029,13 +2051,9 @@ async fn compliance_strict_accepts_put_with_keyring_configured() {
         .expect("strict PUT must succeed when SSE-S4 keyring is configured");
 }
 
-
 // ---- v0.6 #38: CORS bucket configuration + preflight ----
 
-fn put_bucket_cors_request(
-    bucket: &str,
-    rules: Vec<CORSRule>,
-) -> S3Request<PutBucketCorsInput> {
+fn put_bucket_cors_request(bucket: &str, rules: Vec<CORSRule>) -> S3Request<PutBucketCorsInput> {
     let input = PutBucketCorsInput {
         bucket: bucket.into(),
         cors_configuration: CORSConfiguration { cors_rules: rules },
@@ -2192,16 +2210,22 @@ async fn cors_preflight_match_returns_correct_headers() {
         )
         .expect("preflight should match");
     assert_eq!(
-        headers.get("Access-Control-Allow-Origin").map(String::as_str),
+        headers
+            .get("Access-Control-Allow-Origin")
+            .map(String::as_str),
         Some("https://app.example.com"),
         "explicit origin echoed back verbatim"
     );
     assert_eq!(
-        headers.get("Access-Control-Allow-Methods").map(String::as_str),
+        headers
+            .get("Access-Control-Allow-Methods")
+            .map(String::as_str),
         Some("GET, PUT, POST")
     );
     assert_eq!(
-        headers.get("Access-Control-Allow-Headers").map(String::as_str),
+        headers
+            .get("Access-Control-Allow-Headers")
+            .map(String::as_str),
         Some("Content-Type, X-Amz-Date")
     );
     assert_eq!(
@@ -2245,7 +2269,9 @@ async fn cors_preflight_match_returns_correct_headers() {
         .handle_preflight("b", "https://anything", "GET", &["X-Custom".to_owned()])
         .expect("wildcard preflight");
     assert_eq!(
-        headers.get("Access-Control-Allow-Origin").map(String::as_str),
+        headers
+            .get("Access-Control-Allow-Origin")
+            .map(String::as_str),
         Some("*"),
         "wildcard rule echoes Access-Control-Allow-Origin: *"
     );
@@ -2326,7 +2352,9 @@ async fn s3_select_csv_filter_e2e() {
     let req = S3Request {
         input: select_input,
         method: http::Method::POST,
-        uri: "/selbucket/people.csv?select&select-type=2".parse().unwrap(),
+        uri: "/selbucket/people.csv?select&select-type=2"
+            .parse()
+            .unwrap(),
         headers: http::HeaderMap::new(),
         extensions: http::Extensions::new(),
         credentials: None,
@@ -2366,8 +2394,8 @@ async fn s3_select_csv_filter_e2e() {
     assert!(saw_stats, "Stats event missing from stream");
     assert!(saw_end, "End sentinel missing from stream");
 
-    let payload_str = std::str::from_utf8(&records_payload)
-        .expect("Records payload must be UTF-8 CSV");
+    let payload_str =
+        std::str::from_utf8(&records_payload).expect("Records payload must be UTF-8 CSV");
     let rows: Vec<&str> = payload_str
         .split("\r\n")
         .filter(|l| !l.is_empty())
@@ -2583,11 +2611,9 @@ async fn inventory_csv_emission_writes_to_destination_prefix() {
     let (s4, mgr, backend_view) = make_inventory_s4(CodecKind::Passthrough);
     let dst_prefix = "inventories";
     let cfg = aws_inventory_config("d1", "audit-dst", dst_prefix);
-    s4.put_bucket_inventory_configuration(put_bucket_inventory_request(
-        "src", "d1", cfg,
-    ))
-    .await
-    .expect("Put inventory config");
+    s4.put_bucket_inventory_configuration(put_bucket_inventory_request("src", "d1", cfg))
+        .await
+        .expect("Put inventory config");
 
     for (k, body) in [
         ("alpha.txt", &b"AAA"[..]),
@@ -2864,10 +2890,7 @@ fn put_object_tagging_request(
     }
 }
 
-fn get_object_tagging_request(
-    bucket: &str,
-    key: &str,
-) -> S3Request<GetObjectTaggingInput> {
+fn get_object_tagging_request(bucket: &str, key: &str) -> S3Request<GetObjectTaggingInput> {
     let input = GetObjectTaggingInput {
         bucket: bucket.into(),
         key: key.into(),
@@ -2937,11 +2960,7 @@ async fn tagging_x_amz_tagging_header_on_put_persists_tags() {
     // PUT with the `tagging` (== AWS `x-amz-tagging`) input field —
     // S4Service's put_object pre-parses this header before policy
     // evaluation and persists the parsed tags on a successful PUT.
-    let mut put = put_request(
-        "bucket",
-        "with-tags",
-        Bytes::from_static(b"payload-bytes"),
-    );
+    let mut put = put_request("bucket", "with-tags", Bytes::from_static(b"payload-bytes"));
     put.input.tagging = Some("Project=Phoenix&Env=prod%20west".into());
     s4.put_object(put).await.expect("put");
 
@@ -3009,9 +3028,7 @@ fn put_bucket_lifecycle_request(
     }
 }
 
-fn get_bucket_lifecycle_request(
-    bucket: &str,
-) -> S3Request<GetBucketLifecycleConfigurationInput> {
+fn get_bucket_lifecycle_request(bucket: &str) -> S3Request<GetBucketLifecycleConfigurationInput> {
     S3Request {
         input: GetBucketLifecycleConfigurationInput {
             bucket: bucket.into(),
@@ -3089,7 +3106,10 @@ async fn lifecycle_put_get_round_trip() {
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0].id.as_deref(), Some("expire-logs"));
     assert_eq!(rules[0].status.as_str(), ExpirationStatus::ENABLED);
-    let exp = rules[0].expiration.as_ref().expect("expiration round-trips");
+    let exp = rules[0]
+        .expiration
+        .as_ref()
+        .expect("expiration round-trips");
     assert_eq!(exp.days, Some(30));
     let filter = rules[0].filter.as_ref().expect("filter round-trips");
     assert_eq!(filter.prefix.as_deref(), Some("logs/"));
@@ -3294,11 +3314,8 @@ async fn mfa_delete_allows_when_correct_totp_supplied() {
     // Mint a fresh TOTP code from the *same* secret + current wall clock,
     // matching the verifier's view of "now". ±1 step skew gives ample
     // headroom against the small interval between generate / verify.
-    let raw = base32::decode(
-        base32::Alphabet::Rfc4648 { padding: false },
-        secret_b32,
-    )
-    .expect("decode test secret");
+    let raw = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, secret_b32)
+        .expect("decode test secret");
     let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, raw).expect("totp");
     let code = totp.generate(current_unix_secs_for_test());
     let header_value = format!("TOKEN-A {code}");
@@ -3445,7 +3462,9 @@ async fn replication_put_object_replicates_to_destination_bucket() {
         .clone();
     let replica_meta = replica_meta.expect("replica metadata present");
     assert_eq!(
-        replica_meta.get("x-amz-replication-status").map(String::as_str),
+        replica_meta
+            .get("x-amz-replication-status")
+            .map(String::as_str),
         Some("REPLICA"),
         "replica metadata must carry x-amz-replication-status: REPLICA"
     );

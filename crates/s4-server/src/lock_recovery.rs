@@ -131,7 +131,10 @@ mod tests {
             g.push(4);
             panic!("force-poison");
         }));
-        assert!(lock.is_poisoned(), "panic inside write must poison the lock");
+        assert!(
+            lock.is_poisoned(),
+            "panic inside write must poison the lock"
+        );
 
         // recover_read must NOT panic + must surface the post-mutation state.
         let g = recover_read(&lock, "test.recover_read");

@@ -409,10 +409,7 @@ async fn spawn_s4_server_with_cors(
     );
     let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::CpuZstd));
     let cors_mgr = Arc::new(s4_server::cors::CorsManager::new());
-    cors_mgr.put(
-        bucket,
-        s4_server::cors::CorsConfig { rules: vec![rule] },
-    );
+    cors_mgr.put(bucket, s4_server::cors::CorsConfig { rules: vec![rule] });
     let s4 = S4Service::new(proxy, registry, dispatcher).with_cors(Arc::clone(&cors_mgr));
 
     let mut svc = S3ServiceBuilder::new(s4);

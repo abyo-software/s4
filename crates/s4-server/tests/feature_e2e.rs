@@ -71,9 +71,7 @@ async fn ensure_bucket(client: &aws_sdk_s3::Client, bucket: &str) {
 }
 
 fn make_registry() -> Arc<CodecRegistry> {
-    Arc::new(
-        CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)),
-    )
+    Arc::new(CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)))
 }
 
 #[tokio::test]
@@ -98,7 +96,9 @@ async fn lifecycle_scanner_expires_objects_via_minio_backend() {
             .put_object()
             .bucket(bucket)
             .key(key)
-            .body(aws_sdk_s3::primitives::ByteStream::from(body.as_bytes().to_vec()))
+            .body(aws_sdk_s3::primitives::ByteStream::from(
+                body.as_bytes().to_vec(),
+            ))
             .send()
             .await
             .expect("seed put");
@@ -125,14 +125,22 @@ async fn lifecycle_scanner_expires_objects_via_minio_backend() {
     eprintln!("scan report: {report:?}");
     assert_eq!(report.buckets_scanned, 1);
     assert_eq!(report.objects_evaluated, 3);
-    assert_eq!(report.expired, 2, "two objects under `expirable/` must expire");
+    assert_eq!(
+        report.expired, 2,
+        "two objects under `expirable/` must expire"
+    );
     assert_eq!(report.transitioned, 0);
     assert_eq!(report.skipped_locked, 0);
     assert_eq!(report.action_errors, 0);
 
     // Verify backend post-condition via raw aws-sdk-s3 HEAD calls.
     for gone in ["expirable/log-1.txt", "expirable/log-2.txt"] {
-        let res = aws_client.head_object().bucket(bucket).key(gone).send().await;
+        let res = aws_client
+            .head_object()
+            .bucket(bucket)
+            .key(gone)
+            .send()
+            .await;
         assert!(
             res.is_err(),
             "{gone} should have been deleted from MinIO; got {res:?}"
@@ -334,10 +342,7 @@ fn canonical_request(
 /// 127.0.0.1 port, spawn the listener, and return `(host_addr,
 /// gate_arc)`. The gate is returned so the caller can build a fresh
 /// `Authorization` header for each request.
-async fn spawn_sigv4a_listener(
-    access_key: &str,
-    verifying: p256::ecdsa::VerifyingKey,
-) -> String {
+async fn spawn_sigv4a_listener(access_key: &str, verifying: p256::ecdsa::VerifyingKey) -> String {
     let mut keys = HashMap::new();
     keys.insert(access_key.to_string(), verifying);
     let store = std::sync::Arc::new(SigV4aCredentialStore::from_map(keys));
@@ -350,7 +355,9 @@ async fn spawn_sigv4a_listener(
     let server_router = router.clone();
     tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else { break };
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
             let io = TokioIo::new(stream);
             let svc = server_router.clone();
             tokio::spawn(async move {
@@ -430,9 +437,7 @@ async fn sigv4a_verify_real_listener_e2e() {
     let path = "/test-bucket/key";
     let auth = build_sigv4a_request(&signing, "AKIAE2E", &host, path, &x_amz_date, &scope_date);
 
-    let client = reqwest::Client::builder()
-        .build()
-        .expect("reqwest client");
+    let client = reqwest::Client::builder().build().expect("reqwest client");
     let url = format!("http://{host}{path}");
 
     // Happy path: valid signature → 200 from the inner AlwaysOk.
@@ -503,17 +508,21 @@ async fn sigv4a_replay_within_window_ok_old_replay_403() {
     let verifying = p256::ecdsa::VerifyingKey::from(&signing);
     let host = spawn_sigv4a_listener("AKIAREPLAY", verifying).await;
     let path = "/test-bucket/key";
-    let client = reqwest::Client::builder()
-        .build()
-        .expect("reqwest client");
+    let client = reqwest::Client::builder().build().expect("reqwest client");
     let url = format!("http://{host}{path}");
 
     // Phase 1 (fresh): now-stamped request → 200.
     let now = chrono::Utc::now();
     let fresh_date = now.format("%Y%m%dT%H%M%SZ").to_string();
     let scope_date = now.format("%Y%m%d").to_string();
-    let fresh_auth =
-        build_sigv4a_request(&signing, "AKIAREPLAY", &host, path, &fresh_date, &scope_date);
+    let fresh_auth = build_sigv4a_request(
+        &signing,
+        "AKIAREPLAY",
+        &host,
+        path,
+        &fresh_date,
+        &scope_date,
+    );
     let resp = client
         .request(HttpMethod::GET, &url)
         .header(
@@ -633,7 +642,9 @@ async fn inventory_scanner_writes_csv_to_destination_bucket_via_minio() {
     // put so `due()` returns true on the first scan.
     let proxy = s3s_aws::Proxy::from(aws_client.clone());
     let mgr = Arc::new(InventoryManager::new());
-    mgr.put(InventoryConfig::daily_csv("e2e-d1", src_bucket, dst_bucket, "inv"));
+    mgr.put(InventoryConfig::daily_csv(
+        "e2e-d1", src_bucket, dst_bucket, "inv",
+    ));
     let s4 = Arc::new(
         S4Service::new(
             proxy,
@@ -838,7 +849,11 @@ impl S4TestOpts {
         self.mfa = Some((secret_b32.into(), serial.into()));
         self
     }
-    fn with_cors_seed(mut self, bucket: impl Into<String>, rule: s4_server::cors::CorsRule) -> Self {
+    fn with_cors_seed(
+        mut self,
+        bucket: impl Into<String>,
+        rule: s4_server::cors::CorsRule,
+    ) -> Self {
         self.cors_seed = Some((bucket.into(), rule));
         self
     }
@@ -964,10 +979,7 @@ async fn spawn_s4_with_options(backend_endpoint: &str, opts: S4TestOpts) -> Spaw
     // a typed S3 handler).
     let cors_manager = if let Some((bucket, rule)) = opts.cors_seed {
         let mgr = std::sync::Arc::new(s4_server::cors::CorsManager::new());
-        mgr.put(
-            &bucket,
-            s4_server::cors::CorsConfig { rules: vec![rule] },
-        );
+        mgr.put(&bucket, s4_server::cors::CorsConfig { rules: vec![rule] });
         let cloned = std::sync::Arc::clone(&mgr);
         s4 = s4.with_cors(mgr);
         Some(cloned)
@@ -1251,23 +1263,15 @@ async fn sse_s4_chunked_50mb_streaming_get() {
         "MinIO object must begin with S4E6 magic, got: {:?}",
         &raw_bytes[..raw_bytes.len().min(4)],
     );
-    let on_disk_chunk_count = u32::from_be_bytes([
-        raw_bytes[12],
-        raw_bytes[13],
-        raw_bytes[14],
-        raw_bytes[15],
-    ]);
+    let on_disk_chunk_count =
+        u32::from_be_bytes([raw_bytes[12], raw_bytes[13], raw_bytes[14], raw_bytes[15]]);
     assert_eq!(
         on_disk_chunk_count as usize,
         payload_len.div_ceil(chunk_size),
         "on-disk chunk_count must match ceil(payload / chunk_size)"
     );
-    let on_disk_chunk_size = u32::from_be_bytes([
-        raw_bytes[8],
-        raw_bytes[9],
-        raw_bytes[10],
-        raw_bytes[11],
-    ]);
+    let on_disk_chunk_size =
+        u32::from_be_bytes([raw_bytes[8], raw_bytes[9], raw_bytes[10], raw_bytes[11]]);
     assert_eq!(
         on_disk_chunk_size as usize, chunk_size,
         "on-disk chunk_size must match `--sse-chunk-size`"
@@ -1315,8 +1319,7 @@ async fn sse_c_through_aws_sdk() {
     let key_md5_bytes = s4_server::sse::compute_key_md5(&cust_key);
     let key_md5_b64 = base64::engine::general_purpose::STANDARD.encode(key_md5_bytes);
 
-    let payload =
-        bytes::Bytes::from_static(b"customer-key body - server only sees ciphertext");
+    let payload = bytes::Bytes::from_static(b"customer-key body - server only sees ciphertext");
     let put_resp = s4_client
         .put_object()
         .bucket("sse-c-e2e")
@@ -1418,8 +1421,7 @@ async fn sse_kms_through_aws_sdk() {
     ensure_bucket(&backend_client, "sse-kms-e2e").await;
     let s4_client = build_aws_client_v2(&spawned.endpoint_url);
 
-    let payload =
-        bytes::Bytes::from_static(b"sse-kms envelope body - DEK wrapped under alpha");
+    let payload = bytes::Bytes::from_static(b"sse-kms envelope body - DEK wrapped under alpha");
     let put_resp = s4_client
         .put_object()
         .bucket("sse-kms-e2e")
@@ -1545,8 +1547,14 @@ async fn versioning_through_aws_sdk() {
         .send()
         .await
         .expect("put v2");
-    let v1_id = put1.version_id().expect("v1 must have version_id").to_string();
-    let v2_id = put2.version_id().expect("v2 must have version_id").to_string();
+    let v1_id = put1
+        .version_id()
+        .expect("v1 must have version_id")
+        .to_string();
+    let v2_id = put2
+        .version_id()
+        .expect("v2 must have version_id")
+        .to_string();
     assert_ne!(v1_id, v2_id, "each PUT must mint a fresh version_id");
 
     // Latest GET returns v2 (= newest in the chain).
@@ -1585,10 +1593,7 @@ async fn versioning_through_aws_sdk() {
         .await
         .expect("list_object_versions");
     let versions = listed.versions();
-    let entries_for_obj: Vec<_> = versions
-        .iter()
-        .filter(|v| v.key() == Some("obj"))
-        .collect();
+    let entries_for_obj: Vec<_> = versions.iter().filter(|v| v.key() == Some("obj")).collect();
     assert_eq!(
         entries_for_obj.len(),
         2,
@@ -1835,8 +1840,7 @@ async fn tagging_through_aws_sdk() {
         .iter()
         .map(|t| (t.key().to_owned(), t.value().to_owned()))
         .collect();
-    let pairs_set: std::collections::HashSet<(String, String)> =
-        pairs.iter().cloned().collect();
+    let pairs_set: std::collections::HashSet<(String, String)> = pairs.iter().cloned().collect();
     let want_set: std::collections::HashSet<(String, String)> = [
         ("team".to_string(), "infra".to_string()),
         ("phase".to_string(), "alpha".to_string()),
@@ -2280,10 +2284,7 @@ async fn do_3part_multipart_upload(
     // CreateMultipartUpload — apply SSE config + extra metadata. The
     // aws-sdk-s3 builder serialises these onto the
     // `?uploads&` POST exactly like a real workload.
-    let mut create = s4_client
-        .create_multipart_upload()
-        .bucket(bucket)
-        .key(key);
+    let mut create = s4_client.create_multipart_upload().bucket(bucket).key(key);
     if !extra_meta.is_empty() {
         for (k, v) in &extra_meta {
             create = create.metadata(k, v);
@@ -2352,10 +2353,7 @@ async fn do_3part_multipart_upload(
             panic!("create_multipart_upload({bucket}/{key}) failed: {dbg}");
         }
     };
-    let upload_id = create_resp
-        .upload_id()
-        .expect("upload_id")
-        .to_string();
+    let upload_id = create_resp.upload_id().expect("upload_id").to_string();
 
     // UploadPart × 3 — for SSE-C, the same key headers MUST be on every
     // UploadPart (AWS spec: "if you specify a customer-provided
@@ -2480,8 +2478,7 @@ async fn multipart_sse_s4_round_trip() {
     let raw_meta = raw.metadata().cloned().unwrap_or_default();
     let raw_bytes = raw.body.collect().await.expect("raw body").into_bytes();
     let leaks_plaintext = raw_bytes.windows(20).any(|w| w == b"MP-PART-a1-payload-b");
-    let has_sse_marker = raw_meta.get("s4-encrypted").map(String::as_str)
-        == Some("aes-256-gcm");
+    let has_sse_marker = raw_meta.get("s4-encrypted").map(String::as_str) == Some("aes-256-gcm");
     if leaks_plaintext || !has_sse_marker {
         eprintln!(
             "v0.8 #54 BUG-5: multipart × SSE-S4 plaintext on disk (leak={leaks_plaintext}, \
@@ -2491,7 +2488,9 @@ async fn multipart_sse_s4_round_trip() {
              (mirror put_object's SSE encrypt branch into upload_part + stamp s4-encrypted \
              on complete_multipart_upload)."
         );
-        panic!("BUG-5: multipart × SSE-S4 leaks plaintext to backend (raw bytes were not encrypted)");
+        panic!(
+            "BUG-5: multipart × SSE-S4 leaks plaintext to backend (raw bytes were not encrypted)"
+        );
     }
 
     let _ = spawned.shutdown.send(());
@@ -2622,12 +2621,12 @@ async fn multipart_sse_c_part_key_mismatch_rejected() {
 
     let key_a = [0xa5u8; 32];
     let key_a_b64 = base64::engine::general_purpose::STANDARD.encode(key_a);
-    let md5_a_b64 = base64::engine::general_purpose::STANDARD
-        .encode(s4_server::sse::compute_key_md5(&key_a));
+    let md5_a_b64 =
+        base64::engine::general_purpose::STANDARD.encode(s4_server::sse::compute_key_md5(&key_a));
     let key_b = [0xb6u8; 32];
     let key_b_b64 = base64::engine::general_purpose::STANDARD.encode(key_b);
-    let md5_b_b64 = base64::engine::general_purpose::STANDARD
-        .encode(s4_server::sse::compute_key_md5(&key_b));
+    let md5_b_b64 =
+        base64::engine::general_purpose::STANDARD.encode(s4_server::sse::compute_key_md5(&key_b));
 
     // CreateMultipartUpload with key-A.
     let create = s4_client
@@ -2681,8 +2680,7 @@ async fn multipart_sse_c_part_key_mismatch_rejected() {
     );
     let dbg = format!("{err:?}");
     assert!(
-        dbg.contains("InvalidArgument") || dbg.contains("400")
-            || dbg.contains("does not match"),
+        dbg.contains("InvalidArgument") || dbg.contains("400") || dbg.contains("does not match"),
         "expected 400 InvalidArgument for mismatched SSE-C key on UploadPart; got: {dbg}"
     );
 
@@ -2724,8 +2722,8 @@ async fn multipart_sse_c_part_omitted_headers_rejected() {
 
     let key_a = [0xc7u8; 32];
     let key_a_b64 = base64::engine::general_purpose::STANDARD.encode(key_a);
-    let md5_a_b64 = base64::engine::general_purpose::STANDARD
-        .encode(s4_server::sse::compute_key_md5(&key_a));
+    let md5_a_b64 =
+        base64::engine::general_purpose::STANDARD.encode(s4_server::sse::compute_key_md5(&key_a));
 
     // CreateMultipartUpload with key-A.
     let create = s4_client
@@ -2758,8 +2756,10 @@ async fn multipart_sse_c_part_omitted_headers_rejected() {
     );
     let dbg = format!("{err:?}");
     assert!(
-        dbg.contains("InvalidRequest") || dbg.contains("InvalidArgument")
-            || dbg.contains("400") || dbg.contains("SSE-C requires"),
+        dbg.contains("InvalidRequest")
+            || dbg.contains("InvalidArgument")
+            || dbg.contains("400")
+            || dbg.contains("SSE-C requires"),
         "expected 400 for omitted SSE-C headers on UploadPart; got: {dbg}"
     );
 
@@ -2816,7 +2816,9 @@ async fn multipart_sse_kms_round_trip() {
         &s4_client,
         "mp-sse-kms",
         "obj",
-        SseConfig::SseKms { key_id: "alpha".into() },
+        SseConfig::SseKms {
+            key_id: "alpha".into(),
+        },
         HashMap::new(),
     )
     .await;
@@ -2859,9 +2861,7 @@ async fn multipart_sse_kms_round_trip() {
              (service.rs ~L1901) and route the per-part body through the SSE-KMS \
              encrypt path inside upload_part."
         );
-        panic!(
-            "BUG-5 (SSE-KMS variant): HEAD missing aws:kms echo for multipart object"
-        );
+        panic!("BUG-5 (SSE-KMS variant): HEAD missing aws:kms echo for multipart object");
     }
 
     let _ = spawned.shutdown.send(());
@@ -2890,11 +2890,8 @@ async fn multipart_sse_kms_round_trip() {
 #[ignore = "requires Docker for MinIO container"]
 async fn multipart_versioning_round_trip() {
     let minio = start_minio().await;
-    let spawned = spawn_s4_with_options(
-        &minio.endpoint_url,
-        S4TestOpts::default().with_versioning(),
-    )
-    .await;
+    let spawned =
+        spawn_s4_with_options(&minio.endpoint_url, S4TestOpts::default().with_versioning()).await;
     let backend_client = build_aws_client_v2(&minio.endpoint_url);
     ensure_bucket(&backend_client, "mp-ver").await;
     let s4_client = build_aws_client_v2(&spawned.endpoint_url);
@@ -2973,7 +2970,10 @@ async fn multipart_versioning_round_trip() {
             .send()
             .await
             .expect("complete");
-        (cresp.version_id().map(str::to_owned), bytes::Bytes::from(full))
+        (
+            cresp.version_id().map(str::to_owned),
+            bytes::Bytes::from(full),
+        )
     };
     let (vid_opt, full) = parts_payload;
 
@@ -3126,9 +3126,9 @@ async fn multipart_object_lock_compliance_blocks_delete() {
         .send()
         .await;
     match res {
-        Ok(_) => panic!(
-            "BUG-7 follow-up: bypass header succeeded against Compliance multipart object"
-        ),
+        Ok(_) => {
+            panic!("BUG-7 follow-up: bypass header succeeded against Compliance multipart object")
+        }
         Err(err) => {
             let dbg = format!("{err:?}");
             assert!(
@@ -3492,14 +3492,14 @@ async fn multipart_abort_drops_in_flight_parts() {
         .expect("list_multipart_uploads");
     let n = listed.uploads().len();
     assert_eq!(
-        n, 0,
+        n,
+        0,
         "AbortMultipartUpload must remove the in-flight upload; got {n} entries: {:?}",
         listed.uploads()
     );
 
     let _ = spawned.shutdown.send(());
 }
-
 
 // =============================================================================
 // v0.8 #51 — GPU column scan E2E via aws-sdk-s3 SelectObjectContent.
@@ -3660,8 +3660,8 @@ async fn gpu_metrics_scrape_after_put() {
     // tests in the same binary would race on `install_recorder()` so
     // we gate behind a `OnceLock` (same pattern http_e2e.rs uses for
     // its `/metrics` test).
-    static METRICS_HANDLE:
-        OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
+    static METRICS_HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
+        OnceLock::new();
 
     let minio = start_minio().await;
     let backend_client = build_aws_client_v2(&minio.endpoint_url);
@@ -3755,9 +3755,7 @@ async fn gpu_metrics_scrape_after_put() {
         .lines()
         .find(|l| l.starts_with(needle))
         .unwrap_or_else(|| {
-            panic!(
-                "missing `{needle}` in /metrics body. Full body:\n{metrics_body}"
-            )
+            panic!("missing `{needle}` in /metrics body. Full body:\n{metrics_body}")
         });
     // Line shape: `s4_gpu_compress_seconds_count{codec="nvcomp-bitcomp"} <n>`
     let n: u64 = count_line
@@ -3772,7 +3770,8 @@ async fn gpu_metrics_scrape_after_put() {
 
     // Throughput gauge should also be present (set on every GPU op).
     assert!(
-        metrics_body.contains(r#"s4_gpu_throughput_bytes_per_sec{codec="nvcomp-bitcomp",op="compress"}"#),
+        metrics_body
+            .contains(r#"s4_gpu_throughput_bytes_per_sec{codec="nvcomp-bitcomp",op="compress"}"#),
         "missing throughput gauge for compress op. Body:\n{metrics_body}"
     );
 
@@ -3823,8 +3822,8 @@ async fn gpu_auto_detect_picks_nvcomp_for_large_object() {
     // the 5 MiB PUT below crosses the threshold so it gets routed to
     // NvcompZstd.
     let proxy = s3s_aws::Proxy::from(backend_client.clone());
-    let nvcomp = NvcompZstdCodec::new()
-        .expect("NvcompZstdCodec init (GPU available, driver loaded above)");
+    let nvcomp =
+        NvcompZstdCodec::new().expect("NvcompZstdCodec init (GPU available, driver loaded above)");
     let registry = std::sync::Arc::new(
         CodecRegistry::new(CodecKind::CpuZstd)
             .with(std::sync::Arc::new(Passthrough))
@@ -4032,9 +4031,7 @@ async fn multipart_concurrent_complete_no_torn_body() {
                 .body(body.into())
                 .send()
                 .await
-                .unwrap_or_else(|e| {
-                    panic!("upload_part [{upload_idx}] pn={pn} failed: {e:?}")
-                });
+                .unwrap_or_else(|e| panic!("upload_part [{upload_idx}] pn={pn} failed: {e:?}"));
             completed_parts.push(
                 aws_sdk_s3::types::CompletedPart::builder()
                     .e_tag(resp.e_tag().unwrap_or_default())
@@ -4052,9 +4049,8 @@ async fn multipart_concurrent_complete_no_torn_body() {
     // pinned and lets us collect Ok / Err in completion order without
     // imposing an artificial barrier (the race is between `lock.await`
     // re-entries).
-    let mut joinset: tokio::task::JoinSet<
-        Result<usize, (usize, String)>,
-    > = tokio::task::JoinSet::new();
+    let mut joinset: tokio::task::JoinSet<Result<usize, (usize, String)>> =
+        tokio::task::JoinSet::new();
     for (upload_idx, (upload_id, parts, _)) in primed.into_iter().enumerate() {
         let s4 = std::sync::Arc::clone(&s4_client);
         let bucket = bucket.to_string();
@@ -4282,7 +4278,8 @@ async fn replication_stale_task_does_not_overwrite_newer() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert_eq!(
-        last_body, b"beta-bytes",
+        last_body,
+        b"beta-bytes",
         "v0.8.2 #61 C-3 regression: destination must hold the last-PUT's bytes \
          (beta-bytes), not be overwritten by a stale retry of PUT-A. \
          dest body actually = {:?}",
@@ -4474,8 +4471,8 @@ async fn audit_log_e2e_eof_hmac_round_trip() {
 
     use s4_server::access_log::{AccessLog, AccessLogDest, AccessLogEntry};
     use s4_server::audit_log::{
-        AuditHmacKey, EOF_HMAC_COMMENT_PREFIX, PREV_TAIL_COMMENT_PREFIX, VerifyOptions,
-        hex_decode, verify_audit_log,
+        AuditHmacKey, EOF_HMAC_COMMENT_PREFIX, PREV_TAIL_COMMENT_PREFIX, VerifyOptions, hex_decode,
+        verify_audit_log,
     };
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -4570,7 +4567,10 @@ async fn audit_log_e2e_eof_hmac_round_trip() {
             path.display(),
             report.first_break
         );
-        assert!(!report.unsigned_eof, "EOF flag should be clear (we just authenticated it)");
+        assert!(
+            !report.unsigned_eof,
+            "EOF flag should be clear (we just authenticated it)"
+        );
         if idx == 0 {
             // First file: no operator override, so the report flags
             // unsigned_prev_tail only if the file actually carried one.
@@ -4645,9 +4645,7 @@ async fn audit_log_e2e_eof_hmac_round_trip() {
 #[tokio::test]
 #[ignore = "requires Docker for MinIO container"]
 async fn lifecycle_skips_object_lock_compliance_via_minio() {
-    use s4_server::lifecycle::{
-        LifecycleConfig, LifecycleManager, LifecycleRule, run_scan_once,
-    };
+    use s4_server::lifecycle::{LifecycleConfig, LifecycleManager, LifecycleRule, run_scan_once};
     use s4_server::object_lock::{LockMode, ObjectLockManager, ObjectLockState};
 
     let minio = start_minio().await;
@@ -4697,8 +4695,7 @@ async fn lifecycle_skips_object_lock_compliance_via_minio() {
     );
 
     let registry = std::sync::Arc::new(
-        CodecRegistry::new(CodecKind::Passthrough)
-            .with(std::sync::Arc::new(Passthrough)),
+        CodecRegistry::new(CodecKind::Passthrough).with(std::sync::Arc::new(Passthrough)),
     );
     let dispatcher = std::sync::Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
     let s4 = std::sync::Arc::new(
@@ -4871,8 +4868,7 @@ async fn inventory_csv_classifies_sse_kms_correctly() {
                 _ = shutdown_rx.as_mut() => break,
             }
         }
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), graceful.shutdown())
-            .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), graceful.shutdown()).await;
     });
     let s4_client = build_aws_client_v2(&s4_endpoint);
 
@@ -5316,10 +5312,7 @@ async fn replication_propagates_compliance_lock_to_destination() {
             Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
         }
     }
-    assert!(
-        found,
-        "replica must land in lock-repl-dst within 5s",
-    );
+    assert!(found, "replica must land in lock-repl-dst within 5s",);
 
     // 5) GET on the destination through the gateway must succeed (the
     // body is unaffected by lock state — only mutation is gated).
@@ -5675,8 +5668,7 @@ async fn upload_part_copy_propagates_source_version_id() {
 /// in this file that wants to grep `/metrics` MUST go through this
 /// helper (mirrors the `test_metrics_handle()` pattern inside the
 /// crate's own `metrics.rs` unit tests).
-fn install_test_metrics_recorder()
--> &'static metrics_exporter_prometheus::PrometheusHandle {
+fn install_test_metrics_recorder() -> &'static metrics_exporter_prometheus::PrometheusHandle {
     use std::sync::OnceLock;
     static HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
     HANDLE.get_or_init(|| {
@@ -5829,12 +5821,7 @@ fn slice_metric(rendered: &str, name_fragment: &str) -> String {
 /// hand-crafted mirror of `s4_server::sse`'s private `aad_v5` so we
 /// can synthesise a "v0.8.0 vintage" S4E5 blob without exposing the
 /// pre-v0.8.1 emit path through the library API.
-fn aad_v5_for_test(
-    chunk_index: u32,
-    total_chunks: u32,
-    key_id: u16,
-    salt: &[u8; 4],
-) -> [u8; 19] {
+fn aad_v5_for_test(chunk_index: u32, total_chunks: u32, key_id: u16, salt: &[u8; 4]) -> [u8; 19] {
     let mut aad = [0u8; 19];
     aad[..4].copy_from_slice(s4_server::sse::SSE_MAGIC_V5);
     aad[4] = s4_server::sse::ALGO_AES_256_GCM;
@@ -5900,7 +5887,8 @@ fn legacy_s4e5_chunks_decrypt_on_v0_8_4_gateway() {
             .expect("chunk_count fits u32")
     };
 
-    let mut frame: Vec<u8> = Vec::with_capacity(s4_server::sse::S4E5_HEADER_BYTES + plaintext.len());
+    let mut frame: Vec<u8> =
+        Vec::with_capacity(s4_server::sse::S4E5_HEADER_BYTES + plaintext.len());
     // Header.
     frame.extend_from_slice(s4_server::sse::SSE_MAGIC_V5);
     frame.push(s4_server::sse::ALGO_AES_256_GCM);
@@ -6171,8 +6159,7 @@ async fn spawn_s4_cpuzstd(minio_endpoint: &str) -> (SpawnedS4, aws_sdk_s3::Clien
             .with(std::sync::Arc::new(Passthrough))
             .with(std::sync::Arc::new(CpuZstd::default())),
     );
-    let dispatcher =
-        std::sync::Arc::new(AlwaysDispatcher(CodecKind::CpuZstd));
+    let dispatcher = std::sync::Arc::new(AlwaysDispatcher(CodecKind::CpuZstd));
     let s4 = S4Service::new(proxy, registry, dispatcher);
 
     let mut svc = S3ServiceBuilder::new(s4);
@@ -6348,7 +6335,8 @@ async fn streaming_get_corrupted_body_fails_crc_check() {
                 Ok(body) => {
                     let bytes = body.into_bytes();
                     assert_ne!(
-                        bytes, payload,
+                        bytes,
+                        payload,
                         "v0.8.4 #73 H-1 regression: streaming GET silently \
                          returned tampered body as if it were the original \
                          (CRC verifier failed to fire). bytes.len() = {}",
@@ -6485,9 +6473,7 @@ async fn streaming_compress_truncated_input_returns_400() {
     // Yield a single 4 KiB chunk then EOF — 1/4 of the advertised body.
     let advertised: i64 = 16 * 1024;
     let body_chunk = bytes::Bytes::from(vec![b'q'; 4096]);
-    let stream = futures::stream::once(async move {
-        Ok::<_, std::io::Error>(body_chunk)
-    });
+    let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(body_chunk) });
     let body = s3s::dto::StreamingBlob::wrap(stream);
 
     let put_input = PutObjectInput {

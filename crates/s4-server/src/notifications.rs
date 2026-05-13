@@ -271,8 +271,7 @@ impl NotificationManager {
         event: &EventType,
         key: &str,
     ) -> Vec<Destination> {
-        let map =
-            crate::lock_recovery::recover_read(&self.by_bucket, "notifications.by_bucket");
+        let map = crate::lock_recovery::recover_read(&self.by_bucket, "notifications.by_bucket");
         let cfg = match map.get(bucket) {
             Some(c) => c,
             None => return Vec::new(),
@@ -730,10 +729,9 @@ mod tests {
 
     #[test]
     fn build_event_json_schema_matches_aws() {
-        let now =
-            chrono::DateTime::parse_from_rfc3339("2026-05-13T10:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-13T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
         let body = build_event_json(
             "my-bucket",
             "uploads/photo.jpg",
@@ -783,10 +781,7 @@ mod tests {
             NotificationConfig {
                 rules: vec![rule(
                     "r1",
-                    &[
-                        EventType::ObjectCreatedPut,
-                        EventType::ObjectRemovedDelete,
-                    ],
+                    &[EventType::ObjectCreatedPut, EventType::ObjectRemovedDelete],
                     Destination::Sqs {
                         queue_arn: "arn:aws:sqs:us-east-1:123:q".into(),
                     },

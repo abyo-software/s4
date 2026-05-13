@@ -266,10 +266,7 @@ pub enum SseError {
     #[error(
         "S4E4 SseSource::Kms wrapped DEK key_id {supplied:?} doesn't match frame key_id {stored:?}"
     )]
-    KmsWrappedDekMismatch {
-        supplied: String,
-        stored: String,
-    },
+    KmsWrappedDekMismatch { supplied: String, stored: String },
     /// SSE-KMS path got a non-Kms `SseSource` for an S4E4 body. The
     /// async dispatch in `decrypt_with_kms` re-derives the source
     /// internally so this can only happen if a future caller passes
@@ -290,7 +287,9 @@ pub enum SseError {
     /// time chunk N fails — operators need the chunk index in audit
     /// logs to triangulate which byte range was tampered with (or
     /// which disk sector flipped).
-    #[error("S4E5 chunk {chunk_index} auth tag verify failed (key mismatch or chunk tampered with)")]
+    #[error(
+        "S4E5 chunk {chunk_index} auth tag verify failed (key mismatch or chunk tampered with)"
+    )]
     ChunkAuthFailed { chunk_index: u32 },
     /// Caller asked [`encrypt_v2_chunked`] to use a chunk size of 0
     /// — nonsensical (would loop forever). Surfaced as an error
@@ -314,9 +313,7 @@ pub enum SseError {
     /// (`--sse-chunk-size 1` on a multi-GiB object, say) shows up at
     /// PUT time with a clear cause rather than a panic at the u32 →
     /// u24 cast.
-    #[error(
-        "S4E6 chunk_count {got} exceeds 24-bit max ({max}) — pick a larger --sse-chunk-size"
-    )]
+    #[error("S4E6 chunk_count {got} exceeds 24-bit max ({max}) — pick a larger --sse-chunk-size")]
     ChunkCountTooLarge { got: u32, max: u32 },
     // --- v0.8.2 #64: pre-allocation guard for chunked SSE frames ---
     /// `parse_chunked_header` rejected an S4E5 / S4E6 frame because
@@ -764,11 +761,7 @@ pub fn encrypt_with_source(plaintext: &[u8], source: SseSource<'_>) -> Bytes {
     }
 }
 
-fn encrypt_v3(
-    plaintext: &[u8],
-    key: &[u8; KEY_LEN],
-    key_md5: &[u8; KEY_MD5_LEN],
-) -> Bytes {
+fn encrypt_v3(plaintext: &[u8], key: &[u8; KEY_LEN], key_md5: &[u8; KEY_MD5_LEN]) -> Bytes {
     let aes_key = Key::<Aes256Gcm>::from_slice(key);
     let cipher = Aes256Gcm::new(aes_key);
     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -999,7 +992,14 @@ fn encrypt_v4(plaintext: &[u8], dek: &[u8; KEY_LEN], wrapped: &WrappedDek) -> By
 
     let key_id_bytes = wrapped.key_id.as_bytes();
     let mut out = Vec::with_capacity(
-        4 + 1 + 1 + key_id_bytes.len() + 4 + wrapped.ciphertext.len() + NONCE_LEN + TAG_LEN + ct.len(),
+        4 + 1
+            + 1
+            + key_id_bytes.len()
+            + 4
+            + wrapped.ciphertext.len()
+            + NONCE_LEN
+            + TAG_LEN
+            + ct.len(),
     );
     out.extend_from_slice(SSE_MAGIC_V4);
     out.push(ALGO_AES_256_GCM);
@@ -1071,11 +1071,16 @@ pub fn parse_s4e4_header(body: &[u8]) -> Result<S4E4Header<'_>, SseError> {
         body[wrapped_len_off + 3],
     ]) as usize;
     let wrapped_off = wrapped_len_off + 4;
-    let wrapped_end = wrapped_off
-        .checked_add(wrapped_dek_len)
-        .ok_or(SseError::KmsFrameFieldOob { what: "wrapped_dek_len" })?;
+    let wrapped_end =
+        wrapped_off
+            .checked_add(wrapped_dek_len)
+            .ok_or(SseError::KmsFrameFieldOob {
+                what: "wrapped_dek_len",
+            })?;
     if wrapped_end + NONCE_LEN + TAG_LEN > body.len() {
-        return Err(SseError::KmsFrameFieldOob { what: "wrapped_dek" });
+        return Err(SseError::KmsFrameFieldOob {
+            what: "wrapped_dek",
+        });
     }
     let wrapped_dek = &body[wrapped_off..wrapped_end];
     let nonce_off = wrapped_end;
@@ -1108,10 +1113,7 @@ pub fn parse_s4e4_header(body: &[u8]) -> Result<S4E4Header<'_>, SseError> {
 /// wrapped DEK + key_id come from the frame itself, not from the
 /// request — the `SseSource` is built for sync paths where the
 /// caller already knows the key.
-pub async fn decrypt_with_kms(
-    body: &[u8],
-    kms: &dyn KmsBackend,
-) -> Result<Bytes, SseError> {
+pub async fn decrypt_with_kms(body: &[u8], kms: &dyn KmsBackend) -> Result<Bytes, SseError> {
     let hdr = parse_s4e4_header(body)?;
     let wrapped = WrappedDek {
         key_id: hdr.key_id.to_string(),
@@ -1691,10 +1693,7 @@ pub fn parse_s4e6_header(blob: &[u8]) -> Result<S4E6Header<'_>, SseError> {
     })
 }
 
-fn parse_chunked_header(
-    body: &[u8],
-    max_body_bytes: usize,
-) -> Result<ChunkedHeader, SseError> {
+fn parse_chunked_header(body: &[u8], max_body_bytes: usize) -> Result<ChunkedHeader, SseError> {
     if body.len() < 4 {
         return Err(SseError::ChunkFrameTruncated { what: "magic" });
     }
@@ -1780,17 +1779,19 @@ fn parse_chunked_header(
     // not a tampering oracle for the attacker.
     let chunk_size_u64 = chunk_size as u64;
     let chunk_count_u64 = chunk_count as u64;
-    let expected_plain_size = chunk_size_u64
-        .checked_mul(chunk_count_u64)
-        .ok_or(SseError::ChunkFrameTooLarge {
-            details: "chunk_size * chunk_count overflows u64",
-        })?;
+    let expected_plain_size =
+        chunk_size_u64
+            .checked_mul(chunk_count_u64)
+            .ok_or(SseError::ChunkFrameTooLarge {
+                details: "chunk_size * chunk_count overflows u64",
+            })?;
     let per_chunk_overhead = S4E5_PER_CHUNK_OVERHEAD as u64; // = 16 (AES-GCM tag)
-    let total_tag_overhead = per_chunk_overhead.checked_mul(chunk_count_u64).ok_or(
-        SseError::ChunkFrameTooLarge {
-            details: "tag_len * chunk_count overflows u64",
-        },
-    )?;
+    let total_tag_overhead =
+        per_chunk_overhead
+            .checked_mul(chunk_count_u64)
+            .ok_or(SseError::ChunkFrameTooLarge {
+                details: "tag_len * chunk_count overflows u64",
+            })?;
     let max_total = expected_plain_size
         .checked_add(total_tag_overhead)
         .and_then(|t| t.checked_add(header_bytes as u64))
@@ -1928,15 +1929,8 @@ fn walk_chunked<F: FnMut(Bytes) -> Result<(), SseError>>(
         let mut tag = [0u8; TAG_LEN];
         tag.copy_from_slice(&body[tag_off..ct_off]);
         let ct = &body[ct_off..ct_end];
-        let plain = decrypt_chunked_chunk(
-            &cipher,
-            i,
-            hdr.chunk_count,
-            hdr.key_id,
-            &hdr.salt,
-            &tag,
-            ct,
-        )?;
+        let plain =
+            decrypt_chunked_chunk(&cipher, i, hdr.chunk_count, hdr.key_id, &hdr.salt, &tag, ct)?;
         crate::metrics::record_sse_streaming_chunk("decrypt");
         emit(plain)?;
         cursor = ct_end;
@@ -2683,7 +2677,10 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(matches!(err, SseError::CustomerKeyUnexpected), "got {err:?}");
+        assert!(
+            matches!(err, SseError::CustomerKeyUnexpected),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -2984,17 +2981,11 @@ mod tests {
         assert_eq!(decrypt(&v1, &kr).unwrap().as_ref(), b"v0.4 vintage");
 
         let v2 = encrypt_v2(b"v0.5 #29 vintage", &kr);
-        assert_eq!(
-            decrypt(&v2, &kr).unwrap().as_ref(),
-            b"v0.5 #29 vintage"
-        );
+        assert_eq!(decrypt(&v2, &kr).unwrap().as_ref(), b"v0.5 #29 vintage");
 
         let m = cust_key(7);
         let v3 = encrypt_with_source(b"v0.5 #27 vintage", (&m).into());
-        assert_eq!(
-            decrypt(&v3, &m).unwrap().as_ref(),
-            b"v0.5 #27 vintage"
-        );
+        assert_eq!(decrypt(&v3, &m).unwrap().as_ref(), b"v0.5 #27 vintage");
     }
 
     #[test]
@@ -3173,7 +3164,11 @@ mod tests {
         let ct = encrypt_v2_chunked(&pt, &kr, chunk_size).expect("encrypt ok");
         assert_eq!(&ct[..4], SSE_MAGIC_V6, "new PUTs emit S4E6 (v0.8.1 #57)");
         assert_eq!(ct[4], ALGO_AES_256_GCM);
-        assert_eq!(u16::from_be_bytes([ct[5], ct[6]]), 1, "key_id BE = active id");
+        assert_eq!(
+            u16::from_be_bytes([ct[5], ct[6]]),
+            1,
+            "key_id BE = active id"
+        );
         assert_eq!(ct[7], 0, "reserved must be 0");
         assert_eq!(
             u32::from_be_bytes([ct[8], ct[9], ct[10], ct[11]]),
@@ -3189,7 +3184,11 @@ mod tests {
         // zeros (defensive: catches a stuck PRNG that would leave
         // the salt array uninitialized).
         assert_eq!(&ct[16..24].len(), &8, "S4E6 salt slot is 8 bytes");
-        assert_ne!(&ct[16..24], &[0u8; 8], "S4E6 salt must be random, not zeros");
+        assert_ne!(
+            &ct[16..24],
+            &[0u8; 8],
+            "S4E6 salt must be random, not zeros"
+        );
         assert_eq!(
             ct.len(),
             S4E6_HEADER_BYTES + 10 * S4E6_PER_CHUNK_OVERHEAD + pt_len,
@@ -3204,7 +3203,9 @@ mod tests {
         // v0.8.1 #57: round-trip via S4E6 path. encrypt_v2_chunked
         // emits S4E6, decrypt_chunked_stream consumes S4E5/S4E6.
         let kr = keyring_single(0x55);
-        let pt: Vec<u8> = (0..(10 * 1024 * 1024_u32)).map(|i| (i & 0xFF) as u8).collect();
+        let pt: Vec<u8> = (0..(10 * 1024 * 1024_u32))
+            .map(|i| (i & 0xFF) as u8)
+            .collect();
         let ct = encrypt_v2_chunked(&pt, &kr, 1024 * 1024).unwrap();
         // Sanity: the new PUT is S4E6.
         assert_eq!(&ct[..4], SSE_MAGIC_V6, "new emit is S4E6");
@@ -3352,7 +3353,10 @@ mod tests {
         let ct = encrypt_v2_chunked(b"orphan key", &kr_put, 64).unwrap();
         // Sync path
         let err = decrypt(&ct, &kr_get).unwrap_err();
-        assert!(matches!(err, SseError::KeyNotInKeyring { id: 7 }), "got {err:?}");
+        assert!(
+            matches!(err, SseError::KeyNotInKeyring { id: 7 }),
+            "got {err:?}"
+        );
         // Stream path
         let stream = decrypt_chunked_stream(ct, &kr_get);
         let result = collect_chunks(stream).await;
@@ -3454,7 +3458,10 @@ mod tests {
         assert!(matches!(err, SseError::BadMagic { .. }), "got {err:?}");
         // Truncation → ChunkFrameTruncated.
         let err2 = parse_s4e6_header(&ct[..10]).unwrap_err();
-        assert!(matches!(err2, SseError::ChunkFrameTruncated { .. }), "got {err2:?}");
+        assert!(
+            matches!(err2, SseError::ChunkFrameTruncated { .. }),
+            "got {err2:?}"
+        );
     }
 
     #[test]
@@ -3579,7 +3586,10 @@ mod tests {
         assert!(
             matches!(
                 err2,
-                SseError::ChunkCountTooLarge { got: 16_777_216, max: 16_777_215 }
+                SseError::ChunkCountTooLarge {
+                    got: 16_777_216,
+                    max: 16_777_215
+                }
             ),
             "got {err2:?}",
         );
@@ -3736,8 +3746,7 @@ mod tests {
         let chunk_array_size =
             (chunk_count as usize) * (S4E6_PER_CHUNK_OVERHEAD + chunk_size as usize);
         blob.resize(blob.len() + chunk_array_size, 0);
-        let err =
-            decrypt_chunked_buffered(&blob, &kr, DEFAULT_MAX_BODY_BYTES).unwrap_err();
+        let err = decrypt_chunked_buffered(&blob, &kr, DEFAULT_MAX_BODY_BYTES).unwrap_err();
         // The guard let it through (we got past parse_chunked_header)
         // and AES-GCM tag verify failed on chunk 0 — that's the right
         // failure mode. ChunkFrameTooLarge would mean the cap fired
@@ -3778,8 +3787,7 @@ mod tests {
         let chunk_size_b: u32 = 1024 * 1024; // 1 MiB
         let chunk_count_b: u32 = 100;
         let mut blob_b = synth_s4e6_header(chunk_size_b, chunk_count_b);
-        let pad_b =
-            (chunk_count_b as usize) * (S4E6_PER_CHUNK_OVERHEAD + chunk_size_b as usize);
+        let pad_b = (chunk_count_b as usize) * (S4E6_PER_CHUNK_OVERHEAD + chunk_size_b as usize);
         blob_b.resize(blob_b.len() + pad_b, 0);
         // Cap = 1 MiB, declared plaintext = 100 MiB → ChunkFrameTooLarge.
         let err_b = decrypt_chunked_buffered(&blob_b, &kr, 1024 * 1024).unwrap_err();

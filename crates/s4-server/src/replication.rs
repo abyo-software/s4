@@ -338,18 +338,12 @@ impl ReplicationManager {
     /// runs the same binary against its own snapshot.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         let snap = ReplicationSnapshot {
-            by_bucket: crate::lock_recovery::recover_read(
-                &self.by_bucket,
-                "replication.by_bucket",
-            )
-            .clone(),
-            statuses: crate::lock_recovery::recover_read(
-                &self.statuses,
-                "replication.statuses",
-            )
-            .iter()
-            .map(|(k, v)| (k.clone(), StatusOrEntry::Entry(v.clone())))
-            .collect(),
+            by_bucket: crate::lock_recovery::recover_read(&self.by_bucket, "replication.by_bucket")
+                .clone(),
+            statuses: crate::lock_recovery::recover_read(&self.statuses, "replication.statuses")
+                .iter()
+                .map(|(k, v)| (k.clone(), StatusOrEntry::Entry(v.clone())))
+                .collect(),
             next_generation: self.next_generation.load(Ordering::Relaxed),
         };
         serde_json::to_string(&snap)
@@ -433,18 +427,17 @@ impl ReplicationManager {
     ///   `PENDING` instead of `None`.
     /// - Tests that don't care about generation (legacy assertions).
     pub fn record_status(&self, bucket: &str, key: &str, status: ReplicationStatus) {
-        crate::lock_recovery::recover_write(&self.statuses, "replication.statuses")
-            .insert(
-                (bucket.to_owned(), key.to_owned()),
-                ReplicationStatusEntry {
-                    status,
-                    generation: 0,
-                    // v0.8.3 #66: stamp now so a subsequent sweep can
-                    // age this entry out once it reaches a terminal
-                    // state and exceeds the configured TTL.
-                    recorded_at: Utc::now(),
-                },
-            );
+        crate::lock_recovery::recover_write(&self.statuses, "replication.statuses").insert(
+            (bucket.to_owned(), key.to_owned()),
+            ReplicationStatusEntry {
+                status,
+                generation: 0,
+                // v0.8.3 #66: stamp now so a subsequent sweep can
+                // age this entry out once it reaches a terminal
+                // state and exceeds the configured TTL.
+                recorded_at: Utc::now(),
+            },
+        );
     }
 
     /// v0.8.2 #61: CAS-style stamp. Only updates the entry when
@@ -475,15 +468,15 @@ impl ReplicationManager {
     ) -> bool {
         let mut map = crate::lock_recovery::recover_write(&self.statuses, "replication.statuses");
         let now = Utc::now();
-        let entry = map
-            .entry((bucket.to_owned(), key.to_owned()))
-            .or_insert(ReplicationStatusEntry {
-                status: ReplicationStatus::Pending,
-                generation: 0,
-                // v0.8.3 #66: stamp at insertion; will be overwritten
-                // immediately below when the CAS accepts.
-                recorded_at: now,
-            });
+        let entry =
+            map.entry((bucket.to_owned(), key.to_owned()))
+                .or_insert(ReplicationStatusEntry {
+                    status: ReplicationStatus::Pending,
+                    generation: 0,
+                    // v0.8.3 #66: stamp at insertion; will be overwritten
+                    // immediately below when the CAS accepts.
+                    recorded_at: now,
+                });
         if generation < entry.generation {
             return false;
         }
@@ -551,11 +544,7 @@ impl ReplicationManager {
 
 /// AND of (prefix predicate, every tag pair). An empty / `None` prefix
 /// means "any prefix"; an empty tag list means "no tag predicate".
-fn filter_matches(
-    filter: &ReplicationFilter,
-    key: &str,
-    object_tags: &[(String, String)],
-) -> bool {
+fn filter_matches(filter: &ReplicationFilter, key: &str, object_tags: &[(String, String)]) -> bool {
     if let Some(p) = filter.prefix.as_deref()
         && !p.is_empty()
         && !key.starts_with(p)
@@ -563,10 +552,7 @@ fn filter_matches(
         return false;
     }
     for (tk, tv) in &filter.tags {
-        if !object_tags
-            .iter()
-            .any(|(ok, ov)| ok == tk && ov == tv)
-        {
+        if !object_tags.iter().any(|(ok, ov)| ok == tk && ov == tv) {
             return false;
         }
     }
@@ -744,12 +730,10 @@ pub async fn replicate_object<F, Fut>(
         // older bytes. We use `record_status_if_newer` with the
         // **current** entry's status as a no-op when we're not stale,
         // but the cheap path is to peek and bail.
-        if let Some(entry) = crate::lock_recovery::recover_read(
-            &manager.statuses,
-            "replication.statuses",
-        )
-        .get(&(source_bucket.clone(), source_key.clone()))
-        .cloned()
+        if let Some(entry) =
+            crate::lock_recovery::recover_read(&manager.statuses, "replication.statuses")
+                .get(&(source_bucket.clone(), source_key.clone()))
+                .cloned()
             && entry.generation > generation
         {
             tracing::debug!(
@@ -934,7 +918,10 @@ mod tests {
             },
         );
         let picked = mgr.match_rule("src", "k", &[]).expect("match");
-        assert_eq!(picked.id, "first", "tie on priority must keep the earlier rule");
+        assert_eq!(
+            picked.id, "first",
+            "tie on priority must keep the earlier rule"
+        );
     }
 
     #[test]
@@ -970,12 +957,8 @@ mod tests {
         );
         // Only one tag → AND fails.
         assert!(
-            mgr.match_rule(
-                "src",
-                "k",
-                &[("env".into(), "prod".into())]
-            )
-            .is_none(),
+            mgr.match_rule("src", "k", &[("env".into(), "prod".into())])
+                .is_none(),
             "missing one of the required tags must not match"
         );
         // Wrong tag value → AND fails.
@@ -983,10 +966,7 @@ mod tests {
             mgr.match_rule(
                 "src",
                 "k",
-                &[
-                    ("env".into(), "dev".into()),
-                    ("tier".into(), "gold".into())
-                ]
+                &[("env".into(), "dev".into()), ("tier".into(), "gold".into())]
             )
             .is_none(),
             "wrong value on a required tag must not match"
@@ -1032,7 +1012,14 @@ mod tests {
             "src",
             ReplicationConfig {
                 role: "arn:aws:iam::000:role/s4".into(),
-                rules: vec![rule("r1", 7, true, Some("docs/"), &[("env", "prod")], "dst")],
+                rules: vec![rule(
+                    "r1",
+                    7,
+                    true,
+                    Some("docs/"),
+                    &[("env", "prod")],
+                    "dst",
+                )],
             },
         );
         mgr.record_status("src", "docs/a.pdf", ReplicationStatus::Completed);
@@ -1085,7 +1072,12 @@ mod tests {
 
     #[tokio::test]
     async fn replicate_object_happy_path_marks_completed() {
-        type Captured = Vec<(String, String, bytes::Bytes, Option<HashMap<String, String>>)>;
+        type Captured = Vec<(
+            String,
+            String,
+            bytes::Bytes,
+            Option<HashMap<String, String>>,
+        )>;
         let mgr = Arc::new(ReplicationManager::new());
         let captured: Arc<Mutex<Captured>> = Arc::new(Mutex::new(Vec::new()));
         let captured_cl = Arc::clone(&captured);
@@ -1106,7 +1098,10 @@ mod tests {
             "src".into(),
             "obj.bin".into(),
             bytes::Bytes::from_static(b"hello"),
-            Some(HashMap::from([("content-type".into(), "text/plain".into())])),
+            Some(HashMap::from([(
+                "content-type".into(),
+                "text/plain".into(),
+            )])),
             do_put,
             Arc::clone(&mgr),
             mgr.next_generation(),
@@ -1131,7 +1126,10 @@ mod tests {
             Some("REPLICA"),
             "destination meta must carry the REPLICA stamp"
         );
-        assert_eq!(meta.get("content-type").map(String::as_str), Some("text/plain"));
+        assert_eq!(
+            meta.get("content-type").map(String::as_str),
+            Some("text/plain")
+        );
     }
 
     #[tokio::test]
@@ -1195,19 +1193,9 @@ mod tests {
     fn record_status_if_newer_accepts_higher_generation() {
         let mgr = ReplicationManager::new();
         // First stamp at gen=5 — no prior entry, accepted.
-        assert!(mgr.record_status_if_newer(
-            "b",
-            "k",
-            5,
-            ReplicationStatus::Pending,
-        ));
+        assert!(mgr.record_status_if_newer("b", "k", 5, ReplicationStatus::Pending,));
         // Higher generation overrides.
-        assert!(mgr.record_status_if_newer(
-            "b",
-            "k",
-            7,
-            ReplicationStatus::Completed,
-        ));
+        assert!(mgr.record_status_if_newer("b", "k", 7, ReplicationStatus::Completed,));
         assert_eq!(
             mgr.lookup_status("b", "k"),
             Some(ReplicationStatus::Completed)
@@ -1218,20 +1206,10 @@ mod tests {
     fn record_status_if_newer_rejects_stale_generation() {
         let mgr = ReplicationManager::new();
         // Newer PUT lands first.
-        assert!(mgr.record_status_if_newer(
-            "b",
-            "k",
-            10,
-            ReplicationStatus::Completed,
-        ));
+        assert!(mgr.record_status_if_newer("b", "k", 10, ReplicationStatus::Completed,));
         // Older retry must be rejected — destination must not roll
         // back to "alpha" once "beta" has stamped Completed.
-        let accepted = mgr.record_status_if_newer(
-            "b",
-            "k",
-            3,
-            ReplicationStatus::Completed,
-        );
+        let accepted = mgr.record_status_if_newer("b", "k", 3, ReplicationStatus::Completed);
         assert!(!accepted, "stale generation must be rejected");
         // Stored entry stays at the newer generation's terminal state.
         assert_eq!(
@@ -1246,18 +1224,8 @@ mod tests {
         // Completed transition on the same task). The CAS is `>=`
         // not `>`.
         let mgr = ReplicationManager::new();
-        assert!(mgr.record_status_if_newer(
-            "b",
-            "k",
-            42,
-            ReplicationStatus::Pending,
-        ));
-        assert!(mgr.record_status_if_newer(
-            "b",
-            "k",
-            42,
-            ReplicationStatus::Completed,
-        ));
+        assert!(mgr.record_status_if_newer("b", "k", 42, ReplicationStatus::Pending,));
+        assert!(mgr.record_status_if_newer("b", "k", 42, ReplicationStatus::Completed,));
         assert_eq!(
             mgr.lookup_status("b", "k"),
             Some(ReplicationStatus::Completed)
@@ -1288,8 +1256,8 @@ mod tests {
                 [["src", "k"], "Completed"]
             ]
         }"#;
-        let mgr = ReplicationManager::from_json(pre_61_json)
-            .expect("pre-#61 snapshot must deserialise");
+        let mgr =
+            ReplicationManager::from_json(pre_61_json).expect("pre-#61 snapshot must deserialise");
         assert_eq!(
             mgr.lookup_status("src", "k"),
             Some(ReplicationStatus::Completed)
@@ -1298,12 +1266,7 @@ mod tests {
         assert_eq!(mgr.next_generation(), 1);
         // The `generation = 0` legacy entry is overridable by any
         // real PUT (= a generation >= 1).
-        assert!(mgr.record_status_if_newer(
-            "src",
-            "k",
-            1,
-            ReplicationStatus::Pending,
-        ));
+        assert!(mgr.record_status_if_newer("src", "k", 1, ReplicationStatus::Pending,));
     }
 
     // ----- v0.8.3 #66: sweep + TTL unit tests (H-5 audit fix) -----
@@ -1319,15 +1282,14 @@ mod tests {
         status: ReplicationStatus,
         recorded_at: DateTime<Utc>,
     ) {
-        crate::lock_recovery::recover_write(&mgr.statuses, "replication.statuses")
-            .insert(
-                (bucket.to_owned(), key.to_owned()),
-                ReplicationStatusEntry {
-                    status,
-                    generation: 1,
-                    recorded_at,
-                },
-            );
+        crate::lock_recovery::recover_write(&mgr.statuses, "replication.statuses").insert(
+            (bucket.to_owned(), key.to_owned()),
+            ReplicationStatusEntry {
+                status,
+                generation: 1,
+                recorded_at,
+            },
+        );
     }
 
     #[test]
@@ -1432,8 +1394,7 @@ mod tests {
         // recorded_at defaulted to Utc::now() at deserialise time —
         // peek the inner entry to verify the timestamp is in the
         // [before, after] window of the from_json call.
-        let entries =
-            crate::lock_recovery::recover_read(&mgr.statuses, "replication.statuses");
+        let entries = crate::lock_recovery::recover_read(&mgr.statuses, "replication.statuses");
         let entry = entries
             .get(&("src".to_owned(), "k".to_owned()))
             .expect("entry must exist");
@@ -1466,7 +1427,12 @@ mod tests {
     /// can persist the same WORM posture on the replica.
     #[tokio::test]
     async fn replicate_with_source_lock_state_attaches_headers() {
-        type Captured = Vec<(String, String, bytes::Bytes, Option<HashMap<String, String>>)>;
+        type Captured = Vec<(
+            String,
+            String,
+            bytes::Bytes,
+            Option<HashMap<String, String>>,
+        )>;
         let mgr = Arc::new(ReplicationManager::new());
         let captured: Arc<Mutex<Captured>> = Arc::new(Mutex::new(Vec::new()));
         let captured_cl = Arc::clone(&captured);
@@ -1519,7 +1485,9 @@ mod tests {
         let parsed: chrono::DateTime<chrono::FixedOffset> =
             chrono::DateTime::parse_from_rfc3339(stamped_until)
                 .expect("retain-until must be RFC-3339");
-        let diff = (parsed.with_timezone(&Utc) - retain_until).num_seconds().abs();
+        let diff = (parsed.with_timezone(&Utc) - retain_until)
+            .num_seconds()
+            .abs();
         assert!(diff <= 1, "retain-until off by {diff}s");
         assert_eq!(
             meta.get("x-amz-object-lock-legal-hold").map(String::as_str),
@@ -1540,7 +1508,12 @@ mod tests {
     /// non-WORM PUT path).
     #[tokio::test]
     async fn replicate_without_source_lock_state_no_headers_added() {
-        type Captured = Vec<(String, String, bytes::Bytes, Option<HashMap<String, String>>)>;
+        type Captured = Vec<(
+            String,
+            String,
+            bytes::Bytes,
+            Option<HashMap<String, String>>,
+        )>;
         let mgr = Arc::new(ReplicationManager::new());
         let captured: Arc<Mutex<Captured>> = Arc::new(Mutex::new(Vec::new()));
         let captured_cl = Arc::clone(&captured);

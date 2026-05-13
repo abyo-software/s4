@@ -43,9 +43,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 /// なので、`tokio_util::io::StreamReader` を使うと `tokio::io::AsyncRead` に変換できる。
 /// ただし StreamReader は `std::io::Error` を期待するので、StdError → io::Error への
 /// 変換層を挟む必要がある。
-pub fn blob_to_async_read(
-    blob: StreamingBlob,
-) -> impl AsyncRead + Unpin + Send + Sync + 'static {
+pub fn blob_to_async_read(blob: StreamingBlob) -> impl AsyncRead + Unpin + Send + Sync + 'static {
     let mapped = blob.map(|chunk| chunk.map_err(|e| io::Error::other(e.to_string())));
     StreamReader::new(mapped)
 }
@@ -818,10 +816,8 @@ mod tests {
     #[tokio::test]
     async fn streaming_compress_truncated_input_returns_truncated_stream_error() {
         use s4_codec::cpu_zstd::CpuZstd;
-        let registry = Arc::new(
-            CodecRegistry::new(CodecKind::CpuZstd)
-                .with(Arc::new(CpuZstd::default())),
-        );
+        let registry =
+            Arc::new(CodecRegistry::new(CodecKind::CpuZstd).with(Arc::new(CpuZstd::default())));
         // The synthetic body yields exactly 4 KiB but the caller
         // *advertises* 16 KiB — the same shape as a client that
         // disconnected after 25% of the upload.

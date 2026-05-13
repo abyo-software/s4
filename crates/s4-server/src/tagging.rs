@@ -153,11 +153,7 @@ pub enum TagError {
     #[error("tag key too long: {len} bytes (max {max})")]
     KeyTooLong { len: usize, max: usize },
     #[error("tag value too long: key {key:?} value is {len} bytes (max {max})")]
-    ValueTooLong {
-        key: String,
-        len: usize,
-        max: usize,
-    },
+    ValueTooLong { key: String, len: usize, max: usize },
     #[error("duplicate tag key: {key:?}")]
     DuplicateKey { key: String },
     #[error("invalid tag header (URL-encoded): {0}")]
@@ -229,8 +225,7 @@ impl TagManager {
 
     /// Drop the bucket-level tag set (idempotent).
     pub fn delete_bucket_tags(&self, bucket: &str) {
-        crate::lock_recovery::recover_write(&self.buckets, "tagging.buckets")
-            .remove(bucket);
+        crate::lock_recovery::recover_write(&self.buckets, "tagging.buckets").remove(bucket);
     }
 
     /// JSON snapshot for restart-recoverable state. Pair with
@@ -241,8 +236,7 @@ impl TagManager {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-        let buckets =
-            crate::lock_recovery::recover_read(&self.buckets, "tagging.buckets").clone();
+        let buckets = crate::lock_recovery::recover_read(&self.buckets, "tagging.buckets").clone();
         let snap = TagSnapshot { objects, buckets };
         serde_json::to_string(&snap)
     }
@@ -361,11 +355,8 @@ fn hex_digit(b: u8) -> Option<u8> {
 /// output portable.
 fn url_encode_to(out: &mut String, s: &str) {
     for &b in s.as_bytes() {
-        let unreserved = b.is_ascii_alphanumeric()
-            || b == b'-'
-            || b == b'_'
-            || b == b'.'
-            || b == b'~';
+        let unreserved =
+            b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~';
         if unreserved {
             out.push(b as char);
         } else {
@@ -392,7 +383,13 @@ mod tests {
             .collect();
         let err = TagSet::from_pairs(pairs).expect_err("must reject 11 pairs");
         assert!(
-            matches!(err, TagError::TooManyTags { got: 11, max: MAX_TAGS_PER_OBJECT }),
+            matches!(
+                err,
+                TagError::TooManyTags {
+                    got: 11,
+                    max: MAX_TAGS_PER_OBJECT
+                }
+            ),
             "got: {err:?}"
         );
     }
@@ -402,7 +399,13 @@ mod tests {
         let pairs = vec![("k".repeat(129), "v".into())];
         let err = TagSet::from_pairs(pairs).expect_err("must reject 129-byte key");
         assert!(
-            matches!(err, TagError::KeyTooLong { len: 129, max: MAX_TAG_KEY_BYTES }),
+            matches!(
+                err,
+                TagError::KeyTooLong {
+                    len: 129,
+                    max: MAX_TAG_KEY_BYTES
+                }
+            ),
             "got: {err:?}"
         );
     }
@@ -454,8 +457,7 @@ mod tests {
     #[test]
     fn parse_tagging_header_url_encoded_values() {
         // `%20` (space), `%2F` (slash), and `+` (form-style space).
-        let s = parse_tagging_header("Path=foo%2Fbar&Greet=hello%20world&Plus=a+b")
-            .expect("parse");
+        let s = parse_tagging_header("Path=foo%2Fbar&Greet=hello%20world&Plus=a+b").expect("parse");
         assert_eq!(s.get("Path"), Some("foo/bar"));
         assert_eq!(s.get("Greet"), Some("hello world"));
         assert_eq!(s.get("Plus"), Some("a b"));
@@ -499,8 +501,7 @@ mod tests {
     #[test]
     fn manager_object_put_get_delete() {
         let m = TagManager::new();
-        let tags =
-            TagSet::from_pairs(vec![("Owner".into(), "alice".into())]).expect("ts");
+        let tags = TagSet::from_pairs(vec![("Owner".into(), "alice".into())]).expect("ts");
         m.put_object_tags("b", "k", tags.clone());
         assert_eq!(m.get_object_tags("b", "k"), Some(tags));
         m.delete_object_tags("b", "k");
@@ -512,8 +513,7 @@ mod tests {
     #[test]
     fn manager_bucket_put_get_delete() {
         let m = TagManager::new();
-        let tags =
-            TagSet::from_pairs(vec![("CostCenter".into(), "42".into())]).expect("ts");
+        let tags = TagSet::from_pairs(vec![("CostCenter".into(), "42".into())]).expect("ts");
         m.put_bucket_tags("b", tags.clone());
         assert_eq!(m.get_bucket_tags("b"), Some(tags));
         m.delete_bucket_tags("b");
@@ -531,7 +531,10 @@ mod tests {
             "k",
             TagSet::from_pairs(vec![("o".into(), "1".into())]).unwrap(),
         );
-        m.put_bucket_tags("b", TagSet::from_pairs(vec![("b".into(), "2".into())]).unwrap());
+        m.put_bucket_tags(
+            "b",
+            TagSet::from_pairs(vec![("b".into(), "2".into())]).unwrap(),
+        );
         assert_eq!(m.get_object_tags("b", "k").unwrap().get("o"), Some("1"));
         assert!(m.get_object_tags("b", "k").unwrap().get("b").is_none());
         assert_eq!(m.get_bucket_tags("b").unwrap().get("b"), Some("2"));
@@ -579,10 +582,7 @@ mod tests {
         // the public `parse_tagging_header` / `from_pairs` paths reject
         // duplicates outright, so we construct the dup-bearing set
         // directly to exercise the lookup contract.
-        let s = TagSet(vec![
-            ("K".into(), "A".into()),
-            ("K".into(), "B".into()),
-        ]);
+        let s = TagSet(vec![("K".into(), "A".into()), ("K".into(), "B".into())]);
         assert_eq!(s.get("K"), Some("B"));
     }
 
@@ -603,7 +603,13 @@ mod tests {
         let header = format!("{}=v", "k".repeat(129));
         let err = parse_tagging_header(&header).expect_err("129-byte key");
         assert!(
-            matches!(err, TagError::KeyTooLong { len: 129, max: MAX_TAG_KEY_BYTES }),
+            matches!(
+                err,
+                TagError::KeyTooLong {
+                    len: 129,
+                    max: MAX_TAG_KEY_BYTES
+                }
+            ),
             "got: {err:?}"
         );
     }
@@ -644,7 +650,13 @@ mod tests {
             .join("&");
         let err = parse_tagging_header(&header).expect_err("11 tags");
         assert!(
-            matches!(err, TagError::TooManyTags { got: 11, max: MAX_TAGS_PER_OBJECT }),
+            matches!(
+                err,
+                TagError::TooManyTags {
+                    got: 11,
+                    max: MAX_TAGS_PER_OBJECT
+                }
+            ),
             "got: {err:?}"
         );
     }
@@ -659,8 +671,7 @@ mod tests {
         m.put_object_tags(
             "b",
             "k",
-            TagSet::from_pairs(vec![("Project".into(), "Phoenix".into())])
-                .expect("valid"),
+            TagSet::from_pairs(vec![("Project".into(), "Phoenix".into())]).expect("valid"),
         );
         let m = std::sync::Arc::new(m);
         let m_cl = std::sync::Arc::clone(&m);

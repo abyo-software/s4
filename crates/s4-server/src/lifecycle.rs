@@ -352,8 +352,7 @@ impl LifecycleManager {
     /// Drop the bucket's lifecycle configuration (idempotent — missing
     /// bucket is OK).
     pub fn delete(&self, bucket: &str) {
-        crate::lock_recovery::recover_write(&self.by_bucket, "lifecycle.by_bucket")
-            .remove(bucket);
+        crate::lock_recovery::recover_write(&self.by_bucket, "lifecycle.by_bucket").remove(bucket);
     }
 
     /// JSON snapshot for restart-recoverable state. Pair with
@@ -660,7 +659,8 @@ pub struct ScanReport {
 /// treating the object as freshly created (age = 0).
 fn timestamp_to_chrono_utc(ts: &Timestamp) -> Option<DateTime<Utc>> {
     let mut buf = Vec::new();
-    ts.format(s3s::dto::TimestampFormat::DateTime, &mut buf).ok()?;
+    ts.format(s3s::dto::TimestampFormat::DateTime, &mut buf)
+        .ok()?;
     let s = std::str::from_utf8(&buf).ok()?;
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
@@ -986,11 +986,8 @@ async fn scan_in_flight_multipart_uploads<B: S3 + Send + Sync + 'static>(
             upload_id_marker: upload_id_marker.clone(),
             ..Default::default()
         };
-        let list_req = synthetic_request(
-            list_input,
-            http::Method::GET,
-            &format!("/{bucket}?uploads"),
-        );
+        let list_req =
+            synthetic_request(list_input, http::Method::GET, &format!("/{bucket}?uploads"));
         let resp = match s4.as_ref().list_multipart_uploads(list_req).await {
             Ok(r) => r,
             Err(e) => {
@@ -1018,10 +1015,7 @@ async fn scan_in_flight_multipart_uploads<B: S3 + Send + Sync + 'static>(
             // and skip. Matches the conservative `last_modified`
             // handling in `scan_bucket` — never abort an upload
             // whose age we cannot determine.
-            let Some(initiated) = upload
-                .initiated
-                .as_ref()
-                .and_then(timestamp_to_chrono_utc)
+            let Some(initiated) = upload.initiated.as_ref().and_then(timestamp_to_chrono_utc)
             else {
                 continue;
             };
@@ -1031,12 +1025,12 @@ async fn scan_in_flight_multipart_uploads<B: S3 + Send + Sync + 'static>(
                 initiated,
                 tags: Vec::new(),
             };
-            let Some(action) = mgr.evaluate_in_flight_multipart(bucket, &candidate, now)
-            else {
+            let Some(action) = mgr.evaluate_in_flight_multipart(bucket, &candidate, now) else {
                 continue;
             };
-            let LifecycleAction::AbortMultipartUpload { upload_id: action_upload_id } =
-                action
+            let LifecycleAction::AbortMultipartUpload {
+                upload_id: action_upload_id,
+            } = action
             else {
                 // The evaluator is contractually
                 // AbortMultipartUpload-only on this path; this arm
@@ -1061,8 +1055,7 @@ async fn scan_in_flight_multipart_uploads<B: S3 + Send + Sync + 'static>(
                             upload_id: action_upload_id.clone(),
                         },
                     );
-                    report.aborted_multipart =
-                        report.aborted_multipart.saturating_add(1);
+                    report.aborted_multipart = report.aborted_multipart.saturating_add(1);
                     // Drop the per-upload state so the
                     // (Zeroizing-wrapped) SSE-C key bytes / tag
                     // recipe / object-lock recipe go away
@@ -1072,9 +1065,7 @@ async fn scan_in_flight_multipart_uploads<B: S3 + Send + Sync + 'static>(
                     // (some uploads may not have been registered
                     // here, e.g. a server restart between Create
                     // and the lifecycle sweep).
-                    s4.as_ref()
-                        .multipart_state()
-                        .remove(&action_upload_id);
+                    s4.as_ref().multipart_state().remove(&action_upload_id);
                 }
                 Err(e) => {
                     warn!(
@@ -1179,11 +1170,7 @@ async fn execute_expire<B: S3 + Send + Sync + 'static>(
         key: key.to_owned(),
         ..Default::default()
     };
-    let req = synthetic_request(
-        input,
-        http::Method::DELETE,
-        &format!("/{bucket}/{key}"),
-    );
+    let req = synthetic_request(input, http::Method::DELETE, &format!("/{bucket}/{key}"));
     s4.as_ref()
         .delete_object(req)
         .await
@@ -1215,16 +1202,14 @@ async fn execute_transition<B: S3 + Send + Sync + 'static>(
         key: key.to_owned().into_boxed_str(),
         version_id: None,
     });
-    builder.set_metadata_directive(Some(MetadataDirective::from_static(MetadataDirective::COPY)));
+    builder.set_metadata_directive(Some(MetadataDirective::from_static(
+        MetadataDirective::COPY,
+    )));
     builder.set_storage_class(Some(StorageClass::from(storage_class.to_owned())));
     let input = builder
         .build()
         .map_err(|e| format!("CopyObjectInput build: {e}"))?;
-    let req = synthetic_request(
-        input,
-        http::Method::PUT,
-        &format!("/{bucket}/{key}"),
-    );
+    let req = synthetic_request(input, http::Method::PUT, &format!("/{bucket}/{key}"));
     s4.as_ref()
         .copy_object(req)
         .await
@@ -1887,9 +1872,8 @@ mod tests {
     }
 
     fn make_service() -> Arc<S4Service<ScannerMemBackend>> {
-        let registry = Arc::new(
-            CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)),
-        );
+        let registry =
+            Arc::new(CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)));
         let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
         Arc::new(S4Service::new(
             ScannerMemBackend::default(),
@@ -1911,13 +1895,10 @@ mod tests {
         // And: lifecycle manager attached but no buckets configured.
         let mgr = Arc::new(LifecycleManager::new());
         let backend = ScannerMemBackend::default();
-        let registry = Arc::new(
-            CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)),
-        );
+        let registry =
+            Arc::new(CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)));
         let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
-        let s4_empty = Arc::new(
-            S4Service::new(backend, registry, dispatcher).with_lifecycle(mgr),
-        );
+        let s4_empty = Arc::new(S4Service::new(backend, registry, dispatcher).with_lifecycle(mgr));
         let report = run_scan_once(&s4_empty).await.expect("scan empty");
         assert_eq!(report, ScanReport::default());
     }
@@ -1938,9 +1919,8 @@ mod tests {
         let mut rule = LifecycleRule::expire_after_days("r", 0);
         rule.filter.prefix = Some("stale.".into());
         mgr.put("b", LifecycleConfig { rules: vec![rule] });
-        let registry = Arc::new(
-            CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)),
-        );
+        let registry =
+            Arc::new(CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)));
         let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
         let s4 = Arc::new(
             S4Service::new(backend, registry, dispatcher).with_lifecycle(Arc::clone(&mgr)),
@@ -1982,10 +1962,7 @@ mod tests {
         assert!(keys.contains(&"data/keep2.bin".to_string()));
         // Lifecycle action counter: one Expire bumped on bucket "b".
         let snap = mgr.actions_snapshot();
-        assert_eq!(
-            snap.get(&("b".into(), "expire".into())).copied(),
-            Some(1)
-        );
+        assert_eq!(snap.get(&("b".into(), "expire".into())).copied(), Some(1));
     }
 
     #[tokio::test]
@@ -1993,9 +1970,8 @@ mod tests {
         let backend = ScannerMemBackend::default();
         backend.put_now("b", "locked.log", Bytes::from_static(b"x"));
         backend.put_now("b", "free.log", Bytes::from_static(b"y"));
-        let registry = Arc::new(
-            CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)),
-        );
+        let registry =
+            Arc::new(CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)));
         let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
         let mgr = Arc::new(LifecycleManager::new());
         // Aggressive: every object expires immediately.
@@ -2066,9 +2042,8 @@ mod tests {
         backend.put_now(bucket, "middle.log", Bytes::from_static(b"m"));
         backend.put_now(bucket, "outer-c.log", Bytes::from_static(b"c"));
 
-        let registry = Arc::new(
-            CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)),
-        );
+        let registry =
+            Arc::new(CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)));
         let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
         let mgr = Arc::new(LifecycleManager::new());
         mgr.put(
@@ -2179,12 +2154,21 @@ mod tests {
         let backend = ScannerMemBackend::default();
         let bucket = "lc-mp-69";
         let now = Utc::now();
-        backend.put_multipart_upload(bucket, "u-stale", "uploads/big.bin", now - Duration::days(8));
-        backend.put_multipart_upload(bucket, "u-fresh", "uploads/fresh.bin", now - Duration::hours(1));
-
-        let registry = Arc::new(
-            CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)),
+        backend.put_multipart_upload(
+            bucket,
+            "u-stale",
+            "uploads/big.bin",
+            now - Duration::days(8),
         );
+        backend.put_multipart_upload(
+            bucket,
+            "u-fresh",
+            "uploads/fresh.bin",
+            now - Duration::hours(1),
+        );
+
+        let registry =
+            Arc::new(CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)));
         let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
         let mgr = Arc::new(LifecycleManager::new());
         let mut rule = LifecycleRule {
@@ -2387,13 +2371,11 @@ mod tests {
     /// `buckets_scanned = 1` and no actions taken (the malformed page
     /// has zero contents).
     #[tokio::test]
-    async fn scan_handles_truncated_with_missing_marker_without_infinite_loop()
-    {
+    async fn scan_handles_truncated_with_missing_marker_without_infinite_loop() {
         let backend = MalformedListObjectsBackend::default();
         let bucket = "lc-malformed-list-78";
-        let registry = Arc::new(
-            CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)),
-        );
+        let registry =
+            Arc::new(CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)));
         let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
         let mgr = Arc::new(LifecycleManager::new());
         // Any rule will do — the malformed listing returns zero
@@ -2428,13 +2410,11 @@ mod tests {
     /// NOT cause `scan_in_flight_multipart_uploads` to spin. Second
     /// `list_multipart_uploads` call panics if the guard regresses.
     #[tokio::test]
-    async fn scan_multipart_handles_truncated_with_missing_marker_without_infinite_loop()
-    {
+    async fn scan_multipart_handles_truncated_with_missing_marker_without_infinite_loop() {
         let backend = MalformedListMultipartBackend::default();
         let bucket = "lc-malformed-mp-78";
-        let registry = Arc::new(
-            CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)),
-        );
+        let registry =
+            Arc::new(CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)));
         let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
         let mgr = Arc::new(LifecycleManager::new());
         // Rule with `abort_incomplete_multipart_upload_days = Some(7)`

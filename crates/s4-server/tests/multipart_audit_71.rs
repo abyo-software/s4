@@ -268,10 +268,9 @@ impl S3 for FaultInjectMemBackend {
             let parts = st.mpu_parts.remove(&upload_id).ok_or_else(|| {
                 S3Error::with_message(S3ErrorCode::NoSuchUpload, "no such upload")
             })?;
-            let (bucket, key) =
-                st.mpu_objects.remove(&upload_id).ok_or_else(|| {
-                    S3Error::with_message(S3ErrorCode::NoSuchUpload, "no upload context")
-                })?;
+            let (bucket, key) = st.mpu_objects.remove(&upload_id).ok_or_else(|| {
+                S3Error::with_message(S3ErrorCode::NoSuchUpload, "no upload context")
+            })?;
             // Concat parts in part-number order (BTreeMap iter is sorted).
             let mut buf = Vec::new();
             for (_, body) in parts {
@@ -388,9 +387,7 @@ fn complete_mpu_req(
             bucket: bucket.into(),
             key: key.into(),
             upload_id: upload_id.into(),
-            multipart_upload: Some(CompletedMultipartUpload {
-                parts: Some(parts),
-            }),
+            multipart_upload: Some(CompletedMultipartUpload { parts: Some(parts) }),
             ..Default::default()
         },
         http::Method::POST,
@@ -398,11 +395,7 @@ fn complete_mpu_req(
     )
 }
 
-fn abort_mpu_req(
-    bucket: &str,
-    key: &str,
-    upload_id: &str,
-) -> S3Request<AbortMultipartUploadInput> {
+fn abort_mpu_req(bucket: &str, key: &str, upload_id: &str) -> S3Request<AbortMultipartUploadInput> {
     req(
         AbortMultipartUploadInput {
             bucket: bucket.into(),
@@ -436,8 +429,8 @@ async fn multipart_complete_returns_5xx_when_backend_get_fails() {
     // would skip the encrypt-and-PUT branch and the backend bytes
     // would remain plaintext.
     let key = Arc::new(SseKey::from_bytes(&[7u8; 32]).unwrap());
-    let s4 = S4Service::new(backend, make_registry(), make_dispatcher())
-        .with_sse_key(Arc::clone(&key));
+    let s4 =
+        S4Service::new(backend, make_registry(), make_dispatcher()).with_sse_key(Arc::clone(&key));
 
     let bucket = "sse-bucket";
     let object_key = "leak-canary";
@@ -543,8 +536,8 @@ async fn multipart_complete_tolerates_backend_get_no_such_key() {
     let shared_state = Arc::new(Mutex::new(InnerState::new()));
     let backend = FaultInjectMemBackend::from_shared(Arc::clone(&shared_state));
     let key = Arc::new(SseKey::from_bytes(&[7u8; 32]).unwrap());
-    let s4 = S4Service::new(backend, make_registry(), make_dispatcher())
-        .with_sse_key(Arc::clone(&key));
+    let s4 =
+        S4Service::new(backend, make_registry(), make_dispatcher()).with_sse_key(Arc::clone(&key));
 
     let bucket = "sse-bucket";
     let object_key = "raced-with-delete";
@@ -556,9 +549,7 @@ async fn multipart_complete_tolerates_backend_get_no_such_key() {
 
     let body = Bytes::from_static(b"body");
     let r1 = s4
-        .upload_part(upload_part_req(
-            bucket, object_key, &upload_id, 1, body,
-        ))
+        .upload_part(upload_part_req(bucket, object_key, &upload_id, 1, body))
         .await
         .expect("part 1");
 
@@ -573,12 +564,7 @@ async fn multipart_complete_tolerates_backend_get_no_such_key() {
     // can't re-encrypt what isn't there, and there is nothing the
     // gateway stamped as durable that needs SSE marker reconciliation).
     let _ = s4
-        .complete_multipart_upload(complete_mpu_req(
-            bucket,
-            object_key,
-            &upload_id,
-            parts,
-        ))
+        .complete_multipart_upload(complete_mpu_req(bucket, object_key, &upload_id, parts))
         .await
         .expect("NoSuchKey on assembled-body fetch is safe to skip");
 }
@@ -607,9 +593,7 @@ async fn abort_multipart_failure_keeps_state_for_retry() {
 
     let body = Bytes::from_static(b"part-1");
     let _ = s4
-        .upload_part(upload_part_req(
-            bucket, object_key, &upload_id, 1, body,
-        ))
+        .upload_part(upload_part_req(bucket, object_key, &upload_id, 1, body))
         .await
         .expect("part 1");
 

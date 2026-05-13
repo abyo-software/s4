@@ -107,9 +107,7 @@ pub struct AuditHmacKey(Arc<Vec<u8>>);
 
 #[derive(Debug, Error)]
 pub enum AuditKeyError {
-    #[error(
-        "audit-log HMAC key spec must start with `raw:`, `hex:`, or `base64:` (got: {0:?})"
-    )]
+    #[error("audit-log HMAC key spec must start with `raw:`, `hex:`, or `base64:` (got: {0:?})")]
     BadPrefix(String),
     #[error("audit-log HMAC key hex must be even-length and all-hex; got {0}")]
     BadHex(String),
@@ -194,8 +192,8 @@ pub fn genesis_prev() -> [u8; 32] {
 /// without its HMAC suffix (and without the trailing newline).
 /// Output: 32-byte HMAC-SHA256.
 pub fn chain_step(key: &AuditHmacKey, prev_hmac: &[u8], line_no_hmac: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key.as_bytes())
-        .expect("HMAC-SHA256 accepts any key length");
+    let mut mac =
+        HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC-SHA256 accepts any key length");
     mac.update(prev_hmac);
     mac.update(line_no_hmac);
     let out = mac.finalize().into_bytes();
@@ -217,8 +215,8 @@ pub fn chain_step(key: &AuditHmacKey, prev_hmac: &[u8], line_no_hmac: &[u8]) -> 
 /// (whereas truncation that preserves a valid prefix is not, without
 /// the marker — that is the H-2 attack baseline).
 pub fn compute_eof_hmac(key: &AuditHmacKey, prev_chain_state: &[u8; 32]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key.as_bytes())
-        .expect("HMAC-SHA256 accepts any key length");
+    let mut mac =
+        HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC-SHA256 accepts any key length");
     mac.update(EOF_LABEL);
     mac.update(prev_chain_state);
     let out = mac.finalize().into_bytes();
@@ -578,8 +576,8 @@ mod tests {
         .unwrap();
         assert_eq!(h.as_bytes().len(), 32);
         // 32 zero bytes -> base64 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-        let b = AuditHmacKey::from_str("base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-            .unwrap();
+        let b =
+            AuditHmacKey::from_str("base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
         assert_eq!(b.as_bytes(), &[0u8; 32]);
     }
 
@@ -806,11 +804,7 @@ mod tests {
     ) -> (String, [u8; 32]) {
         let mut out = String::new();
         let seed = if let Some(t) = prev_file_tail {
-            out.push_str(&format!(
-                "{}{}\n",
-                PREV_TAIL_COMMENT_PREFIX,
-                hex_encode(&t)
-            ));
+            out.push_str(&format!("{}{}\n", PREV_TAIL_COMMENT_PREFIX, hex_encode(&t)));
             t
         } else {
             genesis_prev()
@@ -847,22 +841,14 @@ mod tests {
         // real_prev_tail). The in-file comment carries `real_prev_tail`
         // honestly here; we'll then replace it with attacker junk
         // and assert the operator-override path still verifies.
-        let (honest, _) = render_chained_file(
-            &key,
-            Some(real_prev_tail),
-            &["line one", "line two"],
-            false,
-        );
+        let (honest, _) =
+            render_chained_file(&key, Some(real_prev_tail), &["line one", "line two"], false);
         // Splice attack: rewrite the in-file `# prev_file_tail=` line
         // to a fabricated value (32 zero bytes). Without operator
         // hint a v0.5 verifier would seed from this fake; with the
         // hint it must override and verify against the real tail.
         let attacker_seed = [0u8; 32];
-        let spliced = honest.replacen(
-            &hex_encode(&real_prev_tail),
-            &hex_encode(&attacker_seed),
-            1,
-        );
+        let spliced = honest.replacen(&hex_encode(&real_prev_tail), &hex_encode(&attacker_seed), 1);
         // Sanity: the splice changed something.
         assert_ne!(honest, spliced);
         // Operator-override verify: pass the real tail; the verifier
@@ -948,12 +934,8 @@ mod tests {
     #[test]
     fn eof_hmac_marker_round_trip() {
         let key = key();
-        let (body, _) = render_chained_file(
-            &key,
-            None,
-            &["entry one", "entry two", "entry three"],
-            true,
-        );
+        let (body, _) =
+            render_chained_file(&key, None, &["entry one", "entry two", "entry three"], true);
         // Relaxed mode.
         let r1 = verify_audit_bytes(
             std::path::Path::new("<eof-rt>"),
@@ -989,12 +971,7 @@ mod tests {
     fn truncated_log_without_expected_eof_silently_passes() {
         let key = key();
         // Producer wrote 4 entries + EOF marker.
-        let (full, _) = render_chained_file(
-            &key,
-            None,
-            &["alpha", "beta", "gamma", "delta"],
-            true,
-        );
+        let (full, _) = render_chained_file(&key, None, &["alpha", "beta", "gamma", "delta"], true);
         // Attacker truncates after entry #2 (drops gamma, delta, marker).
         let cut_at = full.find("gamma").expect("gamma in body");
         let truncated = &full[..cut_at];
@@ -1022,12 +999,7 @@ mod tests {
     #[test]
     fn truncated_log_with_require_eof_fails() {
         let key = key();
-        let (full, _) = render_chained_file(
-            &key,
-            None,
-            &["alpha", "beta", "gamma", "delta"],
-            true,
-        );
+        let (full, _) = render_chained_file(&key, None, &["alpha", "beta", "gamma", "delta"], true);
         let cut_at = full.find("gamma").expect("gamma in body");
         let truncated = &full[..cut_at];
         let err = verify_audit_bytes(

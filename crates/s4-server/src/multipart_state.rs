@@ -77,9 +77,7 @@ pub enum MultipartSseMode {
     },
     /// Named KMS key (resolved against the gateway's KMS backend on
     /// Complete to generate the per-object DEK).
-    SseKms {
-        key_id: String,
-    },
+    SseKms { key_id: String },
 }
 
 // Manual `PartialEq` / `Eq` so `Zeroizing<[u8; 32]>` (which doesn't
@@ -91,13 +89,18 @@ impl PartialEq for MultipartSseMode {
             (MultipartSseMode::None, MultipartSseMode::None) => true,
             (MultipartSseMode::SseS4, MultipartSseMode::SseS4) => true,
             (
-                MultipartSseMode::SseC { key: a, key_md5: am },
-                MultipartSseMode::SseC { key: b, key_md5: bm },
+                MultipartSseMode::SseC {
+                    key: a,
+                    key_md5: am,
+                },
+                MultipartSseMode::SseC {
+                    key: b,
+                    key_md5: bm,
+                },
             ) => a.as_slice() == b.as_slice() && am == bm,
-            (
-                MultipartSseMode::SseKms { key_id: a },
-                MultipartSseMode::SseKms { key_id: b },
-            ) => a == b,
+            (MultipartSseMode::SseKms { key_id: a }, MultipartSseMode::SseKms { key_id: b }) => {
+                a == b
+            }
             _ => false,
         }
     }
@@ -241,10 +244,8 @@ impl MultipartStateStore {
     /// explicit `now` from a fixed timestamp).
     pub fn sweep_stale(&self, now: DateTime<Utc>, max_age: chrono::Duration) -> usize {
         let cutoff = now - max_age;
-        let mut map = crate::lock_recovery::recover_write(
-            &self.by_upload_id,
-            "multipart_state.by_upload_id",
-        );
+        let mut map =
+            crate::lock_recovery::recover_write(&self.by_upload_id, "multipart_state.by_upload_id");
         let stale: Vec<String> = map
             .iter()
             .filter(|(_, (_, ts))| *ts < cutoff)
@@ -306,8 +307,7 @@ impl MultipartStateStore {
     /// tracking. Used by the assertion in `concurrent_put_lookup_race_free`.
     #[cfg(test)]
     fn len(&self) -> usize {
-        crate::lock_recovery::recover_read(&self.by_upload_id, "multipart_state.by_upload_id")
-            .len()
+        crate::lock_recovery::recover_read(&self.by_upload_id, "multipart_state.by_upload_id").len()
     }
 }
 
@@ -545,8 +545,12 @@ mod tests {
         // Hold the first lock and acquire the second under the same
         // task — must NOT deadlock and must NOT block. `try_lock`
         // returns `Ok(MutexGuard)` when uncontended, `Err` otherwise.
-        let guard_a = a.try_lock().expect("lock on bucket-a/shared/key must be free");
-        let guard_b = b.try_lock().expect("lock on bucket-b/shared/key must be free");
+        let guard_a = a
+            .try_lock()
+            .expect("lock on bucket-a/shared/key must be free");
+        let guard_b = b
+            .try_lock()
+            .expect("lock on bucket-b/shared/key must be free");
         // Same key, same bucket from a third call must alias `a` and
         // therefore be contended (a's guard is held above).
         let a2 = store.completion_lock("bucket-a", "shared/key");

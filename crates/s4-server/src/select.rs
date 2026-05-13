@@ -45,8 +45,8 @@
 //! [aws-events]: https://docs.aws.amazon.com/AmazonS3/latest/API/RESTSelectObjectAppendix.html
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, GroupByExpr, ObjectName, Query, Select, SelectItem, SetExpr,
-    Statement, TableFactor, UnaryOperator, Value,
+    BinaryOperator, Expr, GroupByExpr, ObjectName, Query, Select, SelectItem, SetExpr, Statement,
+    TableFactor, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -105,8 +105,8 @@ pub struct SelectQuery {
 /// object: aggregates, GROUP BY, HAVING, JOIN, ORDER BY, LIMIT, DISTINCT.
 pub fn parse_select(sql: &str) -> Result<SelectQuery, SelectError> {
     let dialect = GenericDialect {};
-    let mut statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|e| SelectError::Parse(e.to_string()))?;
+    let mut statements =
+        Parser::parse_sql(&dialect, sql).map_err(|e| SelectError::Parse(e.to_string()))?;
     if statements.len() != 1 {
         return Err(SelectError::Parse(format!(
             "expected exactly one statement, got {}",
@@ -123,7 +123,14 @@ pub fn parse_select(sql: &str) -> Result<SelectQuery, SelectError> {
         }
     };
     let Query {
-        body, order_by, limit, offset, fetch, locks, with, ..
+        body,
+        order_by,
+        limit,
+        offset,
+        fetch,
+        locks,
+        with,
+        ..
     } = query;
     if with.is_some() {
         return Err(SelectError::UnsupportedFeature("CTE / WITH".into()));
@@ -141,7 +148,9 @@ pub fn parse_select(sql: &str) -> Result<SelectQuery, SelectError> {
         return Err(SelectError::UnsupportedFeature("FETCH".into()));
     }
     if !locks.is_empty() {
-        return Err(SelectError::UnsupportedFeature("FOR UPDATE / lock clauses".into()));
+        return Err(SelectError::UnsupportedFeature(
+            "FOR UPDATE / lock clauses".into(),
+        ));
     }
 
     let select = match *body {
@@ -150,10 +159,14 @@ pub fn parse_select(sql: &str) -> Result<SelectQuery, SelectError> {
             return Err(SelectError::UnsupportedFeature("nested query".into()));
         }
         SetExpr::SetOperation { .. } => {
-            return Err(SelectError::UnsupportedFeature("set operation (UNION/INTERSECT/EXCEPT)".into()));
+            return Err(SelectError::UnsupportedFeature(
+                "set operation (UNION/INTERSECT/EXCEPT)".into(),
+            ));
         }
         other => {
-            return Err(SelectError::UnsupportedFeature(format!("unsupported SetExpr: {other:?}")));
+            return Err(SelectError::UnsupportedFeature(format!(
+                "unsupported SetExpr: {other:?}"
+            )));
         }
     };
 
@@ -228,7 +241,11 @@ pub fn parse_select(sql: &str) -> Result<SelectQuery, SelectError> {
             }
         },
         [] => "s3object".to_owned(),
-        _ => return Err(SelectError::UnsupportedFeature("JOIN / multiple FROM tables".into())),
+        _ => {
+            return Err(SelectError::UnsupportedFeature(
+                "JOIN / multiple FROM tables".into(),
+            ));
+        }
     };
 
     Ok(SelectQuery {
@@ -260,11 +277,12 @@ fn validate_simple_column_expr(expr: &Expr) -> Result<(), SelectError> {
     match expr {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Ok(()),
         Expr::Function(_) => Err(SelectError::UnsupportedFeature(
-            "aggregate / scalar function in projection (only bare column references supported)".into(),
+            "aggregate / scalar function in projection (only bare column references supported)"
+                .into(),
         )),
-        Expr::Subquery(_) | Expr::Exists { .. } => {
-            Err(SelectError::UnsupportedFeature("subquery in projection".into()))
-        }
+        Expr::Subquery(_) | Expr::Exists { .. } => Err(SelectError::UnsupportedFeature(
+            "subquery in projection".into(),
+        )),
         _ => Err(SelectError::UnsupportedFeature(format!(
             "unsupported projection expression: {expr}"
         ))),
@@ -401,9 +419,9 @@ pub fn evaluate_row(
             }
             SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
                 let ident = expr_as_column(e)?;
-                let v = row.get(&ident).ok_or_else(|| {
-                    SelectError::RowEval(format!("column not found: {ident}"))
-                })?;
+                let v = row
+                    .get(&ident)
+                    .ok_or_else(|| SelectError::RowEval(format!("column not found: {ident}")))?;
                 out.push(v.to_owned());
             }
         }
@@ -427,16 +445,12 @@ fn expr_as_column(expr: &Expr) -> Result<String, SelectError> {
 fn eval_expr<'a>(expr: &Expr, row: &'a CsvRow<'a>) -> Result<Lit<'a>, SelectError> {
     match expr {
         Expr::Nested(inner) => eval_expr(inner, row),
-        Expr::Identifier(i) => Ok(row
-            .get(&i.value)
-            .map_or(Lit::Null, Lit::from_str_value)),
+        Expr::Identifier(i) => Ok(row.get(&i.value).map_or(Lit::Null, Lit::from_str_value)),
         Expr::CompoundIdentifier(parts) => {
             let last = parts
                 .last()
                 .ok_or_else(|| SelectError::RowEval("empty compound identifier".into()))?;
-            Ok(row
-                .get(&last.value)
-                .map_or(Lit::Null, Lit::from_str_value))
+            Ok(row.get(&last.value).map_or(Lit::Null, Lit::from_str_value))
         }
         Expr::Value(v) => value_to_lit(v),
         Expr::UnaryOp { op, expr } => {
@@ -461,11 +475,14 @@ fn eval_expr<'a>(expr: &Expr, row: &'a CsvRow<'a>) -> Result<Lit<'a>, SelectErro
             let r = eval_expr(right, row)?;
             eval_binary(op, &l, &r)
         }
-        Expr::Like { negated, expr, pattern, escape_char } => {
+        Expr::Like {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+        } => {
             if escape_char.is_some() {
-                return Err(SelectError::UnsupportedFeature(
-                    "LIKE ESCAPE clause".into(),
-                ));
+                return Err(SelectError::UnsupportedFeature("LIKE ESCAPE clause".into()));
             }
             let s_val = eval_expr(expr, row)?;
             let p_val = eval_expr(pattern, row)?;
@@ -523,11 +540,7 @@ fn lit_as_f64(v: &Lit<'_>) -> Option<f64> {
     }
 }
 
-fn eval_binary<'a>(
-    op: &BinaryOperator,
-    l: &Lit<'a>,
-    r: &Lit<'a>,
-) -> Result<Lit<'a>, SelectError> {
+fn eval_binary<'a>(op: &BinaryOperator, l: &Lit<'a>, r: &Lit<'a>) -> Result<Lit<'a>, SelectError> {
     use BinaryOperator::*;
     match op {
         And => Ok(Lit::Bool(l.truthy() && r.truthy())),
@@ -625,7 +638,10 @@ pub fn run_select_csv(
     }
 
     let (has_header, delim) = match input {
-        SelectInputFormat::Csv { has_header, delimiter } => (has_header, delimiter),
+        SelectInputFormat::Csv {
+            has_header,
+            delimiter,
+        } => (has_header, delimiter),
         SelectInputFormat::JsonLines => {
             return Err(SelectError::InputFormat(
                 "run_select_csv called with JsonLines input — use run_select_jsonlines".into(),
@@ -655,8 +671,7 @@ pub fn run_select_csv(
 
     let mut out = Vec::with_capacity(body.len() / 2);
     for record in rdr.records() {
-        let record = record
-            .map_err(|e| SelectError::InputFormat(format!("CSV record: {e}")))?;
+        let record = record.map_err(|e| SelectError::InputFormat(format!("CSV record: {e}")))?;
         let fields: Vec<&str> = record.iter().collect();
         let row = CsvRow {
             fields,
@@ -890,13 +905,7 @@ impl EventStreamWriter {
     /// Build the terminating `End` frame. Clients must wait for this
     /// before assuming the response stream is complete.
     pub fn end(&mut self) -> Vec<u8> {
-        build_frame(
-            &[
-                (":event-type", "End"),
-                (":message-type", "event"),
-            ],
-            None,
-        )
+        build_frame(&[(":event-type", "End"), (":message-type", "event")], None)
     }
 }
 
@@ -906,7 +915,10 @@ fn build_frame(headers: &[(&str, &str)], payload: Option<&[u8]>) -> Vec<u8> {
         let name_bytes = name.as_bytes();
         let value_bytes = value.as_bytes();
         debug_assert!(name_bytes.len() <= u8::MAX as usize, "header name too long");
-        debug_assert!(value_bytes.len() <= u16::MAX as usize, "header value too long");
+        debug_assert!(
+            value_bytes.len() <= u16::MAX as usize,
+            "header value too long"
+        );
         header_buf.push(name_bytes.len() as u8);
         header_buf.extend_from_slice(name_bytes);
         header_buf.push(7); // value type 7 == UTF-8 string
@@ -1044,8 +1056,8 @@ mod gpu {
         // — the kernel emits whole rows verbatim, so we can't apply a
         // narrowing projection cheaply on the GPU side. (CPU path will
         // do the projection if the user asked for one.)
-        let projection_is_star = select.projection.len() == 1
-            && matches!(select.projection[0], SelectItem::Wildcard(_));
+        let projection_is_star =
+            select.projection.len() == 1 && matches!(select.projection[0], SelectItem::Wildcard(_));
         if !projection_is_star {
             return None;
         }
@@ -1061,15 +1073,9 @@ mod gpu {
         };
         let (cmp_op, literal_str) = match (op, *right) {
             (BinaryOperator::Eq, Expr::Value(v)) => (CompareOp::Equal, value_as_str(&v)?),
-            (BinaryOperator::NotEq, Expr::Value(v)) => {
-                (CompareOp::NotEqual, value_as_str(&v)?)
-            }
-            (BinaryOperator::Gt, Expr::Value(v)) => {
-                (CompareOp::GreaterThan, value_as_str(&v)?)
-            }
-            (BinaryOperator::Lt, Expr::Value(v)) => {
-                (CompareOp::LessThan, value_as_str(&v)?)
-            }
+            (BinaryOperator::NotEq, Expr::Value(v)) => (CompareOp::NotEqual, value_as_str(&v)?),
+            (BinaryOperator::Gt, Expr::Value(v)) => (CompareOp::GreaterThan, value_as_str(&v)?),
+            (BinaryOperator::Lt, Expr::Value(v)) => (CompareOp::LessThan, value_as_str(&v)?),
             _ => return None,
         };
 
@@ -1111,11 +1117,7 @@ mod gpu {
 /// path. The CPU path is always the source of truth for output
 /// formatting / projection / multi-condition WHERE / JSON Lines.
 #[must_use]
-pub fn select_gpu(
-    sql: &str,
-    body: &[u8],
-    input: &SelectInputFormat,
-) -> Option<Vec<u8>> {
+pub fn select_gpu(sql: &str, body: &[u8], input: &SelectInputFormat) -> Option<Vec<u8>> {
     #[cfg(feature = "nvcomp-gpu")]
     {
         gpu::try_select_gpu(sql, body, input)
@@ -1152,8 +1154,7 @@ mod tests {
 
     #[test]
     fn parse_select_rejects_group_by() {
-        let err =
-            parse_select("SELECT name, COUNT(*) FROM s3object GROUP BY name").unwrap_err();
+        let err = parse_select("SELECT name, COUNT(*) FROM s3object GROUP BY name").unwrap_err();
         match err {
             SelectError::UnsupportedFeature(_) => {}
             other => panic!("expected UnsupportedFeature, got {other:?}"),
@@ -1162,8 +1163,8 @@ mod tests {
 
     #[test]
     fn parse_select_rejects_join() {
-        let err = parse_select("SELECT a.x FROM s3object a JOIN other b ON a.id = b.id")
-            .unwrap_err();
+        let err =
+            parse_select("SELECT a.x FROM s3object a JOIN other b ON a.id = b.id").unwrap_err();
         assert!(matches!(err, SelectError::UnsupportedFeature(_)));
     }
 
@@ -1298,13 +1299,10 @@ mod tests {
     fn event_stream_records_frame_format() {
         let mut w = EventStreamWriter::new();
         let frame = w.records(b"hello,world\r\n");
-        let total =
-            u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+        let total = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
         assert_eq!(total, frame.len());
-        let headers_len =
-            u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]) as usize;
-        let prelude_crc =
-            u32::from_be_bytes([frame[8], frame[9], frame[10], frame[11]]);
+        let headers_len = u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]) as usize;
+        let prelude_crc = u32::from_be_bytes([frame[8], frame[9], frame[10], frame[11]]);
         assert_eq!(prelude_crc, crc32fast::hash(&frame[..8]));
         let msg_crc = u32::from_be_bytes([
             frame[total - 4],
@@ -1325,10 +1323,8 @@ mod tests {
     fn event_stream_end_frame_no_payload() {
         let mut w = EventStreamWriter::new();
         let frame = w.end();
-        let total =
-            u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
-        let headers_len =
-            u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]) as usize;
+        let total = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+        let headers_len = u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]) as usize;
         assert_eq!(total - 4 - 12 - headers_len, 0);
         let s = String::from_utf8_lossy(&frame[12..12 + headers_len]);
         assert!(s.contains("End"));
@@ -1338,10 +1334,8 @@ mod tests {
     fn event_stream_stats_xml_payload() {
         let mut w = EventStreamWriter::new();
         let frame = w.stats(1024, 800, 64);
-        let total =
-            u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
-        let headers_len =
-            u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]) as usize;
+        let total = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+        let headers_len = u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]) as usize;
         let payload = &frame[12 + headers_len..total - 4];
         let xml = std::str::from_utf8(payload).unwrap();
         assert!(xml.contains("<BytesScanned>1024</BytesScanned>"));

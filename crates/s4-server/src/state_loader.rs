@@ -64,9 +64,7 @@ use std::path::Path;
 /// dogfood follow-up); promoted to the library crate in v0.8.4 #72 so
 /// [`load_or_fresh`] can compose it without forcing main.rs to
 /// re-export.
-pub fn read_state_file_or_fresh(
-    path: &Path,
-) -> Result<Option<String>, std::io::Error> {
+pub fn read_state_file_or_fresh(path: &Path) -> Result<Option<String>, std::io::Error> {
     if path.as_os_str().is_empty() || !path.exists() {
         return Ok(None);
     }

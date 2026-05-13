@@ -120,8 +120,8 @@ pub(crate) fn safe_object_uri(bucket: &str, key: &str) -> S3Result<http::Uri> {
         // if even that lookup fails (cannot happen at runtime — kept
         // as a belt-and-suspenders branch so this helper never
         // panics).
-        let code = S3ErrorCode::from_bytes(b"InvalidObjectName")
-            .unwrap_or(S3ErrorCode::InvalidArgument);
+        let code =
+            S3ErrorCode::from_bytes(b"InvalidObjectName").unwrap_or(S3ErrorCode::InvalidArgument);
         S3Error::with_message(
             code,
             format!("object key cannot be encoded as a request URI: {e}"),
@@ -499,9 +499,7 @@ impl<B: S3> S4Service<B> {
     /// introspection — used by the metrics layer to read
     /// `dropped_total`).
     #[must_use]
-    pub fn notifications_manager(
-        &self,
-    ) -> Option<&Arc<crate::notifications::NotificationManager>> {
+    pub fn notifications_manager(&self) -> Option<&Arc<crate::notifications::NotificationManager>> {
         self.notifications.as_ref()
     }
 
@@ -547,10 +545,7 @@ impl<B: S3> S4Service<B> {
     /// surfaced in the `s4_replication_dropped_total` Prometheus
     /// counter; successes bump `s4_replication_replicated_total`.
     #[must_use]
-    pub fn with_replication(
-        mut self,
-        mgr: Arc<crate::replication::ReplicationManager>,
-    ) -> Self {
+    pub fn with_replication(mut self, mgr: Arc<crate::replication::ReplicationManager>) -> Self {
         self.replication = Some(mgr);
         self
     }
@@ -559,9 +554,7 @@ impl<B: S3> S4Service<B> {
     /// introspection — used by the metrics layer to read
     /// `dropped_total`).
     #[must_use]
-    pub fn replication_manager(
-        &self,
-    ) -> Option<&Arc<crate::replication::ReplicationManager>> {
+    pub fn replication_manager(&self) -> Option<&Arc<crate::replication::ReplicationManager>> {
         self.replication.as_ref()
     }
 
@@ -882,10 +875,7 @@ impl<B: S3> S4Service<B> {
     /// `AccessDenied`; new PUTs to a bucket with a default retention
     /// policy auto-create per-object lock state.
     #[must_use]
-    pub fn with_object_lock(
-        mut self,
-        mgr: Arc<crate::object_lock::ObjectLockManager>,
-    ) -> Self {
+    pub fn with_object_lock(mut self, mgr: Arc<crate::object_lock::ObjectLockManager>) -> Self {
         self.object_lock = Some(mgr);
         self
     }
@@ -1210,8 +1200,9 @@ impl<B: S3> S4Service<B> {
     /// 同じ Arc を持っていて未完了) 場合は `Err` を返さず panic させる
     /// (test 用途専用 helper の caller 契約を維持)。
     pub fn into_backend(self) -> B {
-        Arc::try_unwrap(self.backend)
-            .unwrap_or_else(|_| panic!("into_backend: backend Arc still shared (replication dispatcher in flight?)"))
+        Arc::try_unwrap(self.backend).unwrap_or_else(|_| {
+            panic!("into_backend: backend Arc still shared (replication dispatcher in flight?)")
+        })
     }
 
     /// 必要 frame だけを backend に Range GET し、frame parse + decompress + slice
@@ -1594,18 +1585,16 @@ fn mfa_error_to_s3(e: crate::mfa::MfaError) -> S3Error {
             S3ErrorCode::AccessDenied,
             "MFA token required for this operation",
         ),
-        crate::mfa::MfaError::Malformed => S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            "malformed x-amz-mfa header",
-        ),
+        crate::mfa::MfaError::Malformed => {
+            S3Error::with_message(S3ErrorCode::InvalidRequest, "malformed x-amz-mfa header")
+        }
         crate::mfa::MfaError::SerialMismatch => S3Error::with_message(
             S3ErrorCode::AccessDenied,
             "MFA serial does not match configured device",
         ),
-        crate::mfa::MfaError::InvalidCode => S3Error::with_message(
-            S3ErrorCode::AccessDenied,
-            "invalid MFA code",
-        ),
+        crate::mfa::MfaError::InvalidCode => {
+            S3Error::with_message(S3ErrorCode::AccessDenied, "invalid MFA code")
+        }
     }
 }
 
@@ -1702,10 +1691,7 @@ fn kms_error_to_s3(e: crate::kms::KmsError) -> S3Error {
             S3ErrorCode::ServiceUnavailable,
             format!("KMS backend unavailable: {message}"),
         ),
-        other => S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("KMS error: {other}"),
-        ),
+        other => S3Error::with_message(S3ErrorCode::InternalError, format!("KMS error: {other}")),
     }
 }
 
@@ -1719,10 +1705,9 @@ fn sse_c_error_to_s3(e: crate::sse::SseError) -> S3Error {
             S3ErrorCode::AccessDenied,
             "SSE-C key does not match the key used at PUT time",
         ),
-        E::InvalidCustomerKey { reason } => S3Error::with_message(
-            S3ErrorCode::InvalidArgument,
-            format!("SSE-C: {reason}"),
-        ),
+        E::InvalidCustomerKey { reason } => {
+            S3Error::with_message(S3ErrorCode::InvalidArgument, format!("SSE-C: {reason}"))
+        }
         E::CustomerKeyAlgorithmUnsupported { algo } => S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             format!("SSE-C unsupported algorithm: {algo:?} (only AES256 is allowed)"),
@@ -1818,7 +1803,8 @@ fn parse_bypass_governance_header(headers: &http::HeaderMap) -> bool {
 /// or the value is outside `chrono`'s supported range.
 fn timestamp_to_chrono_utc(ts: &Timestamp) -> Option<chrono::DateTime<chrono::Utc>> {
     let mut buf = Vec::new();
-    ts.format(s3s::dto::TimestampFormat::DateTime, &mut buf).ok()?;
+    ts.format(s3s::dto::TimestampFormat::DateTime, &mut buf)
+        .ok()?;
     let s = std::str::from_utf8(&buf).ok()?;
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
@@ -2045,9 +2031,7 @@ impl<B: S3> S3 for S4Service<B> {
                         // a successful upload of a half-body.
                         S3Error::with_message(
                             S3ErrorCode::IncompleteBody,
-                            format!(
-                                "PUT body truncated: expected {expected} bytes, got {got}"
-                            ),
+                            format!("PUT body truncated: expected {expected} bytes, got {got}"),
                         )
                     }
                     other => internal("streaming framed compress")(other),
@@ -2072,8 +2056,7 @@ impl<B: S3> S3 for S4Service<B> {
                 // throughput gauge, OOM counter) for nvcomp / dietgpu codecs.
                 // CPU codecs come back with `gpu_seconds = None` and the
                 // stamp helper short-circuits — no extra cost on CPU path.
-                let (compress_res, tel) =
-                    self.registry.compress_with_telemetry(bytes, kind).await;
+                let (compress_res, tel) = self.registry.compress_with_telemetry(bytes, kind).await;
                 stamp_gpu_compress_telemetry(&tel);
                 let (body, m) = compress_res.map_err(internal("registry compress"))?;
                 (body, m, false)
@@ -2153,8 +2136,7 @@ impl<B: S3> S3 for S4Service<B> {
                 && sse_c_material.is_none()
                 && kms_key_id.is_none()
                 && self.sse_keyring.is_none()
-                && sse_header.as_ref().map(|s| s.as_str())
-                    != Some(ServerSideEncryption::AES256)
+                && sse_header.as_ref().map(|s| s.as_str()) != Some(ServerSideEncryption::AES256)
             {
                 return Err(S3Error::with_message(
                     S3ErrorCode::InvalidRequest,
@@ -2188,33 +2170,33 @@ impl<B: S3> S3 for S4Service<B> {
             //      for this fix; tracked separately in v0.8.2.
             let kms_wrap: Option<(zeroize::Zeroizing<[u8; 32]>, crate::kms::WrappedDek)> =
                 if let Some(ref key_id) = kms_key_id {
-                let kms = self.kms.as_ref().ok_or_else(|| {
+                    let kms = self.kms.as_ref().ok_or_else(|| {
                     S3Error::with_message(
                         S3ErrorCode::InvalidRequest,
                         "SSE-KMS requested but no --kms-local-dir / --kms-aws-region is configured on this gateway",
                     )
                 })?;
-                // `dek` is `Zeroizing<Vec<u8>>`; deref + slice access
-                // works unchanged via `Deref<Target=Vec<u8>>`.
-                let (dek, wrapped) = kms
-                    .generate_dek(key_id)
-                    .await
-                    .map_err(kms_error_to_s3)?;
-                if dek.len() != 32 {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::InternalError,
-                        format!("KMS backend returned a DEK of {} bytes (expected 32)", dek.len()),
-                    ));
-                }
-                let mut dek_arr: zeroize::Zeroizing<[u8; 32]> =
-                    zeroize::Zeroizing::new([0u8; 32]);
-                dek_arr.copy_from_slice(&dek);
-                // `dek` (the `Zeroizing<Vec<u8>>`) is dropped at the
-                // end of this scope, wiping the heap allocation.
-                Some((dek_arr, wrapped))
-            } else {
-                None
-            };
+                    // `dek` is `Zeroizing<Vec<u8>>`; deref + slice access
+                    // works unchanged via `Deref<Target=Vec<u8>>`.
+                    let (dek, wrapped) = kms.generate_dek(key_id).await.map_err(kms_error_to_s3)?;
+                    if dek.len() != 32 {
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InternalError,
+                            format!(
+                                "KMS backend returned a DEK of {} bytes (expected 32)",
+                                dek.len()
+                            ),
+                        ));
+                    }
+                    let mut dek_arr: zeroize::Zeroizing<[u8; 32]> =
+                        zeroize::Zeroizing::new([0u8; 32]);
+                    dek_arr.copy_from_slice(&dek);
+                    // `dek` (the `Zeroizing<Vec<u8>>`) is dropped at the
+                    // end of this scope, wiping the heap allocation.
+                    Some((dek_arr, wrapped))
+                } else {
+                    None
+                };
             // v0.7 #48 BUG-4 fix: stamp the SSE *type* into metadata
             // alongside `s4-encrypted` so HEAD (which doesn't fetch the
             // body) can echo the correct `x-amz-server-side-encryption`
@@ -2225,8 +2207,10 @@ impl<B: S3> S3 for S4Service<B> {
                 let meta = req.input.metadata.get_or_insert_with(Default::default);
                 meta.insert("s4-encrypted".into(), "aes-256-gcm".into());
                 meta.insert("s4-sse-type".into(), "AES256".into());
-                meta.insert("s4-sse-c-key-md5".into(),
-                    base64::engine::general_purpose::STANDARD.encode(m.key_md5));
+                meta.insert(
+                    "s4-sse-c-key-md5".into(),
+                    base64::engine::general_purpose::STANDARD.encode(m.key_md5),
+                );
                 crate::sse::encrypt_with_source(
                     &compressed,
                     crate::sse::SseSource::CustomerKey {
@@ -2248,7 +2232,10 @@ impl<B: S3> S3 for S4Service<B> {
                 let dek_ref: &[u8; 32] = dek;
                 crate::sse::encrypt_with_source(
                     &compressed,
-                    crate::sse::SseSource::Kms { dek: dek_ref, wrapped },
+                    crate::sse::SseSource::Kms {
+                        dek: dek_ref,
+                        wrapped,
+                    },
                 )
             } else if let Some(keyring) = self.sse_keyring.as_ref() {
                 // SSE-S4 is server-driven transparent encryption; the
@@ -2267,17 +2254,13 @@ impl<B: S3> S3 for S4Service<B> {
                 // frame at chunk_size=0 (default) so existing
                 // deployments are bit-for-bit unchanged.
                 if self.sse_chunk_size > 0 {
-                    crate::sse::encrypt_v2_chunked(
-                        &compressed,
-                        keyring,
-                        self.sse_chunk_size,
-                    )
-                    .map_err(|e| {
-                        S3Error::with_message(
-                            S3ErrorCode::InternalError,
-                            format!("SSE-S4 chunked encrypt failed: {e}"),
-                        )
-                    })?
+                    crate::sse::encrypt_v2_chunked(&compressed, keyring, self.sse_chunk_size)
+                        .map_err(|e| {
+                            S3Error::with_message(
+                                S3ErrorCode::InternalError,
+                                format!("SSE-S4 chunked encrypt failed: {e}"),
+                            )
+                        })?
                 } else {
                     crate::sse::encrypt_v2(&compressed, keyring)
                 }
@@ -2313,12 +2296,10 @@ impl<B: S3> S3 for S4Service<B> {
                 .as_ref()
                 .map(|mgr| mgr.state(&put_bucket))
                 .map(|state| match state {
-                    crate::versioning::VersioningState::Enabled => {
-                        crate::versioning::PutOutcome {
-                            version_id: crate::versioning::VersioningManager::new_version_id(),
-                            versioned_response: true,
-                        }
-                    }
+                    crate::versioning::VersioningState::Enabled => crate::versioning::PutOutcome {
+                        version_id: crate::versioning::VersioningManager::new_version_id(),
+                        versioned_response: true,
+                    },
                     crate::versioning::VersioningState::Suspended
                     | crate::versioning::VersioningState::Unversioned => {
                         crate::versioning::PutOutcome {
@@ -2357,11 +2338,7 @@ impl<B: S3> S3 for S4Service<B> {
                 // sidecar still binds to *something*; the GET HEAD will
                 // see the same backend ETag (None vs None) and treat the
                 // pair as consistent.
-                let source_etag = resp
-                    .output
-                    .e_tag
-                    .as_ref()
-                    .map(|t| t.value().to_string());
+                let source_etag = resp.output.e_tag.as_ref().map(|t| t.value().to_string());
                 idx.source_etag = source_etag;
                 idx.source_compressed_size = backend_object_size;
                 self.write_sidecar(&put_bucket, &put_key, &idx).await;
@@ -2401,18 +2378,16 @@ impl<B: S3> S3 for S4Service<B> {
             // requested algorithm and which key fingerprint matched.
             if let (Some(m), Ok(resp)) = (sse_c_material.as_ref(), backend_resp.as_mut()) {
                 resp.output.sse_customer_algorithm = Some(crate::sse::SSE_C_ALGORITHM.into());
-                resp.output.sse_customer_key_md5 = Some(
-                    base64::engine::general_purpose::STANDARD.encode(m.key_md5),
-                );
+                resp.output.sse_customer_key_md5 =
+                    Some(base64::engine::general_purpose::STANDARD.encode(m.key_md5));
             }
             // v0.5 #28: SSE-KMS echo — `aws:kms` + the canonical key id
             // the backend returned (AWS KMS returns the ARN even when
             // the request used an alias).
-            if let (Some((_, wrapped)), Ok(resp)) =
-                (kms_wrap.as_ref(), backend_resp.as_mut())
-            {
-                resp.output.server_side_encryption =
-                    Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS));
+            if let (Some((_, wrapped)), Ok(resp)) = (kms_wrap.as_ref(), backend_resp.as_mut()) {
+                resp.output.server_side_encryption = Some(ServerSideEncryption::from_static(
+                    ServerSideEncryption::AWS_KMS,
+                ));
                 resp.output.ssekms_key_id = Some(wrapped.key_id.clone());
             }
             // v0.5 #30: persist any per-PUT explicit retention / legal
@@ -2515,8 +2490,7 @@ impl<B: S3> S3 for S4Service<B> {
             // tagging is a full-replace operation (not a merge), so
             // any pre-existing entry for `(bucket, key)` is overwritten.
             if backend_resp.is_ok()
-                && let (Some(mgr), Some(tags)) =
-                    (self.tagging.as_ref(), request_tags.clone())
+                && let (Some(mgr), Some(tags)) = (self.tagging.as_ref(), request_tags.clone())
             {
                 mgr.put_object_tags(&put_bucket, &put_key, tags);
             }
@@ -2693,8 +2667,7 @@ impl<B: S3> S3 for S4Service<B> {
         let sse_c_alg = req.input.sse_customer_algorithm.take();
         let sse_c_key = req.input.sse_customer_key.take();
         let sse_c_md5 = req.input.sse_customer_key_md5.take();
-        let get_sse_c_material =
-            extract_sse_c_material(&sse_c_alg, &sse_c_key, &sse_c_md5)?;
+        let get_sse_c_material = extract_sse_c_material(&sse_c_alg, &sse_c_key, &sse_c_md5)?;
 
         // v0.5 #34: route the GET through the VersioningManager when
         // attached AND the bucket is in a versioning-aware state.
@@ -2714,12 +2687,15 @@ impl<B: S3> S3 for S4Service<B> {
             {
                 let req_vid = req.input.version_id.take();
                 let entry = match req_vid.as_deref() {
-                    Some(vid) => mgr.lookup_version(&get_bucket, &get_key, vid).ok_or_else(
-                        || S3Error::with_message(
-                            S3ErrorCode::NoSuchVersion,
-                            format!("no such version: {vid}"),
-                        ),
-                    )?,
+                    Some(vid) => {
+                        mgr.lookup_version(&get_bucket, &get_key, vid)
+                            .ok_or_else(|| {
+                                S3Error::with_message(
+                                    S3ErrorCode::NoSuchVersion,
+                                    format!("no such version: {vid}"),
+                                )
+                            })?
+                    }
                     None => mgr.lookup_latest(&get_bucket, &get_key).ok_or_else(|| {
                         S3Error::with_message(
                             S3ErrorCode::NoSuchKey,
@@ -2837,10 +2813,8 @@ impl<B: S3> S3 for S4Service<B> {
                 // be absent — otherwise we surface a clear
                 // misconfiguration error instead of silently
                 // falling through to the buffered chunked path.
-                if matches!(
-                    crate::sse::peek_magic(&body),
-                    Some("S4E5") | Some("S4E6")
-                ) && get_sse_c_material.is_none()
+                if matches!(crate::sse::peek_magic(&body), Some("S4E5") | Some("S4E6"))
+                    && get_sse_c_material.is_none()
                 {
                     let keyring_arc = self.sse_keyring.clone().ok_or_else(|| {
                         S3Error::with_message(
@@ -2849,8 +2823,7 @@ impl<B: S3> S3 for S4Service<B> {
                         )
                     })?;
                     let body_len = body.len() as u64;
-                    let stream =
-                        crate::sse::decrypt_chunked_stream(body, keyring_arc.as_ref());
+                    let stream = crate::sse::decrypt_chunked_stream(body, keyring_arc.as_ref());
                     // Stream is `'static` (the keyring borrow is
                     // consumed up front; the cipher lives inside
                     // the stream state — see decrypt_chunked_stream
@@ -2858,9 +2831,7 @@ impl<B: S3> S3 for S4Service<B> {
                     // StreamingBlob without lifetime gymnastics.
                     use futures::StreamExt;
                     let mapped = stream.map(|r| {
-                        r.map_err(|e| std::io::Error::other(format!(
-                            "SSE-S4 chunked decrypt: {e}"
-                        )))
+                        r.map_err(|e| std::io::Error::other(format!("SSE-S4 chunked decrypt: {e}")))
                     });
                     use s3s::dto::StreamingBlob;
                     resp.output.body = Some(StreamingBlob::wrap(mapped));
@@ -2942,9 +2913,9 @@ impl<B: S3> S3 for S4Service<B> {
                 if matches!(crate::sse::peek_magic(&body), Some("S4E4"))
                     && let Ok(hdr) = crate::sse::parse_s4e4_header(&body)
                 {
-                    resp.output.server_side_encryption = Some(
-                        ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                    );
+                    resp.output.server_side_encryption = Some(ServerSideEncryption::from_static(
+                        ServerSideEncryption::AWS_KMS,
+                    ));
                     resp.output.ssekms_key_id = Some(hdr.key_id.to_string());
                 }
                 bytes_to_blob(plain)
@@ -2952,7 +2923,9 @@ impl<B: S3> S3 for S4Service<B> {
                 // Client sent SSE-C headers for an unencrypted object —
                 // mirror AWS S3's 400 InvalidRequest.
                 let _ = m;
-                return Err(sse_c_error_to_s3(crate::sse::SseError::CustomerKeyUnexpected));
+                return Err(sse_c_error_to_s3(
+                    crate::sse::SseError::CustomerKeyUnexpected,
+                ));
             } else {
                 blob
             };
@@ -2960,9 +2933,8 @@ impl<B: S3> S3 for S4Service<B> {
             // tell the client that the supplied key was the one used.
             if let Some(ref m) = get_sse_c_material {
                 resp.output.sse_customer_algorithm = Some(crate::sse::SSE_C_ALGORITHM.into());
-                resp.output.sse_customer_key_md5 = Some(
-                    base64::engine::general_purpose::STANDARD.encode(m.key_md5),
-                );
+                resp.output.sse_customer_key_md5 =
+                    Some(base64::engine::general_purpose::STANDARD.encode(m.key_md5));
             }
             // ====== Streaming fast path (CpuZstd, non-multipart, codec supports it) ======
             // 大規模 object (e.g. 5 GB) を memory に collect すると OOM するので、
@@ -3113,8 +3085,9 @@ impl<B: S3> S3 for S4Service<B> {
         if let Some(mgr) = self.replication.as_ref()
             && let Some(status) = mgr.lookup_status(&get_bucket, &get_key)
         {
-            resp.output.replication_status =
-                Some(s3s::dto::ReplicationStatus::from(status.as_aws_str().to_owned()));
+            resp.output.replication_status = Some(s3s::dto::ReplicationStatus::from(
+                status.as_aws_str().to_owned(),
+            ));
         }
         Ok(resp)
     }
@@ -3170,8 +3143,9 @@ impl<B: S3> S3 for S4Service<B> {
         if let Some(mgr) = self.replication.as_ref()
             && let Some(status) = mgr.lookup_status(&head_bucket, &head_key)
         {
-            resp.output.replication_status =
-                Some(s3s::dto::ReplicationStatus::from(status.as_aws_str().to_owned()));
+            resp.output.replication_status = Some(s3s::dto::ReplicationStatus::from(
+                status.as_aws_str().to_owned(),
+            ));
         }
         // v0.7 #48 BUG-4 fix: HEAD must echo SSE indicators so SDKs
         // and pipelines see the same posture they got on PUT. The PUT
@@ -3701,7 +3675,9 @@ impl<B: S3> S3 for S4Service<B> {
                     "SSE-KMS requested but no --kms-local-dir / --kms-aws-region is configured on this gateway",
                 ));
             }
-            crate::multipart_state::MultipartSseMode::SseKms { key_id: kid.clone() }
+            crate::multipart_state::MultipartSseMode::SseKms {
+                key_id: kid.clone(),
+            }
         } else if self.sse_keyring.is_some() {
             // SSE-S4: server-driven transparent encryption. Activates
             // whenever the gateway has a keyring configured AND the
@@ -3771,14 +3747,13 @@ impl<B: S3> S3 for S4Service<B> {
         match &sse_mode {
             crate::multipart_state::MultipartSseMode::SseC { key_md5, .. } => {
                 resp.output.sse_customer_algorithm = Some(crate::sse::SSE_C_ALGORITHM.into());
-                resp.output.sse_customer_key_md5 = Some(
-                    base64::engine::general_purpose::STANDARD.encode(key_md5),
-                );
+                resp.output.sse_customer_key_md5 =
+                    Some(base64::engine::general_purpose::STANDARD.encode(key_md5));
             }
             crate::multipart_state::MultipartSseMode::SseKms { key_id } => {
-                resp.output.server_side_encryption = Some(
-                    ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                );
+                resp.output.server_side_encryption = Some(ServerSideEncryption::from_static(
+                    ServerSideEncryption::AWS_KMS,
+                ));
                 resp.output.ssekms_key_id = Some(key_id.clone());
             }
             _ => {}
@@ -3808,9 +3783,7 @@ impl<B: S3> S3 for S4Service<B> {
         // encrypting the whole assembled body keeps the GET path's
         // `is_sse_encrypted` branch in get_object L2429 working
         // unchanged).
-        let sse_ctx = self
-            .multipart_state
-            .get(req.input.upload_id.as_str());
+        let sse_ctx = self.multipart_state.get(req.input.upload_id.as_str());
         // v0.8.2 #62 (H-1 audit fix): SSE-C key consistency check.
         // The AWS S3 spec requires the same SSE-C key headers on
         // every UploadPart and rejects mismatches with 400. Prior to
@@ -3826,8 +3799,9 @@ impl<B: S3> S3 for S4Service<B> {
         // now and reject with 400 InvalidArgument on mismatch /
         // omission / partial supply, matching real-S3 behaviour.
         if let Some(ref ctx) = sse_ctx {
-            if let crate::multipart_state::MultipartSseMode::SseC { key_md5: ctx_md5, .. } =
-                &ctx.sse
+            if let crate::multipart_state::MultipartSseMode::SseC {
+                key_md5: ctx_md5, ..
+            } = &ctx.sse
             {
                 let alg = req.input.sse_customer_algorithm.take();
                 let key_b64 = req.input.sse_customer_key.take();
@@ -3841,9 +3815,8 @@ impl<B: S3> S3 for S4Service<B> {
                         // would. Then compare the parsed MD5 to the
                         // upload-context's MD5; mismatch is a
                         // different-key UploadPart and must reject.
-                        let part_material =
-                            crate::sse::parse_customer_key_headers(&a, &k, &m)
-                                .map_err(sse_c_error_to_s3)?;
+                        let part_material = crate::sse::parse_customer_key_headers(&a, &k, &m)
+                            .map_err(sse_c_error_to_s3)?;
                         if part_material.key_md5 != *ctx_md5 {
                             return Err(S3Error::with_message(
                                 S3ErrorCode::InvalidArgument,
@@ -3925,7 +3898,8 @@ impl<B: S3> S3 for S4Service<B> {
                 .compress_with_telemetry(bytes, codec_kind)
                 .await;
             stamp_gpu_compress_telemetry(&tel);
-            let (compressed, manifest) = compress_res.map_err(internal("registry compress part"))?;
+            let (compressed, manifest) =
+                compress_res.map_err(internal("registry compress part"))?;
             let header = FrameHeader {
                 codec: codec_kind,
                 original_size,
@@ -4017,82 +3991,79 @@ impl<B: S3> S3 for S4Service<B> {
         // the SSE encrypt re-PUT + versioning shadow-key rewrite +
         // replication source-bytes capture, so we GET once and reuse
         // the bytes for every post-processing step.
-        let assembled_body: Option<bytes::Bytes> =
-            if let Ok(uri) = safe_object_uri(&bucket, &key) {
-                let get_input = GetObjectInput {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    ..Default::default()
-                };
-                let get_req = S3Request {
-                    input: get_input,
-                    method: http::Method::GET,
-                    uri,
-                    headers: http::HeaderMap::new(),
-                    extensions: http::Extensions::new(),
-                    credentials: None,
-                    region: None,
-                    service: None,
-                    trailing_headers: None,
-                };
-                match self.backend.get_object(get_req).await {
-                    Ok(get_resp) => match get_resp.output.body {
-                        Some(blob) => collect_blob(blob, self.max_body_bytes).await.ok(),
-                        None => None,
-                    },
-                    Err(e) => {
-                        // v0.8.4 #71 (C-1 audit fix): a silent
-                        // `Err(_) => None` here is a SSE plaintext
-                        // leak. The post-processing block below only
-                        // runs the SSE re-encrypt branch when
-                        // `assembled_body.is_some()`, so swallowing a
-                        // backend error skipped the encrypt step and
-                        // left the multipart object on disk as
-                        // plaintext, even on SSE-S4 / SSE-C / SSE-KMS
-                        // configured buckets. Same root-cause family
-                        // as v0.8 BUG-5; this branch closes the
-                        // remaining read-side window.
-                        //
-                        // We distinguish two cases:
-                        //  - `NoSuchKey`: the object is genuinely
-                        //    missing post-Complete. This is rare and
-                        //    typically races with a concurrent
-                        //    DeleteObject; there is nothing to re-
-                        //    encrypt and no SSE markers to honour, so
-                        //    falling through to the legacy
-                        //    `assembled_body = None` path is safe.
-                        //  - everything else (5xx, network, auth,
-                        //    etc.): we must FAIL the Complete so the
-                        //    client can retry. Returning Ok with
-                        //    `assembled_body = None` would silently
-                        //    skip the SSE re-encrypt and leave the
-                        //    backend bytes plaintext.
-                        if matches!(e.code(), &S3ErrorCode::NoSuchKey) {
-                            tracing::warn!(
-                                bucket = %bucket,
-                                key = %key,
-                                "multipart Complete: backend GET returned NoSuchKey; \
-                                 skipping post-processing (object likely raced with DeleteObject)"
-                            );
-                            None
-                        } else {
-                            tracing::error!(
-                                bucket = %bucket,
-                                key = %key,
-                                error = %e,
-                                "multipart Complete: backend GET failed; failing the Complete \
-                                 so the client retries (silent fall-through would skip SSE \
-                                 re-encrypt and store plaintext)"
-                            );
-                            return Err(internal(
-                                "multipart Complete: backend body fetch failed",
-                            )(e));
-                        }
+        let assembled_body: Option<bytes::Bytes> = if let Ok(uri) = safe_object_uri(&bucket, &key) {
+            let get_input = GetObjectInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                ..Default::default()
+            };
+            let get_req = S3Request {
+                input: get_input,
+                method: http::Method::GET,
+                uri,
+                headers: http::HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            match self.backend.get_object(get_req).await {
+                Ok(get_resp) => match get_resp.output.body {
+                    Some(blob) => collect_blob(blob, self.max_body_bytes).await.ok(),
+                    None => None,
+                },
+                Err(e) => {
+                    // v0.8.4 #71 (C-1 audit fix): a silent
+                    // `Err(_) => None` here is a SSE plaintext
+                    // leak. The post-processing block below only
+                    // runs the SSE re-encrypt branch when
+                    // `assembled_body.is_some()`, so swallowing a
+                    // backend error skipped the encrypt step and
+                    // left the multipart object on disk as
+                    // plaintext, even on SSE-S4 / SSE-C / SSE-KMS
+                    // configured buckets. Same root-cause family
+                    // as v0.8 BUG-5; this branch closes the
+                    // remaining read-side window.
+                    //
+                    // We distinguish two cases:
+                    //  - `NoSuchKey`: the object is genuinely
+                    //    missing post-Complete. This is rare and
+                    //    typically races with a concurrent
+                    //    DeleteObject; there is nothing to re-
+                    //    encrypt and no SSE markers to honour, so
+                    //    falling through to the legacy
+                    //    `assembled_body = None` path is safe.
+                    //  - everything else (5xx, network, auth,
+                    //    etc.): we must FAIL the Complete so the
+                    //    client can retry. Returning Ok with
+                    //    `assembled_body = None` would silently
+                    //    skip the SSE re-encrypt and leave the
+                    //    backend bytes plaintext.
+                    if matches!(e.code(), &S3ErrorCode::NoSuchKey) {
+                        tracing::warn!(
+                            bucket = %bucket,
+                            key = %key,
+                            "multipart Complete: backend GET returned NoSuchKey; \
+                             skipping post-processing (object likely raced with DeleteObject)"
+                        );
+                        None
+                    } else {
+                        tracing::error!(
+                            bucket = %bucket,
+                            key = %key,
+                            error = %e,
+                            "multipart Complete: backend GET failed; failing the Complete \
+                             so the client retries (silent fall-through would skip SSE \
+                             re-encrypt and store plaintext)"
+                        );
+                        return Err(internal("multipart Complete: backend body fetch failed")(e));
                     }
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
         // Sidecar build (existing behaviour, gated on assembled body).
         if let Some(ref body) = assembled_body
             && let Ok(index) = build_index_from_body(body)
@@ -4114,12 +4085,10 @@ impl<B: S3> S3 for S4Service<B> {
                 .as_ref()
                 .map(|mgr| mgr.state(&bucket))
                 .map(|state| match state {
-                    crate::versioning::VersioningState::Enabled => {
-                        crate::versioning::PutOutcome {
-                            version_id: crate::versioning::VersioningManager::new_version_id(),
-                            versioned_response: true,
-                        }
-                    }
+                    crate::versioning::VersioningState::Enabled => crate::versioning::PutOutcome {
+                        version_id: crate::versioning::VersioningManager::new_version_id(),
+                        versioned_response: true,
+                    },
                     crate::versioning::VersioningState::Suspended
                     | crate::versioning::VersioningState::Unversioned => {
                         crate::versioning::PutOutcome {
@@ -4162,40 +4131,34 @@ impl<B: S3> S3 for S4Service<B> {
                 // single-PUT KMS branch — DEK plaintext lives in
                 // `Zeroizing<[u8; 32]>` for the lifetime of this
                 // Complete handler, then is wiped on drop.
-                let kms_wrap: Option<(
-                    zeroize::Zeroizing<[u8; 32]>,
-                    crate::kms::WrappedDek,
-                )> = if let crate::multipart_state::MultipartSseMode::SseKms {
-                    ref key_id,
-                } = ctx.sse
-                {
-                    let kms = self.kms.as_ref().ok_or_else(|| {
+                let kms_wrap: Option<(zeroize::Zeroizing<[u8; 32]>, crate::kms::WrappedDek)> =
+                    if let crate::multipart_state::MultipartSseMode::SseKms { ref key_id } = ctx.sse
+                    {
+                        let kms = self.kms.as_ref().ok_or_else(|| {
                         S3Error::with_message(
                             S3ErrorCode::InvalidRequest,
                             "SSE-KMS requested but no --kms-local-dir / --kms-aws-region is configured on this gateway",
                         )
                     })?;
-                    let (dek, wrapped) = kms
-                        .generate_dek(key_id)
-                        .await
-                        .map_err(kms_error_to_s3)?;
-                    if dek.len() != 32 {
-                        return Err(S3Error::with_message(
-                            S3ErrorCode::InternalError,
-                            format!(
-                                "KMS backend returned a DEK of {} bytes (expected 32)",
-                                dek.len()
-                            ),
-                        ));
-                    }
-                    let mut dek_arr: zeroize::Zeroizing<[u8; 32]> =
-                        zeroize::Zeroizing::new([0u8; 32]);
-                    dek_arr.copy_from_slice(&dek);
-                    // `dek` (Zeroizing<Vec<u8>>) is dropped at scope end.
-                    Some((dek_arr, wrapped))
-                } else {
-                    None
-                };
+                        let (dek, wrapped) =
+                            kms.generate_dek(key_id).await.map_err(kms_error_to_s3)?;
+                        if dek.len() != 32 {
+                            return Err(S3Error::with_message(
+                                S3ErrorCode::InternalError,
+                                format!(
+                                    "KMS backend returned a DEK of {} bytes (expected 32)",
+                                    dek.len()
+                                ),
+                            ));
+                        }
+                        let mut dek_arr: zeroize::Zeroizing<[u8; 32]> =
+                            zeroize::Zeroizing::new([0u8; 32]);
+                        dek_arr.copy_from_slice(&dek);
+                        // `dek` (Zeroizing<Vec<u8>>) is dropped at scope end.
+                        Some((dek_arr, wrapped))
+                    } else {
+                        None
+                    };
                 // Build the new metadata map: re-fetch via HEAD so
                 // the multipart / codec markers the backend stamped
                 // on Create flow through unchanged, then layer the
@@ -4236,7 +4199,10 @@ impl<B: S3> S3 for S4Service<B> {
                         let key_ref: &[u8; 32] = key;
                         crate::sse::encrypt_with_source(
                             &body,
-                            crate::sse::SseSource::CustomerKey { key: key_ref, key_md5 },
+                            crate::sse::SseSource::CustomerKey {
+                                key: key_ref,
+                                key_md5,
+                            },
                         )
                     }
                     crate::multipart_state::MultipartSseMode::SseKms { .. } => {
@@ -4245,15 +4211,17 @@ impl<B: S3> S3 for S4Service<B> {
                             .expect("SseKms branch implies kms_wrap is Some");
                         new_metadata.insert("s4-encrypted".into(), "aes-256-gcm".into());
                         new_metadata.insert("s4-sse-type".into(), "aws:kms".into());
-                        new_metadata
-                            .insert("s4-sse-kms-key-id".into(), wrapped.key_id.clone());
+                        new_metadata.insert("s4-sse-kms-key-id".into(), wrapped.key_id.clone());
                         // v0.8.1 #58: auto-deref from `&Zeroizing<[u8; 32]>`
                         // to `&[u8; 32]` (same shape as the put_object
                         // single-PUT branch).
                         let dek_ref: &[u8; 32] = dek;
                         crate::sse::encrypt_with_source(
                             &body,
-                            crate::sse::SseSource::Kms { dek: dek_ref, wrapped },
+                            crate::sse::SseSource::Kms {
+                                dek: dek_ref,
+                                wrapped,
+                            },
                         )
                     }
                     crate::multipart_state::MultipartSseMode::SseS4 => {
@@ -4274,19 +4242,13 @@ impl<B: S3> S3 for S4Service<B> {
                         // the chunked path here is required to keep
                         // GET streaming on multipart-uploaded objects.
                         if self.sse_chunk_size > 0 {
-                            crate::sse::encrypt_v2_chunked(
-                                &body,
-                                keyring,
-                                self.sse_chunk_size,
-                            )
-                            .map_err(|e| {
-                                S3Error::with_message(
-                                    S3ErrorCode::InternalError,
-                                    format!(
-                                        "SSE-S4 chunked encrypt failed at Complete: {e}"
-                                    ),
-                                )
-                            })?
+                            crate::sse::encrypt_v2_chunked(&body, keyring, self.sse_chunk_size)
+                                .map_err(|e| {
+                                    S3Error::with_message(
+                                        S3ErrorCode::InternalError,
+                                        format!("SSE-S4 chunked encrypt failed at Complete: {e}"),
+                                    )
+                                })?
                         } else {
                             crate::sse::encrypt_v2(&body, keyring)
                         }
@@ -4414,14 +4376,14 @@ impl<B: S3> S3 for S4Service<B> {
             // sse_customer_* — those round-tripped on Create / parts).
             match &ctx.sse {
                 crate::multipart_state::MultipartSseMode::SseC { .. } => {
-                    resp.output.server_side_encryption = Some(
-                        ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                    );
+                    resp.output.server_side_encryption = Some(ServerSideEncryption::from_static(
+                        ServerSideEncryption::AES256,
+                    ));
                 }
                 crate::multipart_state::MultipartSseMode::SseKms { key_id } => {
-                    resp.output.server_side_encryption = Some(
-                        ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                    );
+                    resp.output.server_side_encryption = Some(ServerSideEncryption::from_static(
+                        ServerSideEncryption::AWS_KMS,
+                    ));
                     resp.output.ssekms_key_id = Some(key_id.clone());
                 }
                 _ => {}
@@ -4553,9 +4515,8 @@ impl<B: S3> S3 for S4Service<B> {
         };
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
-        let parsed = aws_to_tagset(&req.input.tagging.tag_set).map_err(|e| {
-            S3Error::with_message(S3ErrorCode::InvalidArgument, e.to_string())
-        })?;
+        let parsed = aws_to_tagset(&req.input.tagging.tag_set)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, e.to_string()))?;
         // v0.6 #39: gate via IAM policy with both the request tags
         // (`s3:RequestObjectTag/<key>`) and any existing tags on the
         // target object (`s3:ExistingObjectTag/<key>`).
@@ -4780,29 +4741,27 @@ impl<B: S3> S3 for S4Service<B> {
         req: S3Request<GetObjectLockConfigurationInput>,
     ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
         if let Some(mgr) = self.object_lock.as_ref() {
-            let cfg = mgr.bucket_default(&req.input.bucket).map(|d| {
-                ObjectLockConfiguration {
+            let cfg = mgr
+                .bucket_default(&req.input.bucket)
+                .map(|d| ObjectLockConfiguration {
                     object_lock_enabled: Some(ObjectLockEnabled::from_static(
                         ObjectLockEnabled::ENABLED,
                     )),
                     rule: Some(ObjectLockRule {
                         default_retention: Some(DefaultRetention {
                             days: Some(d.retention_days as i32),
-                            mode: Some(ObjectLockRetentionMode::from_static(
-                                match d.mode {
-                                    crate::object_lock::LockMode::Governance => {
-                                        ObjectLockRetentionMode::GOVERNANCE
-                                    }
-                                    crate::object_lock::LockMode::Compliance => {
-                                        ObjectLockRetentionMode::COMPLIANCE
-                                    }
-                                },
-                            )),
+                            mode: Some(ObjectLockRetentionMode::from_static(match d.mode {
+                                crate::object_lock::LockMode::Governance => {
+                                    ObjectLockRetentionMode::GOVERNANCE
+                                }
+                                crate::object_lock::LockMode::Compliance => {
+                                    ObjectLockRetentionMode::COMPLIANCE
+                                }
+                            })),
                             years: None,
                         }),
                     }),
-                }
-            });
+                });
             let output = GetObjectLockConfigurationOutput {
                 object_lock_configuration: cfg,
             };
@@ -5053,11 +5012,7 @@ impl<B: S3> S3 for S4Service<B> {
                 (Some(h), Some(s)) => match crate::mfa::parse_mfa_header(h) {
                     Ok((serial, code)) => {
                         serial == s.serial
-                            && crate::mfa::verify_totp(
-                                &s.secret_base32,
-                                &code,
-                                current_unix_secs(),
-                            )
+                            && crate::mfa::verify_totp(&s.secret_base32, &code, current_unix_secs())
                     }
                     Err(_) => false,
                 },
@@ -5203,9 +5158,9 @@ impl<B: S3> S3 for S4Service<B> {
                         allowed_methods: r.allowed_methods,
                         allowed_headers: r.allowed_headers.unwrap_or_default(),
                         expose_headers: r.expose_headers.unwrap_or_default(),
-                        max_age_seconds: r.max_age_seconds.and_then(|s| {
-                            if s < 0 { None } else { Some(s as u32) }
-                        }),
+                        max_age_seconds: r
+                            .max_age_seconds
+                            .and_then(|s| if s < 0 { None } else { Some(s as u32) }),
                         id: r.id,
                     })
                     .collect(),
@@ -5293,9 +5248,8 @@ impl<B: S3> S3 for S4Service<B> {
             return self.backend.put_bucket_tagging(req).await;
         };
         let bucket = req.input.bucket.clone();
-        let parsed = aws_to_tagset(&req.input.tagging.tag_set).map_err(|e| {
-            S3Error::with_message(S3ErrorCode::InvalidArgument, e.to_string())
-        })?;
+        let parsed = aws_to_tagset(&req.input.tagging.tag_set)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, e.to_string()))?;
         self.enforce_policy(&req, "s3:PutBucketTagging", &bucket, None)?;
         mgr.put_bucket_tags(&bucket, parsed);
         Ok(S3Response::new(PutBucketTaggingOutput::default()))
@@ -5436,7 +5390,10 @@ impl<B: S3> S3 for S4Service<B> {
                 })),
                 None => Err(S3Error::with_message(
                     S3ErrorCode::Custom("ReplicationConfigurationNotFoundError".into()),
-                    format!("no replication configuration on bucket {}", req.input.bucket),
+                    format!(
+                        "no replication configuration on bucket {}",
+                        req.input.bucket
+                    ),
                 )),
             };
         }
@@ -5548,12 +5505,7 @@ impl<B: S3> S3 for S4Service<B> {
         let select_bucket = req.input.bucket.clone();
         let select_key = req.input.key.clone();
         self.enforce_rate_limit(&req, &select_bucket)?;
-        self.enforce_policy(
-            &req,
-            "s3:GetObject",
-            &select_bucket,
-            Some(&select_key),
-        )?;
+        self.enforce_policy(&req, "s3:GetObject", &select_bucket, Some(&select_key))?;
 
         let request = req.input.request;
         let sql = request.expression.clone();
@@ -5660,11 +5612,8 @@ impl<B: S3> S3 for S4Service<B> {
         let scanned = body_bytes.len() as u64;
 
         let matched_payload = match input_format {
-            SelectInputFormat::JsonLines => {
-                run_select_jsonlines(&sql, &body_bytes, output_format).map_err(
-                    |e| select_error_to_s3(e, "JSON Lines"),
-                )?
-            }
+            SelectInputFormat::JsonLines => run_select_jsonlines(&sql, &body_bytes, output_format)
+                .map_err(|e| select_error_to_s3(e, "JSON Lines"))?,
             SelectInputFormat::Csv { .. } => {
                 run_select_csv(&sql, &body_bytes, input_format, output_format)
                     .map_err(|e| select_error_to_s3(e, "CSV"))?
@@ -5691,8 +5640,7 @@ impl<B: S3> S3 for S4Service<B> {
         // build (the actual wire framing is delegated to s3s).
         let _writer = EventStreamWriter::new();
 
-        let stream =
-            SelectObjectContentEventStream::new(futures::stream::iter(events));
+        let stream = SelectObjectContentEventStream::new(futures::stream::iter(events));
         let output = SelectObjectContentOutput {
             payload: Some(stream),
         };
@@ -5723,7 +5671,9 @@ impl<B: S3> S3 for S4Service<B> {
                 &req.input.inventory_configuration,
             );
             mgr.put(cfg);
-            return Ok(S3Response::new(PutBucketInventoryConfigurationOutput::default()));
+            return Ok(S3Response::new(
+                PutBucketInventoryConfigurationOutput::default(),
+            ));
         }
         self.backend.put_bucket_inventory_configuration(req).await
     }
@@ -5746,8 +5696,8 @@ impl<B: S3> S3 for S4Service<B> {
             // for this code, so we round-trip through `from_bytes` which
             // wraps unknown codes as `Custom(...)` (= the AWS-canonical
             // error-code string survives into the XML response envelope).
-            let code = S3ErrorCode::from_bytes(b"NoSuchConfiguration")
-                .unwrap_or(S3ErrorCode::NoSuchKey);
+            let code =
+                S3ErrorCode::from_bytes(b"NoSuchConfiguration").unwrap_or(S3ErrorCode::NoSuchKey);
             return Err(S3Error::with_message(
                 code,
                 format!(
@@ -5791,7 +5741,9 @@ impl<B: S3> S3 for S4Service<B> {
                 DeleteBucketInventoryConfigurationOutput::default(),
             ));
         }
-        self.backend.delete_bucket_inventory_configuration(req).await
+        self.backend
+            .delete_bucket_inventory_configuration(req)
+            .await
     }
 }
 
@@ -5892,9 +5844,7 @@ fn inv_to_dto(cfg: &crate::inventory::InventoryConfig) -> InventoryConfiguration
 // available `Webhook` destination be reachable.
 // ---------------------------------------------------------------------------
 
-fn notif_from_dto(
-    dto: &NotificationConfiguration,
-) -> crate::notifications::NotificationConfig {
+fn notif_from_dto(dto: &NotificationConfiguration) -> crate::notifications::NotificationConfig {
     let mut rules: Vec<crate::notifications::NotificationRule> = Vec::new();
     if let Some(topics) = dto.topic_configurations.as_ref() {
         for (idx, t) in topics.iter().enumerate() {
@@ -5929,9 +5879,7 @@ fn notif_from_dto(
     crate::notifications::NotificationConfig { rules }
 }
 
-fn notif_to_dto(
-    cfg: &crate::notifications::NotificationConfig,
-) -> NotificationConfiguration {
+fn notif_to_dto(cfg: &crate::notifications::NotificationConfig) -> NotificationConfiguration {
     let mut topics: Vec<TopicConfiguration> = Vec::new();
     let mut queues: Vec<QueueConfiguration> = Vec::new();
     for rule in &cfg.rules {
@@ -5968,8 +5916,16 @@ fn notif_to_dto(
     NotificationConfiguration {
         event_bridge_configuration: None,
         lambda_function_configurations: None,
-        queue_configurations: if queues.is_empty() { None } else { Some(queues) },
-        topic_configurations: if topics.is_empty() { None } else { Some(topics) },
+        queue_configurations: if queues.is_empty() {
+            None
+        } else {
+            Some(queues)
+        },
+        topic_configurations: if topics.is_empty() {
+            None
+        } else {
+            Some(topics)
+        },
     }
 }
 
@@ -6045,19 +6001,16 @@ fn filter_to_dto(
 // supported in this release" semantics.
 // ---------------------------------------------------------------------------
 
-fn replication_from_dto(
-    dto: &ReplicationConfiguration,
-) -> crate::replication::ReplicationConfig {
+fn replication_from_dto(dto: &ReplicationConfiguration) -> crate::replication::ReplicationConfig {
     let rules = dto
         .rules
         .iter()
         .enumerate()
         .map(|(idx, r)| {
-            let id = r
-                .id
-                .as_ref()
-                .map(|s| s.as_str().to_owned())
-                .unwrap_or_else(|| format!("rule-{idx}"));
+            let id =
+                r.id.as_ref()
+                    .map(|s| s.as_str().to_owned())
+                    .unwrap_or_else(|| format!("rule-{idx}"));
             let priority = r.priority.unwrap_or(0).max(0) as u32;
             let status_enabled = r.status.as_str() == ReplicationRuleStatus::ENABLED;
             let filter = replication_filter_from_dto(r.filter.as_ref(), r.prefix.as_deref());
@@ -6083,9 +6036,7 @@ fn replication_from_dto(
     }
 }
 
-fn replication_to_dto(
-    cfg: &crate::replication::ReplicationConfig,
-) -> ReplicationConfiguration {
+fn replication_to_dto(cfg: &crate::replication::ReplicationConfig) -> ReplicationConfiguration {
     let rules = cfg
         .rules
         .iter()
@@ -6162,9 +6113,7 @@ fn replication_filter_from_dto(
     crate::replication::ReplicationFilter { prefix, tags }
 }
 
-fn replication_filter_to_dto(
-    f: &crate::replication::ReplicationFilter,
-) -> ReplicationRuleFilter {
+fn replication_filter_to_dto(f: &crate::replication::ReplicationFilter) -> ReplicationRuleFilter {
     if f.tags.is_empty() {
         ReplicationRuleFilter {
             and: None,
@@ -6759,8 +6708,7 @@ mod tests {
         // S3 keys legally contain '/' as a logical path separator —
         // the helper must NOT escape it (otherwise the synthetic URI
         // changes the perceived hierarchy).
-        let uri =
-            safe_object_uri("bucket", "key/with/slashes").expect("slashes must round-trip");
+        let uri = safe_object_uri("bucket", "key/with/slashes").expect("slashes must round-trip");
         assert_eq!(uri.path(), "/bucket/key/with/slashes");
     }
 

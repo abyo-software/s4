@@ -365,26 +365,20 @@ mod tests {
 
     #[tokio::test]
     async fn gpu_pref_promotes_large_text_to_nvcomp_zstd() {
-        let d = SamplingDispatcher::new(CodecKind::CpuZstd)
-            .with_gpu_preference(true, 1_048_576);
+        let d = SamplingDispatcher::new(CodecKind::CpuZstd).with_gpu_preference(true, 1_048_576);
         let sample = text_sample();
         // 2 MiB total body — past the 1 MiB threshold → GPU promotion.
-        let kind = d
-            .pick_with_size_hint(&sample, Some(2 * 1024 * 1024))
-            .await;
+        let kind = d.pick_with_size_hint(&sample, Some(2 * 1024 * 1024)).await;
         assert_eq!(kind, CodecKind::NvcompZstd);
     }
 
     #[tokio::test]
     async fn gpu_pref_keeps_small_object_on_cpu() {
-        let d = SamplingDispatcher::new(CodecKind::CpuZstd)
-            .with_gpu_preference(true, 1_048_576);
+        let d = SamplingDispatcher::new(CodecKind::CpuZstd).with_gpu_preference(true, 1_048_576);
         let sample = text_sample();
         // 100 KiB total body — under the 1 MiB threshold → GPU upload
         // overhead would exceed compress savings, stay on CPU.
-        let kind = d
-            .pick_with_size_hint(&sample, Some(100 * 1024))
-            .await;
+        let kind = d.pick_with_size_hint(&sample, Some(100 * 1024)).await;
         assert_eq!(kind, CodecKind::CpuZstd);
     }
 
@@ -393,16 +387,13 @@ mod tests {
         // Default — no `with_gpu_preference` call → prefer_gpu = false.
         let d = SamplingDispatcher::new(CodecKind::CpuZstd);
         let sample = text_sample();
-        let kind = d
-            .pick_with_size_hint(&sample, Some(10 * 1024 * 1024))
-            .await;
+        let kind = d.pick_with_size_hint(&sample, Some(10 * 1024 * 1024)).await;
         assert_eq!(kind, CodecKind::CpuZstd);
     }
 
     #[tokio::test]
     async fn gpu_pref_does_not_override_passthrough_on_high_entropy() {
-        let d = SamplingDispatcher::new(CodecKind::CpuZstd)
-            .with_gpu_preference(true, 1_048_576);
+        let d = SamplingDispatcher::new(CodecKind::CpuZstd).with_gpu_preference(true, 1_048_576);
         // High-entropy pseudo-random payload → entropy filter wins,
         // returns Passthrough; GPU promotion is skipped because
         // already-compressed data won't compress further on GPU either.
@@ -414,16 +405,13 @@ mod tests {
             state ^= state << 17;
             payload.push((state & 0xff) as u8);
         }
-        let kind = d
-            .pick_with_size_hint(&payload, Some(8 * 1024 * 1024))
-            .await;
+        let kind = d.pick_with_size_hint(&payload, Some(8 * 1024 * 1024)).await;
         assert_eq!(kind, CodecKind::Passthrough);
     }
 
     #[tokio::test]
     async fn gpu_pref_with_no_size_hint_stays_conservative() {
-        let d = SamplingDispatcher::new(CodecKind::CpuZstd)
-            .with_gpu_preference(true, 1_048_576);
+        let d = SamplingDispatcher::new(CodecKind::CpuZstd).with_gpu_preference(true, 1_048_576);
         let sample = text_sample();
         // Chunked transfer: caller has no Content-Length, so total_size =
         // None. We can't safely commit to GPU because the body might be

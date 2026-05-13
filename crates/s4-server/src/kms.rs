@@ -266,13 +266,7 @@ impl KmsBackend for LocalKms {
         let nonce = Nonce::from_slice(&nonce_bytes);
         let aad = key_id.as_bytes();
         let ct_with_tag = cipher
-            .encrypt(
-                nonce,
-                Payload {
-                    msg: &dek,
-                    aad,
-                },
-            )
+            .encrypt(nonce, Payload { msg: &dek, aad })
             .expect("aes-gcm encrypt cannot fail with a 32-byte key");
 
         // Layout: nonce || ct_with_tag (the latter already contains
@@ -400,7 +394,9 @@ pub mod aws {
             let ciphertext = resp
                 .ciphertext_blob
                 .ok_or_else(|| KmsError::BackendUnavailable {
-                    message: format!("GenerateDataKey({key_id}): missing CiphertextBlob in response"),
+                    message: format!(
+                        "GenerateDataKey({key_id}): missing CiphertextBlob in response"
+                    ),
                 })?
                 .into_inner();
             // Use the response's KeyId (canonical ARN) when present so
@@ -505,7 +501,10 @@ mod tests {
         assert_eq!(wrapped.key_id, "main");
         // Wrapped form: 12-byte nonce + 32-byte ciphertext + 16-byte
         // tag = 60 bytes.
-        assert_eq!(wrapped.ciphertext.len(), WRAP_NONCE_LEN + DEK_LEN + WRAP_TAG_LEN);
+        assert_eq!(
+            wrapped.ciphertext.len(),
+            WRAP_NONCE_LEN + DEK_LEN + WRAP_TAG_LEN
+        );
 
         let unwrapped = kms.decrypt_dek(&wrapped).await.unwrap();
         assert_eq!(unwrapped, dek);
@@ -519,7 +518,10 @@ mod tests {
         let (dek1, w1) = kms.generate_dek("k").await.unwrap();
         let (dek2, w2) = kms.generate_dek("k").await.unwrap();
         assert_ne!(dek1, dek2, "DEK must be random per call");
-        assert_ne!(w1.ciphertext, w2.ciphertext, "wrap nonce must be random per call");
+        assert_ne!(
+            w1.ciphertext, w2.ciphertext,
+            "wrap nonce must be random per call"
+        );
     }
 
     #[tokio::test]

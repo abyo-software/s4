@@ -155,8 +155,7 @@ impl MfaDeleteManager {
                 "mfa.default_secret",
             )
             .clone(),
-            by_bucket: crate::lock_recovery::recover_read(&self.by_bucket, "mfa.by_bucket")
-                .clone(),
+            by_bucket: crate::lock_recovery::recover_read(&self.by_bucket, "mfa.by_bucket").clone(),
             enabled: crate::lock_recovery::recover_read(&self.enabled, "mfa.enabled").clone(),
         };
         serde_json::to_string(&snap)
@@ -217,10 +216,8 @@ pub fn parse_mfa_header(value: &str) -> Result<(String, String), MfaError> {
 /// windows.
 #[must_use]
 pub fn verify_totp(secret_base32: &str, code: &str, now_unix_secs: u64) -> bool {
-    let Some(raw) = base32::decode(
-        base32::Alphabet::Rfc4648 { padding: false },
-        secret_base32,
-    ) else {
+    let Some(raw) = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, secret_base32)
+    else {
         return false;
     };
     let Ok(totp) = TOTP::new(Algorithm::SHA1, 6, 1, 30, raw) else {
@@ -267,8 +264,11 @@ mod tests {
     const TEST_SECRET_B32: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
 
     fn raw_secret() -> Vec<u8> {
-        base32::decode(base32::Alphabet::Rfc4648 { padding: false }, TEST_SECRET_B32)
-            .expect("decode test secret")
+        base32::decode(
+            base32::Alphabet::Rfc4648 { padding: false },
+            TEST_SECRET_B32,
+        )
+        .expect("decode test secret")
     }
 
     fn totp_at(time: u64) -> String {

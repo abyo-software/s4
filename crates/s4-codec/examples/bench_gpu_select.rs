@@ -184,7 +184,12 @@ fn main() {
     let kernel = GpuSelectKernel::new().expect("CUDA unavailable — set S4_BENCH_CPU_ONLY=1?");
     // Warm-up to amortize NVRTC compile + CUDA context init.
     let _ = kernel
-        .scan_csv(&body[..body.len().min(64 * 1024)], 1, CompareOp::Equal, b"Japan")
+        .scan_csv(
+            &body[..body.len().min(64 * 1024)],
+            1,
+            CompareOp::Equal,
+            b"Japan",
+        )
         .expect("warm-up scan");
 
     let t = Instant::now();

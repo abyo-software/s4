@@ -259,10 +259,7 @@ mod tests {
 
     #[test]
     fn matches_glob_exact_match() {
-        assert!(matches_glob(
-            "https://example.com",
-            "https://example.com"
-        ));
+        assert!(matches_glob("https://example.com", "https://example.com"));
         assert!(matches_glob("GET", "GET"));
     }
 
@@ -275,10 +272,7 @@ mod tests {
     #[test]
     fn matches_glob_origin_is_case_sensitive() {
         // S3 origin matching is case-sensitive byte equality.
-        assert!(!matches_glob(
-            "https://Example.com",
-            "https://example.com"
-        ));
+        assert!(!matches_glob("https://Example.com", "https://example.com"));
     }
 
     #[test]
@@ -315,8 +309,7 @@ mod tests {
     #[test]
     fn match_preflight_no_rule_for_bucket() {
         let mgr = CorsManager::new();
-        let m =
-            mgr.match_preflight("ghost", "https://anything", "GET", &[]);
+        let m = mgr.match_preflight("ghost", "https://anything", "GET", &[]);
         assert!(m.is_none());
     }
 
@@ -330,7 +323,10 @@ mod tests {
             },
         );
         // Rule allows GET only — DELETE preflight must miss.
-        assert!(mgr.match_preflight("b", "https://x", "DELETE", &[]).is_none());
+        assert!(
+            mgr.match_preflight("b", "https://x", "DELETE", &[])
+                .is_none()
+        );
         // Sanity: GET still matches.
         assert!(mgr.match_preflight("b", "https://x", "GET", &[]).is_some());
     }
@@ -426,12 +422,7 @@ mod tests {
         );
         // request header sent in lowercase — must still match the
         // CamelCase pattern (HTTP header names are case-insensitive).
-        let m = mgr.match_preflight(
-            "b",
-            "https://x",
-            "PUT",
-            &["content-type".to_owned()],
-        );
+        let m = mgr.match_preflight("b", "https://x", "PUT", &["content-type".to_owned()]);
         assert!(m.is_some());
     }
 

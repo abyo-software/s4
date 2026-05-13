@@ -591,7 +591,8 @@ fn synthetic_request<T>(input: T, method: http::Method, uri_path: &str) -> S3Req
 /// caller falls back to `Utc::now()` so the row still emits.
 fn timestamp_to_chrono_utc(ts: &Timestamp) -> Option<DateTime<Utc>> {
     let mut buf = Vec::new();
-    ts.format(s3s::dto::TimestampFormat::DateTime, &mut buf).ok()?;
+    ts.format(s3s::dto::TimestampFormat::DateTime, &mut buf)
+        .ok()?;
     let s = std::str::from_utf8(&buf).ok()?;
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
@@ -1063,10 +1064,7 @@ mod tests {
             "inv/src/daily-csv/data/2026-05-13T000000Z.csv"
         );
         assert_eq!(files[0]["MD5checksum"], "d41d8cd98f00b204e9800998ecf8427e");
-        assert_eq!(
-            v["creationTimestamp"],
-            now.timestamp_millis().to_string()
-        );
+        assert_eq!(v["creationTimestamp"], now.timestamp_millis().to_string());
         let schema = v["fileSchema"].as_str().expect("fileSchema string");
         assert!(schema.starts_with("Bucket, Key, VersionId"));
         assert!(schema.ends_with("StorageClass, EncryptionStatus"));
@@ -1423,7 +1421,11 @@ mod tests {
             .filter(|k| k.ends_with("manifest.json"))
             .cloned()
             .collect();
-        assert_eq!(csv_keys.len(), 1, "exactly one CSV must land; got {dst_keys:?}");
+        assert_eq!(
+            csv_keys.len(),
+            1,
+            "exactly one CSV must land; got {dst_keys:?}"
+        );
         assert_eq!(
             manifest_keys.len(),
             1,
@@ -1479,10 +1481,7 @@ mod tests {
 
         let report = run_scan_once(&s4).await.expect("scan");
         assert_eq!(report.configs_evaluated, 1);
-        assert_eq!(
-            report.buckets_scanned, 0,
-            "no walk; due() returned false"
-        );
+        assert_eq!(report.buckets_scanned, 0, "no walk; due() returned false");
         assert_eq!(report.csvs_written, 0);
         assert_eq!(report.objects_listed, 0);
         assert_eq!(report.errors, 0);

@@ -245,16 +245,12 @@ impl GpuSelectKernel {
         let f_bytes = device
             .get_func("s4_gpu_select", "column_compare_bytes")
             .ok_or_else(|| {
-                GpuSelectError::Cuda(
-                    "column_compare_bytes not found after load_ptx".into(),
-                )
+                GpuSelectError::Cuda("column_compare_bytes not found after load_ptx".into())
             })?;
         let f_i64 = device
             .get_func("s4_gpu_select", "column_compare_i64")
             .ok_or_else(|| {
-                GpuSelectError::Cuda(
-                    "column_compare_i64 not found after load_ptx".into(),
-                )
+                GpuSelectError::Cuda("column_compare_i64 not found after load_ptx".into())
             })?;
         Ok(Self {
             device,
@@ -305,9 +301,8 @@ impl GpuSelectKernel {
         // host into i64 so the kernel can take it by value.
         let literal_i64 = match op {
             CompareOp::GreaterThan | CompareOp::LessThan => {
-                let s = std::str::from_utf8(literal).map_err(|_| {
-                    GpuSelectError::LiteralNotNumeric(literal.to_vec())
-                })?;
+                let s = std::str::from_utf8(literal)
+                    .map_err(|_| GpuSelectError::LiteralNotNumeric(literal.to_vec()))?;
                 Some(
                     s.parse::<i64>()
                         .map_err(|_| GpuSelectError::LiteralNotNumeric(literal.to_vec()))?,
@@ -387,8 +382,7 @@ impl GpuSelectKernel {
         // byte range verbatim from the original body so we preserve
         // the original line terminator (LF or CRLF).
         let _ = ncols; // already validated against `where_column_idx`
-        let mut out =
-            Vec::with_capacity(header_end + (csv_body.len() - header_end) / 2);
+        let mut out = Vec::with_capacity(header_end + (csv_body.len() - header_end) / 2);
         out.extend_from_slice(&csv_body[..header_end]);
         for i in 0..num_rows {
             if flags[i] != 0 {
@@ -427,10 +421,7 @@ struct RowIndex {
 /// `,`. Cheap on >GB inputs because every loop iteration is one
 /// `memchr`-class byte test, no UTF-8 validation, no allocations
 /// inside the loop.
-fn build_row_index(
-    csv: &[u8],
-    where_column_idx: usize,
-) -> Result<RowIndex, GpuSelectError> {
+fn build_row_index(csv: &[u8], where_column_idx: usize) -> Result<RowIndex, GpuSelectError> {
     if csv.is_empty() {
         return Err(GpuSelectError::MalformedCsv(
             "empty body — at least a header row is required".into(),
@@ -471,10 +462,7 @@ fn build_row_index(
         }
 
         // Find the WHERE column inside this row.
-        let (cs, cl) = locate_column(
-            &csv[row_start..row_text_end],
-            where_column_idx,
-        );
+        let (cs, cl) = locate_column(&csv[row_start..row_text_end], where_column_idx);
         // Record absolute (body-relative) offsets.
         col_starts.push((row_start + cs) as u32);
         col_lens.push(cl as u32);
