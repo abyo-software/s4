@@ -6,10 +6,23 @@
 //! resource-based ACLs.
 //!
 //! Supported AWS S3 actions:
-//! - `s3:GetObject`
-//! - `s3:PutObject`
-//! - `s3:DeleteObject`
-//! - `s3:ListBucket`
+//! - `s3:GetObject` / `s3:PutObject` / `s3:DeleteObject` (object-level)
+//! - `s3:GetObjectTagging` / `s3:PutObjectTagging` / `s3:DeleteObjectTagging`
+//! - `s3:GetObjectAcl` / `s3:PutObjectAcl`
+//! - `s3:RestoreObject` / `s3:GetObjectVersion` / `s3:DeleteObjectVersion`
+//! - `s3:GetObjectRetention` / `s3:PutObjectRetention`
+//! - `s3:GetObjectLegalHold` / `s3:PutObjectLegalHold`
+//! - `s3:BypassGovernanceRetention` / `s3:AbortMultipartUpload`
+//! - `s3:ListBucket` / `s3:GetBucketLocation` / `s3:GetBucketAcl` (bucket-level)
+//! - `s3:GetBucketCors` / `s3:PutBucketCors` / `s3:DeleteBucketCors`
+//! - `s3:GetBucketVersioning` / `s3:PutBucketVersioning`
+//! - `s3:GetBucketTagging` / `s3:PutBucketTagging` / `s3:DeleteBucketTagging`
+//! - `s3:GetBucketReplication` / `s3:PutBucketReplication` / `s3:DeleteBucketReplication`
+//! - `s3:GetBucketLifecycleConfiguration` / `s3:PutBucketLifecycleConfiguration`
+//! - `s3:GetBucketNotification` / `s3:PutBucketNotification`
+//! - `s3:GetInventoryConfiguration` / `s3:PutInventoryConfiguration`
+//! - `s3:GetObjectLockConfiguration` / `s3:PutObjectLockConfiguration`
+//! - `s3:CreateBucket` / `s3:DeleteBucket` / `s3:ListMultipartUploads`
 //! - `s3:*` (wildcard, matches all of the above)
 //! - `*` (wildcard, matches everything)
 //!
@@ -19,11 +32,24 @@
 //! - Trailing or interior `*` glob in the key portion
 //! - `arn:aws:s3:::*` — any bucket / any key
 //!
+//! v0.8.4 #75 (audit H-4): Resource ARN scoping is now namespace-aware. A
+//! bucket-form ARN (`arn:aws:s3:::b`) only matches bucket-level actions; an
+//! object-form ARN (`arn:aws:s3:::b/k`) only matches object-level actions.
+//! Pre-v0.8.4 a single bucket-form ARN with a `s3:GetObject` Action would
+//! silently grant the object op — this is now correctly rejected so a
+//! mis-typed policy fails closed instead of escalating privilege.
+//!
 //! Supported Principal forms:
-//! - `"Principal": "*"` — anyone authenticated by S4's auth layer
-//! - `"Principal": {"AWS": ["AKIA...", "AKIA..."]}` — match by SigV4 access
-//!   key ID. (Full IAM user/role ARN matching is a future extension once
-//!   STS integration lands.)
+//! - `"Principal": "*"` — anyone authenticated by S4's auth layer. The
+//!   string MUST be exactly `"*"` (v0.8.4 #75 / audit H-5); any other
+//!   bare-string form (e.g. `"AKIA..."`) is rejected at parse time.
+//! - `"Principal": {"AWS": ["AKIA...", "AKIA..."]}` — match by SigV4
+//!   access key ID. The list MUST be non-empty (an empty list previously
+//!   widened to "match anyone", which is unsafe). `Service`, `Federated`
+//!   and `CanonicalUser` Principal types are NOT supported and are
+//!   rejected at parse time so silent acceptance can't hide a policy gap.
+//!   (Full IAM user/role ARN matching is a future extension once STS
+//!   integration lands.)
 //!
 //! Decision: **explicit Deny > explicit Allow > implicit Deny** — the
 //! standard AWS evaluation order.
@@ -59,17 +85,57 @@ impl StringOrVec {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum PrincipalSet {
-    /// `"Principal": "*"` — JSON string form. The string content is
-    /// untyped (only the string variant matters), so we accept any but
-    /// don't read the value.
-    Wildcard(#[allow(dead_code)] String),
-    Map {
-        #[serde(rename = "AWS", default)]
-        aws: Option<StringOrVec>,
-    },
+/// v0.8.4 #75 (audit H-5): Principal set is parsed by hand from
+/// `serde_json::Value` so we can reject silently-permissive shapes (a
+/// bare string that isn't `"*"`, an empty `{"AWS": []}` list, or any
+/// `Service` / `Federated` / `CanonicalUser` Principal type that we
+/// don't support).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrincipalSet {
+    /// `"Principal": "*"` — match any caller (incl. anonymous / unauth).
+    /// The bare string must be exactly `"*"`; any other string form is a
+    /// parse error.
+    Wildcard,
+    /// `"Principal": {"AWS": ["AKIA...", ...]}` — match those access key
+    /// ids. Guaranteed non-empty after parse.
+    Specific(Vec<String>),
+}
+
+impl PrincipalSet {
+    /// Parse the JSON value attached to a Statement's `Principal` field.
+    pub fn parse(value: &serde_json::Value) -> Result<Self, PolicyParseError> {
+        match value {
+            serde_json::Value::String(s) if s == "*" => Ok(PrincipalSet::Wildcard),
+            serde_json::Value::String(other) => {
+                Err(PolicyParseError::InvalidWildcard(other.clone()))
+            }
+            serde_json::Value::Object(map) => {
+                if map.len() != 1 || !map.contains_key("AWS") {
+                    return Err(PolicyParseError::UnsupportedPrincipalType);
+                }
+                let aws = &map["AWS"];
+                let principals: Vec<String> = match aws {
+                    serde_json::Value::String(s) => vec![s.clone()],
+                    serde_json::Value::Array(arr) => {
+                        let mut out = Vec::with_capacity(arr.len());
+                        for v in arr {
+                            match v {
+                                serde_json::Value::String(s) => out.push(s.clone()),
+                                _ => return Err(PolicyParseError::InvalidPrincipalShape),
+                            }
+                        }
+                        out
+                    }
+                    _ => return Err(PolicyParseError::InvalidPrincipalShape),
+                };
+                if principals.is_empty() {
+                    return Err(PolicyParseError::EmptyPrincipalList);
+                }
+                Ok(PrincipalSet::Specific(principals))
+            }
+            _ => Err(PolicyParseError::InvalidPrincipalShape),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,8 +148,11 @@ struct StatementJson {
     action: StringOrVec,
     #[serde(rename = "Resource")]
     resource: StringOrVec,
+    /// Captured as a raw JSON value so [`PrincipalSet::parse`] can apply
+    /// the v0.8.4 #75 strict-shape validation (bare `"*"` only, non-empty
+    /// `AWS` list, no `Service` / `Federated` / `CanonicalUser`).
     #[serde(rename = "Principal", default)]
-    principal: Option<PrincipalSet>,
+    principal: Option<serde_json::Value>,
     /// Optional Condition map (v0.3 #13): operator → key → values.
     /// `{"IpAddress": {"aws:SourceIp": ["10.0.0.0/8"]}, ...}`.
     #[serde(rename = "Condition", default)]
@@ -98,6 +167,148 @@ struct PolicyJson {
     statements: Vec<StatementJson>,
 }
 
+/// v0.8.4 #75: a parsed Resource ARN with namespace tag (bucket-form vs
+/// object-form). Built once at policy-parse time so statement evaluation
+/// can route bucket-only / object-only actions to the right ARN shape
+/// without re-parsing on every request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResourceArn {
+    /// `arn:aws:s3:::<bucket>` — matches bucket-level actions only.
+    Bucket(String),
+    /// `arn:aws:s3:::<bucket>/<key-pattern>` — matches object-level
+    /// actions only. `key_pattern` may carry `*` / `?` glob characters.
+    Object {
+        bucket: String,
+        key_pattern: String,
+    },
+}
+
+/// v0.8.4 #75: which resource ARN shape an Action accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceKind {
+    /// Action operates on an object — only `Object{...}` ARNs match.
+    ObjectOnly,
+    /// Action operates on a bucket — only `Bucket(...)` ARNs match.
+    BucketOnly,
+    /// Action's namespace is ambiguous (e.g. `s3:*`, or an unknown
+    /// forward-compat action) — both ARN forms may match.
+    Either,
+}
+
+/// v0.8.4 #75: structured parse / validation errors. Surfaced via
+/// [`Display`] for the public `Result<_, String>` boundary so existing
+/// CLI / test call sites that string-match on the message keep working.
+#[derive(Debug, thiserror::Error)]
+pub enum PolicyParseError {
+    #[error("policy JSON parse error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error(
+        "Resource ARN must start with \"arn:aws:s3:::\" — got {0:?}"
+    )]
+    InvalidResourceArn(String),
+    #[error("Resource ARN bucket name is empty: {0:?}")]
+    EmptyBucketInArn(String),
+    #[error("Principal wildcard must be exact \"*\" — got {0:?}")]
+    InvalidWildcard(String),
+    #[error(
+        "unsupported Principal type (only AWS principals are supported, no Service / Federated / CanonicalUser)"
+    )]
+    UnsupportedPrincipalType,
+    #[error("Principal AWS list must not be empty")]
+    EmptyPrincipalList,
+    #[error("Principal value must be the string \"*\" or a {{AWS: ...}} object")]
+    InvalidPrincipalShape,
+    #[error(
+        "unsupported policy Condition operator: {op:?}. v0.3 supports IpAddress / NotIpAddress / StringEquals / StringNotEquals / StringLike / StringNotLike / DateGreaterThan / DateLessThan / Bool."
+    )]
+    UnsupportedConditionOperator { op: String },
+}
+
+/// v0.8.4 #75: parse a Resource string into the typed [`ResourceArn`].
+/// Accepts `arn:aws:s3:::<bucket>` and `arn:aws:s3:::<bucket>/<key>`
+/// (with optional glob chars in `<key>`). The all-buckets wildcard
+/// `arn:aws:s3:::*` parses as `Bucket("*")` for the bare form and
+/// `Object{bucket="*", ..}` when a slash follows.
+pub fn parse_resource_arn(s: &str) -> Result<ResourceArn, PolicyParseError> {
+    const PREFIX: &str = "arn:aws:s3:::";
+    let rest = s
+        .strip_prefix(PREFIX)
+        .ok_or_else(|| PolicyParseError::InvalidResourceArn(s.to_owned()))?;
+    match rest.split_once('/') {
+        None => {
+            if rest.is_empty() {
+                return Err(PolicyParseError::EmptyBucketInArn(s.to_owned()));
+            }
+            Ok(ResourceArn::Bucket(rest.to_owned()))
+        }
+        Some((bucket, key_pattern)) => {
+            if bucket.is_empty() {
+                return Err(PolicyParseError::EmptyBucketInArn(s.to_owned()));
+            }
+            Ok(ResourceArn::Object {
+                bucket: bucket.to_owned(),
+                key_pattern: key_pattern.to_owned(),
+            })
+        }
+    }
+}
+
+/// v0.8.4 #75: map an Action verb to the ARN namespace it operates on.
+/// Unknown actions resolve to [`ResourceKind::Either`] to stay forward-
+/// compatible with future S3 actions a policy author wants to gate
+/// today.
+fn action_resource_kind(action: &str) -> ResourceKind {
+    match action {
+        // ----- Object-level -----
+        "s3:GetObject"
+        | "s3:PutObject"
+        | "s3:DeleteObject"
+        | "s3:GetObjectTagging"
+        | "s3:PutObjectTagging"
+        | "s3:DeleteObjectTagging"
+        | "s3:GetObjectAcl"
+        | "s3:PutObjectAcl"
+        | "s3:RestoreObject"
+        | "s3:GetObjectVersion"
+        | "s3:DeleteObjectVersion"
+        | "s3:GetObjectRetention"
+        | "s3:PutObjectRetention"
+        | "s3:GetObjectLegalHold"
+        | "s3:PutObjectLegalHold"
+        | "s3:BypassGovernanceRetention"
+        | "s3:AbortMultipartUpload" => ResourceKind::ObjectOnly,
+        // ----- Bucket-level -----
+        "s3:ListBucket"
+        | "s3:GetBucketLocation"
+        | "s3:GetBucketAcl"
+        | "s3:GetBucketCors"
+        | "s3:PutBucketCors"
+        | "s3:DeleteBucketCors"
+        | "s3:GetBucketVersioning"
+        | "s3:PutBucketVersioning"
+        | "s3:GetBucketTagging"
+        | "s3:PutBucketTagging"
+        | "s3:DeleteBucketTagging"
+        | "s3:GetBucketReplication"
+        | "s3:PutBucketReplication"
+        | "s3:DeleteBucketReplication"
+        | "s3:GetBucketLifecycleConfiguration"
+        | "s3:PutBucketLifecycleConfiguration"
+        | "s3:GetBucketNotification"
+        | "s3:PutBucketNotification"
+        | "s3:GetInventoryConfiguration"
+        | "s3:PutInventoryConfiguration"
+        | "s3:GetObjectLockConfiguration"
+        | "s3:PutObjectLockConfiguration"
+        | "s3:CreateBucket"
+        | "s3:DeleteBucket"
+        | "s3:ListMultipartUploads" => ResourceKind::BucketOnly,
+        // `s3:*`, `*`, and any unknown verb stay permissive so a policy
+        // gating a future action keeps working without a server upgrade.
+        _ => ResourceKind::Either,
+    }
+}
+
 /// Compiled bucket policy ready to evaluate requests.
 #[derive(Debug, Clone)]
 pub struct Policy {
@@ -108,15 +319,17 @@ pub struct Policy {
 struct Statement {
     sid: Option<String>,
     effect: Effect,
-    actions: Vec<String>,   // `s3:GetObject`, `s3:*`, `*`
-    resources: Vec<String>, // `arn:aws:s3:::bucket/key*`
-    /// `None` = no Principal field = match anyone (for resource-attached
-    /// bucket policies the convention is to require Principal, but for our
-    /// gateway we treat absence as "any authenticated caller").
-    /// `Some(vec![])` after parsing wildcard "*" = same effect.
-    /// `Some(vec!["AKIA..."])` = match those access key ids.
-    /// An empty `principals` vector means "wildcard (any principal)".
-    principals: Option<Vec<String>>,
+    actions: Vec<String>, // `s3:GetObject`, `s3:*`, `*`
+    /// v0.8.4 #75: pre-parsed Resource ARNs, tagged by namespace so
+    /// statement evaluation can route bucket-only / object-only Actions
+    /// to the correct ARN shape (audit H-4).
+    resources: Vec<ResourceArn>,
+    /// `None` = no Principal field on the statement → match anyone
+    /// (incl. anonymous). `Some(PrincipalSet::Wildcard)` (the literal
+    /// `"*"` form) is semantically the same. `Some(Specific(vec))` =
+    /// only those access key ids. Validated at parse time by
+    /// [`PrincipalSet::parse`] (v0.8.4 #75 / audit H-5).
+    principals: Option<PrincipalSet>,
     /// Compiled Condition clauses; empty vec = no condition restriction
     /// (statement always matches once Action / Resource / Principal pass).
     conditions: Vec<Condition>,
@@ -188,22 +401,30 @@ impl ConditionOp {
 }
 
 impl Policy {
+    /// Parse a JSON bucket policy. Returns the human-readable [`Display`]
+    /// of the underlying [`PolicyParseError`] for backward compatibility
+    /// with the pre-v0.8.4 `Result<_, String>` callers (CLI flag handler,
+    /// existing E2E tests). Use [`Policy::from_json_str_typed`] when you
+    /// need to inspect the error variant programmatically.
     pub fn from_json_str(s: &str) -> Result<Self, String> {
-        let raw: PolicyJson =
-            serde_json::from_str(s).map_err(|e| format!("policy JSON parse error: {e}"))?;
+        Self::from_json_str_typed(s).map_err(|e| e.to_string())
+    }
+
+    /// v0.8.4 #75: typed-error variant of [`Policy::from_json_str`]. Lets
+    /// new callers (and the unit tests for audit H-4 / H-5) match on
+    /// [`PolicyParseError`] directly instead of grepping a String.
+    pub fn from_json_str_typed(s: &str) -> Result<Self, PolicyParseError> {
+        let raw: PolicyJson = serde_json::from_str(s)?;
         let mut statements = Vec::with_capacity(raw.statements.len());
-        for s in raw.statements {
+        for stmt in raw.statements {
             let mut conditions = Vec::new();
-            if let Some(cond_map) = s.condition {
+            if let Some(cond_map) = stmt.condition {
                 for (op_name, key_map) in cond_map {
-                    let op = ConditionOp::parse(&op_name).ok_or_else(|| {
-                        format!(
-                            "unsupported policy Condition operator: {op_name:?}. \
-                             v0.3 supports IpAddress / NotIpAddress / StringEquals / \
-                             StringNotEquals / StringLike / StringNotLike / \
-                             DateGreaterThan / DateLessThan / Bool."
-                        )
-                    })?;
+                    let op = ConditionOp::parse(&op_name).ok_or(
+                        PolicyParseError::UnsupportedConditionOperator {
+                            op: op_name.clone(),
+                        },
+                    )?;
                     for (key, values) in key_map {
                         conditions.push(Condition {
                             op,
@@ -213,15 +434,24 @@ impl Policy {
                     }
                 }
             }
+            // v0.8.4 #75 / audit H-4: pre-parse every Resource ARN here
+            // so statement_matches_resource() can dispatch on namespace
+            // without re-parsing on the hot path.
+            let mut resources = Vec::with_capacity(stmt.resource.clone().into_vec().len());
+            for raw_arn in stmt.resource.into_vec() {
+                resources.push(parse_resource_arn(&raw_arn)?);
+            }
+            // v0.8.4 #75 / audit H-5: validate Principal shape strictly.
+            let principals = match stmt.principal {
+                None => None,
+                Some(value) => Some(PrincipalSet::parse(&value)?),
+            };
             statements.push(Statement {
-                sid: s.sid,
-                effect: s.effect,
-                actions: s.action.into_vec(),
-                resources: s.resource.into_vec(),
-                principals: s.principal.map(|p| match p {
-                    PrincipalSet::Wildcard(_) => Vec::new(),
-                    PrincipalSet::Map { aws } => aws.map(|v| v.into_vec()).unwrap_or_default(),
-                }),
+                sid: stmt.sid,
+                effect: stmt.effect,
+                actions: stmt.action.into_vec(),
+                resources,
+                principals,
                 conditions,
             });
         }
@@ -269,12 +499,6 @@ impl Policy {
         principal_id: Option<&str>,
         ctx: &RequestContext,
     ) -> Decision {
-        let object_resource = match key {
-            Some(k) => format!("arn:aws:s3:::{bucket}/{k}"),
-            None => format!("arn:aws:s3:::{bucket}"),
-        };
-        let bucket_resource = format!("arn:aws:s3:::{bucket}");
-
         let mut matched_allow: Option<Option<String>> = None;
         let mut matched_deny: Option<Option<String>> = None;
 
@@ -282,13 +506,10 @@ impl Policy {
             if !st.actions.iter().any(|p| action_matches(p, action)) {
                 continue;
             }
-            let any_resource_matches = st.resources.iter().any(|p| {
-                resource_matches(p, &object_resource) || resource_matches(p, &bucket_resource)
-            });
-            if !any_resource_matches {
+            if !Self::statement_matches_resource(st, action, bucket, key) {
                 continue;
             }
-            if !principal_matches(&st.principals, principal_id) {
+            if !principal_matches(st.principals.as_ref(), principal_id) {
                 continue;
             }
             // v0.3 #13: Conditions are ALL-AND — a statement applies only
@@ -319,6 +540,94 @@ impl Policy {
         } else {
             Decision::implicit_deny()
         }
+    }
+
+    /// v0.8.4 #75 (audit H-4): namespace-aware Resource match.
+    ///
+    /// * `BucketOnly` actions (e.g. `s3:ListBucket`) only match
+    ///   `Bucket(...)` ARNs.
+    /// * `ObjectOnly` actions (e.g. `s3:GetObject`) only match
+    ///   `Object{...}` ARNs, whose `key_pattern` is glob-matched against
+    ///   the request key.
+    /// * `Either` (the catch-all for `s3:*`, `*`, and any unknown
+    ///   forward-compat verb) accepts whichever ARN form the policy
+    ///   carries — this preserves the existing `{"Action":"s3:*"}`
+    ///   ergonomics where a single statement covers an entire bucket.
+    ///
+    /// Pre-v0.8.4 behaviour conflated bucket-form and object-form ARNs
+    /// for **every** action, which silently widened any bucket-only
+    /// statement into object grants. That conflation is removed; mis-
+    /// typed policies now fail closed.
+    fn statement_matches_resource(
+        stmt: &Statement,
+        action: &str,
+        bucket: &str,
+        key: Option<&str>,
+    ) -> bool {
+        let kind = action_resource_kind(action);
+        for parsed in &stmt.resources {
+            match (parsed, kind) {
+                // ----- bucket-only actions -----
+                (ResourceArn::Bucket(b), ResourceKind::BucketOnly) => {
+                    if glob_match(b, bucket) {
+                        return true;
+                    }
+                }
+                // ----- object-only actions -----
+                (
+                    ResourceArn::Object {
+                        bucket: b,
+                        key_pattern: kp,
+                    },
+                    ResourceKind::ObjectOnly,
+                ) => {
+                    if !glob_match(b, bucket) {
+                        continue;
+                    }
+                    if let Some(k) = key
+                        && glob_match(kp, k)
+                    {
+                        return true;
+                    }
+                }
+                // ----- Either: forward-compat permissive branch -----
+                (ResourceArn::Bucket(b), ResourceKind::Either) => {
+                    if glob_match(b, bucket) {
+                        return true;
+                    }
+                }
+                (
+                    ResourceArn::Object {
+                        bucket: b,
+                        key_pattern: kp,
+                    },
+                    ResourceKind::Either,
+                ) => {
+                    if !glob_match(b, bucket) {
+                        continue;
+                    }
+                    match key {
+                        Some(k) => {
+                            if glob_match(kp, k) {
+                                return true;
+                            }
+                        }
+                        None => {
+                            // No key in the request and the ARN is
+                            // object-form — only the all-objects glob
+                            // counts as covering "the bucket itself".
+                            if kp == "*" {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                // ----- mismatched namespace → skip (the H-4 fix) -----
+                (ResourceArn::Bucket(_), ResourceKind::ObjectOnly)
+                | (ResourceArn::Object { .. }, ResourceKind::BucketOnly) => continue,
+            }
+        }
+        false
     }
 }
 
@@ -367,12 +676,6 @@ fn action_matches(pattern: &str, action: &str) -> bool {
     pattern == action
 }
 
-/// Match a resource ARN pattern against a concrete resource ARN. Supports
-/// `*` and `?` glob characters.
-fn resource_matches(pattern: &str, resource: &str) -> bool {
-    glob_match(pattern, resource)
-}
-
 /// Hand-rolled glob (`*` = any sequence, `?` = any single char) so we don't
 /// pull in the `globset` crate for a single use site.
 fn glob_match(pattern: &str, s: &str) -> bool {
@@ -406,12 +709,17 @@ fn glob_match_bytes(p: &[u8], s: &[u8]) -> bool {
     pi == p.len()
 }
 
-fn principal_matches(allowed: &Option<Vec<String>>, principal_id: Option<&str>) -> bool {
+fn principal_matches(allowed: Option<&PrincipalSet>, principal_id: Option<&str>) -> bool {
     match allowed {
         // No Principal field on the statement → match any caller (incl. anonymous).
         None => true,
-        Some(list) if list.is_empty() => true,
-        Some(list) => match principal_id {
+        // `"Principal": "*"` → match any caller (incl. anonymous).
+        Some(PrincipalSet::Wildcard) => true,
+        // `"Principal": {"AWS": [...]}` → match by access-key-id only;
+        // anonymous callers (`principal_id = None`) are rejected here so
+        // an unauth request can never satisfy a Specific list (closes a
+        // sibling of audit H-5: silent anonymous widening).
+        Some(PrincipalSet::Specific(list)) => match principal_id {
             None => false,
             Some(id) => list.iter().any(|p| p == "*" || p == id),
         },
@@ -646,12 +954,20 @@ mod tests {
 
     #[test]
     fn s3_action_wildcard() {
+        // v0.8.4 #75: a bare `arn:aws:s3:::*` is bucket-form and only
+        // covers bucket-level actions; object reach requires the
+        // explicit `/*` glob in the key portion. Use a two-statement
+        // policy that grants both ARN namespaces.
         let pol = p(r#"{
             "Version": "2012-10-17",
-            "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "arn:aws:s3:::*"}]
+            "Statement": [
+              {"Effect": "Allow", "Action": "s3:*", "Resource": "arn:aws:s3:::*"},
+              {"Effect": "Allow", "Action": "s3:*", "Resource": "arn:aws:s3:::*/*"}
+            ]
         }"#);
         assert!(pol.evaluate("s3:GetObject", "any", Some("k"), None).allow);
         assert!(pol.evaluate("s3:PutObject", "any", Some("k"), None).allow);
+        assert!(pol.evaluate("s3:ListBucket", "any", None, None).allow);
         // Non-s3 action would not match (we don't generate any non-s3 actions
         // from S4Service handlers, but verify the matcher behaves correctly)
         assert!(!pol.evaluate("iam:ListUsers", "any", None, None).allow);
@@ -1060,5 +1376,199 @@ mod tests {
               "Resource": "arn:aws:s3:::b/*"}]
         }"#);
         assert!(pol.evaluate("s3:GetObject", "b", Some("k"), None).allow);
+    }
+
+    // ===== v0.8.4 #75 (audit H-4 + H-5) =====
+
+    #[test]
+    fn parse_resource_arn_bucket_form() {
+        let arn = parse_resource_arn("arn:aws:s3:::mybucket").expect("parse");
+        assert_eq!(arn, ResourceArn::Bucket("mybucket".into()));
+    }
+
+    #[test]
+    fn parse_resource_arn_object_form() {
+        let arn = parse_resource_arn("arn:aws:s3:::mybucket/some/key").expect("parse");
+        assert_eq!(
+            arn,
+            ResourceArn::Object {
+                bucket: "mybucket".into(),
+                key_pattern: "some/key".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_resource_arn_object_wildcard() {
+        let arn = parse_resource_arn("arn:aws:s3:::mybucket/*").expect("parse");
+        assert_eq!(
+            arn,
+            ResourceArn::Object {
+                bucket: "mybucket".into(),
+                key_pattern: "*".into(),
+            }
+        );
+        // Trailing-glob in key portion stays in `key_pattern` verbatim.
+        let pre = parse_resource_arn("arn:aws:s3:::b/data/*.parquet").expect("parse");
+        assert_eq!(
+            pre,
+            ResourceArn::Object {
+                bucket: "b".into(),
+                key_pattern: "data/*.parquet".into(),
+            }
+        );
+        // Bad ARN: missing prefix.
+        assert!(matches!(
+            parse_resource_arn("not-an-arn"),
+            Err(PolicyParseError::InvalidResourceArn(_))
+        ));
+        // Bad ARN: empty bucket.
+        assert!(matches!(
+            parse_resource_arn("arn:aws:s3:::"),
+            Err(PolicyParseError::EmptyBucketInArn(_))
+        ));
+        assert!(matches!(
+            parse_resource_arn("arn:aws:s3:::/key"),
+            Err(PolicyParseError::EmptyBucketInArn(_))
+        ));
+    }
+
+    #[test]
+    fn bucket_only_arn_does_not_grant_object_action() {
+        // Audit H-4: a bare `arn:aws:s3:::b` Resource MUST NOT grant
+        // `s3:GetObject` (or any other object-level action). Pre-v0.8.4
+        // it did, silently widening privilege.
+        let pol = p(r#"{
+            "Statement": [{
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::mybucket"
+            }]
+        }"#);
+        let d = pol.evaluate("s3:GetObject", "mybucket", Some("k"), None);
+        assert!(!d.allow, "bucket-form ARN must not grant s3:GetObject");
+        assert_eq!(d.matched_effect, None, "should be implicit deny");
+        // Sanity: an object-form ARN against the same bucket DOES grant.
+        let pol_ok = p(r#"{
+            "Statement": [{
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::mybucket/*"
+            }]
+        }"#);
+        assert!(
+            pol_ok
+                .evaluate("s3:GetObject", "mybucket", Some("k"), None)
+                .allow
+        );
+    }
+
+    #[test]
+    fn object_arn_does_not_grant_bucket_action() {
+        // Audit H-4 (other direction): an `arn:aws:s3:::b/k` Resource
+        // MUST NOT grant `s3:ListBucket` (a bucket-level action).
+        let pol = p(r#"{
+            "Statement": [{
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": "s3:ListBucket",
+              "Resource": "arn:aws:s3:::b/k"
+            }]
+        }"#);
+        let d = pol.evaluate("s3:ListBucket", "b", None, None);
+        assert!(!d.allow, "object-form ARN must not grant s3:ListBucket");
+        assert_eq!(d.matched_effect, None);
+    }
+
+    #[test]
+    fn principal_wildcard_only_accepts_literal_star() {
+        // Audit H-5: a bare `"Principal": "AKIA..."` must be rejected
+        // at parse time — pre-v0.8.4 it deserialized to
+        // `PrincipalSet::Wildcard("AKIA...")` and silently matched any
+        // caller (incl. anonymous).
+        let err = Policy::from_json_str_typed(
+            r#"{"Statement": [{
+              "Effect": "Allow", "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::b/*",
+              "Principal": "AKIATESTNOTAWILDCARD"
+            }]}"#,
+        )
+        .expect_err("non-* string principal must be rejected");
+        assert!(
+            matches!(err, PolicyParseError::InvalidWildcard(ref s) if s == "AKIATESTNOTAWILDCARD"),
+            "expected InvalidWildcard, got {err:?}"
+        );
+        // The literal "*" still parses fine.
+        let ok = PrincipalSet::parse(&serde_json::Value::String("*".into())).expect("ok");
+        assert_eq!(ok, PrincipalSet::Wildcard);
+    }
+
+    #[test]
+    fn principal_unsupported_service_type_rejected() {
+        // Audit H-5: `{"Service": "..."}` (and other non-AWS principal
+        // types) must be rejected at parse time so a policy author
+        // can't think they granted access to a Lambda role when in
+        // fact the field was silently dropped to "match anyone".
+        let err = Policy::from_json_str_typed(
+            r#"{"Statement": [{
+              "Effect": "Allow", "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::b/*",
+              "Principal": {"Service": "lambda.amazonaws.com"}
+            }]}"#,
+        )
+        .expect_err("Service principal must be rejected");
+        assert!(
+            matches!(err, PolicyParseError::UnsupportedPrincipalType),
+            "expected UnsupportedPrincipalType, got {err:?}"
+        );
+        // Federated / CanonicalUser also rejected.
+        for shape in [
+            r#"{"Federated": "cognito-identity.amazonaws.com"}"#,
+            r#"{"CanonicalUser": "abcdef"}"#,
+            r#"{"AWS": "AKIA", "Service": "x"}"#,
+        ] {
+            let v: serde_json::Value = serde_json::from_str(shape).unwrap();
+            assert!(
+                matches!(
+                    PrincipalSet::parse(&v),
+                    Err(PolicyParseError::UnsupportedPrincipalType)
+                ),
+                "expected UnsupportedPrincipalType for {shape}"
+            );
+        }
+    }
+
+    #[test]
+    fn principal_empty_aws_list_rejected() {
+        // Audit H-5: `{"AWS": []}` must be rejected — pre-v0.8.4 the
+        // empty list flowed through `principals: Some(vec![])` which
+        // the matcher treated as "any caller", silently widening.
+        let err = Policy::from_json_str_typed(
+            r#"{"Statement": [{
+              "Effect": "Allow", "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::b/*",
+              "Principal": {"AWS": []}
+            }]}"#,
+        )
+        .expect_err("empty AWS principal list must be rejected");
+        assert!(
+            matches!(err, PolicyParseError::EmptyPrincipalList),
+            "expected EmptyPrincipalList, got {err:?}"
+        );
+        // Sanity: a single-element list parses to Specific.
+        let v: serde_json::Value = serde_json::from_str(r#"{"AWS": "AKIAONE"}"#).unwrap();
+        assert_eq!(
+            PrincipalSet::parse(&v).unwrap(),
+            PrincipalSet::Specific(vec!["AKIAONE".into()])
+        );
+        // Anonymous caller against a Specific list → no match.
+        let pol = p(r#"{"Statement": [{
+            "Effect": "Allow", "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::b/*",
+            "Principal": {"AWS": ["AKIAONE"]}
+        }]}"#);
+        assert!(!pol.evaluate("s3:GetObject", "b", Some("k"), None).allow);
     }
 }
