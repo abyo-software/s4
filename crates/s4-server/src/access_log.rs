@@ -39,7 +39,8 @@ use bytes::Bytes;
 use tokio::sync::Mutex;
 
 use crate::audit_log::{
-    AuditHmacKey, PREV_TAIL_COMMENT_PREFIX, chain_step, genesis_prev, hex_encode,
+    AuditHmacKey, EOF_HMAC_COMMENT_PREFIX, PREV_TAIL_COMMENT_PREFIX, chain_step, compute_eof_hmac,
+    genesis_prev, hex_encode,
 };
 
 /// Per-request structured fields collected at handler completion. The
@@ -115,6 +116,18 @@ pub struct AccessLog {
     /// the genesis seed if nothing has been emitted yet). Updated
     /// in-place at the end of each flush batch.
     chain_state: Arc<Mutex<ChainState>>,
+    /// v0.8.2 #63: synchronous mirror of the chain state's `last_hmac`,
+    /// kept under a `std::sync::Mutex` so `Drop` (which runs in
+    /// non-async contexts during graceful shutdown) can compute and
+    /// write a final `# eof_hmac=` marker without entering the tokio
+    /// runtime. `None` until at least one batch has been emitted.
+    last_emitted_hmac: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    /// v0.8.2 #63: the path of the most recently flushed batch file —
+    /// kept for diagnostics. Each batch file is already terminated by
+    /// an `# eof_hmac=` marker as it is written, so `Drop`'s job is
+    /// only to flush any **pending** entries plus a marker into a new
+    /// final batch file.
+    last_emitted_path: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +157,8 @@ impl AccessLog {
             batch_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             hmac_key: None,
             chain_state: Arc::new(Mutex::new(ChainState::default())),
+            last_emitted_hmac: Arc::new(std::sync::Mutex::new(None)),
+            last_emitted_path: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -179,6 +194,8 @@ impl AccessLog {
         let counter = Arc::clone(&self.batch_counter);
         let hmac_key = self.hmac_key.clone();
         let chain_state = Arc::clone(&self.chain_state);
+        let last_emitted_hmac = Arc::clone(&self.last_emitted_hmac);
+        let last_emitted_path = Arc::clone(&self.last_emitted_path);
         if let Err(e) = std::fs::create_dir_all(&dest.dir) {
             tracing::warn!(
                 "S4 access log: could not create dir {}: {e}",
@@ -199,14 +216,30 @@ impl AccessLog {
                 let now = SystemTime::now();
                 let batch = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let path = dest.path_for(now, batch);
-                let body = if let Some(key) = hmac_key.as_ref() {
+                let (body, new_last_for_drop) = if let Some(key) = hmac_key.as_ref() {
                     let mut state = chain_state.lock().await;
                     let (rendered, new_last) = render_lines_chained(&drained, key, &state);
                     state.last_hmac = new_last;
                     state.primed = true;
-                    rendered
+                    // v0.8.2 #63: append the EOF HMAC marker as the
+                    // last line of every batch file. Each batch is its
+                    // own file under the current rotation scheme
+                    // (batch counter is in the filename), so end-of-
+                    // batch == end-of-file, and a verifier with
+                    // `--require-eof-hmac` can therefore alert on any
+                    // file that ended mid-write (truncation / crash —
+                    // closing H-2). The marker is computed over the
+                    // chain state AFTER the last emitted entry and is
+                    // NOT itself part of the chain (uses the EOF_LABEL
+                    // domain separator).
+                    let mut with_marker = rendered;
+                    let eof = compute_eof_hmac(key, &new_last);
+                    with_marker.push_str(EOF_HMAC_COMMENT_PREFIX);
+                    with_marker.push_str(&hex_encode(&eof));
+                    with_marker.push('\n');
+                    (with_marker, Some(new_last))
                 } else {
-                    render_lines(&drained)
+                    (render_lines(&drained), None)
                 };
                 let body_bytes: Bytes = Bytes::from(body);
                 let path_clone = path.clone();
@@ -220,7 +253,20 @@ impl AccessLog {
                 })
                 .await;
                 match res {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        // v0.8.2 #63: only update the Drop bookkeeping
+                        // after a successful write — otherwise Drop
+                        // could try to flush against a path / chain
+                        // state we never durably committed.
+                        if let Some(h) = new_last_for_drop {
+                            if let Ok(mut g) = last_emitted_hmac.lock() {
+                                *g = Some(h);
+                            }
+                            if let Ok(mut g) = last_emitted_path.lock() {
+                                *g = Some(path.clone());
+                            }
+                        }
+                    }
                     Ok(Err(e)) => {
                         tracing::warn!("S4 access log write failed at {}: {e}", path.display());
                     }
@@ -230,6 +276,103 @@ impl AccessLog {
                 }
             }
         })
+    }
+
+    /// v0.8.2 #63: best-effort drain of any buffered entries plus a
+    /// terminating `# eof_hmac=` marker, used by `Drop` (graceful
+    /// shutdown). Synchronous — runs blocking file I/O on the calling
+    /// thread because `Drop` cannot `.await`. Errors are
+    /// logged-and-swallowed; a producer crash that prevents this from
+    /// running is the only legitimate way for an audit log file to end
+    /// without an EOF marker, and strict verifiers
+    /// (`require_eof_hmac = true`) will surface that as
+    /// [`crate::audit_log::VerifyError::EofHmacMissing`].
+    fn drop_emit_eof_marker(&mut self) {
+        // try_lock so Drop never blocks. Anything we cannot drain is
+        // lost — but that loss was already implicit pre-v0.8.2 (the
+        // flusher could be killed mid-tick) and we are not making it
+        // worse. The EOF marker is generated for the new batch file
+        // we are about to create alongside the salvaged entries.
+        let pending: Vec<AccessLogEntry> = match self.buf.try_lock() {
+            Ok(mut b) => b.drain(..).collect(),
+            Err(_) => Vec::new(),
+        };
+        let Some(key) = self.hmac_key.clone() else {
+            // Without HMAC chaining there is nothing to authenticate;
+            // the audit_log path is degenerate. Do nothing — pending
+            // entries are dropped, matching pre-v0.8.2 behavior.
+            return;
+        };
+        if pending.is_empty() {
+            // Every batch file written by `spawn_flusher` already
+            // carries its own `# eof_hmac=` marker, so a graceful
+            // shutdown with nothing buffered has no extra work to do
+            // here; pre-existing files are already verifiable.
+            return;
+        }
+        // Synchronous render path — we cannot `.await chain_state.lock()`
+        // from `Drop`. Try to `try_lock` the async chain state for the
+        // most up-to-date view; fall back to the synchronous mirror
+        // (`last_emitted_hmac`) which the flusher updates after every
+        // successful write; finally fall back to genesis (treating
+        // this as a fresh chain).
+        let mut state = ChainState::default();
+        if let Ok(s) = self.chain_state.try_lock() {
+            state = s.clone();
+        } else if let Ok(g) = self.last_emitted_hmac.lock()
+            && let Some(h) = *g
+        {
+            state.last_hmac = h;
+            state.primed = true;
+        }
+        let now = SystemTime::now();
+        let batch = self
+            .batch_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = self.dest.path_for(now, batch);
+        let (rendered, new_last) = render_lines_chained(&pending, &key, &state);
+        let mut with_marker = rendered;
+        let eof = compute_eof_hmac(&key, &new_last);
+        with_marker.push_str(EOF_HMAC_COMMENT_PREFIX);
+        with_marker.push_str(&hex_encode(&eof));
+        with_marker.push('\n');
+        if let Err(e) = std::fs::create_dir_all(&self.dest.dir) {
+            tracing::warn!(
+                "S4 access log Drop: could not ensure dir {}: {e}",
+                self.dest.dir.display()
+            );
+            return;
+        }
+        let res = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(with_marker.as_bytes())
+            });
+        if let Err(e) = res {
+            tracing::warn!(
+                "S4 access log Drop: failed to flush + EOF marker to {}: {e}",
+                path.display()
+            );
+        } else if let Ok(mut g) = self.last_emitted_path.lock() {
+            *g = Some(path);
+        }
+    }
+}
+
+impl Drop for AccessLog {
+    fn drop(&mut self) {
+        // v0.8.2 #63: best-effort EOF marker emission on graceful
+        // shutdown. Process crashes that prevent this from running
+        // are by construction undetectable from the producer side;
+        // operators who need crash-safe truncation detection should
+        // run the verifier with `--require-eof-hmac` and treat
+        // `EofHmacMissing` as a "this file ended without a clean
+        // shutdown" alert (which is exactly the H-2 baseline we are
+        // closing).
+        self.drop_emit_eof_marker();
     }
 }
 
@@ -406,8 +549,13 @@ mod tests {
             assert!(suf[1..].chars().all(|c| c.is_ascii_hexdigit()));
         }
         // Verifier is happy.
-        let report =
-            verify_audit_bytes(std::path::Path::new("<mem>"), text.as_bytes(), &key).unwrap();
+        let report = verify_audit_bytes(
+            std::path::Path::new("<mem>"),
+            text.as_bytes(),
+            &key,
+            crate::audit_log::VerifyOptions::default(),
+        )
+        .unwrap();
         assert!(report.first_break.is_none());
         assert_eq!(report.ok_lines, 3);
     }
@@ -416,7 +564,7 @@ mod tests {
     fn second_batch_emits_prev_file_tail_and_chains() {
         use std::str::FromStr;
 
-        use crate::audit_log::{AuditHmacKey, verify_audit_bytes};
+        use crate::audit_log::{AuditHmacKey, VerifyOptions, verify_audit_bytes};
         let key = AuditHmacKey::from_str("raw:0123456789abcdef0123456789abcdef").unwrap();
 
         // First batch.
@@ -431,13 +579,23 @@ mod tests {
         let entries2 = vec![sample_entry("b2")];
         let (text2, _) = render_lines_chained(&entries2, &key, &state);
         assert!(text2.starts_with("# prev_file_tail="));
-        let report =
-            verify_audit_bytes(std::path::Path::new("<mem>"), text2.as_bytes(), &key).unwrap();
+        let report = verify_audit_bytes(
+            std::path::Path::new("<mem>"),
+            text2.as_bytes(),
+            &key,
+            VerifyOptions::default(),
+        )
+        .unwrap();
         assert!(report.first_break.is_none(), "second batch must verify");
         assert_eq!(report.ok_lines, 1);
         // First batch verifies on its own too.
-        let r1 =
-            verify_audit_bytes(std::path::Path::new("<mem>"), text1.as_bytes(), &key).unwrap();
+        let r1 = verify_audit_bytes(
+            std::path::Path::new("<mem>"),
+            text1.as_bytes(),
+            &key,
+            VerifyOptions::default(),
+        )
+        .unwrap();
         assert!(r1.first_break.is_none());
     }
 

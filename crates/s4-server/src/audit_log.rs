@@ -78,6 +78,12 @@ use thiserror::Error;
 /// not const-fn yet.
 pub const GENESIS_LABEL: &[u8] = b"S4-AUDIT-V1";
 
+/// v0.8.2 #63: domain-separation label for the EOF HMAC marker. The
+/// EOF marker is a separate HMAC over `EOF_LABEL || prev_chain_state`
+/// so it cannot collide with any chain entry (whose input is
+/// `prev_hmac || line_bytes`).
+pub const EOF_LABEL: &[u8] = b"S4-AUDIT-EOF-V1";
+
 /// Hex-encoded HMAC field length in characters (SHA-256 → 32 bytes →
 /// 64 hex chars).
 pub const HMAC_HEX_LEN: usize = 64;
@@ -85,6 +91,12 @@ pub const HMAC_HEX_LEN: usize = 64;
 /// Comment prefix used to carry the previous file's last HMAC across a
 /// rotation boundary.
 pub const PREV_TAIL_COMMENT_PREFIX: &str = "# prev_file_tail=";
+
+/// v0.8.2 #63: comment prefix carrying the EOF HMAC marker. Written as
+/// the **last** line of every rotated / closed audit-log file so a
+/// verifier with `require_eof_hmac = true` can detect tail truncation
+/// (H-2). Computed via [`compute_eof_hmac`].
+pub const EOF_HMAC_COMMENT_PREFIX: &str = "# eof_hmac=";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -192,6 +204,29 @@ pub fn chain_step(key: &AuditHmacKey, prev_hmac: &[u8], line_no_hmac: &[u8]) -> 
     buf
 }
 
+/// v0.8.2 #63: compute the EOF HMAC marker.
+///
+/// `eof_hmac = HMAC-SHA256(key, EOF_LABEL || prev_chain_state)`.
+///
+/// `prev_chain_state` is the last chained HMAC emitted in the file
+/// (or [`genesis_prev`] when the file contained no chained entries).
+/// The marker is written as a separate trailing comment line and is
+/// **not** itself part of the chain — verifiers honour it as a tail
+/// authenticator independent of the per-entry chain so a downstream
+/// truncation that lops off entries plus the marker is detectable
+/// (whereas truncation that preserves a valid prefix is not, without
+/// the marker — that is the H-2 attack baseline).
+pub fn compute_eof_hmac(key: &AuditHmacKey, prev_chain_state: &[u8; 32]) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes())
+        .expect("HMAC-SHA256 accepts any key length");
+    mac.update(EOF_LABEL);
+    mac.update(prev_chain_state);
+    let out = mac.finalize().into_bytes();
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&out);
+    buf
+}
+
 /// Render `bytes` as lowercase hex (no separators).
 pub fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -214,6 +249,28 @@ pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// v0.8.2 #63: knobs that change how strictly `verify_audit_log` walks
+/// the file. Defaults preserve back-compat with v0.5 #31 callers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VerifyOptions {
+    /// Operator-supplied previous-file tail HMAC. When `Some(tail)`, any
+    /// `# prev_file_tail=<hex>` comment in the file is ignored as
+    /// authentication (it is still parsed as a sanity check, but the
+    /// chain seed is the operator-supplied value). Eliminates H-3
+    /// (splice/replay): an attacker who fabricates a `# prev_file_tail=`
+    /// comment cannot forge cross-file linkage when the operator
+    /// supplies the real previous-file's tail out-of-band.
+    pub expected_prev_tail: Option<[u8; 32]>,
+    /// When `true`, the file MUST end with a recognized
+    /// `# eof_hmac=<hex>` marker that verifies against the file's
+    /// final chain state; otherwise the verifier returns
+    /// [`VerifyError::EofHmacMissing`] (or [`VerifyError::EofHmacMismatch`]
+    /// on a malformed value). Mitigates H-2 (truncation un-detection).
+    /// Off by default for back-compat with pre-v0.8.2 audit logs that
+    /// don't yet carry the marker.
+    pub require_eof_hmac: bool,
+}
+
 /// Result of `verify_audit_log`. `first_break` is `None` when the
 /// chain is intact end-to-end.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +278,18 @@ pub struct VerifyReport {
     pub total_lines: u64,
     pub ok_lines: u64,
     pub first_break: Option<VerifyBreak>,
+    /// v0.8.2 #63: `true` when the file does NOT end with a recognized
+    /// `# eof_hmac=<hex>` marker. With `require_eof_hmac = false` this
+    /// is informational (operator should treat as suspicious for any
+    /// post-v0.8.2 producer); with `require_eof_hmac = true` the
+    /// verifier additionally returns [`VerifyError::EofHmacMissing`].
+    pub unsigned_eof: bool,
+    /// v0.8.2 #63: `true` when the chain seed for this file came from
+    /// an in-file `# prev_file_tail=<hex>` comment that is not itself
+    /// authenticated (H-3 baseline). Cleared when the operator supplied
+    /// `VerifyOptions::expected_prev_tail` (then the chain seed is
+    /// trusted-by-construction).
+    pub unsigned_prev_tail: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,6 +316,23 @@ pub enum VerifyError {
         path: std::path::PathBuf,
         value: String,
     },
+    /// v0.8.2 #63: `--require-eof-hmac` was set and the file did not
+    /// end with a recognized `# eof_hmac=<hex>` marker line.
+    #[error(
+        "audit-log file {path:?}: required `# eof_hmac=` marker is absent (truncation suspected — H-2)"
+    )]
+    EofHmacMissing { path: std::path::PathBuf },
+    /// v0.8.2 #63: the EOF marker was present but its value either
+    /// failed hex-decode / length check, or did not match the recomputed
+    /// `HMAC(key, EOF_LABEL || prev_chain_state)`.
+    #[error(
+        "audit-log file {path:?}: `# eof_hmac=` marker did not authenticate (expected {expected:?}, got {actual:?})"
+    )]
+    EofHmacMismatch {
+        path: std::path::PathBuf,
+        expected: String,
+        actual: String,
+    },
 }
 
 /// Walk an audit-log file, recomputing each line's HMAC and comparing
@@ -256,17 +342,25 @@ pub enum VerifyError {
 ///
 /// Comment lines (lines starting with `#`) are honoured — specifically
 /// `# prev_file_tail=<hex>` resets the running `prev_hmac` to that
-/// value before the next non-comment line. Other comment lines are
-/// counted but not chain-checked.
+/// value before the next non-comment line, and `# eof_hmac=<hex>`
+/// (when present) is captured for the end-of-file authentication
+/// check. Other comment lines are counted but not chain-checked.
 ///
 /// Empty / whitespace-only lines are skipped (counted but neither
 /// chain-checked nor flagged).
-pub fn verify_audit_log(path: &Path, key: &AuditHmacKey) -> Result<VerifyReport, VerifyError> {
+///
+/// `options` controls the H-2 / H-3 mitigations introduced in v0.8.2
+/// #63 — see [`VerifyOptions`].
+pub fn verify_audit_log(
+    path: &Path,
+    key: &AuditHmacKey,
+    options: VerifyOptions,
+) -> Result<VerifyReport, VerifyError> {
     let raw = std::fs::read(path).map_err(|source| VerifyError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    verify_audit_bytes(path, &raw, key)
+    verify_audit_bytes(path, &raw, key, options)
 }
 
 /// Same as `verify_audit_log` but takes the in-memory bytes directly.
@@ -276,16 +370,34 @@ pub fn verify_audit_bytes(
     path: &Path,
     bytes: &[u8],
     key: &AuditHmacKey,
+    options: VerifyOptions,
 ) -> Result<VerifyReport, VerifyError> {
     let text = std::str::from_utf8(bytes).map_err(|e| VerifyError::Io {
         path: path.to_path_buf(),
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
     })?;
 
-    let mut prev_hmac: [u8; 32] = genesis_prev();
-    let mut have_explicit_prev = false;
+    // v0.8.2 #63: when the operator supplies the previous-file tail
+    // out-of-band, seed the chain from it and ignore any in-file
+    // `# prev_file_tail=` comment as authentication. Otherwise fall
+    // back to the v0.5 behavior of trusting the in-file comment as
+    // a hint (and surface that fact via `unsigned_prev_tail`).
+    let operator_seed = options.expected_prev_tail;
+    let mut prev_hmac: [u8; 32] = operator_seed.unwrap_or_else(genesis_prev);
+    // Tracks whether the chain seed currently in `prev_hmac` came from
+    // an in-file `# prev_file_tail=<hex>` comment (used to flag
+    // `unsigned_prev_tail`). Always false when the operator supplied a
+    // seed (the operator value is trusted-by-construction).
+    let mut prev_tail_came_from_file = false;
     let mut total: u64 = 0;
     let mut ok: u64 = 0;
+    let mut eof_marker: Option<[u8; 32]> = None;
+    // The chain state at the moment we observed the EOF marker — used
+    // to recompute `HMAC(key, EOF_LABEL || state)` and compare. We
+    // capture this at the line *before* the marker so trailing blank
+    // lines after the marker do not change the authenticator input.
+    let mut state_at_eof: [u8; 32] = prev_hmac;
+    let mut saw_eof_marker_line = false;
 
     for (idx, raw_line) in text.split_inclusive('\n').enumerate() {
         total += 1;
@@ -309,8 +421,40 @@ pub fn verify_audit_bytes(
                     value: hex.to_owned(),
                 });
             }
-            prev_hmac.copy_from_slice(&bytes);
-            have_explicit_prev = true;
+            // Operator seed wins — H-3 mitigation. We still parse the
+            // comment (so a malformed value is loud) but do NOT let it
+            // override the operator-supplied chain seed.
+            if operator_seed.is_none() {
+                prev_hmac.copy_from_slice(&bytes);
+                state_at_eof = prev_hmac;
+                prev_tail_came_from_file = true;
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(EOF_HMAC_COMMENT_PREFIX) {
+            // v0.8.2 #63: capture the marker for end-of-file validation
+            // but do NOT chain-step it — the marker is authenticated
+            // separately via `compute_eof_hmac`. The marker uses the
+            // chain state AS OF THIS LINE, matching the producer's
+            // contract (the producer writes `compute_eof_hmac(key,
+            // last_chain_hmac)` immediately after the last entry).
+            let hex = rest.trim();
+            match hex_decode(hex) {
+                Some(b) if b.len() == 32 => {
+                    let mut buf = [0u8; 32];
+                    buf.copy_from_slice(&b);
+                    eof_marker = Some(buf);
+                    state_at_eof = prev_hmac;
+                    saw_eof_marker_line = true;
+                }
+                _ => {
+                    return Err(VerifyError::EofHmacMismatch {
+                        path: path.to_path_buf(),
+                        expected: "<computed at end-of-file>".to_owned(),
+                        actual: hex.to_owned(),
+                    });
+                }
+            }
             continue;
         }
         if line.starts_with('#') {
@@ -329,6 +473,8 @@ pub fn verify_audit_bytes(
                         expected_hmac: hex_encode(&chain_step(key, &prev_hmac, line.as_bytes())),
                         actual_hmac: "<missing>".to_owned(),
                     }),
+                    unsigned_eof: !saw_eof_marker_line,
+                    unsigned_prev_tail: prev_tail_came_from_file,
                 });
             }
         };
@@ -337,7 +483,6 @@ pub fn verify_audit_bytes(
         if expected_hex == actual_hex {
             ok += 1;
             prev_hmac = expected;
-            have_explicit_prev = true;
         } else {
             return Ok(VerifyReport {
                 total_lines: total,
@@ -347,14 +492,37 @@ pub fn verify_audit_bytes(
                     expected_hmac: expected_hex,
                     actual_hmac: actual_hex.to_owned(),
                 }),
+                unsigned_eof: !saw_eof_marker_line,
+                unsigned_prev_tail: prev_tail_came_from_file,
             });
         }
     }
-    let _ = have_explicit_prev; // reserved for future cross-file walk reporting
+
+    // EOF marker check. If the marker appeared in the loop we captured
+    // the chain state at that point in `state_at_eof`. The producer
+    // computes `compute_eof_hmac(key, last_entry_hmac)`; the verifier
+    // recomputes the same and compares.
+    if let Some(marker) = eof_marker {
+        let expected = compute_eof_hmac(key, &state_at_eof);
+        if expected != marker {
+            return Err(VerifyError::EofHmacMismatch {
+                path: path.to_path_buf(),
+                expected: hex_encode(&expected),
+                actual: hex_encode(&marker),
+            });
+        }
+    } else if options.require_eof_hmac {
+        return Err(VerifyError::EofHmacMissing {
+            path: path.to_path_buf(),
+        });
+    }
+
     Ok(VerifyReport {
         total_lines: total,
         ok_lines: ok,
         first_break: None,
+        unsigned_eof: !saw_eof_marker_line,
+        unsigned_prev_tail: prev_tail_came_from_file,
     })
 }
 
@@ -442,8 +610,13 @@ mod tests {
             buf.push('\n');
             prev = mac;
         }
-        let report =
-            verify_audit_bytes(std::path::Path::new("<mem>"), buf.as_bytes(), &key).unwrap();
+        let report = verify_audit_bytes(
+            std::path::Path::new("<mem>"),
+            buf.as_bytes(),
+            &key,
+            VerifyOptions::default(),
+        )
+        .unwrap();
         assert_eq!(report.total_lines, 3);
         assert_eq!(report.ok_lines, 3);
         assert!(report.first_break.is_none());
@@ -465,8 +638,13 @@ mod tests {
         }
         // Flip one character in the middle of line 2's body.
         let bad = buf.replace("middle", "MIDDLE");
-        let report =
-            verify_audit_bytes(std::path::Path::new("<mem>"), bad.as_bytes(), &key).unwrap();
+        let report = verify_audit_bytes(
+            std::path::Path::new("<mem>"),
+            bad.as_bytes(),
+            &key,
+            VerifyOptions::default(),
+        )
+        .unwrap();
         assert!(report.first_break.is_some(), "expected a break");
         let br = report.first_break.unwrap();
         assert_eq!(br.line_no, 2, "break should be on line 2");
@@ -488,8 +666,13 @@ mod tests {
         bad.push_str(&s[..last]);
         bad.push(new_c);
         bad.push_str(&s[last + 1..]);
-        let report =
-            verify_audit_bytes(std::path::Path::new("<mem>"), bad.as_bytes(), &key).unwrap();
+        let report = verify_audit_bytes(
+            std::path::Path::new("<mem>"),
+            bad.as_bytes(),
+            &key,
+            VerifyOptions::default(),
+        )
+        .unwrap();
         let br = report.first_break.expect("expected break");
         assert_eq!(br.line_no, 1);
         // Actual byte was flipped, so c is unchanged in `bad`.
@@ -500,8 +683,13 @@ mod tests {
     fn missing_hmac_column_reports_break_with_missing_marker() {
         let key = key();
         let s = "no hmac at all\n";
-        let report =
-            verify_audit_bytes(std::path::Path::new("<mem>"), s.as_bytes(), &key).unwrap();
+        let report = verify_audit_bytes(
+            std::path::Path::new("<mem>"),
+            s.as_bytes(),
+            &key,
+            VerifyOptions::default(),
+        )
+        .unwrap();
         let br = report.first_break.expect("expected break");
         assert_eq!(br.actual_hmac, "<missing>");
     }
@@ -513,8 +701,13 @@ mod tests {
         let line1 = "first file lone line";
         let mac1 = chain_step(&key, &genesis_prev(), line1.as_bytes());
         let f1 = format!("{} {}\n", line1, hex_encode(&mac1));
-        let r1 =
-            verify_audit_bytes(std::path::Path::new("<f1>"), f1.as_bytes(), &key).unwrap();
+        let r1 = verify_audit_bytes(
+            std::path::Path::new("<f1>"),
+            f1.as_bytes(),
+            &key,
+            VerifyOptions::default(),
+        )
+        .unwrap();
         assert!(r1.first_break.is_none());
 
         // Second "file": prev_file_tail comment, then one line whose
@@ -527,11 +720,19 @@ mod tests {
             line2,
             hex_encode(&mac2)
         );
-        let r2 =
-            verify_audit_bytes(std::path::Path::new("<f2>"), f2.as_bytes(), &key).unwrap();
+        let r2 = verify_audit_bytes(
+            std::path::Path::new("<f2>"),
+            f2.as_bytes(),
+            &key,
+            VerifyOptions::default(),
+        )
+        .unwrap();
         assert!(r2.first_break.is_none(), "cross-file chain must verify");
         assert_eq!(r2.ok_lines, 1);
         assert_eq!(r2.total_lines, 2); // comment + entry
+        // v0.8.2 #63: in-file `# prev_file_tail=` is the chain seed
+        // here (no operator override) so the report flags it.
+        assert!(r2.unsigned_prev_tail);
     }
 
     #[test]
@@ -550,8 +751,13 @@ mod tests {
             line2,
             hex_encode(&actual_mac)
         );
-        let r =
-            verify_audit_bytes(std::path::Path::new("<f2>"), f2.as_bytes(), &key).unwrap();
+        let r = verify_audit_bytes(
+            std::path::Path::new("<f2>"),
+            f2.as_bytes(),
+            &key,
+            VerifyOptions::default(),
+        )
+        .unwrap();
         assert!(r.first_break.is_some());
     }
 
@@ -582,5 +788,261 @@ mod tests {
         assert_eq!(s, "000102ff10ab");
         let dec = hex_decode(&s).unwrap();
         assert_eq!(dec, raw);
+    }
+
+    // ---------------------------------------------------------------
+    // v0.8.2 #63: H-2 (truncation) + H-3 (cross-file auth) tests.
+    // ---------------------------------------------------------------
+
+    /// Helper: render a chained file body for the given lines, optionally
+    /// seeded by a previous file's tail (mimicking what the producer
+    /// would write across rotations) and optionally appending the
+    /// v0.8.2 #63 EOF HMAC marker as the last line.
+    fn render_chained_file(
+        key: &AuditHmacKey,
+        prev_file_tail: Option<[u8; 32]>,
+        lines: &[&str],
+        with_eof_marker: bool,
+    ) -> (String, [u8; 32]) {
+        let mut out = String::new();
+        let seed = if let Some(t) = prev_file_tail {
+            out.push_str(&format!(
+                "{}{}\n",
+                PREV_TAIL_COMMENT_PREFIX,
+                hex_encode(&t)
+            ));
+            t
+        } else {
+            genesis_prev()
+        };
+        let mut prev = seed;
+        for ln in lines {
+            let mac = chain_step(key, &prev, ln.as_bytes());
+            out.push_str(ln);
+            out.push(' ');
+            out.push_str(&hex_encode(&mac));
+            out.push('\n');
+            prev = mac;
+        }
+        if with_eof_marker {
+            let eof = compute_eof_hmac(key, &prev);
+            out.push_str(EOF_HMAC_COMMENT_PREFIX);
+            out.push_str(&hex_encode(&eof));
+            out.push('\n');
+        }
+        (out, prev)
+    }
+
+    /// v0.8.2 #63: H-3 mitigation — when the operator supplies the
+    /// previous-file tail out-of-band, an attacker-fabricated
+    /// `# prev_file_tail=` comment inside the file is ignored as
+    /// authentication. The chain must verify against the operator's
+    /// seed even when the in-file comment is wildly wrong.
+    #[test]
+    fn verify_with_expected_prev_tail_overrides_in_file_hint() {
+        let key = key();
+        // Producer's truth: previous file ended with this tail.
+        let real_prev_tail = [0x42u8; 32];
+        // What the producer would have written (chained from
+        // real_prev_tail). The in-file comment carries `real_prev_tail`
+        // honestly here; we'll then replace it with attacker junk
+        // and assert the operator-override path still verifies.
+        let (honest, _) = render_chained_file(
+            &key,
+            Some(real_prev_tail),
+            &["line one", "line two"],
+            false,
+        );
+        // Splice attack: rewrite the in-file `# prev_file_tail=` line
+        // to a fabricated value (32 zero bytes). Without operator
+        // hint a v0.5 verifier would seed from this fake; with the
+        // hint it must override and verify against the real tail.
+        let attacker_seed = [0u8; 32];
+        let spliced = honest.replacen(
+            &hex_encode(&real_prev_tail),
+            &hex_encode(&attacker_seed),
+            1,
+        );
+        // Sanity: the splice changed something.
+        assert_ne!(honest, spliced);
+        // Operator-override verify: pass the real tail; the verifier
+        // must ignore the in-file (now-attacker) comment as auth.
+        let report = verify_audit_bytes(
+            std::path::Path::new("<spliced>"),
+            spliced.as_bytes(),
+            &key,
+            VerifyOptions {
+                expected_prev_tail: Some(real_prev_tail),
+                require_eof_hmac: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            report.first_break.is_none(),
+            "operator-supplied tail must let the chain verify even when the in-file comment is a forged splice: {report:?}"
+        );
+        // Operator override means the chain seed is trusted, not from
+        // the file — so `unsigned_prev_tail` must be cleared.
+        assert!(!report.unsigned_prev_tail);
+
+        // Control: same spliced bytes WITHOUT operator override break
+        // because the entries were chained against `real_prev_tail`,
+        // not against the attacker's value.
+        let no_override = verify_audit_bytes(
+            std::path::Path::new("<spliced>"),
+            spliced.as_bytes(),
+            &key,
+            VerifyOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            no_override.first_break.is_some(),
+            "without operator override the spliced comment seeds wrong, breaking the chain"
+        );
+        assert!(no_override.unsigned_prev_tail);
+    }
+
+    /// v0.8.2 #63: H-2 mitigation — when `require_eof_hmac = true` and
+    /// the file does not carry a `# eof_hmac=` marker, the verifier
+    /// returns `EofHmacMissing`. This is the strict mode operators run
+    /// to detect tail truncation.
+    #[test]
+    fn verify_without_eof_hmac_when_required_fails() {
+        let key = key();
+        let (body, _) = render_chained_file(&key, None, &["a", "b", "c"], false);
+        let err = verify_audit_bytes(
+            std::path::Path::new("<no-eof>"),
+            body.as_bytes(),
+            &key,
+            VerifyOptions {
+                expected_prev_tail: None,
+                require_eof_hmac: true,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, VerifyError::EofHmacMissing { .. }));
+    }
+
+    /// v0.8.2 #63: relaxed mode — pre-v0.8.2 logs (no EOF marker) still
+    /// verify successfully, but `unsigned_eof = true` flags them so a
+    /// dashboard / operator can decide whether to escalate.
+    #[test]
+    fn verify_without_eof_hmac_when_optional_succeeds_with_unsigned_eof_flag() {
+        let key = key();
+        let (body, _) = render_chained_file(&key, None, &["a", "b", "c"], false);
+        let report = verify_audit_bytes(
+            std::path::Path::new("<no-eof-relaxed>"),
+            body.as_bytes(),
+            &key,
+            VerifyOptions::default(),
+        )
+        .unwrap();
+        assert!(report.first_break.is_none());
+        assert!(report.unsigned_eof, "relaxed mode flags missing EOF marker");
+        assert_eq!(report.ok_lines, 3);
+    }
+
+    /// v0.8.2 #63: a complete file with EOF marker round-trips through
+    /// the verifier with both relaxed and strict (`require_eof_hmac`)
+    /// modes returning OK, no flags raised.
+    #[test]
+    fn eof_hmac_marker_round_trip() {
+        let key = key();
+        let (body, _) = render_chained_file(
+            &key,
+            None,
+            &["entry one", "entry two", "entry three"],
+            true,
+        );
+        // Relaxed mode.
+        let r1 = verify_audit_bytes(
+            std::path::Path::new("<eof-rt>"),
+            body.as_bytes(),
+            &key,
+            VerifyOptions::default(),
+        )
+        .unwrap();
+        assert!(r1.first_break.is_none());
+        assert!(!r1.unsigned_eof);
+        assert_eq!(r1.ok_lines, 3);
+        // Strict mode.
+        let r2 = verify_audit_bytes(
+            std::path::Path::new("<eof-rt>"),
+            body.as_bytes(),
+            &key,
+            VerifyOptions {
+                expected_prev_tail: None,
+                require_eof_hmac: true,
+            },
+        )
+        .unwrap();
+        assert!(r2.first_break.is_none());
+        assert!(!r2.unsigned_eof);
+    }
+
+    /// v0.8.2 #63 H-2 baseline: a truncated log without
+    /// `require_eof_hmac` silently passes verify (this is the attack
+    /// the issue documents). This regression test pins the baseline so
+    /// the next audit can reason about what `require_eof_hmac = false`
+    /// allows.
+    #[test]
+    fn truncated_log_without_expected_eof_silently_passes() {
+        let key = key();
+        // Producer wrote 4 entries + EOF marker.
+        let (full, _) = render_chained_file(
+            &key,
+            None,
+            &["alpha", "beta", "gamma", "delta"],
+            true,
+        );
+        // Attacker truncates after entry #2 (drops gamma, delta, marker).
+        let cut_at = full.find("gamma").expect("gamma in body");
+        let truncated = &full[..cut_at];
+        // Sanity: the truncated body is shorter and ends at a newline.
+        assert!(truncated.ends_with('\n'));
+        let report = verify_audit_bytes(
+            std::path::Path::new("<truncated>"),
+            truncated.as_bytes(),
+            &key,
+            VerifyOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            report.first_break.is_none(),
+            "H-2 baseline: a valid prefix verifies clean without `require_eof_hmac` — \
+             this is the attack window the marker closes"
+        );
+        // The flag is the only signal in relaxed mode.
+        assert!(report.unsigned_eof);
+        assert_eq!(report.ok_lines, 2);
+    }
+
+    /// v0.8.2 #63 H-2 mitigated: the same truncated log with
+    /// `require_eof_hmac = true` returns `EofHmacMissing`.
+    #[test]
+    fn truncated_log_with_require_eof_fails() {
+        let key = key();
+        let (full, _) = render_chained_file(
+            &key,
+            None,
+            &["alpha", "beta", "gamma", "delta"],
+            true,
+        );
+        let cut_at = full.find("gamma").expect("gamma in body");
+        let truncated = &full[..cut_at];
+        let err = verify_audit_bytes(
+            std::path::Path::new("<truncated-strict>"),
+            truncated.as_bytes(),
+            &key,
+            VerifyOptions {
+                expected_prev_tail: None,
+                require_eof_hmac: true,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, VerifyError::EofHmacMissing { .. }),
+            "strict mode rejects truncated logs (H-2 mitigated): got {err:?}"
+        );
     }
 }

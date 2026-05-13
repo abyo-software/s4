@@ -517,6 +517,21 @@ struct VerifyAuditLogArgs {
     /// `base64:<b64>`.
     #[clap(long = "hmac-key")]
     hmac_key: String,
+
+    /// v0.8.2 #63: operator-supplied previous-file tail HMAC (hex,
+    /// 64 chars). When set, the in-file `# prev_file_tail=` comment
+    /// is ignored as authentication (treated as a hint only),
+    /// eliminating splice/replay attacks via fabricated comment.
+    /// Closes audit finding H-3.
+    #[clap(long = "expected-prev-tail", value_name = "HEX")]
+    expected_prev_tail: Option<String>,
+
+    /// v0.8.2 #63: require the file end with a recognized
+    /// `# eof_hmac=` marker (truncation detection). Off by default
+    /// for back-compat with pre-v0.8.2 logs that don't have the
+    /// marker. Closes audit finding H-2.
+    #[clap(long = "require-eof-hmac", default_value_t = false)]
+    require_eof_hmac: bool,
 }
 
 fn setup_tracing(
@@ -1328,8 +1343,47 @@ fn run_subcommand(cmd: &Cmd) -> Result<(), Box<dyn Error + Send + Sync + 'static
         Cmd::VerifyAuditLog(args) => {
             let key = s4_server::audit_log::AuditHmacKey::from_str(&args.hmac_key)
                 .map_err(|e| format!("--hmac-key: {e}"))?;
-            let report = s4_server::audit_log::verify_audit_log(&args.file, &key)
+            // v0.8.2 #63: parse the optional operator-supplied prev tail
+            // (hex, must decode to 32 bytes).
+            let expected_prev_tail = if let Some(hex) = args.expected_prev_tail.as_deref() {
+                let bytes = s4_server::audit_log::hex_decode(hex.trim())
+                    .ok_or_else(|| "--expected-prev-tail: not valid hex".to_string())?;
+                if bytes.len() != 32 {
+                    return Err(format!(
+                        "--expected-prev-tail: must decode to 32 bytes, got {}",
+                        bytes.len()
+                    )
+                    .into());
+                }
+                let mut buf = [0u8; 32];
+                buf.copy_from_slice(&bytes);
+                Some(buf)
+            } else {
+                None
+            };
+            let options = s4_server::audit_log::VerifyOptions {
+                expected_prev_tail,
+                require_eof_hmac: args.require_eof_hmac,
+            };
+            let report = s4_server::audit_log::verify_audit_log(&args.file, &key, options)
                 .map_err(|e| format!("verify-audit-log {}: {e}", args.file.display()))?;
+            // v0.8.2 #63: surface the new flags in the OK output so the
+            // operator sees exactly what was authenticated. `unsigned_*`
+            // are warnings, not errors.
+            if report.unsigned_prev_tail {
+                eprintln!(
+                    "WARN {}: chain seed came from in-file `# prev_file_tail=` comment \
+                     (not operator-authenticated; pass --expected-prev-tail to close H-3)",
+                    args.file.display()
+                );
+            }
+            if report.unsigned_eof {
+                eprintln!(
+                    "WARN {}: file does not end with a `# eof_hmac=` marker \
+                     (truncation un-detection — H-2; pass --require-eof-hmac to escalate)",
+                    args.file.display()
+                );
+            }
             match report.first_break {
                 None => {
                     println!(
