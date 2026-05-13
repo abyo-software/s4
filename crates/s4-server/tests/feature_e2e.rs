@@ -3055,3 +3055,112 @@ async fn multipart_abort_drops_in_flight_parts() {
     let _ = spawned.shutdown.send(());
 }
 
+
+// =============================================================================
+// v0.8 #51 — GPU column scan E2E via aws-sdk-s3 SelectObjectContent.
+// =============================================================================
+//
+// Exercises the full wire path: AWS SDK builds the SelectObjectContent
+// request → S4 listener parses → s4-server `run_select_csv` tries the
+// new GPU fast path (`select_gpu`) → CUDA kernel filters → event-stream
+// frames go back over HTTP → SDK's EventReceiver decodes them.
+//
+// Gated `#[cfg(feature = "nvcomp-gpu")]` because the GPU fast path is
+// only compiled in with that feature; the test would otherwise just
+// exercise the existing CPU path that `s3_select_csv_filter_e2e` in
+// roundtrip.rs already covers. The kernel itself further skips at
+// runtime if no CUDA device is visible (init returns Err → CPU
+// fallback in `select_gpu`), so this still passes on a CPU-only CI box
+// — it just wouldn't exercise the GPU path on that host.
+#[cfg(feature = "nvcomp-gpu")]
+#[tokio::test]
+async fn s3_select_gpu_filter_via_aws_sdk() {
+    use aws_sdk_s3::types::{
+        CsvInput, CsvOutput, ExpressionType, FileHeaderInfo, InputSerialization,
+        OutputSerialization, SelectObjectContentEventStream,
+    };
+
+    let minio = start_minio().await;
+    let spawned = spawn_s4_with_options(&minio.endpoint_url, S4TestOpts::default()).await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    ensure_bucket(&backend_client, "gpu-select-e2e").await;
+    let s4_client = build_aws_client_v2(&spawned.endpoint_url);
+
+    // 1M-row CSV: id,country,value. id is the row index (0..=999_999).
+    // Hand-format integers to keep build fast at 1M rows.
+    let mut body = String::with_capacity(28_000_000);
+    body.push_str("id,country,value\n");
+    for i in 0..1_000_000u64 {
+        let country = if i % 10 == 0 { "Japan" } else { "Other" };
+        body.push_str(&format!("{i},{country},{}\n", i * 7));
+    }
+    s4_client
+        .put_object()
+        .bucket("gpu-select-e2e")
+        .key("rows.csv")
+        .body(bytes::Bytes::from(body.into_bytes()).into())
+        .send()
+        .await
+        .expect("PUT 1M-row CSV");
+
+    let select_resp = s4_client
+        .select_object_content()
+        .bucket("gpu-select-e2e")
+        .key("rows.csv")
+        .expression("SELECT * FROM s3object WHERE id > 500000")
+        .expression_type(ExpressionType::Sql)
+        .input_serialization(
+            InputSerialization::builder()
+                .csv(
+                    CsvInput::builder()
+                        .file_header_info(FileHeaderInfo::Use)
+                        .field_delimiter(",")
+                        .build(),
+                )
+                .build(),
+        )
+        .output_serialization(
+            OutputSerialization::builder()
+                .csv(CsvOutput::builder().build())
+                .build(),
+        )
+        .send()
+        .await
+        .expect("SelectObjectContent SDK call");
+
+    let mut payload = select_resp.payload;
+    let mut bytes_received = Vec::<u8>::new();
+    let mut saw_end = false;
+    while let Some(event) = payload
+        .recv()
+        .await
+        .expect("recv must not error on a successful call")
+    {
+        match event {
+            SelectObjectContentEventStream::Records(r) => {
+                if let Some(b) = r.payload {
+                    bytes_received.extend_from_slice(b.as_ref());
+                }
+            }
+            SelectObjectContentEventStream::Stats(_) => {}
+            SelectObjectContentEventStream::End(_) => {
+                saw_end = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_end, "End sentinel must be present in event stream");
+
+    // WHERE id > 500000 against ids 0..=999_999 = 499_999 matching
+    // rows. The kernel emits the header row plus one row per match —
+    // we verify the count by line.
+    let s = std::str::from_utf8(&bytes_received).expect("payload utf-8");
+    let row_count = s.lines().filter(|l| !l.is_empty()).count();
+    // Header (1) + 499_999 matches = 500_000 lines total.
+    assert_eq!(
+        row_count, 500_000,
+        "expected 1 header + 499_999 matching rows, got {row_count}"
+    );
+
+    let _ = spawned.shutdown.send(());
+}

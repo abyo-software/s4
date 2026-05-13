@@ -32,7 +32,12 @@ default = []
 # NVCOMP_HOME env var pointing to an extracted nvCOMP redist tarball at build
 # time, plus a CUDA-capable GPU at runtime. Without this feature, S4 runs
 # CPU-only (cpu_zstd / passthrough).
-nvcomp-gpu = []
+#
+# Pulls `cudarc` for the v0.8 #51 GPU column-scan kernel (see `gpu_select/`).
+# `cuda-12080` selects the CUDA 12.8 driver-API binding header subset; cudarc
+# loads `libcuda.so` / `libnvrtc.so` dynamically at runtime via libloading,
+# so the same binary works against any CUDA 12.x driver on the host.
+nvcomp-gpu = ["dep:cudarc"]
 
 [dependencies]
 async-trait.workspace = true
@@ -51,9 +56,19 @@ zstd.workspace = true
 tokio = { version = "1", default-features = false, features = ["rt"] }
 thiserror.workspace = true
 flate2 = "1"
+# v0.8 #51: GPU column scan for S3 Select. cudarc 0.13.x bundles the CUDA
+# 12.x driver / NVRTC bindings with runtime libloading — no CUDA SDK needed
+# at build time, just at runtime. `default-features = false` strips cuBLAS /
+# cuDNN / cuRAND / NCCL we don't use; we keep `std`, `driver` (which already
+# implies `nvrtc`), and the `cuda-12080` header subset.
+cudarc = { version = "0.13", optional = true, default-features = false, features = ["std", "driver", "cuda-12080"] }
 
 [dev-dependencies]
 # Tests use `#[tokio::test]` (= `macros` + `rt`).
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread"] }
 proptest.workspace = true
 bolero.workspace = true
+# v0.8 #51 bench (`examples/bench_gpu_select.rs`) compares GPU column scan
+# against the same `csv` crate pipeline s4-server's CPU `run_select_csv`
+# uses, so the speedup numbers reflect what users actually experience.
+csv = "1"

@@ -18,6 +18,14 @@ pub mod dietgpu;
 pub mod dispatcher;
 #[cfg(feature = "nvcomp-gpu")]
 mod ferro_compress;
+/// v0.8 #51: GPU-accelerated CSV column scan for the S3 Select WHERE
+/// evaluator. Feature-gated on `nvcomp-gpu` so the default build doesn't
+/// need cudarc / a CUDA driver. The s4-server `select` module calls into
+/// this only when the parsed query shape matches the supported subset
+/// (single-column equality / inequality / GT / LT / LIKE-prefix), and
+/// otherwise falls back to the existing CPU evaluator transparently.
+#[cfg(feature = "nvcomp-gpu")]
+pub mod gpu_select;
 pub mod index;
 pub mod multipart;
 pub mod nvcomp;

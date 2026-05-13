@@ -610,6 +610,20 @@ pub fn run_select_csv(
     input: SelectInputFormat,
     output: SelectOutputFormat,
 ) -> Result<Vec<u8>, SelectError> {
+    // v0.8 #51: try the GPU column-scan fast path first. It returns
+    // `None` if the query shape doesn't fit (multi-condition WHERE,
+    // projection that isn't `*`, no header, etc) or if the GPU
+    // surfaces a runtime error — in which case we transparently fall
+    // through to the CPU evaluator below. The GPU path only handles
+    // CSV-output today; CSV-output is what S3 Select callers use
+    // 95%+ of the time, so we gate the fast-path on that to keep the
+    // shape narrow.
+    if matches!(output, SelectOutputFormat::Csv)
+        && let Some(filtered) = select_gpu(sql, body, &input)
+    {
+        return Ok(filtered);
+    }
+
     let (has_header, delim) = match input {
         SelectInputFormat::Csv { has_header, delimiter } => (has_header, delimiter),
         SelectInputFormat::JsonLines => {
@@ -916,19 +930,201 @@ fn build_frame(headers: &[(&str, &str)], payload: Option<&[u8]>) -> Vec<u8> {
 }
 
 // =====================================================================
-// GPU stub (v0.7+ scope marker)
+// GPU column-scan fast path (v0.8 #51)
 // =====================================================================
+//
+// `select_gpu` is the entry point [`run_select_csv`] tries before
+// falling back to the per-row CPU evaluator. Its contract is "return
+// `Some(filtered_csv_bytes)` when the kernel both _can_ and _did_
+// handle the query, otherwise `None`". Failure modes that justify a
+// `None` return:
+//   - feature `nvcomp-gpu` is off (compile-time dispatch to the no-op
+//     fallback further down)
+//   - the SQL shape isn't single-column compare (multi-cond AND/OR,
+//     function calls, projection that's not `*`, etc)
+//   - the input isn't header-bearing CSV (JsonLines / no-header CSV)
+//   - the kernel hit a runtime error (no driver, OOB column, body
+//     larger than the device budget) — we swallow these and let the
+//     CPU path run so the user still gets a correct answer
+//
+// The CPU path is always the source of truth; the GPU path's output
+// must be byte-identical to it for any query the kernel claims to
+// support. The bench in `crates/s4-codec/examples/bench_gpu_select.rs`
+// asserts that explicitly on a 100M-row CSV.
 
-/// GPU acceleration stub — always returns `None` today. The integration
-/// test verifies it's wired but inactive; v0.7 will swap in an actual
-/// CUDA WHERE-evaluator.
+#[cfg(feature = "nvcomp-gpu")]
+mod gpu {
+    use super::{Expr, GenericDialect, Parser, SelectInputFormat, Statement, Value};
+    use s4_codec::gpu_select::{CompareOp, GpuSelectKernel};
+    use sqlparser::ast::{BinaryOperator, SelectItem, SetExpr};
+    use std::sync::OnceLock;
+
+    /// One global kernel instance per process — `GpuSelectKernel::new`
+    /// is expensive (CUDA context init + NVRTC compile) and the kernel
+    /// itself is stateless / thread-safe to call. We hold the result
+    /// of the first init attempt so subsequent Selects don't re-pay
+    /// the cost (or re-pay the failure log) on a host without CUDA.
+    static KERNEL: OnceLock<Option<GpuSelectKernel>> = OnceLock::new();
+
+    fn kernel() -> Option<&'static GpuSelectKernel> {
+        KERNEL
+            .get_or_init(|| match GpuSelectKernel::new() {
+                Ok(k) => Some(k),
+                Err(e) => {
+                    tracing::debug!(
+                        target: "s4_server::select::gpu",
+                        ?e,
+                        "GpuSelectKernel init failed; falling back to CPU permanently"
+                    );
+                    None
+                }
+            })
+            .as_ref()
+    }
+
+    /// Attempt the GPU path. Returns `Some(filtered_csv)` on success,
+    /// `None` if the query shape doesn't fit the kernel's supported
+    /// subset or the GPU surfaced an error.
+    pub(super) fn try_select_gpu(
+        sql: &str,
+        body: &[u8],
+        input: &SelectInputFormat,
+    ) -> Option<Vec<u8>> {
+        // Only header-bearing CSV qualifies — column-name lookup is
+        // how we resolve the WHERE column to an index.
+        let SelectInputFormat::Csv {
+            has_header: true,
+            delimiter: ',',
+        } = input
+        else {
+            return None;
+        };
+
+        let (col_name, op, literal) = parse_simple_predicate(sql)?;
+
+        // Resolve column name → index by reading the header row only.
+        // The kernel itself does the per-row column extraction; this
+        // host-side header parse is a single linear scan over the
+        // first ~kilobyte of the body.
+        let col_idx = resolve_header_column(body, &col_name)?;
+
+        let kernel = kernel()?;
+        match kernel.scan_csv(body, col_idx, op, literal.as_bytes()) {
+            Ok(out) => Some(out),
+            Err(e) => {
+                tracing::debug!(
+                    target: "s4_server::select::gpu",
+                    ?e,
+                    "GPU scan failed; falling back to CPU"
+                );
+                None
+            }
+        }
+    }
+
+    /// Narrow the parsed SQL down to the single `WHERE col OP literal`
+    /// shape the kernel handles. Anything else (AND/OR composition,
+    /// function calls, multi-column projection that isn't `*`)
+    /// returns `None` so the caller falls back to CPU.
+    fn parse_simple_predicate(sql: &str) -> Option<(String, CompareOp, String)> {
+        let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+        if stmts.len() != 1 {
+            return None;
+        }
+        let Statement::Query(query) = stmts.pop()? else {
+            return None;
+        };
+        if query.order_by.is_some() || query.limit.is_some() || query.with.is_some() {
+            return None;
+        }
+        let SetExpr::Select(select) = *query.body else {
+            return None;
+        };
+        // Projection must be `*` or a single bare wildcard / identifier
+        // — the kernel emits whole rows verbatim, so we can't apply a
+        // narrowing projection cheaply on the GPU side. (CPU path will
+        // do the projection if the user asked for one.)
+        let projection_is_star = select.projection.len() == 1
+            && matches!(select.projection[0], SelectItem::Wildcard(_));
+        if !projection_is_star {
+            return None;
+        }
+        let where_expr = select.selection?;
+
+        // Narrow WHERE to `Identifier OP Literal`.
+        let Expr::BinaryOp { op, left, right } = where_expr else {
+            return None;
+        };
+        let col_name = match *left {
+            Expr::Identifier(i) => i.value,
+            _ => return None,
+        };
+        let (cmp_op, literal_str) = match (op, *right) {
+            (BinaryOperator::Eq, Expr::Value(v)) => (CompareOp::Equal, value_as_str(&v)?),
+            (BinaryOperator::NotEq, Expr::Value(v)) => {
+                (CompareOp::NotEqual, value_as_str(&v)?)
+            }
+            (BinaryOperator::Gt, Expr::Value(v)) => {
+                (CompareOp::GreaterThan, value_as_str(&v)?)
+            }
+            (BinaryOperator::Lt, Expr::Value(v)) => {
+                (CompareOp::LessThan, value_as_str(&v)?)
+            }
+            _ => return None,
+        };
+
+        Some((col_name, cmp_op, literal_str))
+    }
+
+    fn value_as_str(v: &Value) -> Option<String> {
+        match v {
+            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Some(s.clone()),
+            Value::Number(s, _) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// Find the 0-based index of `col_name` (case-insensitive) in the
+    /// header row of `body`. Returns `None` if the column isn't
+    /// present. We only scan the first line — the kernel handles the
+    /// rest.
+    fn resolve_header_column(body: &[u8], col_name: &str) -> Option<usize> {
+        let nl = body.iter().position(|&b| b == b'\n').unwrap_or(body.len());
+        let mut header = &body[..nl];
+        if header.last() == Some(&b'\r') {
+            header = &header[..header.len() - 1];
+        }
+        let header_str = std::str::from_utf8(header).ok()?;
+        for (i, h) in header_str.split(',').enumerate() {
+            if h.eq_ignore_ascii_case(col_name) {
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
+/// GPU acceleration entry point — replaced the v0.6 #41 stub in
+/// v0.8 #51. Returns `Some(filtered_csv_bytes)` when the GPU path
+/// both _can_ and _did_ handle the query (single-column compare on
+/// header-bearing CSV); `None` means the caller should run the CPU
+/// path. The CPU path is always the source of truth for output
+/// formatting / projection / multi-condition WHERE / JSON Lines.
 #[must_use]
 pub fn select_gpu(
-    _sql: &str,
-    _body: &[u8],
-    _input: &SelectInputFormat,
+    sql: &str,
+    body: &[u8],
+    input: &SelectInputFormat,
 ) -> Option<Vec<u8>> {
-    None
+    #[cfg(feature = "nvcomp-gpu")]
+    {
+        gpu::try_select_gpu(sql, body, input)
+    }
+    #[cfg(not(feature = "nvcomp-gpu"))]
+    {
+        let _ = (sql, body, input);
+        None
+    }
 }
 
 // =====================================================================
@@ -1154,13 +1350,34 @@ mod tests {
     }
 
     #[test]
-    fn gpu_stub_returns_none() {
+    fn gpu_no_where_falls_through() {
+        // No WHERE clause → kernel can't accelerate (it needs a
+        // single-column predicate). `select_gpu` must return None
+        // regardless of whether the feature is built in or not.
         let v = select_gpu(
             "SELECT * FROM s3object",
             b"name,age\nalice,30\n",
             &csv_input(),
         );
-        assert!(v.is_none(), "GPU stub must always return None for v0.6");
+        assert!(
+            v.is_none(),
+            "queries without a WHERE predicate must fall through to CPU"
+        );
+    }
+
+    #[test]
+    fn gpu_jsonlines_falls_through() {
+        // JSON Lines isn't supported by the kernel — must always
+        // fall through, even when the feature is on.
+        let v = select_gpu(
+            "SELECT * FROM s3object WHERE country = 'Japan'",
+            b"{\"country\":\"Japan\"}\n",
+            &SelectInputFormat::JsonLines,
+        );
+        assert!(
+            v.is_none(),
+            "JSON Lines input must always fall through to CPU"
+        );
     }
 
     #[test]
