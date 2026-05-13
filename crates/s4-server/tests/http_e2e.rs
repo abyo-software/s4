@@ -385,3 +385,201 @@ async fn http_list_objects_through_s4_proxies_correctly() {
 
     let _ = shutdown.send(());
 }
+
+// v0.7 #44: HTTP-level OPTIONS preflight interceptor wired into the
+// hyper listener. The S4 server spawned below has a CORS manager
+// attached and a rule registered for bucket `cors-e2e`; the test sends
+// a raw OPTIONS request via reqwest (browsers send these for non-simple
+// PUT/DELETE requests) and asserts the Access-Control-Allow-* headers
+// are echoed correctly.
+
+/// Variant of [`spawn_s4_server`] that attaches a CORS manager pre-seeded
+/// with one rule for `bucket`. Used by the v0.7 #44 preflight test below.
+async fn spawn_s4_server_with_cors(
+    backend_endpoint: &str,
+    bucket: &str,
+    rule: s4_server::cors::CorsRule,
+) -> (String, oneshot::Sender<()>) {
+    let backend_client = build_aws_client(backend_endpoint);
+    let proxy = s3s_aws::Proxy::from(backend_client);
+    let registry = Arc::new(
+        CodecRegistry::new(CodecKind::CpuZstd)
+            .with(Arc::new(Passthrough))
+            .with(Arc::new(CpuZstd::default())),
+    );
+    let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::CpuZstd));
+    let cors_mgr = Arc::new(s4_server::cors::CorsManager::new());
+    cors_mgr.put(
+        bucket,
+        s4_server::cors::CorsConfig { rules: vec![rule] },
+    );
+    let s4 = S4Service::new(proxy, registry, dispatcher).with_cors(Arc::clone(&cors_mgr));
+
+    let mut svc = S3ServiceBuilder::new(s4);
+    svc.set_auth(SimpleAuth::from_single(MINIO_USER, MINIO_PASS));
+    let service = svc.build();
+    let backend_for_ready = build_aws_client(backend_endpoint);
+    let ready_check: s4_server::routing::ReadyCheck = Arc::new(move || {
+        let c = backend_for_ready.clone();
+        Box::pin(async move {
+            c.list_buckets()
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("{e}"))
+        })
+    });
+    let metrics_handle = METRICS_HANDLE
+        .get_or_init(s4_server::metrics::install)
+        .clone();
+    // v0.7 #44: install the same CORS manager into the HealthRouter so
+    // OPTIONS preflight is intercepted at the HTTP layer.
+    let service = HealthRouter::new(service, Some(ready_check))
+        .with_metrics(metrics_handle)
+        .with_cors_manager(cors_mgr);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let local = listener.local_addr().expect("local addr");
+    let endpoint_url = format!("http://{local}");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        let http_server = ConnBuilder::new(TokioExecutor::new());
+        let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+        let mut shutdown_rx = std::pin::pin!(shutdown_rx);
+        loop {
+            tokio::select! {
+                accept = listener.accept() => {
+                    match accept {
+                        Ok((socket, _)) => {
+                            let conn = http_server
+                                .serve_connection(TokioIo::new(socket), service.clone());
+                            let conn = graceful.watch(conn.into_owned());
+                            tokio::spawn(async move {
+                                let _ = conn.await;
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("S4 test server accept error: {e}");
+                            continue;
+                        }
+                    }
+                }
+                _ = shutdown_rx.as_mut() => {
+                    break;
+                }
+            }
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), graceful.shutdown()).await;
+    });
+
+    (endpoint_url, shutdown_tx)
+}
+
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn cors_preflight_options_returns_allow_headers() {
+    // Boot MinIO + S4 with a CORS rule pre-seeded for bucket `cors-e2e`.
+    let minio = start_minio().await;
+    let rule = s4_server::cors::CorsRule {
+        allowed_origins: vec!["https://app.example.com".into()],
+        allowed_methods: vec!["GET".into(), "PUT".into(), "DELETE".into()],
+        allowed_headers: vec!["Content-Type".into(), "X-Amz-Date".into()],
+        expose_headers: vec!["ETag".into()],
+        max_age_seconds: Some(600),
+        id: Some("e2e-rule".into()),
+    };
+    let (s4_endpoint, shutdown) =
+        spawn_s4_server_with_cors(&minio.endpoint_url, "cors-e2e", rule).await;
+
+    // 1. Allowed preflight — must return 200 with Allow-* headers.
+    let client = reqwest::Client::new();
+    let resp = client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{s4_endpoint}/cors-e2e/some-key"),
+        )
+        .header("Origin", "https://app.example.com")
+        .header("Access-Control-Request-Method", "PUT")
+        .header("Access-Control-Request-Headers", "content-type, x-amz-date")
+        .send()
+        .await
+        .expect("OPTIONS preflight request");
+    assert_eq!(
+        resp.status(),
+        200,
+        "matching preflight must be 200 (got body: {:?})",
+        resp.text().await.unwrap_or_default()
+    );
+    let h = resp.headers();
+    assert_eq!(
+        h.get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("https://app.example.com"),
+        "Allow-Origin must echo the matched explicit origin"
+    );
+    let allow_methods = h
+        .get("access-control-allow-methods")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        allow_methods.contains("PUT") && allow_methods.contains("GET"),
+        "Allow-Methods missing PUT/GET: {allow_methods}"
+    );
+    let allow_headers = h
+        .get("access-control-allow-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        allow_headers.contains("Content-Type"),
+        "Allow-Headers missing Content-Type: {allow_headers}"
+    );
+    assert_eq!(
+        h.get("access-control-max-age")
+            .and_then(|v| v.to_str().ok()),
+        Some("600")
+    );
+    assert_eq!(
+        h.get("access-control-expose-headers")
+            .and_then(|v| v.to_str().ok()),
+        Some("ETag")
+    );
+
+    // 2. Origin not allowed → 403 (bucket has CORS but rule doesn't match).
+    let resp = client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{s4_endpoint}/cors-e2e/some-key"),
+        )
+        .header("Origin", "https://evil.example.com")
+        .header("Access-Control-Request-Method", "PUT")
+        .send()
+        .await
+        .expect("OPTIONS preflight (denied)");
+    assert_eq!(
+        resp.status(),
+        403,
+        "origin outside rule must be 403 (got body: {:?})",
+        resp.text().await.unwrap_or_default()
+    );
+
+    // 3. OPTIONS to a bucket without CORS config falls through (s3s typically
+    // returns 4xx; we only assert the interceptor did NOT inject Allow-Origin).
+    let resp = client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{s4_endpoint}/no-cors-bucket/key"),
+        )
+        .header("Origin", "https://app.example.com")
+        .header("Access-Control-Request-Method", "PUT")
+        .send()
+        .await
+        .expect("OPTIONS preflight (no config)");
+    assert!(
+        resp.headers().get("access-control-allow-origin").is_none(),
+        "interceptor must NOT inject Allow-Origin when bucket has no CORS config"
+    );
+
+    let _ = shutdown.send(());
+}

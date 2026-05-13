@@ -1172,7 +1172,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         s4_server::metrics::record_compliance_mode_active("strict");
         info!("S4 compliance-mode strict ACTIVE — every PUT must declare SSE");
     }
-    run_server(s4, &sdk_conf, &opt, ready_client).await
+    // v0.7 #44: snapshot the optional CORS manager Arc before the
+    // s3s ServiceBuilder consumes `s4`. The HTTP-level OPTIONS preflight
+    // interceptor needs the same manager because s3s does not surface
+    // OPTIONS as a typed S3 handler — match has to happen at the hyper
+    // layer instead.
+    let cors_manager = s4.cors_manager().cloned();
+    run_server(s4, &sdk_conf, &opt, ready_client, cors_manager).await
 }
 
 /// v0.5 #32: enforce compliance-mode prerequisites at boot. Each
@@ -1279,6 +1285,7 @@ async fn run_server<S>(
     sdk_conf: &aws_config::SdkConfig,
     opt: &Opt,
     ready_client: aws_sdk_s3::Client,
+    cors_manager: Option<Arc<s4_server::cors::CorsManager>>,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>>
 where
     S: S3 + Send + Sync + 'static,
@@ -1301,7 +1308,13 @@ where
     let ready_check = build_ready_check(ready_client);
     // Prometheus metrics exporter を install。/metrics endpoint で render される
     let metrics_handle = s4_server::metrics::install();
-    let routed_service = HealthRouter::new(service, Some(ready_check)).with_metrics(metrics_handle);
+    let mut routed_service =
+        HealthRouter::new(service, Some(ready_check)).with_metrics(metrics_handle);
+    if let Some(mgr) = cors_manager {
+        // v0.7 #44: install the CORS manager so OPTIONS preflight is
+        // handled at the HTTP layer (Allow-* headers / 403 deny).
+        routed_service = routed_service.with_cors_manager(mgr);
+    }
 
     let listener = TcpListener::bind((opt.host.as_str(), opt.port)).await?;
     let http_server = ConnBuilder::new(TokioExecutor::new());
