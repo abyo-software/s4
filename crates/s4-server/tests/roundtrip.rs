@@ -2696,3 +2696,274 @@ async fn inventory_csv_emission_writes_to_destination_prefix() {
     assert!(manifest_key.starts_with("inventories/src/d1/"));
     assert!(manifest_key.ends_with("manifest.json"));
 }
+
+// ---- v0.6 #35: Bucket notifications — webhook fire on PutObject ----
+
+#[tokio::test]
+async fn notifications_put_object_fires_event_via_webhook() {
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // Spin up a tiny tokio HTTP receiver on a random port. It accepts one
+    // connection, captures the raw bytes, and replies 200 OK so the
+    // dispatcher counts the delivery as successful.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_cl = Arc::clone(&received);
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 32 * 1024];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            received_cl
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&buf[..n]).to_string());
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        }
+    });
+
+    // Build the service with a notifications manager attached.
+    let backend = MemoryBackend::new();
+    let mgr = Arc::new(s4_server::notifications::NotificationManager::new());
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::Passthrough),
+        make_dispatcher(CodecKind::Passthrough),
+    )
+    .with_notifications(Arc::clone(&mgr));
+
+    // Register a webhook rule for s3:ObjectCreated:Put on bucket "b" via
+    // the wire-typed PutBucketNotificationConfiguration handler. We model
+    // the webhook as a "topic" (TopicConfiguration takes any ARN-shaped
+    // string); for testing we instead seed the manager directly so the
+    // webhook destination — which has no AWS wire form — is exercised.
+    mgr.put(
+        "b",
+        s4_server::notifications::NotificationConfig {
+            rules: vec![s4_server::notifications::NotificationRule {
+                id: "hook-1".into(),
+                events: vec![s4_server::notifications::EventType::ObjectCreatedPut],
+                destination: s4_server::notifications::Destination::Webhook {
+                    url: format!("http://{addr}/hook"),
+                },
+                filter_prefix: None,
+                filter_suffix: None,
+            }],
+        },
+    );
+
+    // Round-trip the (empty-input) GET to make sure the handler at least
+    // returns success when nothing wire-translatable is configured (only
+    // the webhook, which is dropped from the GET surface).
+    let get_input = GetBucketNotificationConfigurationInput {
+        bucket: "b".into(),
+        expected_bucket_owner: None,
+    };
+    let get_req = S3Request {
+        input: get_input,
+        method: http::Method::GET,
+        uri: "/b?notification".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    s4.get_bucket_notification_configuration(get_req)
+        .await
+        .expect("GetBucketNotificationConfiguration");
+
+    // Now PUT an object — should trigger the webhook fire-and-forget.
+    let payload = Bytes::from_static(b"event payload");
+    s4.put_object(put_request("b", "uploaded.bin", payload))
+        .await
+        .expect("put_object");
+
+    // Wait for the detached dispatcher task; cap at 2s.
+    for _ in 0..100 {
+        if !received.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let raw = received.lock().unwrap().clone();
+    assert!(!raw.is_empty(), "webhook receiver got nothing");
+    let body = &raw[0];
+    assert!(body.contains("POST /hook"), "missing POST line in: {body}");
+    assert!(
+        body.contains("s3:ObjectCreated:Put"),
+        "missing event name in: {body}"
+    );
+    assert!(
+        body.contains("\"uploaded.bin\""),
+        "missing object key in: {body}"
+    );
+    assert!(body.contains("\"name\":\"b\""), "missing bucket in: {body}");
+    assert_eq!(
+        mgr.dropped_total.load(Ordering::Relaxed),
+        0,
+        "no drops on a successful 200 webhook"
+    );
+}
+
+// =========================================================================
+// v0.6 #39: Object + Bucket Tagging.
+// =========================================================================
+
+fn make_tagged_s4(
+    codec: CodecKind,
+) -> (
+    S4Service<MemoryBackend>,
+    Arc<s4_server::tagging::TagManager>,
+) {
+    let backend = MemoryBackend::new();
+    let mgr = Arc::new(s4_server::tagging::TagManager::new());
+    let s4 = S4Service::new(backend, make_registry(codec), make_dispatcher(codec))
+        .with_tagging(Arc::clone(&mgr));
+    (s4, mgr)
+}
+
+fn put_object_tagging_request(
+    bucket: &str,
+    key: &str,
+    pairs: &[(&str, &str)],
+) -> S3Request<PutObjectTaggingInput> {
+    let tag_set: Vec<Tag> = pairs
+        .iter()
+        .map(|(k, v)| Tag {
+            key: Some((*k).to_owned()),
+            value: Some((*v).to_owned()),
+        })
+        .collect();
+    let input = PutObjectTaggingInput {
+        bucket: bucket.into(),
+        key: key.into(),
+        tagging: Tagging { tag_set },
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+        request_payer: None,
+        version_id: None,
+    };
+    S3Request {
+        input,
+        method: http::Method::PUT,
+        uri: format!("/{bucket}/{key}?tagging").parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+fn get_object_tagging_request(
+    bucket: &str,
+    key: &str,
+) -> S3Request<GetObjectTaggingInput> {
+    let input = GetObjectTaggingInput {
+        bucket: bucket.into(),
+        key: key.into(),
+        ..Default::default()
+    };
+    S3Request {
+        input,
+        method: http::Method::GET,
+        uri: format!("/{bucket}/{key}?tagging").parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+#[tokio::test]
+async fn tagging_put_get_round_trip() {
+    let (s4, _mgr) = make_tagged_s4(CodecKind::CpuZstd);
+    // Materialise an object first so PutObjectTagging targets a real key.
+    s4.put_object(put_request(
+        "bucket",
+        "tagged-key",
+        Bytes::from_static(b"some-bytes"),
+    ))
+    .await
+    .expect("put");
+
+    s4.put_object_tagging(put_object_tagging_request(
+        "bucket",
+        "tagged-key",
+        &[("Project", "Phoenix"), ("Env", "prod"), ("Owner", "alice")],
+    ))
+    .await
+    .expect("put_object_tagging");
+
+    let resp = s4
+        .get_object_tagging(get_object_tagging_request("bucket", "tagged-key"))
+        .await
+        .expect("get_object_tagging");
+    let tag_set = &resp.output.tag_set;
+    assert_eq!(tag_set.len(), 3, "must echo all three tags");
+    let mut pairs: Vec<(String, String)> = tag_set
+        .iter()
+        .filter_map(|t| {
+            let k = t.key.clone()?;
+            let v = t.value.clone()?;
+            Some((k, v))
+        })
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Env".to_owned(), "prod".to_owned()),
+            ("Owner".to_owned(), "alice".to_owned()),
+            ("Project".to_owned(), "Phoenix".to_owned()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn tagging_x_amz_tagging_header_on_put_persists_tags() {
+    let (s4, mgr) = make_tagged_s4(CodecKind::CpuZstd);
+    // PUT with the `tagging` (== AWS `x-amz-tagging`) input field —
+    // S4Service's put_object pre-parses this header before policy
+    // evaluation and persists the parsed tags on a successful PUT.
+    let mut put = put_request(
+        "bucket",
+        "with-tags",
+        Bytes::from_static(b"payload-bytes"),
+    );
+    put.input.tagging = Some("Project=Phoenix&Env=prod%20west".into());
+    s4.put_object(put).await.expect("put");
+
+    // Tags must be discoverable via GetObjectTagging.
+    let resp = s4
+        .get_object_tagging(get_object_tagging_request("bucket", "with-tags"))
+        .await
+        .expect("get_object_tagging");
+    let tags: std::collections::HashMap<String, String> = resp
+        .output
+        .tag_set
+        .iter()
+        .filter_map(|t| Some((t.key.clone()?, t.value.clone()?)))
+        .collect();
+    assert_eq!(tags.get("Project").map(String::as_str), Some("Phoenix"));
+    assert_eq!(
+        tags.get("Env").map(String::as_str),
+        Some("prod west"),
+        "%20 must round-trip through parse_tagging_header"
+    );
+    // And, equivalently, via the manager directly.
+    let stored = mgr.get_object_tags("bucket", "with-tags").expect("stored");
+    assert_eq!(stored.get("Project"), Some("Phoenix"));
+    assert_eq!(stored.get("Env"), Some("prod west"));
+}

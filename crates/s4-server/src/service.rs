@@ -138,6 +138,40 @@ pub struct S4Service<B: S3> {
     /// `InventoryManager::run_once_for_test` on a fixed cadence; the
     /// service handlers below only deal with config-level CRUD.
     inventory: Option<Arc<crate::inventory::InventoryManager>>,
+    /// v0.6 #35: optional first-class S3 bucket-notification manager.
+    /// When `Some(...)`, S4-server itself owns per-bucket notification
+    /// configurations and `put_bucket_notification_configuration` /
+    /// `get_bucket_notification_configuration` consult the manager
+    /// instead of passing through to the backend. Successful PUT /
+    /// DELETE handlers fire matching destinations on a detached tokio
+    /// task (best-effort; see `crate::notifications::dispatch_event`).
+    notifications: Option<Arc<crate::notifications::NotificationManager>>,
+    /// v0.6 #37: optional first-class S3 Lifecycle configuration
+    /// manager. When `Some(...)`, S4-server itself owns per-bucket
+    /// lifecycle rules and `put_bucket_lifecycle_configuration` /
+    /// `get_bucket_lifecycle_configuration` /
+    /// `delete_bucket_lifecycle` consult the manager instead of
+    /// passing through to the backend. The actual background scanner
+    /// (list_objects_v2 -> evaluate -> delete / metadata-rewrite per
+    /// rule) is a v0.7+ follow-up; the test path
+    /// `S4Service::run_lifecycle_once_for_test` exercises the
+    /// evaluator end-to-end so this v0.6 #37 wiring is enough to ship
+    /// the configuration-management half without putting a
+    /// half-wired bucket-walk in front of users.
+    lifecycle: Option<Arc<crate::lifecycle::LifecycleManager>>,
+    /// v0.6 #39: optional first-class object + bucket Tagging manager.
+    /// When `Some(...)`, S4-server itself owns per-(bucket, key) and
+    /// per-bucket tag state — `PutObjectTagging` /
+    /// `GetObjectTagging` / `DeleteObjectTagging` /
+    /// `PutBucketTagging` / `GetBucketTagging` /
+    /// `DeleteBucketTagging` route through the manager (replacing the
+    /// previous backend-passthrough behaviour). `put_object` also
+    /// pre-parses the `x-amz-tagging` header / `Tagging` input field
+    /// so the IAM policy evaluator can gate on
+    /// `s3:RequestObjectTag/<key>` and `s3:ExistingObjectTag/<key>`.
+    /// On a successful PUT the parsed tags are persisted; on a
+    /// successful DELETE the matching tag entry is dropped.
+    tagging: Option<Arc<crate::tagging::TagManager>>,
     /// v0.5 #32: when `true`, every PUT must carry an SSE indicator
     /// (`x-amz-server-side-encryption`, the SSE-C customer-key headers,
     /// or be matched against a configured server-managed keyring/KMS).
@@ -171,8 +205,31 @@ impl<B: S3> S4Service<B> {
             object_lock: None,
             cors: None,
             inventory: None,
+            notifications: None,
+            lifecycle: None,
+            tagging: None,
             compliance_strict: false,
         }
+    }
+
+    /// v0.6 #39: attach the in-memory object + bucket Tagging manager.
+    /// Once set, `Put/Get/Delete` `Object/Bucket Tagging` route
+    /// through the manager (instead of forwarding to the backend),
+    /// and `put_object`'s `x-amz-tagging` parse path becomes the
+    /// source of `s3:RequestObjectTag/<key>` for the IAM policy
+    /// evaluator. The manager itself is shared via `Arc`.
+    #[must_use]
+    pub fn with_tagging(mut self, mgr: Arc<crate::tagging::TagManager>) -> Self {
+        self.tagging = Some(mgr);
+        self
+    }
+
+    /// v0.6 #39: borrow the attached tagging manager (test /
+    /// introspection — the snapshotter in `main.rs`, when wired,
+    /// will keep its own `Arc` clone).
+    #[must_use]
+    pub fn tag_manager(&self) -> Option<&Arc<crate::tagging::TagManager>> {
+        self.tagging.as_ref()
     }
 
     /// v0.6 #36: attach the in-memory S3 Inventory manager. Once set,
@@ -197,6 +254,108 @@ impl<B: S3> S4Service<B> {
     #[must_use]
     pub fn inventory_manager(&self) -> Option<&Arc<crate::inventory::InventoryManager>> {
         self.inventory.as_ref()
+    }
+
+    /// v0.6 #37: attach the in-memory S3 Lifecycle configuration
+    /// manager. Once set, `put_bucket_lifecycle_configuration` /
+    /// `get_bucket_lifecycle_configuration` / `delete_bucket_lifecycle`
+    /// route through the manager (replacing the previous backend-
+    /// passthrough behaviour). The actual periodic scanner that walks
+    /// the source bucket and invokes Expiration / Transition /
+    /// NoncurrentExpiration actions is a v0.7+ follow-up — see
+    /// [`Self::run_lifecycle_once_for_test`] for the in-memory test
+    /// path that exercises the evaluator end-to-end.
+    #[must_use]
+    pub fn with_lifecycle(mut self, mgr: Arc<crate::lifecycle::LifecycleManager>) -> Self {
+        self.lifecycle = Some(mgr);
+        self
+    }
+
+    /// v0.6 #37: borrow the attached lifecycle manager (test /
+    /// introspection — the background scheduler in `main.rs` keeps its
+    /// own `Arc` clone, so this accessor is for the test path that
+    /// invokes the evaluator directly).
+    #[must_use]
+    pub fn lifecycle_manager(&self) -> Option<&Arc<crate::lifecycle::LifecycleManager>> {
+        self.lifecycle.as_ref()
+    }
+
+    /// v0.6 #37: synchronous test entry that runs the lifecycle evaluator
+    /// against a caller-provided list of `(key, age, size, tags)` tuples
+    /// and returns the `(key, action)` pairs that should fire. The actual
+    /// backend invocation (S3.delete_object / metadata rewrite) is left
+    /// to the caller — the unit + E2E tests use this to verify the
+    /// evaluator without spawning the (deferred) background scanner.
+    /// Returns an empty `Vec` when no lifecycle manager is attached or
+    /// no rule matches.
+    #[must_use]
+    pub fn run_lifecycle_once_for_test(
+        &self,
+        bucket: &str,
+        objects: &[(String, chrono::Duration, u64, Vec<(String, String)>)],
+    ) -> Vec<(String, crate::lifecycle::LifecycleAction)> {
+        let Some(mgr) = self.lifecycle.as_ref() else {
+            return Vec::new();
+        };
+        crate::lifecycle::evaluate_batch(mgr, bucket, objects)
+    }
+
+    /// v0.6 #35: attach the in-memory bucket-notification manager. Once
+    /// set, `put_bucket_notification_configuration` /
+    /// `get_bucket_notification_configuration` route through the manager
+    /// (replacing the previous backend-passthrough behaviour); successful
+    /// `put_object` / `delete_object` calls fire matching destinations
+    /// on a detached tokio task via
+    /// `crate::notifications::dispatch_event` (best-effort, fire-and-
+    /// forget — failures bump the manager's `dropped_total` counter and
+    /// log at warn but do NOT fail the originating S3 request).
+    #[must_use]
+    pub fn with_notifications(
+        mut self,
+        mgr: Arc<crate::notifications::NotificationManager>,
+    ) -> Self {
+        self.notifications = Some(mgr);
+        self
+    }
+
+    /// v0.6 #35: borrow the attached notifications manager (test /
+    /// introspection — used by the metrics layer to read
+    /// `dropped_total`).
+    #[must_use]
+    pub fn notifications_manager(
+        &self,
+    ) -> Option<&Arc<crate::notifications::NotificationManager>> {
+        self.notifications.as_ref()
+    }
+
+    /// v0.6 #35: internal helper used by the DELETE handlers to fire a
+    /// matching notification on a detached tokio task. No-op when no
+    /// manager is attached or no rule on the bucket matches the given
+    /// (event, key) tuple.
+    fn fire_delete_notification(
+        &self,
+        bucket: &str,
+        key: &str,
+        event: crate::notifications::EventType,
+        version_id: Option<String>,
+    ) {
+        let Some(mgr) = self.notifications.as_ref() else {
+            return;
+        };
+        let dests = mgr.match_destinations(bucket, &event, key);
+        if dests.is_empty() {
+            return;
+        }
+        tokio::spawn(crate::notifications::dispatch_event(
+            Arc::clone(mgr),
+            bucket.to_owned(),
+            key.to_owned(),
+            event,
+            None,
+            None,
+            version_id,
+            format!("S4-{}", uuid::Uuid::new_v4()),
+        ));
     }
 
     /// v0.6 #38: attach the in-memory CORS configuration manager. Once
@@ -515,6 +674,8 @@ impl<B: S3> S4Service<B> {
             user_agent,
             request_time: Some(std::time::SystemTime::now()),
             secure_transport: self.secure_transport,
+            existing_object_tags: None,
+            request_object_tags: None,
             extra: Default::default(),
         }
     }
@@ -530,11 +691,35 @@ impl<B: S3> S4Service<B> {
         bucket: &str,
         key: Option<&str>,
     ) -> S3Result<()> {
+        self.enforce_policy_with_extra(req, action, bucket, key, None, None)
+    }
+
+    /// v0.6 #39: variant of [`Self::enforce_policy`] that lets the
+    /// caller plumb tag context (existing-on-object + on-request) into
+    /// the policy evaluator. Both arguments default to `None`, in
+    /// which case the resulting `RequestContext` is identical to
+    /// [`Self::enforce_policy`]'s — so for handlers that don't deal
+    /// with tags this is a transparent no-op.
+    fn enforce_policy_with_extra<I>(
+        &self,
+        req: &S3Request<I>,
+        action: &'static str,
+        bucket: &str,
+        key: Option<&str>,
+        request_tags: Option<&crate::tagging::TagSet>,
+        existing_tags: Option<&crate::tagging::TagSet>,
+    ) -> S3Result<()> {
         let Some(policy) = self.policy.as_ref() else {
             return Ok(());
         };
         let principal_id = Self::principal_of(req);
-        let ctx = self.request_context(req);
+        let mut ctx = self.request_context(req);
+        if let Some(t) = request_tags {
+            ctx.request_object_tags = Some(t.clone());
+        }
+        if let Some(t) = existing_tags {
+            ctx.existing_object_tags = Some(t.clone());
+        }
         let decision = policy.evaluate_with(action, bucket, key, principal_id, &ctx);
         if decision.allow {
             Ok(())
@@ -1038,6 +1223,36 @@ fn chrono_utc_to_timestamp(dt: chrono::DateTime<chrono::Utc>) -> Timestamp {
     Timestamp::parse(s3s::dto::TimestampFormat::DateTime, &s).unwrap_or_default()
 }
 
+/// v0.6 #39: convert our internal [`crate::tagging::TagSet`] into the
+/// s3s `Vec<Tag>` wire shape used on `GetObject/BucketTaggingOutput`.
+/// Both halves of every pair land in the `Some(_)` slot — AWS marks
+/// the field optional but always populates it on response.
+fn tagset_to_aws(set: &crate::tagging::TagSet) -> Vec<Tag> {
+    set.iter()
+        .map(|(k, v)| Tag {
+            key: Some(k.clone()),
+            value: Some(v.clone()),
+        })
+        .collect()
+}
+
+/// v0.6 #39: inverse of [`tagset_to_aws`] for input handlers. Missing
+/// keys / values become empty strings (mirrors AWS, which rejects
+/// `<Key/>` with InvalidTag at the parser layer; downstream
+/// `TagSet::validate` then enforces our size limits).
+fn aws_to_tagset(tags: &[Tag]) -> Result<crate::tagging::TagSet, crate::tagging::TagError> {
+    let pairs = tags
+        .iter()
+        .map(|t| {
+            (
+                t.key.clone().unwrap_or_default(),
+                t.value.clone().unwrap_or_default(),
+            )
+        })
+        .collect();
+    crate::tagging::TagSet::from_pairs(pairs)
+}
+
 /// `Range` request を decompressed object サイズ `total` に適用して `(start, end_exclusive)`
 /// を返す。`Range::Int { first, last }` は `bytes=first-last` (last は inclusive)、
 /// `Range::Suffix { length }` は末尾 `length` byte。S3 仕様に準拠。
@@ -1084,7 +1299,30 @@ impl<B: S3> S3 for S4Service<B> {
         let put_key = req.input.key.clone();
         let access_preamble = self.access_log_preamble(&req);
         self.enforce_rate_limit(&req, &put_bucket)?;
-        self.enforce_policy(&req, "s3:PutObject", &put_bucket, Some(&put_key))?;
+        // v0.6 #39: parse `x-amz-tagging` (URL-encoded query string) so
+        // the IAM policy gate sees the request's tags via
+        // `s3:RequestObjectTag/<key>`. `existing_object_tags` is also
+        // resolved from the Tagging manager (when wired) so
+        // `s3:ExistingObjectTag/<key>` works on overwrite.
+        let request_tags: Option<crate::tagging::TagSet> = req
+            .input
+            .tagging
+            .as_deref()
+            .map(crate::tagging::parse_tagging_header)
+            .transpose()
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, e.to_string()))?;
+        let existing_tags: Option<crate::tagging::TagSet> = self
+            .tagging
+            .as_ref()
+            .and_then(|m| m.get_object_tags(&put_bucket, &put_key));
+        self.enforce_policy_with_extra(
+            &req,
+            "s3:PutObject",
+            &put_bucket,
+            Some(&put_key),
+            request_tags.as_ref(),
+            existing_tags.as_ref(),
+        )?;
         // v0.5 #30: an Object Lock-protected key cannot be overwritten by
         // a non-versioned PUT (Suspended / Unversioned bucket). Enabled
         // bucket PUTs are exempt because they materialise a fresh
@@ -1488,6 +1726,50 @@ impl<B: S3> S3 for S4Service<B> {
                 ok = backend_resp.is_ok(),
                 "S4 put completed"
             );
+            // v0.6 #35: fire bucket-notification destinations (best-effort,
+            // detached). Skipped when no manager is attached or when the
+            // bucket has no rule matching `s3:ObjectCreated:Put` for this
+            // key.
+            if backend_resp.is_ok()
+                && let Some(mgr) = self.notifications.as_ref()
+            {
+                let dests = mgr.match_destinations(
+                    &put_bucket,
+                    &crate::notifications::EventType::ObjectCreatedPut,
+                    &put_key,
+                );
+                if !dests.is_empty() {
+                    let etag = backend_resp
+                        .as_ref()
+                        .ok()
+                        .and_then(|r| r.output.e_tag.clone())
+                        .map(ETag::into_value);
+                    let version_id = pending_version
+                        .as_ref()
+                        .filter(|pv| pv.versioned_response)
+                        .map(|pv| pv.version_id.clone());
+                    tokio::spawn(crate::notifications::dispatch_event(
+                        Arc::clone(mgr),
+                        put_bucket.clone(),
+                        put_key.clone(),
+                        crate::notifications::EventType::ObjectCreatedPut,
+                        Some(original_size),
+                        etag,
+                        version_id,
+                        format!("S4-{}", uuid::Uuid::new_v4()),
+                    ));
+                }
+            }
+            // v0.6 #39: persist parsed `x-amz-tagging` tags into the
+            // tagging manager on a successful PUT. AWS PutObject's
+            // tagging is a full-replace operation (not a merge), so
+            // any pre-existing entry for `(bucket, key)` is overwritten.
+            if backend_resp.is_ok()
+                && let (Some(mgr), Some(tags)) =
+                    (self.tagging.as_ref(), request_tags.clone())
+            {
+                mgr.put_object_tags(&put_bucket, &put_key, tags);
+            }
             return backend_resp;
         }
         // Body-less PUT (rare: zero-length object). Mirror the body-full
@@ -1561,6 +1843,47 @@ impl<B: S3> S3 for S4Service<B> {
                 mgr.set(&put_bucket, &put_key, state);
             }
             mgr.apply_default_on_put(&put_bucket, &put_key, chrono::Utc::now());
+        }
+        // v0.6 #35: same notification fire-point as the body-bearing PUT
+        // branch above (zero-length objects still match `ObjectCreated:Put`
+        // rules per the AWS event taxonomy).
+        if backend_resp.is_ok()
+            && let Some(mgr) = self.notifications.as_ref()
+        {
+            let dests = mgr.match_destinations(
+                &put_bucket,
+                &crate::notifications::EventType::ObjectCreatedPut,
+                &put_key,
+            );
+            if !dests.is_empty() {
+                let etag = backend_resp
+                    .as_ref()
+                    .ok()
+                    .and_then(|r| r.output.e_tag.clone())
+                    .map(ETag::into_value);
+                let version_id = pending_version
+                    .as_ref()
+                    .filter(|pv| pv.versioned_response)
+                    .map(|pv| pv.version_id.clone());
+                tokio::spawn(crate::notifications::dispatch_event(
+                    Arc::clone(mgr),
+                    put_bucket.clone(),
+                    put_key.clone(),
+                    crate::notifications::EventType::ObjectCreatedPut,
+                    Some(0),
+                    etag,
+                    version_id,
+                    format!("S4-{}", uuid::Uuid::new_v4()),
+                ));
+            }
+        }
+        // v0.6 #39: persist parsed `x-amz-tagging` for the body-less
+        // (zero-length) PUT branch too — same shape as the body-bearing
+        // branch above.
+        if backend_resp.is_ok()
+            && let (Some(mgr), Some(tags)) = (self.tagging.as_ref(), request_tags.clone())
+        {
+            mgr.put_object_tags(&put_bucket, &put_key, tags);
         }
         backend_resp
     }
@@ -2041,6 +2364,15 @@ impl<B: S3> S3 for S4Service<B> {
                     {
                         output.delete_marker = Some(true);
                     }
+                    // v0.6 #35: specific-version DELETE always counts as
+                    // a hard `ObjectRemoved:Delete` event (the chain
+                    // entry, marker or not, is gone after this call).
+                    self.fire_delete_notification(
+                        &bucket,
+                        &key,
+                        crate::notifications::EventType::ObjectRemovedDelete,
+                        Some(vid.clone()),
+                    );
                     return Ok(S3Response::new(output));
                 }
                 // No version_id: record a delete marker (state-aware).
@@ -2068,9 +2400,19 @@ impl<B: S3> S3 for S4Service<B> {
                 }
                 let output = DeleteObjectOutput {
                     delete_marker: Some(true),
-                    version_id: outcome.version_id,
+                    version_id: outcome.version_id.clone(),
                     ..Default::default()
                 };
+                // v0.6 #35: versioned bucket DELETE without a version-id
+                // creates a delete marker — the dedicated AWS event
+                // taxonomy entry. Suspended-state buckets also push a
+                // (null) marker, so the same event fires there.
+                self.fire_delete_notification(
+                    &bucket,
+                    &key,
+                    crate::notifications::EventType::ObjectRemovedDeleteMarker,
+                    outcome.version_id,
+                );
                 return Ok(S3Response::new(output));
             }
         }
@@ -2083,6 +2425,14 @@ impl<B: S3> S3 for S4Service<B> {
         // already passed `can_delete` above, so this is purely cleanup.
         if let Some(mgr) = self.object_lock.as_ref() {
             mgr.clear(&bucket, &key);
+        }
+        // v0.6 #39: drop any object-level tag set on physical delete —
+        // the freed key starts a fresh tag history if a future PUT
+        // re-creates it. (Versioned-delete branches above return early
+        // and do NOT touch tags, mirroring AWS where tag state is
+        // attached to the logical key, not the version chain.)
+        if let Some(mgr) = self.tagging.as_ref() {
+            mgr.delete_object_tags(&bucket, &key);
         }
         let sidecar_input = DeleteObjectInput {
             bucket: bucket.clone(),
@@ -2101,6 +2451,14 @@ impl<B: S3> S3 for S4Service<B> {
             trailing_headers: None,
         };
         let _ = self.backend.delete_object(sidecar_req).await;
+        // v0.6 #35: legacy unversioned-bucket hard delete fires the
+        // canonical `ObjectRemoved:Delete` event.
+        self.fire_delete_notification(
+            &bucket,
+            &key,
+            crate::notifications::EventType::ObjectRemovedDelete,
+            None,
+        );
         Ok(resp)
     }
     async fn delete_objects(
@@ -2488,23 +2846,73 @@ impl<B: S3> S3 for S4Service<B> {
     ) -> S3Result<S3Response<PutObjectAclOutput>> {
         self.backend.put_object_acl(req).await
     }
+    // v0.6 #39: object tagging — when a `TagManager` is attached the
+    // configuration / per-(bucket, key) state lives in the manager and
+    // these handlers serve directly from it; when no manager is
+    // attached they fall back to the backend (legacy passthrough so
+    // v0.5 deployments are unaffected).
     async fn get_object_tagging(
         &self,
         req: S3Request<GetObjectTaggingInput>,
     ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
-        self.backend.get_object_tagging(req).await
+        let Some(mgr) = self.tagging.as_ref() else {
+            return self.backend.get_object_tagging(req).await;
+        };
+        let tags = mgr
+            .get_object_tags(&req.input.bucket, &req.input.key)
+            .unwrap_or_default();
+        Ok(S3Response::new(GetObjectTaggingOutput {
+            tag_set: tagset_to_aws(&tags),
+            ..Default::default()
+        }))
     }
     async fn put_object_tagging(
         &self,
         req: S3Request<PutObjectTaggingInput>,
     ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
-        self.backend.put_object_tagging(req).await
+        let Some(mgr) = self.tagging.as_ref() else {
+            return self.backend.put_object_tagging(req).await;
+        };
+        let bucket = req.input.bucket.clone();
+        let key = req.input.key.clone();
+        let parsed = aws_to_tagset(&req.input.tagging.tag_set).map_err(|e| {
+            S3Error::with_message(S3ErrorCode::InvalidArgument, e.to_string())
+        })?;
+        // v0.6 #39: gate via IAM policy with both the request tags
+        // (`s3:RequestObjectTag/<key>`) and any existing tags on the
+        // target object (`s3:ExistingObjectTag/<key>`).
+        let existing = mgr.get_object_tags(&bucket, &key);
+        self.enforce_policy_with_extra(
+            &req,
+            "s3:PutObjectTagging",
+            &bucket,
+            Some(&key),
+            Some(&parsed),
+            existing.as_ref(),
+        )?;
+        mgr.put_object_tags(&bucket, &key, parsed);
+        Ok(S3Response::new(PutObjectTaggingOutput::default()))
     }
     async fn delete_object_tagging(
         &self,
         req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
-        self.backend.delete_object_tagging(req).await
+        let Some(mgr) = self.tagging.as_ref() else {
+            return self.backend.delete_object_tagging(req).await;
+        };
+        let bucket = req.input.bucket.clone();
+        let key = req.input.key.clone();
+        let existing = mgr.get_object_tags(&bucket, &key);
+        self.enforce_policy_with_extra(
+            &req,
+            "s3:DeleteObjectTagging",
+            &bucket,
+            Some(&key),
+            None,
+            existing.as_ref(),
+        )?;
+        mgr.delete_object_tags(&bucket, &key);
+        Ok(S3Response::new(DeleteObjectTaggingOutput::default()))
     }
     async fn get_object_attributes(
         &self,
@@ -3078,44 +3486,91 @@ impl<B: S3> S3 for S4Service<B> {
         self.backend.delete_bucket_cors(req).await
     }
 
-    // ---- Bucket lifecycle ----
+    // ---- Bucket lifecycle (v0.6 #37) ----
     async fn get_bucket_lifecycle_configuration(
         &self,
         req: S3Request<GetBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
+        if let Some(mgr) = self.lifecycle.as_ref() {
+            let cfg = mgr.get(&req.input.bucket).ok_or_else(|| {
+                S3Error::with_message(
+                    S3ErrorCode::NoSuchLifecycleConfiguration,
+                    "The lifecycle configuration does not exist".to_string(),
+                )
+            })?;
+            let rules: Vec<LifecycleRule> = cfg.rules.iter().map(internal_rule_to_dto).collect();
+            return Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
+                rules: Some(rules),
+                transition_default_minimum_object_size: None,
+            }));
+        }
         self.backend.get_bucket_lifecycle_configuration(req).await
     }
     async fn put_bucket_lifecycle_configuration(
         &self,
         req: S3Request<PutBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        if let Some(mgr) = self.lifecycle.as_ref() {
+            let bucket = req.input.bucket.clone();
+            let dto_cfg = req.input.lifecycle_configuration.unwrap_or_default();
+            let cfg = dto_lifecycle_to_internal(&dto_cfg);
+            mgr.put(&bucket, cfg);
+            return Ok(S3Response::new(
+                PutBucketLifecycleConfigurationOutput::default(),
+            ));
+        }
         self.backend.put_bucket_lifecycle_configuration(req).await
     }
     async fn delete_bucket_lifecycle(
         &self,
         req: S3Request<DeleteBucketLifecycleInput>,
     ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
+        if let Some(mgr) = self.lifecycle.as_ref() {
+            mgr.delete(&req.input.bucket);
+            return Ok(S3Response::new(DeleteBucketLifecycleOutput::default()));
+        }
         self.backend.delete_bucket_lifecycle(req).await
     }
 
-    // ---- Bucket tagging ----
+    // ---- Bucket tagging (v0.6 #39) ----
     async fn get_bucket_tagging(
         &self,
         req: S3Request<GetBucketTaggingInput>,
     ) -> S3Result<S3Response<GetBucketTaggingOutput>> {
-        self.backend.get_bucket_tagging(req).await
+        let Some(mgr) = self.tagging.as_ref() else {
+            return self.backend.get_bucket_tagging(req).await;
+        };
+        let tags = mgr.get_bucket_tags(&req.input.bucket).unwrap_or_default();
+        Ok(S3Response::new(GetBucketTaggingOutput {
+            tag_set: tagset_to_aws(&tags),
+        }))
     }
     async fn put_bucket_tagging(
         &self,
         req: S3Request<PutBucketTaggingInput>,
     ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
-        self.backend.put_bucket_tagging(req).await
+        let Some(mgr) = self.tagging.as_ref() else {
+            return self.backend.put_bucket_tagging(req).await;
+        };
+        let bucket = req.input.bucket.clone();
+        let parsed = aws_to_tagset(&req.input.tagging.tag_set).map_err(|e| {
+            S3Error::with_message(S3ErrorCode::InvalidArgument, e.to_string())
+        })?;
+        self.enforce_policy(&req, "s3:PutBucketTagging", &bucket, None)?;
+        mgr.put_bucket_tags(&bucket, parsed);
+        Ok(S3Response::new(PutBucketTaggingOutput::default()))
     }
     async fn delete_bucket_tagging(
         &self,
         req: S3Request<DeleteBucketTaggingInput>,
     ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
-        self.backend.delete_bucket_tagging(req).await
+        let Some(mgr) = self.tagging.as_ref() else {
+            return self.backend.delete_bucket_tagging(req).await;
+        };
+        let bucket = req.input.bucket.clone();
+        self.enforce_policy(&req, "s3:PutBucketTagging", &bucket, None)?;
+        mgr.delete_bucket_tags(&bucket);
+        Ok(S3Response::new(DeleteBucketTaggingOutput::default()))
     }
 
     // ---- Bucket encryption ----
@@ -3152,11 +3607,29 @@ impl<B: S3> S3 for S4Service<B> {
         self.backend.put_bucket_logging(req).await
     }
 
-    // ---- Bucket notification ----
+    // ---- Bucket notification (v0.6 #35) ----
+    //
+    // When a `NotificationManager` is attached, S4 itself owns per-bucket
+    // notification configurations and the PUT / GET handlers route through
+    // the manager. The wire DTO's queue / topic configurations map onto
+    // S4's `Destination::Sqs` / `Destination::Sns`; LambdaFunction and
+    // EventBridge configurations are accepted on PUT but silently dropped
+    // (out of scope for v0.6 #35). When no manager is attached the legacy
+    // backend-passthrough behaviour applies.
     async fn get_bucket_notification_configuration(
         &self,
         req: S3Request<GetBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketNotificationConfigurationOutput>> {
+        if let Some(mgr) = self.notifications.as_ref() {
+            let cfg = mgr.get(&req.input.bucket).unwrap_or_default();
+            let dto = notif_to_dto(&cfg);
+            return Ok(S3Response::new(GetBucketNotificationConfigurationOutput {
+                event_bridge_configuration: dto.event_bridge_configuration,
+                lambda_function_configurations: dto.lambda_function_configurations,
+                queue_configurations: dto.queue_configurations,
+                topic_configurations: dto.topic_configurations,
+            }));
+        }
         self.backend
             .get_bucket_notification_configuration(req)
             .await
@@ -3165,6 +3638,13 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<PutBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
+        if let Some(mgr) = self.notifications.as_ref() {
+            let cfg = notif_from_dto(&req.input.notification_configuration);
+            mgr.put(&req.input.bucket, cfg);
+            return Ok(S3Response::new(
+                PutBucketNotificationConfigurationOutput::default(),
+            ));
+        }
         self.backend
             .put_bucket_notification_configuration(req)
             .await
@@ -3635,6 +4115,400 @@ fn inv_to_dto(cfg: &crate::inventory::InventoryConfig) -> InventoryConfiguration
         optional_fields: None,
     }
 }
+
+// ---------------------------------------------------------------------------
+// v0.6 #35: Convert between the s3s-typed `NotificationConfiguration` (the
+// wire surface) and our internal `crate::notifications::NotificationConfig`.
+//
+// We support TopicConfiguration (-> Destination::Sns) and QueueConfiguration
+// (-> Destination::Sqs). LambdaFunction and EventBridge configurations are
+// silently dropped on PUT (out of scope for v0.6 #35); the GET response only
+// surfaces topic / queue rules.
+//
+// The webhook destination has no AWS-native wire form: operators configure
+// webhooks via the JSON snapshot file (`--notifications-state-file`) or by
+// poking `NotificationManager::put` directly from a custom binary. This
+// keeps the wire surface AWS-compatible while still letting the always-
+// available `Webhook` destination be reachable.
+// ---------------------------------------------------------------------------
+
+fn notif_from_dto(
+    dto: &NotificationConfiguration,
+) -> crate::notifications::NotificationConfig {
+    let mut rules: Vec<crate::notifications::NotificationRule> = Vec::new();
+    if let Some(topics) = dto.topic_configurations.as_ref() {
+        for (idx, t) in topics.iter().enumerate() {
+            let events = events_from_dto(&t.events);
+            let (prefix, suffix) = filter_from_dto(t.filter.as_ref());
+            rules.push(crate::notifications::NotificationRule {
+                id: t.id.clone().unwrap_or_else(|| format!("topic-{idx}")),
+                events,
+                destination: crate::notifications::Destination::Sns {
+                    topic_arn: t.topic_arn.clone(),
+                },
+                filter_prefix: prefix,
+                filter_suffix: suffix,
+            });
+        }
+    }
+    if let Some(queues) = dto.queue_configurations.as_ref() {
+        for (idx, q) in queues.iter().enumerate() {
+            let events = events_from_dto(&q.events);
+            let (prefix, suffix) = filter_from_dto(q.filter.as_ref());
+            rules.push(crate::notifications::NotificationRule {
+                id: q.id.clone().unwrap_or_else(|| format!("queue-{idx}")),
+                events,
+                destination: crate::notifications::Destination::Sqs {
+                    queue_arn: q.queue_arn.clone(),
+                },
+                filter_prefix: prefix,
+                filter_suffix: suffix,
+            });
+        }
+    }
+    crate::notifications::NotificationConfig { rules }
+}
+
+fn notif_to_dto(
+    cfg: &crate::notifications::NotificationConfig,
+) -> NotificationConfiguration {
+    let mut topics: Vec<TopicConfiguration> = Vec::new();
+    let mut queues: Vec<QueueConfiguration> = Vec::new();
+    for rule in &cfg.rules {
+        let events: Vec<Event> = rule
+            .events
+            .iter()
+            .map(|e| Event::from(e.as_aws_str().to_owned()))
+            .collect();
+        let filter = filter_to_dto(rule.filter_prefix.as_deref(), rule.filter_suffix.as_deref());
+        match &rule.destination {
+            crate::notifications::Destination::Sns { topic_arn } => {
+                topics.push(TopicConfiguration {
+                    events,
+                    filter,
+                    id: Some(rule.id.clone()),
+                    topic_arn: topic_arn.clone(),
+                });
+            }
+            crate::notifications::Destination::Sqs { queue_arn } => {
+                queues.push(QueueConfiguration {
+                    events,
+                    filter,
+                    id: Some(rule.id.clone()),
+                    queue_arn: queue_arn.clone(),
+                });
+            }
+            // Webhook destinations have no AWS wire equivalent — they
+            // round-trip through the JSON snapshot only. Skip them on the
+            // GET surface (an SDK consumer wouldn't know what to do with
+            // them anyway).
+            crate::notifications::Destination::Webhook { .. } => {}
+        }
+    }
+    NotificationConfiguration {
+        event_bridge_configuration: None,
+        lambda_function_configurations: None,
+        queue_configurations: if queues.is_empty() { None } else { Some(queues) },
+        topic_configurations: if topics.is_empty() { None } else { Some(topics) },
+    }
+}
+
+fn events_from_dto(events: &[Event]) -> Vec<crate::notifications::EventType> {
+    events
+        .iter()
+        .filter_map(|e| crate::notifications::EventType::from_aws_str(e.as_ref()))
+        .collect()
+}
+
+fn filter_from_dto(
+    f: Option<&NotificationConfigurationFilter>,
+) -> (Option<String>, Option<String>) {
+    let Some(f) = f else {
+        return (None, None);
+    };
+    let Some(key) = f.key.as_ref() else {
+        return (None, None);
+    };
+    let Some(rules) = key.filter_rules.as_ref() else {
+        return (None, None);
+    };
+    let mut prefix = None;
+    let mut suffix = None;
+    for r in rules {
+        let name = r.name.as_ref().map(|n| n.as_str().to_ascii_lowercase());
+        let value = r.value.clone();
+        match name.as_deref() {
+            Some("prefix") => prefix = value,
+            Some("suffix") => suffix = value,
+            _ => {}
+        }
+    }
+    (prefix, suffix)
+}
+
+fn filter_to_dto(
+    prefix: Option<&str>,
+    suffix: Option<&str>,
+) -> Option<NotificationConfigurationFilter> {
+    if prefix.is_none() && suffix.is_none() {
+        return None;
+    }
+    let mut rules: Vec<FilterRule> = Vec::new();
+    if let Some(p) = prefix {
+        rules.push(FilterRule {
+            name: Some(FilterRuleName::from("prefix".to_owned())),
+            value: Some(p.to_owned()),
+        });
+    }
+    if let Some(s) = suffix {
+        rules.push(FilterRule {
+            name: Some(FilterRuleName::from("suffix".to_owned())),
+            value: Some(s.to_owned()),
+        });
+    }
+    Some(NotificationConfigurationFilter {
+        key: Some(S3KeyFilter {
+            filter_rules: Some(rules),
+        }),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// v0.6 #37: Convert between the s3s-typed `BucketLifecycleConfiguration`
+// (the wire surface) and our internal `crate::lifecycle::LifecycleConfig`.
+// The internal representation flattens AWS's "Filter | And" disjunction
+// into a single `LifecycleFilter` struct of optional fields plus a tag
+// vector. Fields S4's evaluator does not consume
+// (`expired_object_delete_marker`, `noncurrent_version_transitions`,
+// `transition_default_minimum_object_size`, the storage class on the
+// noncurrent expiration) are dropped on PUT and re-rendered as their
+// AWS-default shape on GET so the client always sees a well-formed
+// configuration.
+// ---------------------------------------------------------------------------
+
+fn dto_lifecycle_to_internal(
+    dto: &BucketLifecycleConfiguration,
+) -> crate::lifecycle::LifecycleConfig {
+    crate::lifecycle::LifecycleConfig {
+        rules: dto.rules.iter().map(dto_rule_to_internal).collect(),
+    }
+}
+
+fn dto_rule_to_internal(rule: &LifecycleRule) -> crate::lifecycle::LifecycleRule {
+    let status = crate::lifecycle::LifecycleStatus::from_aws_str(rule.status.as_str());
+    let filter = rule
+        .filter
+        .as_ref()
+        .map(dto_filter_to_internal)
+        .unwrap_or_default();
+    let expiration_days = rule
+        .expiration
+        .as_ref()
+        .and_then(|e| e.days)
+        .and_then(|d| u32::try_from(d).ok());
+    let expiration_date = rule
+        .expiration
+        .as_ref()
+        .and_then(|e| e.date.as_ref())
+        .and_then(timestamp_to_chrono_utc);
+    let transitions: Vec<crate::lifecycle::TransitionRule> = rule
+        .transitions
+        .as_ref()
+        .map(|ts| {
+            ts.iter()
+                .filter_map(|t| {
+                    let days = u32::try_from(t.days?).ok()?;
+                    let storage_class = t.storage_class.as_ref()?.as_str().to_owned();
+                    Some(crate::lifecycle::TransitionRule {
+                        days,
+                        storage_class,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let noncurrent_version_expiration_days = rule
+        .noncurrent_version_expiration
+        .as_ref()
+        .and_then(|n| n.noncurrent_days)
+        .and_then(|d| u32::try_from(d).ok());
+    let abort_incomplete_multipart_upload_days = rule
+        .abort_incomplete_multipart_upload
+        .as_ref()
+        .and_then(|a| a.days_after_initiation)
+        .and_then(|d| u32::try_from(d).ok());
+    crate::lifecycle::LifecycleRule {
+        id: rule.id.clone().unwrap_or_default(),
+        status,
+        filter,
+        expiration_days,
+        expiration_date,
+        transitions,
+        noncurrent_version_expiration_days,
+        abort_incomplete_multipart_upload_days,
+    }
+}
+
+fn dto_filter_to_internal(filter: &LifecycleRuleFilter) -> crate::lifecycle::LifecycleFilter {
+    let mut prefix = filter.prefix.clone();
+    let mut tags: Vec<(String, String)> = Vec::new();
+    let mut size_gt: Option<u64> = filter
+        .object_size_greater_than
+        .and_then(|n| u64::try_from(n).ok());
+    let mut size_lt: Option<u64> = filter
+        .object_size_less_than
+        .and_then(|n| u64::try_from(n).ok());
+    if let Some(t) = &filter.tag
+        && let (Some(k), Some(v)) = (t.key.as_ref(), t.value.as_ref())
+    {
+        tags.push((k.clone(), v.clone()));
+    }
+    if let Some(and) = &filter.and {
+        if prefix.is_none() {
+            prefix = and.prefix.clone();
+        }
+        if size_gt.is_none() {
+            size_gt = and
+                .object_size_greater_than
+                .and_then(|n| u64::try_from(n).ok());
+        }
+        if size_lt.is_none() {
+            size_lt = and
+                .object_size_less_than
+                .and_then(|n| u64::try_from(n).ok());
+        }
+        if let Some(ts) = &and.tags {
+            for t in ts {
+                if let (Some(k), Some(v)) = (t.key.as_ref(), t.value.as_ref()) {
+                    tags.push((k.clone(), v.clone()));
+                }
+            }
+        }
+    }
+    crate::lifecycle::LifecycleFilter {
+        prefix,
+        tags,
+        object_size_greater_than: size_gt,
+        object_size_less_than: size_lt,
+    }
+}
+
+fn internal_rule_to_dto(rule: &crate::lifecycle::LifecycleRule) -> LifecycleRule {
+    let expiration = if rule.expiration_days.is_some() || rule.expiration_date.is_some() {
+        Some(LifecycleExpiration {
+            date: rule.expiration_date.map(chrono_utc_to_timestamp),
+            days: rule.expiration_days.map(|d| d as i32),
+            expired_object_delete_marker: None,
+        })
+    } else {
+        None
+    };
+    let transitions: Option<TransitionList> = if rule.transitions.is_empty() {
+        None
+    } else {
+        Some(
+            rule.transitions
+                .iter()
+                .map(|t| Transition {
+                    date: None,
+                    days: Some(t.days as i32),
+                    storage_class: Some(TransitionStorageClass::from(t.storage_class.clone())),
+                })
+                .collect(),
+        )
+    };
+    let noncurrent_version_expiration =
+        rule.noncurrent_version_expiration_days
+            .map(|d| NoncurrentVersionExpiration {
+                newer_noncurrent_versions: None,
+                noncurrent_days: Some(d as i32),
+            });
+    let abort_incomplete_multipart_upload =
+        rule.abort_incomplete_multipart_upload_days
+            .map(|d| AbortIncompleteMultipartUpload {
+                days_after_initiation: Some(d as i32),
+            });
+    let filter = if rule.filter.tags.is_empty()
+        && rule.filter.object_size_greater_than.is_none()
+        && rule.filter.object_size_less_than.is_none()
+    {
+        rule.filter.prefix.as_ref().map(|p| LifecycleRuleFilter {
+            and: None,
+            object_size_greater_than: None,
+            object_size_less_than: None,
+            prefix: Some(p.clone()),
+            tag: None,
+        })
+    } else if rule.filter.tags.len() == 1
+        && rule.filter.prefix.is_none()
+        && rule.filter.object_size_greater_than.is_none()
+        && rule.filter.object_size_less_than.is_none()
+    {
+        let (k, v) = rule.filter.tags[0].clone();
+        Some(LifecycleRuleFilter {
+            and: None,
+            object_size_greater_than: None,
+            object_size_less_than: None,
+            prefix: None,
+            tag: Some(Tag {
+                key: Some(k),
+                value: Some(v),
+            }),
+        })
+    } else {
+        let tags = if rule.filter.tags.is_empty() {
+            None
+        } else {
+            Some(
+                rule.filter
+                    .tags
+                    .iter()
+                    .map(|(k, v)| Tag {
+                        key: Some(k.clone()),
+                        value: Some(v.clone()),
+                    })
+                    .collect(),
+            )
+        };
+        Some(LifecycleRuleFilter {
+            and: Some(LifecycleRuleAndOperator {
+                object_size_greater_than: rule
+                    .filter
+                    .object_size_greater_than
+                    .and_then(|n| i64::try_from(n).ok()),
+                object_size_less_than: rule
+                    .filter
+                    .object_size_less_than
+                    .and_then(|n| i64::try_from(n).ok()),
+                prefix: rule.filter.prefix.clone(),
+                tags,
+            }),
+            object_size_greater_than: None,
+            object_size_less_than: None,
+            prefix: None,
+            tag: None,
+        })
+    };
+    LifecycleRule {
+        abort_incomplete_multipart_upload,
+        expiration,
+        filter,
+        id: if rule.id.is_empty() {
+            None
+        } else {
+            Some(rule.id.clone())
+        },
+        noncurrent_version_expiration,
+        noncurrent_version_transitions: None,
+        prefix: None,
+        status: ExpirationStatus::from(rule.status.as_aws_str().to_owned()),
+        transitions,
+    }
+}
+
+// (timestamp <-> chrono helpers `timestamp_to_chrono_utc` /
+// `chrono_utc_to_timestamp` are defined earlier in this file for the
+// tagging/notifications work; the lifecycle DTO converters reuse them.)
 
 // ---------------------------------------------------------------------------
 // v0.5 #33: SigV4a (asymmetric ECDSA-P256) integration hook.

@@ -37,6 +37,44 @@ pub mod names {
     pub const ACME_CERT_EXPIRY_SECONDS: &str = "s4_acme_cert_expiry_seconds";
     pub const RATE_LIMIT_THROTTLED_TOTAL: &str = "s4_rate_limit_throttled_total";
     pub const COMPLIANCE_MODE_ACTIVE: &str = "s4_compliance_mode_active";
+    /// v0.6 #35: bumped each time the notification dispatcher exhausts
+    /// its retry budget on a destination (or skips an `aws-events`-gated
+    /// destination because the feature is off).
+    pub const NOTIFICATIONS_DROPPED_TOTAL: &str = "s4_notifications_dropped_total";
+    /// v0.6 #37: bumped by the lifecycle scanner each time it executes an
+    /// Expiration / Transition / NoncurrentVersionExpiration action.
+    /// Labels: `bucket` (S3 bucket name), `action` (= `"expire"` /
+    /// `"transition"` / `"noncurrent_expire"`). Cardinality bounded by
+    /// (#buckets × 3).
+    pub const LIFECYCLE_ACTIONS_TOTAL: &str = "s4_lifecycle_actions_total";
+}
+
+/// v0.6 #37: bumped each time the lifecycle scanner executes an action
+/// (Expiration / Transition / NoncurrentVersionExpiration). Pair with
+/// [`crate::lifecycle::LifecycleManager::record_action`] which keeps the
+/// in-process counter in sync with this Prometheus counter so a
+/// `/metrics` scrape and an admin introspection of `actions_snapshot()`
+/// agree.
+pub fn record_lifecycle_action(bucket: &str, action: &'static str) {
+    metrics::counter!(
+        names::LIFECYCLE_ACTIONS_TOTAL,
+        "bucket" => bucket.to_owned(),
+        "action" => action,
+    )
+    .increment(1);
+}
+
+/// v0.6 #35: bumped each time the notification dispatcher drops an event
+/// (5xx after retry budget exhausted, network failure after retries, or an
+/// `aws-events`-gated destination invoked without the feature compiled
+/// in). Label `dest` is one of `"webhook"` / `"sqs"` / `"sns"` so
+/// dashboards can split by destination type without leaking ARNs / URLs.
+pub fn record_notification_drop(dest_type: &'static str) {
+    metrics::counter!(
+        names::NOTIFICATIONS_DROPPED_TOTAL,
+        "dest" => dest_type,
+    )
+    .increment(1);
 }
 
 /// v0.5 #32: stamp the gauge so operators can `up{...} * on() s4_compliance_mode_active`

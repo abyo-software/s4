@@ -7,7 +7,9 @@ pub mod blob;
 pub mod cors;
 pub mod inventory;
 pub mod kms;
+pub mod lifecycle;
 pub mod metrics;
+pub mod notifications;
 pub mod object_lock;
 pub mod policy;
 pub mod rate_limit;
@@ -17,6 +19,7 @@ pub mod service;
 pub mod sigv4a;
 pub mod sse;
 pub mod streaming;
+pub mod tagging;
 pub mod tls;
 pub mod versioning;
 

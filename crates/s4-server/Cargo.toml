@@ -34,6 +34,11 @@ nvcomp-gpu = ["s4-codec/nvcomp-gpu"]
 # AWS KMS for KEK custody. The default-features `LocalKms` (file-backed
 # KEKs) is always available for dev / on-prem.
 aws-kms = ["dep:aws-sdk-kms"]
+# v0.6 #35: SQS / SNS notification destinations. The `Webhook` variant of
+# `notifications::Destination` is always available (no extra deps); SQS /
+# SNS pull `aws-sdk-sqs` / `aws-sdk-sns` only when this feature is
+# enabled, mirroring the `aws-kms` flag's shape.
+aws-events = ["dep:aws-sdk-sns", "dep:aws-sdk-sqs"]
 
 [[bin]]
 name = "s4"
@@ -102,6 +107,15 @@ uuid = { version = "1", features = ["v4"] }
 # is gated behind the `aws-kms` cargo feature so the default `cargo
 # build` doesn't pull aws-sdk-kms.
 aws-sdk-kms = { version = "1", optional = true }
+# v0.6 #35: webhook destination for bucket notifications. Always pulled
+# in (default-features off, rustls + json) because the `Webhook` variant
+# of `notifications::Destination` is the always-available baseline.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# v0.6 #35: SQS / SNS notification destinations — both gated behind the
+# `aws-events` cargo feature so the default build doesn't pull the
+# aws-sdk-sns / aws-sdk-sqs trees.
+aws-sdk-sns = { version = "1", optional = true }
+aws-sdk-sqs = { version = "1", optional = true }
 
 s4-codec = { path = "../s4-codec", version = "0.5.0" }
 s4-config = { path = "../s4-config", version = "0.5.0" }
