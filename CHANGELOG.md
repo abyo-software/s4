@@ -7,6 +7,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-05-13
+
+Performance / GPU pipeline doubling-down — circle back to the original
+differentiation. Seven v0.8 milestone issues delivered (#50–#56) plus
+**six wire-bug fixes** in the multipart × SSE / versioning / object-lock
+/ tagging / replication interactions surfaced by the new E2E suite.
+
+### Wire-level bug fixes (BUG-5..10, surfaced by #54 multipart E2E)
+
+- **BUG-5 (CRITICAL — silent plaintext leak)**: `upload_part` had no
+  SSE branch. Multipart × SSE-S4/SSE-C/SSE-KMS used to **store
+  plaintext on the backend** even when the gateway was configured for
+  encryption. Fixed by routing multipart through a per-upload
+  `MultipartUploadContext` (new `multipart_state.rs` module): SSE
+  config from `CreateMultipartUpload` is held and applied during
+  `CompleteMultipartUpload` (whole-body re-encrypt, single decrypt
+  on GET — same on-disk shape as v0.7 SSE).
+- **BUG-6**: `complete_multipart_upload` didn't mint a version-id on
+  versioned buckets (multipart bypassed the chain). Fixed by
+  replicating the `pending_version` branch from `put_object`.
+- **BUG-7 (CRITICAL — compliance)**: `complete_multipart_upload`
+  didn't call `ObjectLockManager::apply_default_on_put`. **Multipart
+  uploads bypassed WORM** — DELETE succeeded on Compliance buckets.
+- **BUG-8**: `complete_multipart_upload` didn't call
+  `spawn_replication_if_matched` — multipart uploads to a replication
+  source never reached the destination.
+- **BUG-9**: `create_multipart_upload`'s `Tagging` field was dropped
+  on the floor — `TagManager` was never populated, GetObjectTagging
+  returned empty.
+- **BUG-10**: `create_multipart_upload` forwarded SSE-C / SSE-KMS
+  request headers to the backend (same class as v0.7 #48 BUG-2/3,
+  unfixed for the multipart entry point). MinIO rejected with
+  "HTTPS required" / "KMS not configured". Fixed by `take()`-ing the
+  SSE input fields off `req.input` before backend dispatch.
+
+### Added
+
+- **GPU column scan for S3 Select** (#51) — `select_gpu(...)` stub
+  from v0.6 #41 replaced with an actual cudarc-backed kernel.
+  NVRTC-compiled CUDA C source with two kernels:
+  `column_compare_bytes` (Eq / NotEq / LikePrefix) and
+  `column_compare_i64` (GT / LT, on-device i64 parse). Bench: 100M-row
+  CSV, `WHERE country='Japan'`, GPU 0.94 GiB/s vs CPU 0.56 GiB/s
+  (1.60× — the 5× target needs a parallel-scan row-indexing pass on
+  GPU as well, deferred).
+- **Chunked SSE wire frame S4E5 for streaming GET** (#52) — new
+  20-byte header + per-chunk 16-byte AES-GCM tag, default 1 MiB
+  chunks. GET emits decrypted chunks via `tokio::Stream`; client sees
+  first byte after one chunk's verify (vs full-body buffer
+  previously). `--sse-chunk-size 0` keeps the legacy buffered S4E2
+  path. SSE-S4 keyring path only — SSE-C / SSE-KMS chunked variants
+  deferred. Salt is 4 bytes per PUT (~65k birthday limit per key —
+  follow-up tracks 8-byte widening).
+- **AES-NI hardware-accelerated SSE measurement** (#50) — runtime
+  detect via `is_x86_feature_detected!("aes")` + `pclmulqdq`; new
+  metric `s4_sse_aes_backend{kind}` gauge; new bench example
+  `bench_sse_throughput`. Measured throughput on Ryzen 9 9950X:
+  AES-NI **1661 MB/s** (1 MiB body) vs software fallback **194 MB/s
+  (8.7× speedup)**. README "Performance" section updated with the
+  full 3-size × 2-op table.
+- **GPU pipeline Prometheus metrics** (#55) —
+  `s4_gpu_compress_seconds` / `s4_gpu_decompress_seconds` histograms,
+  `s4_gpu_throughput_bytes_per_sec` gauge,
+  `s4_gpu_in_flight` / `s4_gpu_oom_total`. Surfaced via a new
+  callback-style `CodecRegistry::compress_with_telemetry` API that
+  keeps the s4-codec crate slim (no `metrics` dep). New
+  `docs/observability.md` documents the metric set + a 4-panel
+  Grafana layout.
+- **GPU auto-detect at boot** (#56) — `nvcomp-gpu` feature build
+  + a CUDA device at runtime → sampling dispatcher prefers
+  `nvcomp-zstd` over `cpu-zstd` for objects ≥ `--gpu-min-bytes`
+  (default 1 MiB; below this the PCIe upload + kernel launch
+  overhead exceeds CPU compress time). New trait method
+  `CodecDispatcher::pick_with_size_hint(sample, total_size)` —
+  default impl delegates to the existing `pick(sample)` so all
+  downstream impls keep working.
+- **Multipart × SSE / versioning / object-lock / tagging /
+  replication E2E** (#54) — new `feature_e2e.rs` Docker-gated tests
+  (9 multipart × feature scenarios). All pass after the BUG-5..10
+  fixes.
+
+### Changed
+
+- Workspace bumped to 0.8.0.
+- `S4Service` now holds an always-on `multipart_state:
+  Arc<MultipartStateStore>` for per-upload-id SSE / Tagging / Object
+  Lock context.
+- `CodecRegistry` exposes `compress_with_telemetry` /
+  `decompress_with_telemetry` (additive, non-breaking).
+
+### Performance
+
+- nvCOMP bench refresh on RTX 4070 Ti SUPER + nvCOMP 5.2.0.10 (#53):
+  v0.3 → v0.8 same-code gains of +20–36% across codecs (driver +
+  hardware only). Headline: **nvcomp-bitcomp gives 11.93× ratio on
+  sorted u32 posting lists** (vs cpu-zstd 1.48×). nvcomp-zstd is
+  3.3–4.5× faster than cpu-zstd on numeric columns. nvcomp wins on
+  every workload's decompress path; cpu-zstd-3 still wins on
+  text-heavy compress because the Rust zstd library is highly tuned
+  and PCIe round-trip dominates small bodies.
+
+### Notes
+
+- **Single-encrypt over assembled multipart body**: `CompleteMultipartUpload`
+  GETs the assembled bytes from the backend, encrypts once, and PUTs
+  back. This costs an extra round-trip per Complete but keeps the
+  GET decrypt path identical to single-PUT. Per-part encrypt with a
+  multi-segment decrypt walker is a follow-up.
+- **GPU select 1.60× speedup, not 5×**: the host-side memchr row
+  indexing is the shared bottleneck. A future Wave moves indexing
+  onto the GPU via parallel scan to unlock the remaining headroom.
+
 ## [0.7.1] — 2026-05-13
 
 Operator-UX patch release surfaced by a dogfood walkthrough against
