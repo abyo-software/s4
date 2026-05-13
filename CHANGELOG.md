@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-05-13
+
+E2E hardening sprint — six v0.7 milestone issues delivered (#44–#49).
+**No new features.** Theme: finish the half-built v0.6 features
+(CORS / Lifecycle / Inventory / SigV4a) and validate v0.4–v0.6 against
+a real MinIO backend through aws-sdk-s3. The MinIO E2E suite (#48)
+surfaced **four production wire-level bugs** in SSE that
+`MemoryBackend` mocks couldn't catch — all fixed in this release.
+
+### Wire-level bug fixes (surfaced by #48 E2E)
+
+- **BUG-1**: `service::put_object` stamped `content_length` from the
+  post-compression bytes, but the SSE encryption branch then made the
+  body longer (frame header + nonce + tag). Hyper rejected every SSE
+  PUT to a real S3 backend with `StreamLengthMismatch`. Fixed by
+  re-stamping `content_length` from `body_to_send.len()` after the
+  encryption branch decides the final bytes.
+- **BUG-2 / 3**: SSE-C / SSE-KMS request headers were forwarded to
+  the upstream backend (MemoryBackend ignored them). Real backends
+  rejected: MinIO requires HTTPS for SSE-C and refuses SSE-KMS without
+  KMS configured. Fixed by `take()`-ing the SSE input fields off
+  `req.input` before backend dispatch — S4 owns the
+  encrypt-then-store contract.
+- **BUG-4**: HEAD didn't echo `x-amz-server-side-encryption` +
+  `x-amz-server-side-encryption-aws-kms-key-id` for SSE-KMS / SSE-C
+  objects. HEAD has no body so it can't peek the frame magic. Fixed
+  by stamping `s4-sse-type` / `s4-sse-kms-key-id` / `s4-sse-c-key-md5`
+  metadata at PUT time and reading them on HEAD. SSE-S4 stays
+  deliberately unstamped — server-driven transparent encryption
+  shouldn't masquerade as SSE-S3.
+
+### Finished
+
+- **CORS OPTIONS preflight wired through hyper listener** (#44) —
+  v0.6 #38 landed `S4Service::handle_preflight` but no listener
+  routed OPTIONS to it. The `routing.rs` interceptor now intercepts
+  before the s3s pipeline; matched preflights return 200 with
+  Allow-Origin/Methods/Headers, mismatches return 403, no-CORS
+  buckets fall through to s3s.
+- **Lifecycle scanner: actual list_objects + execute** (#45) — v0.6
+  #37 landed the evaluator + handlers but the scheduler was
+  skeleton-only. `lifecycle::run_scan_once(&Arc<S4Service>)` walks
+  every bucket with a config, lists each object via
+  `list_objects_v2`, executes Expire (delete) / Transition
+  (copy_object with new storage class) — Object-Lock-protected
+  objects skipped (lock wins). Foundational `SharedService<B>` Arc
+  wrapper added so background scanners can call into the service.
+- **Inventory scanner: actual bucket walk + CSV emit** (#46) — v0.6
+  #36 landed manager + handlers + render helpers but the scheduler
+  only marked runs. Now walks buckets via
+  `list_objects_v2`, builds `InventoryRow` per object (including
+  encryption-status from `s4-encrypted` metadata), writes CSV +
+  manifest.json to the configured destination prefix.
+- **SigV4a verify gate wired into request flow** (#47) — v0.5 #33
+  landed credential store + verifier but no middleware. The
+  `routing.rs` middleware now detects
+  `Authorization: AWS4-ECDSA-P256-SHA256`, builds canonical-request
+  bytes (using the `x-amz-content-sha256` header for the payload
+  hash to keep the body stream borrow non-destructive), calls the
+  verifier, and returns 403 `SignatureDoesNotMatch` on failure.
+
+### Quality
+
+- **MinIO E2E smoke for v0.4–v0.6 features** (#48) — new
+  `tests/feature_e2e.rs` Docker-gated suite, **12 tests** through
+  real `aws-sdk-s3` against MinIO covering: SSE-S4 / SSE-C /
+  SSE-KMS round-trip, versioning, Object Lock (Compliance +
+  Governance + bypass), tagging, replication, CORS preflight, MFA
+  Delete, plus the lifecycle / inventory / SigV4a scanners from
+  #45/#46/#47. All pass after the four BUG fixes.
+- **URL parse hardening** (#49) — five `format!("/{bucket}/{key}").parse::<Uri>().unwrap()`
+  call sites in `service.rs` (sidecar key paths) replaced with a
+  `safe_object_uri(bucket, key)` helper that percent-encodes via the
+  `percent-encoding` crate and returns `S3Error(InvalidObjectName)`
+  on failure. New fuzz test runs every byte 0x00–0xFF and 11
+  adversarial Unicode codepoints (RTL, NULL, BOM, ZWS, line/paragraph
+  separators, U+10FFFF, etc.) through put/get/head/delete handlers
+  asserting no panic.
+
+### Changed
+
+- Workspace bumped to 0.7.0.
+- `S4Service` now wrapped in `SharedService<B>(Arc<S4Service<B>>)`
+  newtype with delegating `impl S3` for all 99 trait methods, so
+  background scanners (lifecycle / inventory) can call into the
+  service via an `Arc` clone.
+
+### Test posture (post-v0.7)
+
+| | passed | ignored (Docker / AWS-creds) |
+|---|---|---|
+| Workspace | 461 | 28 |
+| MinIO E2E (with Docker) | 12 (feature_e2e) + 3 (minio_e2e) + 5 (http_e2e) + 4 (multipart_e2e) | 0 |
+| AWS-creds E2E | 0 | 3 |
+
 ## [0.6.0] — 2026-05-13
 
 Eight v0.6 milestone issues delivered (#35–#42). Theme: **ecosystem
