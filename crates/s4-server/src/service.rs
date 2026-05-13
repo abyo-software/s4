@@ -2525,26 +2525,29 @@ impl<B: S3> S3 for S4Service<B> {
                 // through the KMS backend (async). S4E1/E2/E3 take
                 // the sync path (keyring or customer key).
                 //
-                // v0.8 #52: S4E5 takes the *streaming* path — we
-                // hand the response body a per-chunk
-                // verify-and-emit Stream so the client sees chunk 0
-                // plaintext after one chunk-worth of AES-GCM verify
-                // (vs. waiting for the whole body's tag), and the
-                // gateway no longer needs to materialize the full
-                // plaintext in memory before responding. SSE-C is
-                // out of scope for v0.8 #52 (chunked S4E3 is a
-                // follow-up), so the S4E5 path requires the
-                // SSE-S4 keyring to be wired and `get_sse_c_material`
-                // to be absent — otherwise we surface a clear
-                // misconfiguration error instead of silently falling
-                // through to the buffered S4E5 path.
-                if matches!(crate::sse::peek_magic(&body), Some("S4E5"))
-                    && get_sse_c_material.is_none()
+                // v0.8 #52 (S4E5) / v0.8.1 #57 (S4E6): the chunked
+                // SSE-S4 frames take the *streaming* path — we hand
+                // the response body a per-chunk verify-and-emit
+                // Stream so the client sees chunk 0 plaintext after
+                // one chunk-worth of AES-GCM verify (vs. waiting
+                // for the whole body's tag), and the gateway no
+                // longer needs to materialize the full plaintext
+                // in memory before responding. SSE-C is out of
+                // scope for the chunked path (chunked S4E3 is a
+                // follow-up), so this branch requires the SSE-S4
+                // keyring to be wired and `get_sse_c_material` to
+                // be absent — otherwise we surface a clear
+                // misconfiguration error instead of silently
+                // falling through to the buffered chunked path.
+                if matches!(
+                    crate::sse::peek_magic(&body),
+                    Some("S4E5") | Some("S4E6")
+                ) && get_sse_c_material.is_none()
                 {
                     let keyring_arc = self.sse_keyring.clone().ok_or_else(|| {
                         S3Error::with_message(
                             S3ErrorCode::InvalidRequest,
-                            "object is SSE-S4 encrypted (S4E5) but no --sse-s4-key is configured on this gateway",
+                            "object is SSE-S4 encrypted (S4E5/S4E6) but no --sse-s4-key is configured on this gateway",
                         )
                     })?;
                     let body_len = body.len() as u64;
@@ -2570,8 +2573,8 @@ impl<B: S3> S3 for S4Service<B> {
                     // encoding) rather than lying about the size.
                     resp.output.content_length = None;
                     // The backend's checksums + ETag describe the
-                    // encrypted body (S4E5 wire format), not the
-                    // plaintext we're about to stream — clear them
+                    // encrypted body (S4E5/S4E6 wire format), not
+                    // the plaintext we're about to stream — clear them
                     // so the AWS SDK doesn't fail the GET with a
                     // ChecksumMismatch on a successful round-trip.
                     // Mirrors the streaming-zstd path at L1180-1185.

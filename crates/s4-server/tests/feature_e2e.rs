@@ -1029,22 +1029,27 @@ async fn sse_s4_through_aws_sdk() {
 }
 
 // ---------------------------------------------------------------------------
-// 1b) v0.8 #52 — SSE-S4 chunked S4E5 frame, 50 MB streaming GET.
+// 1b) v0.8 #52 (S4E5) / v0.8.1 #57 (S4E6) — SSE-S4 chunked frame,
+//     50 MB streaming GET.
 // ---------------------------------------------------------------------------
 //
 // PUT a 50 MB body through a gateway configured with `--sse-chunk-size
 // 1048576` (1 MiB plaintext chunks) and verify:
 //
 // 1. Round-trip is byte-equal for the client.
-// 2. The on-disk MinIO object starts with `S4E5` magic (proves the
+// 2. The on-disk MinIO object starts with `S4E6` magic (proves the
 //    chunked frame, not the legacy S4E2, was actually written).
+//    v0.8.1 #57 widened the per-PUT salt 4 → 8 bytes (S4E5 → S4E6),
+//    so the on-disk header is now 24 bytes instead of 20; the
+//    chunk_size / chunk_count field offsets [8..12] / [12..16] are
+//    unchanged.
 // 3. The on-disk header declares the expected chunk_count
 //    (50 MB / 1 MiB ≈ 50 chunks at the SSE-S4 boundary; the codec is
 //    Passthrough so post-compression length == pre-compression length).
 //
-// This is the wire-level proof that v0.8 #52 actually fires end-to-
-// end through the s3s_aws::Proxy → MinIO leg, not just in the
-// in-process sse.rs unit tests.
+// This is the wire-level proof that the chunked SSE path actually
+// fires end-to-end through the s3s_aws::Proxy → MinIO leg, not just
+// in the in-process sse.rs unit tests.
 #[tokio::test]
 #[ignore = "requires Docker for MinIO container"]
 async fn sse_s4_chunked_50mb_streaming_get() {
@@ -1111,9 +1116,10 @@ async fn sse_s4_chunked_50mb_streaming_get() {
         (body.len() as f64) / elapsed.as_secs_f64() / (1024.0 * 1024.0),
     );
 
-    // Direct backend read: the on-disk object must start with `S4E5`
-    // magic and declare ~50 chunks (proves v0.8 #52 wire format
-    // actually landed; without the chunked frame this would be S4E2).
+    // Direct backend read: the on-disk object must start with `S4E6`
+    // magic (v0.8.1 #57 widened the per-PUT salt 4→8 B; new PUTs now
+    // emit S4E6) and declare ~50 chunks. Without the chunked frame
+    // this would be S4E2; without #57 it would be S4E5.
     let raw = backend_client
         .get_object()
         .bucket("sse-s4-chunked-e2e")
@@ -1123,8 +1129,8 @@ async fn sse_s4_chunked_50mb_streaming_get() {
         .expect("raw get");
     let raw_bytes = raw.body.collect().await.expect("raw body").into_bytes();
     assert!(
-        raw_bytes.len() >= 20 && &raw_bytes[..4] == b"S4E5",
-        "MinIO object must begin with S4E5 magic, got: {:?}",
+        raw_bytes.len() >= 24 && &raw_bytes[..4] == b"S4E6",
+        "MinIO object must begin with S4E6 magic, got: {:?}",
         &raw_bytes[..raw_bytes.len().min(4)],
     );
     let on_disk_chunk_count = u32::from_be_bytes([
