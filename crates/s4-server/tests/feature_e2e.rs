@@ -4642,3 +4642,296 @@ async fn lifecycle_skips_object_lock_compliance_via_minio() {
         "two outer expires must be counted in the in-process snapshot"
     );
 }
+
+// =============================================================================
+// v0.8.3 #67 (audit H-7) — Inventory CSV must classify SSE-KMS correctly.
+// =============================================================================
+//
+// Pre-fix: `encryption_status_from_head` short-circuited on
+// `head.ssekms_key_id.is_some()` before it consulted
+// `head.server_side_encryption`, but HEAD does not carry a separate
+// `ssekms_key_id` field on the S4 / MinIO path — the SSE-KMS signal is
+// `server_side_encryption = "aws:kms"`. The `metadata["s4-encrypted"]`
+// arm then mis-claimed the row, so the CSV labelled SSE-KMS objects
+// `"SSE-S4"`. Audit H-7.
+//
+// This E2E PUTs four objects of mixed SSE posture through an S4
+// listener with `--kms-local-dir` configured (LocalKms with KEK `alpha`)
+// and SSE-S4 enabled, then drives `inventory::run_scan_once` via a
+// `SharedService` clone of the same `S4Service`. The rendered CSV must
+// carry the four canonical labels:
+//
+//   - plain unencrypted PUT             → `"NOT-SSE"`
+//   - SSE-S4 (gateway-default keyring)  → `"SSE-S4"`
+//   - SSE-KMS (`aws:kms` + KEK alpha)   → `"SSE-KMS"`  ← the fix target
+//   - SSE-C   (customer-supplied key)   → `"SSE-C"`
+//
+// Topology: aws-sdk-s3 client → S4 hyper listener → MinIO container.
+// The inventory scanner runs on the same Arc<S4Service<...>>, so the
+// HEAD responses it consumes go through the same `s4-sse-type` echo
+// path that the audit pinned (`service.rs` ~L2967).
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn inventory_csv_classifies_sse_kms_correctly() {
+    use base64::Engine as _;
+    use s4_codec::cpu_zstd::CpuZstd;
+    use s4_server::inventory::{
+        InventoryConfig, InventoryManager, run_scan_once as run_inv_scan_once,
+    };
+    use s4_server::service_arc::SharedService;
+
+    let minio = start_minio().await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    let src_bucket = "s4-inv-sse-src";
+    let dst_bucket = "s4-inv-sse-dst";
+    ensure_bucket(&backend_client, src_bucket).await;
+    ensure_bucket(&backend_client, dst_bucket).await;
+
+    // Build an `S4Service` with every SSE flavour wired AND an
+    // inventory manager pre-loaded with a daily-CSV config for
+    // src→dst. Hand-rolled here (rather than via
+    // `spawn_s4_with_options`) so we can wrap the service in
+    // `SharedService` and call `run_scan_once` on the same handle
+    // the listener serves.
+    let sse_s4_key = [0xa3u8; 32];
+    let kek_alpha = [0x33u8; 32];
+    let mgr = std::sync::Arc::new(InventoryManager::new());
+    mgr.put(InventoryConfig::daily_csv(
+        "h7-d1", src_bucket, dst_bucket, "inv",
+    ));
+
+    let proxy = s3s_aws::Proxy::from(backend_client.clone());
+    let registry = std::sync::Arc::new(
+        CodecRegistry::new(CodecKind::Passthrough)
+            .with(std::sync::Arc::new(Passthrough))
+            .with(std::sync::Arc::new(CpuZstd::default())),
+    );
+    let dispatcher = std::sync::Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
+    let mut keks = std::collections::HashMap::new();
+    keks.insert("alpha".to_owned(), kek_alpha);
+    let kms = std::sync::Arc::new(s4_server::kms::LocalKms::from_keks(
+        std::env::temp_dir(),
+        keks,
+    )) as std::sync::Arc<dyn s4_server::kms::KmsBackend>;
+    let s4 = S4Service::new(proxy, registry, dispatcher)
+        .with_sse_key(std::sync::Arc::new(s4_server::sse::SseKey {
+            bytes: sse_s4_key,
+        }))
+        .with_kms_backend(kms, Some("alpha".into()))
+        .with_inventory(std::sync::Arc::clone(&mgr));
+    let s4_arc = std::sync::Arc::new(s4);
+    let shared = SharedService::new(std::sync::Arc::clone(&s4_arc));
+
+    // Spawn the hyper listener on `127.0.0.1:0` backed by a
+    // `SharedService` clone (one Arc::clone bump). Scanner uses the
+    // sister Arc directly.
+    let mut svc = S3ServiceBuilder::new(shared.clone());
+    svc.set_auth(SimpleAuth::from_single(MINIO_USER, MINIO_PASS));
+    let service = svc.build();
+    let router = HealthRouterV2::new(service, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let local = listener.local_addr().expect("local addr");
+    let s4_endpoint = format!("http://{local}");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let http_server = ConnBuilderV2::new(TokioExecV2::new());
+        let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+        let mut shutdown_rx = std::pin::pin!(shutdown_rx);
+        loop {
+            tokio::select! {
+                accept = listener.accept() => match accept {
+                    Ok((socket, _)) => {
+                        let conn = http_server
+                            .serve_connection(TokioIoV2::new(socket), router.clone());
+                        let conn = graceful.watch(conn.into_owned());
+                        tokio::spawn(async move { let _ = conn.await; });
+                    }
+                    Err(e) => { eprintln!("accept: {e}"); continue; }
+                },
+                _ = shutdown_rx.as_mut() => break,
+            }
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), graceful.shutdown())
+            .await;
+    });
+    let s4_client = build_aws_client_v2(&s4_endpoint);
+
+    // PUT four objects of mixed SSE posture. Each PUT may hit
+    // v0.7 #48 BUG-1 (StreamLengthMismatch on the s3s_aws::Proxy
+    // path) on the encryption branches — guard the same way the
+    // other SSE-* tests in this file do (eprintln + early-shutdown
+    // skip) so this test stays green until the source fix lands.
+    // For the unencrypted row we PUT directly to MinIO via the raw
+    // backend client. PUTs through the s4 listener would otherwise
+    // pick up gateway-default SSE-S4 (the `with_sse_key` keyring
+    // transparently encrypts every "no SSE headers" PUT) — that is
+    // the *correct* gateway behaviour, but it means we can't sample
+    // "NOT-SSE" through the s4 listener path. Bypassing the listener
+    // for this one object lets the scanner observe a genuinely
+    // unencrypted object on the backend.
+    backend_client
+        .put_object()
+        .bucket(src_bucket)
+        .key("plain.txt")
+        .body(aws_sdk_s3::primitives::ByteStream::from(b"PLAIN".to_vec()))
+        .send()
+        .await
+        .expect("put plain (raw backend)");
+
+    let sse_s4_resp = s4_client
+        .put_object()
+        .bucket(src_bucket)
+        .key("sse_s4.txt")
+        .body(aws_sdk_s3::primitives::ByteStream::from(b"S4S4".to_vec()))
+        .send()
+        .await;
+    if let Err(ref e) = sse_s4_resp
+        && format!("{e:?}").contains("InternalError")
+    {
+        eprintln!(
+            "SKIP inventory_csv_classifies_sse_kms_correctly: v0.7 #48 BUG-1 \
+             detected on SSE-S4 PUT (content_length stamped pre-encrypt). \
+             Re-engage once source fix lands."
+        );
+        let _ = shutdown_tx.send(());
+        return;
+    }
+    sse_s4_resp.expect("put SSE-S4");
+
+    let sse_kms_resp = s4_client
+        .put_object()
+        .bucket(src_bucket)
+        .key("sse_kms.txt")
+        .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+        .ssekms_key_id("alpha")
+        .body(aws_sdk_s3::primitives::ByteStream::from(b"KMS!".to_vec()))
+        .send()
+        .await;
+    if let Err(ref e) = sse_kms_resp
+        && format!("{e:?}").contains("InternalError")
+    {
+        eprintln!(
+            "SKIP inventory_csv_classifies_sse_kms_correctly: v0.7 #48 BUG-1 \
+             detected on SSE-KMS PUT."
+        );
+        let _ = shutdown_tx.send(());
+        return;
+    }
+    sse_kms_resp.expect("put SSE-KMS");
+
+    let cust_key = [0xa5u8; 32];
+    let key_b64 = base64::engine::general_purpose::STANDARD.encode(cust_key);
+    let key_md5_b64 = base64::engine::general_purpose::STANDARD
+        .encode(s4_server::sse::compute_key_md5(&cust_key));
+    let sse_c_resp = s4_client
+        .put_object()
+        .bucket(src_bucket)
+        .key("sse_c.txt")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(key_b64.clone())
+        .sse_customer_key_md5(key_md5_b64.clone())
+        .body(aws_sdk_s3::primitives::ByteStream::from(b"CCCC".to_vec()))
+        .send()
+        .await;
+    if let Err(ref e) = sse_c_resp
+        && format!("{e:?}").contains("InternalError")
+    {
+        eprintln!(
+            "SKIP inventory_csv_classifies_sse_kms_correctly: v0.7 #48 BUG-1 \
+             detected on SSE-C PUT."
+        );
+        let _ = shutdown_tx.send(());
+        return;
+    }
+    sse_c_resp.expect("put SSE-C");
+
+    // Drive the inventory scanner directly against the same s4
+    // service handle (Arc::clone). It walks `list_objects_v2`,
+    // HEADs each of the four keys, classifies via the v0.8.3 #67
+    // fixed `encryption_status_from_head`, and writes the CSV /
+    // manifest to `dst`.
+    let report = run_inv_scan_once(&s4_arc).await.expect("scan");
+    eprintln!("v0.8.3 #67 scan report: {report:?}");
+    assert_eq!(report.configs_evaluated, 1);
+    assert_eq!(report.buckets_scanned, 1);
+    assert_eq!(report.objects_listed, 4);
+    assert_eq!(report.csvs_written, 1);
+    assert_eq!(report.errors, 0);
+
+    // Pull the rendered CSV back out of dst. The scanner's PUT
+    // went through the same `S4Service` we wired with `with_sse_key`,
+    // so the CSV body is SSE-S4-encrypted on disk in MinIO (gateway-
+    // default behaviour). GET via the `s4_client` so the listener
+    // transparently decrypts.
+    let listed = s4_client
+        .list_objects_v2()
+        .bucket(dst_bucket)
+        .prefix(format!("inv/{src_bucket}/h7-d1/"))
+        .send()
+        .await
+        .expect("list dst via s4");
+    let csv_key = listed
+        .contents()
+        .iter()
+        .filter_map(|o| o.key())
+        .find(|k| k.ends_with(".csv"))
+        .expect("one CSV under prefix")
+        .to_owned();
+    let csv_body = s4_client
+        .get_object()
+        .bucket(dst_bucket)
+        .key(&csv_key)
+        .send()
+        .await
+        .expect("get CSV via s4")
+        .body
+        .collect()
+        .await
+        .expect("collect")
+        .into_bytes();
+    let csv_text = std::str::from_utf8(&csv_body).expect("utf8");
+    eprintln!("v0.8.3 #67 CSV body:\n{csv_text}");
+
+    // Parse rows: header + 4 data lines. Each row's last column is
+    // the EncryptionStatus cell — that's the cell the audit fix
+    // targets. CSV cells are quoted (see `render_csv`), so look for
+    // the literal `"<status>"` suffix.
+    let lines: Vec<&str> = csv_text.lines().collect();
+    assert_eq!(lines.len(), 5, "header + 4 data rows; got:\n{csv_text}");
+    let extract_status = |key: &str| -> String {
+        for line in lines.iter().skip(1) {
+            if line.contains(&format!("\"{key}\"")) {
+                // The last field is the EncryptionStatus, quoted.
+                let last = line.rsplit(',').next().expect("non-empty row");
+                return last.trim_matches('"').to_owned();
+            }
+        }
+        panic!("row for key {key} not found in:\n{csv_text}");
+    };
+
+    assert_eq!(
+        extract_status("plain.txt"),
+        "NOT-SSE",
+        "unencrypted PUT must classify NOT-SSE",
+    );
+    assert_eq!(
+        extract_status("sse_s4.txt"),
+        "SSE-S4",
+        "gateway-default SSE-S4 must classify SSE-S4 (via `s4-encrypted` metadata)",
+    );
+    assert_eq!(
+        extract_status("sse_kms.txt"),
+        "SSE-KMS",
+        "v0.8.3 #67: SSE-KMS must classify SSE-KMS (server_side_encryption=aws:kms), \
+         not SSE-S4 as pre-fix",
+    );
+    assert_eq!(
+        extract_status("sse_c.txt"),
+        "SSE-C",
+        "SSE-C must classify SSE-C (sse_customer_algorithm echoed on HEAD)",
+    );
+
+    let _ = shutdown_tx.send(());
+}

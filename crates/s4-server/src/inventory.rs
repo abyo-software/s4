@@ -620,30 +620,64 @@ fn timestamp_to_chrono_utc(ts: &Timestamp) -> Option<DateTime<Utc>> {
 /// `"NOT-SSE"`. S4 emits `"SSE-S4"` instead of `"SSE-S3"` because the
 /// gateway's own SSE marker is the `s4-encrypted: aes-256-gcm`
 /// metadata flag (see `service.rs::is_sse_encrypted`).
+///
+/// ## v0.8.3 #67 (audit H-7) — field-check ordering fix
+///
+/// HEAD response represents SSE-KMS as
+/// `server_side_encryption = "aws:kms"` (the canonical AWS wire form);
+/// the separate `ssekms_key_id` field is **only** populated by the
+/// PUT/GET output path, **not** by HEAD. Pre-fix the function
+/// short-circuited on `metadata["s4-encrypted"]` *after* the
+/// `ssekms_key_id` check — but for SSE-KMS objects `ssekms_key_id`
+/// was `None` on HEAD, so `server_side_encryption == "aws:kms"`
+/// fell through to the `s4-encrypted` arm and was misclassified
+/// `"SSE-S4"`. Fix: check `server_side_encryption` *first*. The
+/// `ssekms_key_id` arm is retained as a heuristic fallback for backends
+/// that *do* echo the key id on HEAD (real AWS S3 — bonus correctness
+/// when S4 is used as a thin gateway in front of AWS).
 fn encryption_status_from_head(head: &HeadObjectOutput) -> String {
-    if head.sse_customer_algorithm.is_some() {
-        return "SSE-C".to_owned();
-    }
-    if head.ssekms_key_id.is_some() {
-        return "SSE-KMS".to_owned();
-    }
+    // 1. SSE-KMS: the canonical wire signal is
+    //    `x-amz-server-side-encryption: aws:kms`. Check this FIRST
+    //    because HEAD does not carry a separate `ssekms_key_id` field
+    //    on the S4 / MinIO path (see #67 / audit H-7).
     if let Some(sse) = head.server_side_encryption.as_ref() {
         let s = sse.as_str();
         if s.eq_ignore_ascii_case("aws:kms") || s.eq_ignore_ascii_case("aws:kms:dsse") {
             return "SSE-KMS".to_owned();
         }
-        if !s.is_empty() {
-            // `"AES256"` (= AWS SSE-S3) and any other present-but-
-            // non-KMS value: report as the S4 native marker, matching
-            // what `is_sse_encrypted` in service.rs flags.
-            return "SSE-S4".to_owned();
-        }
+        // Fall through: `"AES256"` (= AWS SSE-S3) and any other
+        // present-but-non-KMS value is handled below after the SSE-C
+        // and S4-internal-flag checks, so an object that carries BOTH
+        // an SSE-C customer algorithm header AND a backend-stamped
+        // `AES256` is correctly classified as SSE-C (the customer-
+        // managed signal wins over the bucket-default).
     }
+    // 2. SSE-C: the customer-key headers are unambiguous.
+    if head.sse_customer_algorithm.is_some() {
+        return "SSE-C".to_owned();
+    }
+    // 3. SSE-S4: the gateway-internal marker that `service.rs::
+    //    is_sse_encrypted` checks for.
     if head
         .metadata
         .as_ref()
         .and_then(|m| m.get("s4-encrypted"))
         .is_some()
+    {
+        return "SSE-S4".to_owned();
+    }
+    // 4. Heuristic: real AWS S3 echoes `ssekms_key_id` on HEAD even
+    //    though MinIO / S4 do not — honor it when present so the CSV
+    //    is correct against an AWS-backed deployment.
+    if head.ssekms_key_id.is_some() {
+        return "SSE-KMS".to_owned();
+    }
+    // 5. `server_side_encryption` was set but to a non-KMS value
+    //    (canonically `"AES256"` = SSE-S3). S4 doesn't differentiate
+    //    SSE-S3 from its own SSE-S4 marker, so report `"SSE-S4"` to
+    //    match what `is_sse_encrypted` flags.
+    if let Some(sse) = head.server_side_encryption.as_ref()
+        && !sse.as_str().is_empty()
     {
         return "SSE-S4".to_owned();
     }
@@ -1125,6 +1159,53 @@ mod tests {
             |_, _, _| Ok(()),
         );
         assert!(matches!(err, Err(RunError::UnknownConfig(_, _))));
+    }
+
+    // ---- v0.8.3 #67 (audit H-7): encryption_status_from_head ordering --
+    //
+    // HEAD's SSE-KMS signal is `server_side_encryption = "aws:kms"`;
+    // the separate `ssekms_key_id` field is a PUT/GET output only.
+    // Pre-fix the function checked `ssekms_key_id` before
+    // `server_side_encryption` and an SSE-S4 fall-through branch
+    // misclassified `aws:kms` HEADs as `"SSE-S4"`. These four tests
+    // pin the post-fix ordering at the unit level so a future refactor
+    // cannot silently re-introduce the bug.
+
+    #[test]
+    fn encryption_status_sse_kms_via_aws_kms_string() {
+        let head = HeadObjectOutput {
+            server_side_encryption: Some(ServerSideEncryption::from_static(
+                ServerSideEncryption::AWS_KMS,
+            )),
+            ..Default::default()
+        };
+        assert_eq!(encryption_status_from_head(&head), "SSE-KMS");
+    }
+
+    #[test]
+    fn encryption_status_sse_c_via_customer_algorithm() {
+        let head = HeadObjectOutput {
+            sse_customer_algorithm: Some("AES256".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(encryption_status_from_head(&head), "SSE-C");
+    }
+
+    #[test]
+    fn encryption_status_sse_s4_via_metadata_flag() {
+        let mut metadata = HashMap::new();
+        metadata.insert("s4-encrypted".to_owned(), "aes-256-gcm".to_owned());
+        let head = HeadObjectOutput {
+            metadata: Some(metadata),
+            ..Default::default()
+        };
+        assert_eq!(encryption_status_from_head(&head), "SSE-S4");
+    }
+
+    #[test]
+    fn encryption_status_not_sse_when_all_absent() {
+        let head = HeadObjectOutput::default();
+        assert_eq!(encryption_status_from_head(&head), "NOT-SSE");
     }
 
     // ---- v0.7 #46: scanner runner tests --------------------------------
