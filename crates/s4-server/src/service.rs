@@ -6224,15 +6224,51 @@ fn internal_rule_to_dto(rule: &crate::lifecycle::LifecycleRule) -> LifecycleRule
 /// "request is plain SigV4 — pass through" and "request is SigV4a and
 /// verified", and an `Err(...)` containing a 403-equivalent diagnostic
 /// otherwise. Cheap to clone (the inner store is `Arc`-backed).
+///
+/// v0.8.4 #76 (audit H-6): the gate now enforces an `x-amz-date`
+/// freshness window (default 15 min, AWS-spec) and a strict credential
+/// scope shape (`<key>/<YYYYMMDD>/s3/aws4_request`), shutting the
+/// captured-request replay vector — previously a stolen valid SigV4a
+/// signature could be replayed indefinitely (including DELETE).
 #[derive(Debug, Clone)]
 pub struct SigV4aGate {
     store: crate::sigv4a::SharedSigV4aCredentialStore,
+    /// v0.8.4 #76: how far the request's `x-amz-date` may drift from
+    /// the server's clock before being rejected with 403
+    /// `RequestTimeTooSkewed`. Matches the AWS S3 spec default of
+    /// 15 min when constructed via [`SigV4aGate::new`]; the operator
+    /// can override via [`SigV4aGate::with_skew_tolerance`] (CLI flag
+    /// `--sigv4a-skew-tolerance-seconds`).
+    skew_tolerance: chrono::Duration,
 }
 
 impl SigV4aGate {
+    /// Default `x-amz-date` skew tolerance — 15 min, matching AWS S3.
+    pub const DEFAULT_SKEW_TOLERANCE_SECS: i64 = 900;
+
     #[must_use]
     pub fn new(store: crate::sigv4a::SharedSigV4aCredentialStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            skew_tolerance: chrono::Duration::seconds(Self::DEFAULT_SKEW_TOLERANCE_SECS),
+        }
+    }
+
+    /// v0.8.4 #76: override the `x-amz-date` skew tolerance (default
+    /// 15 min). Operators can widen this for high-clock-drift
+    /// environments or tighten it for compliance regimes that demand
+    /// stricter freshness.
+    #[must_use]
+    pub fn with_skew_tolerance(mut self, skew: chrono::Duration) -> Self {
+        self.skew_tolerance = skew;
+        self
+    }
+
+    /// Read the configured skew tolerance — exposed mostly for test +
+    /// observability use.
+    #[must_use]
+    pub fn skew_tolerance(&self) -> chrono::Duration {
+        self.skew_tolerance
     }
 
     /// Inspect an incoming HTTP request. Behaviour:
@@ -6240,10 +6276,14 @@ impl SigV4aGate {
     /// - Not SigV4a (no `X-Amz-Region-Set` and no SigV4a `Authorization`
     ///   prefix) → returns `Ok(())`; the framework's existing SigV4
     ///   path handles the request.
-    /// - SigV4a + valid signature + region match → `Ok(())`.
+    /// - SigV4a + valid signature + region match + fresh x-amz-date
+    ///   → `Ok(())`.
     /// - SigV4a + unknown access-key-id → `Err` with `InvalidAccessKeyId`.
     /// - SigV4a + bad signature / region mismatch → `Err` with
     ///   `SignatureDoesNotMatch`.
+    /// - SigV4a + missing or skewed `x-amz-date` → `Err` with one of
+    ///   the v0.8.4 #76 freshness variants (`RequestTimeTooSkewed`
+    ///   et al.).
     ///
     /// `canonical_request_bytes` is the SigV4a string-to-sign (or
     /// canonical-request bytes; the caller decides) that the framework
@@ -6256,6 +6296,24 @@ impl SigV4aGate {
         requested_region: &str,
         canonical_request_bytes: &[u8],
     ) -> Result<(), SigV4aGateError> {
+        self.pre_route_at(
+            req,
+            requested_region,
+            canonical_request_bytes,
+            chrono::Utc::now(),
+        )
+    }
+
+    /// Like [`SigV4aGate::pre_route`] but takes an explicit `now` for
+    /// tests that need to pin the freshness clock. Production callers
+    /// use `pre_route` (which calls `chrono::Utc::now()`).
+    pub fn pre_route_at<B>(
+        &self,
+        req: &http::Request<B>,
+        requested_region: &str,
+        canonical_request_bytes: &[u8],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), SigV4aGateError> {
         if !crate::sigv4a::detect(req) {
             return Ok(());
         }
@@ -6265,7 +6323,7 @@ impl SigV4aGate {
             .and_then(|v| v.to_str().ok())
             .ok_or(SigV4aGateError::MissingAuthorization)?;
         let parsed = crate::sigv4a::parse_authorization_header(auth_hdr)
-            .ok_or(SigV4aGateError::MalformedAuthorization)?;
+            .map_err(|_| SigV4aGateError::MalformedAuthorization)?;
         let region_set = req
             .headers()
             .get(crate::sigv4a::REGION_SET_HEADER)
@@ -6275,12 +6333,26 @@ impl SigV4aGate {
             .store
             .get(&parsed.access_key_id)
             .ok_or_else(|| SigV4aGateError::UnknownAccessKey(parsed.access_key_id.clone()))?;
-        crate::sigv4a::verify(
-            &crate::sigv4a::CanonicalRequest::new(canonical_request_bytes),
-            &parsed.signature_der,
+        // v0.8.4 #76: snapshot the request headers into a
+        // lowercase-keyed flat map so `verify_request` can do the
+        // x-amz-date freshness checks without taking a generic
+        // `HeaderMap` dep. Cheap because the headers list is tiny.
+        let mut header_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::with_capacity(req.headers().len());
+        for (name, value) in req.headers() {
+            if let Ok(v) = value.to_str() {
+                header_map.insert(name.as_str().to_ascii_lowercase(), v.to_string());
+            }
+        }
+        crate::sigv4a::verify_request(
+            &parsed,
+            &header_map,
+            canonical_request_bytes,
             key,
             region_set,
             requested_region,
+            now,
+            self.skew_tolerance,
         )
         .map_err(SigV4aGateError::Verify)?;
         Ok(())
@@ -6289,7 +6361,8 @@ impl SigV4aGate {
 
 /// Failure modes from [`SigV4aGate::pre_route`]. All variants map to
 /// HTTP 403 with one of the two AWS-standard error codes
-/// (`InvalidAccessKeyId` or `SignatureDoesNotMatch`).
+/// (`InvalidAccessKeyId` / `SignatureDoesNotMatch` / `RequestTimeTooSkewed`)
+/// — see [`SigV4aGateError::s3_error_code`].
 #[derive(Debug, thiserror::Error)]
 pub enum SigV4aGateError {
     #[error("missing Authorization header")]
@@ -6303,12 +6376,50 @@ pub enum SigV4aGateError {
 }
 
 impl SigV4aGateError {
-    /// AWS S3 error code that should accompany a 403 response.
+    /// AWS S3 error code that should accompany the response.
+    ///
+    /// v0.8.4 #76 (audit H-6): the freshness check surfaces
+    /// `RequestTimeTooSkewed` (matches AWS spec); date / scope shape
+    /// failures surface as `InvalidRequest` (400); other failures stay
+    /// `SignatureDoesNotMatch` / `InvalidAccessKeyId` (403) so the wire
+    /// surface stays AWS-compatible.
     #[must_use]
     pub fn s3_error_code(&self) -> &'static str {
         match self {
             Self::UnknownAccessKey(_) => "InvalidAccessKeyId",
+            Self::Verify(crate::sigv4a::SigV4aError::RequestTimeTooSkewed { .. }) => {
+                "RequestTimeTooSkewed"
+            }
+            Self::Verify(
+                crate::sigv4a::SigV4aError::MissingXAmzDate
+                | crate::sigv4a::SigV4aError::InvalidDateFormat
+                | crate::sigv4a::SigV4aError::DateScopeMismatch
+                | crate::sigv4a::SigV4aError::XAmzDateNotSigned
+                | crate::sigv4a::SigV4aError::InvalidTerminator
+                | crate::sigv4a::SigV4aError::WrongService { .. }
+                | crate::sigv4a::SigV4aError::InvalidCredentialScope,
+            ) => "InvalidRequest",
             _ => "SignatureDoesNotMatch",
+        }
+    }
+
+    /// HTTP status code to accompany the response. v0.8.4 #76: format
+    /// errors that are clearly client mistakes (missing / malformed
+    /// `x-amz-date`, malformed credential scope, wrong service) are
+    /// surfaced as 400 InvalidRequest; the rest stay 403.
+    #[must_use]
+    pub fn http_status(&self) -> http::StatusCode {
+        match self {
+            Self::Verify(
+                crate::sigv4a::SigV4aError::MissingXAmzDate
+                | crate::sigv4a::SigV4aError::InvalidDateFormat
+                | crate::sigv4a::SigV4aError::DateScopeMismatch
+                | crate::sigv4a::SigV4aError::XAmzDateNotSigned
+                | crate::sigv4a::SigV4aError::InvalidTerminator
+                | crate::sigv4a::SigV4aError::WrongService { .. }
+                | crate::sigv4a::SigV4aError::InvalidCredentialScope,
+            ) => http::StatusCode::BAD_REQUEST,
+            _ => http::StatusCode::FORBIDDEN,
         }
     }
 }

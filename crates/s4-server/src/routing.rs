@@ -280,6 +280,19 @@ pub fn try_sigv4a_verify<B>(
     gate: Option<&Arc<SigV4aGate>>,
     requested_region: &str,
 ) -> Option<Result<(), Response<s3s::Body>>> {
+    try_sigv4a_verify_at(req, gate, requested_region, chrono::Utc::now())
+}
+
+/// v0.8.4 #76: like [`try_sigv4a_verify`] but takes an explicit `now`
+/// for tests that need to pin the freshness clock without time-warping
+/// the system clock. Production callers always reach this via
+/// `try_sigv4a_verify` (which calls `chrono::Utc::now()`).
+pub fn try_sigv4a_verify_at<B>(
+    req: &Request<B>,
+    gate: Option<&Arc<SigV4aGate>>,
+    requested_region: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Result<(), Response<s3s::Body>>> {
     let gate = gate?;
     if !crate::sigv4a::detect(req) {
         // Not a SigV4a request — caller forwards to the SigV4 path.
@@ -289,12 +302,20 @@ pub fn try_sigv4a_verify<B>(
     // list to canonicalise in. If the header is malformed, fail fast
     // with 403 rather than building canonical bytes that can never
     // verify.
+    //
+    // v0.8.4 #76: `parse_authorization_header` now returns `Result`
+    // (was `Option`) so the gate can surface scope-shape failures
+    // (`InvalidCredentialScope`, `WrongService`, etc.) as 400
+    // InvalidRequest. Any non-Ok parse falls through to the
+    // SignatureDoesNotMatch 403 the original code returned, since at
+    // this point we can't extract a `signed_headers` list to feed the
+    // canonical-request builder.
     let auth_hdr = req
         .headers()
         .get(http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     let signed_headers: Vec<String> = match auth_hdr
-        .and_then(crate::sigv4a::parse_authorization_header)
+        .and_then(|hdr| crate::sigv4a::parse_authorization_header(hdr).ok())
     {
         Some(parsed) => parsed.signed_headers,
         None => {
@@ -302,17 +323,19 @@ pub fn try_sigv4a_verify<B>(
             // it as SigV4a-shaped (e.g. only the region-set header is
             // present) — surface as SignatureDoesNotMatch directly.
             return Some(Err(build_sigv4a_error_response(
+                StatusCode::FORBIDDEN,
                 "SignatureDoesNotMatch",
                 "missing or malformed Authorization header for SigV4a request",
             )));
         }
     };
     let canonical = build_canonical_request_bytes(req, &signed_headers);
-    match gate.pre_route(req, requested_region, &canonical) {
+    match gate.pre_route_at(req, requested_region, &canonical, now) {
         Ok(()) => Some(Ok(())),
         Err(err) => {
             tracing::warn!(error = %err, "SigV4a verify rejected request");
             Some(Err(build_sigv4a_error_response(
+                err.http_status(),
                 err.s3_error_code(),
                 &err.to_string(),
             )))
@@ -425,18 +448,26 @@ fn trim_collapse_ws(s: &str) -> String {
     out
 }
 
-/// v0.7 #47: build an AWS-shaped 403 XML response for a SigV4a verify
+/// v0.7 #47: build an AWS-shaped XML response for a SigV4a verify
 /// failure. The response body matches the wire format AWS S3 emits for
 /// the same conditions so SDKs surface the right exception class to the
 /// caller.
-fn build_sigv4a_error_response(code: &str, message: &str) -> Response<s3s::Body> {
+///
+/// v0.8.4 #76: now takes `status` so the gate can return 400
+/// InvalidRequest for malformed-input failures (missing x-amz-date,
+/// wrong service scope, etc.) and 403 for actual auth failures.
+fn build_sigv4a_error_response(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) -> Response<s3s::Body> {
     let body_str = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <Error>\n  <Code>{code}</Code>\n  <Message>{message}</Message>\n</Error>"
     );
     let bytes = Bytes::from(body_str.into_bytes());
     Response::builder()
-        .status(StatusCode::FORBIDDEN)
+        .status(status)
         .header("content-type", "application/xml")
         .header("content-length", bytes.len().to_string())
         .body(s3s::Body::http_body(
@@ -955,6 +986,17 @@ mod sigv4a_gate_tests {
             .to_vec()
     }
 
+    /// v0.8.4 #76: pinned `now` matching the `x-amz-date: 20260513T120000Z`
+    /// the test fixtures stamp. Without this the freshness check would
+    /// reject every gate test (the timestamp would be days/weeks old by
+    /// the time CI runs). Production callers use `try_sigv4a_verify`
+    /// (which calls `Utc::now()`).
+    fn fixture_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-05-13T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
     #[test]
     fn no_sigv4a_prefix_returns_none() {
         // Plain SigV4 (HMAC-SHA256) request — gate must defer to s3s.
@@ -973,7 +1015,7 @@ mod sigv4a_gate_tests {
             )],
         );
         assert!(
-            try_sigv4a_verify(&r, Some(&gate), "us-east-1").is_none(),
+            try_sigv4a_verify_at(&r, Some(&gate), "us-east-1", fixture_now()).is_none(),
             "plain SigV4 request must fall through to the inner service"
         );
     }
@@ -983,7 +1025,7 @@ mod sigv4a_gate_tests {
         let (r, vk) =
             make_signed_request("AKIAOK", Method::GET, "/bucket/key", "us-east-1,us-west-2");
         let gate = make_gate_with("AKIAOK", vk);
-        let result = try_sigv4a_verify(&r, Some(&gate), "us-east-1")
+        let result = try_sigv4a_verify_at(&r, Some(&gate), "us-east-1", fixture_now())
             .expect("must intercept SigV4a request");
         assert!(
             result.is_ok(),
@@ -1025,7 +1067,7 @@ mod sigv4a_gate_tests {
                 ("authorization", &tampered_auth),
             ],
         );
-        let result = try_sigv4a_verify(&tampered, Some(&gate), "us-east-1")
+        let result = try_sigv4a_verify_at(&tampered, Some(&gate), "us-east-1", fixture_now())
             .expect("must intercept SigV4a request");
         let resp = result.expect_err("tampered signature must surface a 403 response");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1046,7 +1088,7 @@ mod sigv4a_gate_tests {
         // SignatureDoesNotMatch).
         let (r, vk) = make_signed_request("AKIAOK", Method::GET, "/bucket/key", "us-east-1");
         let gate = make_gate_with("AKIAOK", vk);
-        let result = try_sigv4a_verify(&r, Some(&gate), "eu-west-1")
+        let result = try_sigv4a_verify_at(&r, Some(&gate), "eu-west-1", fixture_now())
             .expect("must intercept SigV4a request");
         let resp = result.expect_err("region mismatch must produce 403");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1066,7 +1108,7 @@ mod sigv4a_gate_tests {
         // visible to the operator.
         let (r, _vk) = make_signed_request("AKIAOK", Method::GET, "/bucket/key", "us-east-1");
         assert!(
-            try_sigv4a_verify(&r, None, "us-east-1").is_none(),
+            try_sigv4a_verify_at(&r, None, "us-east-1", fixture_now()).is_none(),
             "missing gate must defer to inner service"
         );
     }
@@ -1080,7 +1122,7 @@ mod sigv4a_gate_tests {
         let other_signing = SigningKey::random(&mut OsRng);
         let other_vk = p256::ecdsa::VerifyingKey::from(&other_signing);
         let gate = make_gate_with("AKIASOMEONEELSE", other_vk);
-        let result = try_sigv4a_verify(&r, Some(&gate), "us-east-1")
+        let result = try_sigv4a_verify_at(&r, Some(&gate), "us-east-1", fixture_now())
             .expect("must intercept SigV4a request");
         let resp = result.expect_err("unknown key must produce 403");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1116,7 +1158,7 @@ mod sigv4a_gate_tests {
                 (REGION_SET_HEADER, "us-east-1"),
             ],
         );
-        let result = try_sigv4a_verify(&r, Some(&gate), "us-east-1")
+        let result = try_sigv4a_verify_at(&r, Some(&gate), "us-east-1", fixture_now())
             .expect("must intercept SigV4a-shaped request");
         let resp = result.expect_err("region-set without sigv4a auth must produce 403");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1125,6 +1167,33 @@ mod sigv4a_gate_tests {
         assert!(
             body_str.contains("<Code>SignatureDoesNotMatch</Code>"),
             "missing/malformed Authorization for SigV4a-shaped request must fail closed: {body_str}"
+        );
+    }
+
+    /// v0.8.4 #76 (audit H-6): captured-request replay outside the
+    /// 15-min window → 403 RequestTimeTooSkewed (not
+    /// SignatureDoesNotMatch). This is the headline gate-level
+    /// behaviour change; pre-#76 the same captured request would have
+    /// reached the inner service, allowing destructive replay (DELETE
+    /// included).
+    #[tokio::test]
+    async fn sigv4a_replay_outside_window_returns_403_request_time_too_skewed() {
+        let (r, vk) = make_signed_request("AKIAOK", Method::GET, "/bucket/key", "us-east-1");
+        let gate = make_gate_with("AKIAOK", vk);
+        // Request stamped 20260513T120000Z; "now" is 30 min later → drift
+        // 1800s, beyond the 900s default tolerance.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-13T12:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let result = try_sigv4a_verify_at(&r, Some(&gate), "us-east-1", now)
+            .expect("must intercept SigV4a request");
+        let resp = result.expect_err("replay outside window must reject");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_to_bytes(resp).await;
+        let body_str = String::from_utf8(body).expect("xml utf-8");
+        assert!(
+            body_str.contains("<Code>RequestTimeTooSkewed</Code>"),
+            "replay outside window must surface RequestTimeTooSkewed: {body_str}"
         );
     }
 

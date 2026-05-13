@@ -73,6 +73,47 @@ pub enum SigV4aError {
         #[source]
         source: std::io::Error,
     },
+    // ------------------------------------------------------------------
+    // v0.8.4 #76 — replay protection (audit H-6).
+    // ------------------------------------------------------------------
+    /// `x-amz-date` header is missing on a SigV4a request. Without it
+    /// the gate cannot enforce a freshness window, so the request is
+    /// rejected outright (matches AWS S3 behaviour).
+    #[error("missing x-amz-date header (required for SigV4a)")]
+    MissingXAmzDate,
+    /// `x-amz-date` is not in the AWS canonical `YYYYMMDDTHHMMSSZ`
+    /// format, or the credential-scope date is not 8 ASCII digits.
+    #[error("x-amz-date format must be YYYYMMDDTHHMMSSZ")]
+    InvalidDateFormat,
+    /// The request timestamp is outside the configured skew window
+    /// (`--sigv4a-skew-tolerance-seconds`, default 900s = 15min).
+    /// Maps to HTTP 403 `RequestTimeTooSkewed` per AWS S3 spec.
+    #[error("request time too skewed: {drift_secs}s drift, tolerance {tolerance_secs}s")]
+    RequestTimeTooSkewed { drift_secs: i64, tolerance_secs: i64 },
+    /// `x-amz-date` date portion (first 8 chars) does not match the
+    /// date in the credential scope. Defends against replays whose
+    /// scope and timestamp were mixed and matched.
+    #[error("x-amz-date date does not match credential scope date")]
+    DateScopeMismatch,
+    /// `x-amz-date` is not listed in `SignedHeaders=` so the gate
+    /// cannot trust that the timestamp was actually covered by the
+    /// signature — must be present in the signed-headers list.
+    #[error("x-amz-date must be in SignedHeaders list")]
+    XAmzDateNotSigned,
+    /// Credential-scope terminator (the trailing component) is not the
+    /// literal string `aws4_request` AWS mandates.
+    #[error("credential scope must end with /aws4_request")]
+    InvalidTerminator,
+    /// Credential-scope service component is not the literal `s3`.
+    /// Defends against replaying a SigV4a signature scoped to e.g.
+    /// `ec2` or `lambda` against this S3 listener.
+    #[error("credential scope service must be 's3', got {got:?}")]
+    WrongService { got: String },
+    /// Credential string doesn't have the right number of `/`-separated
+    /// components for SigV4a (`<access-key>/<date>/<service>/aws4_request`,
+    /// 4 components total).
+    #[error("credential scope must have 4 components separated by '/'")]
+    InvalidCredentialScope,
 }
 
 /// Newtype wrapper around the bytes that the SigV4a signature was
@@ -101,14 +142,29 @@ impl<'a> CanonicalRequest<'a> {
 }
 
 /// Parsed `Authorization: AWS4-ECDSA-P256-SHA256 ...` header.
+///
+/// v0.8.4 #76 (audit H-6): the credential scope is now broken out into
+/// typed fields (`date`, `service`, `terminator`) so the verifier can
+/// cross-check against the request's `x-amz-date` and reject malformed
+/// or off-service scopes (`/ec2/aws4_request`, etc.) before any ECDSA
+/// math runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SigV4aAuth {
     /// AWS access key id (the `Credential=<key>/...` first segment).
     pub access_key_id: String,
+    /// Credential-scope date — `YYYYMMDD`, 8 ASCII digits.
+    pub date: String,
+    /// Credential-scope service — must be the literal `"s3"` for
+    /// requests targeting this listener.
+    pub service: String,
+    /// Credential-scope terminator — must be the literal
+    /// `"aws4_request"` per AWS spec.
+    pub terminator: String,
     /// Credential scope path elements after the access-key-id, e.g.
     /// `["20260513", "s3", "aws4_request"]`. SigV4a omits the region
     /// (it lives in `X-Amz-Region-Set`), so this slice is one element
-    /// shorter than the SigV4 equivalent.
+    /// shorter than the SigV4 equivalent. Retained alongside the typed
+    /// fields above for callers that prefer the slice form.
     pub credential_scope: Vec<String>,
     /// The list of header names that participated in the canonical
     /// request, lowercase, in the order signed.
@@ -120,12 +176,25 @@ pub struct SigV4aAuth {
 
 /// Parse an `Authorization` header value as a SigV4a credential.
 ///
-/// Returns `None` for any header that doesn't begin with the SigV4a
-/// algorithm token, or that is malformed. Successful parses fully
-/// populate the [`SigV4aAuth`] struct.
-#[must_use]
-pub fn parse_authorization_header(header: &str) -> Option<SigV4aAuth> {
-    let rest = header.trim().strip_prefix(SIGV4A_ALGORITHM)?;
+/// Returns `Ok(SigV4aAuth)` on a fully-valid SigV4a header. Returns
+/// `Err(SigV4aError)` when the header begins with the SigV4a algorithm
+/// token but is malformed in some recoverable way the caller should
+/// surface as a 400 / 403 (e.g. wrong service, malformed date).
+/// Returns `Err(SigV4aError::BadSignature(...))` for non-SigV4a
+/// headers (callers typically test [`detect`] first and should treat
+/// this as "not our request").
+///
+/// v0.8.4 #76 (audit H-6): credential-scope shape is now strictly
+/// validated. Previously any `<key>/<...>/<...>/<...>` shape parsed,
+/// which let attackers replay a captured SigV4a signature scoped to
+/// e.g. `lambda` against this S3 listener.
+pub fn parse_authorization_header(header: &str) -> Result<SigV4aAuth, SigV4aError> {
+    let rest = header
+        .trim()
+        .strip_prefix(SIGV4A_ALGORITHM)
+        .ok_or_else(|| {
+            SigV4aError::BadSignature("not a SigV4a Authorization header".into())
+        })?;
     let rest = rest.trim_start();
 
     let mut credential: Option<&str> = None;
@@ -143,28 +212,58 @@ pub fn parse_authorization_header(header: &str) -> Option<SigV4aAuth> {
         }
     }
 
-    let cred = credential?;
-    let mut cred_iter = cred.split('/');
-    let access_key_id = cred_iter.next()?.to_owned();
-    let credential_scope: Vec<String> = cred_iter.map(str::to_owned).collect();
-    if credential_scope.is_empty() {
-        return None;
+    let cred = credential
+        .ok_or_else(|| SigV4aError::BadSignature("missing Credential= field".into()))?;
+    // SigV4a credential format: `<access-key>/<date>/<service>/aws4_request`
+    // (4 slash-separated components). The region lives in the
+    // `X-Amz-Region-Set` header, NOT in the credential scope, which is
+    // what differentiates SigV4a from SigV4 here.
+    let scope_parts: Vec<&str> = cred.split('/').collect();
+    if scope_parts.len() != 4 {
+        return Err(SigV4aError::InvalidCredentialScope);
     }
+    let access_key_id = scope_parts[0].to_owned();
+    let date = scope_parts[1].to_owned();
+    let service = scope_parts[2].to_owned();
+    let terminator = scope_parts[3].to_owned();
+    if access_key_id.is_empty() {
+        return Err(SigV4aError::InvalidCredentialScope);
+    }
+    if date.len() != 8 || !date.chars().all(|c| c.is_ascii_digit()) {
+        return Err(SigV4aError::InvalidDateFormat);
+    }
+    if service != "s3" {
+        return Err(SigV4aError::WrongService { got: service });
+    }
+    if terminator != "aws4_request" {
+        return Err(SigV4aError::InvalidTerminator);
+    }
+    let credential_scope: Vec<String> = scope_parts[1..]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
 
-    let signed_headers: Vec<String> = signed_headers?
+    let signed_headers_raw = signed_headers
+        .ok_or_else(|| SigV4aError::BadSignature("missing SignedHeaders= field".into()))?;
+    let signed_headers: Vec<String> = signed_headers_raw
         .split(';')
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
         .collect();
     if signed_headers.is_empty() {
-        return None;
+        return Err(SigV4aError::BadSignature("empty SignedHeaders= list".into()));
     }
 
-    let signature_hex = signature?;
-    let signature_der = decode_hex(signature_hex)?;
+    let signature_hex = signature
+        .ok_or_else(|| SigV4aError::BadSignature("missing Signature= field".into()))?;
+    let signature_der = decode_hex(signature_hex)
+        .ok_or_else(|| SigV4aError::BadSignature("non-hex Signature= value".into()))?;
 
-    Some(SigV4aAuth {
+    Ok(SigV4aAuth {
         access_key_id,
+        date,
+        service,
+        terminator,
         credential_scope,
         signed_headers,
         signature_der,
@@ -222,6 +321,113 @@ pub fn verify(
     pubkey
         .verify(request_bytes.as_bytes(), &sig)
         .map_err(|_| SigV4aError::VerificationFailed)
+}
+
+/// v0.8.4 #76 (audit H-6): full SigV4a request verification with
+/// **replay protection**. Builds on the lower-level [`verify`] above
+/// by additionally enforcing every constraint AWS requires for a
+/// SigV4a request to be considered "fresh and well-scoped":
+///
+/// 1. `x-amz-date` header **MUST** be present (no fallback to the
+///    legacy `Date` header — modern AWS SDKs always send `x-amz-date`).
+/// 2. `x-amz-date` MUST parse as `YYYYMMDDTHHMMSSZ`.
+/// 3. `|now − x-amz-date| <= skew_tolerance` (default 15 min, AWS spec).
+/// 4. The first 8 chars of `x-amz-date` MUST match the credential
+///    scope `date` field (defends against scope/timestamp mix-and-match).
+/// 5. `x-amz-date` MUST appear in the `SignedHeaders=` list (so the
+///    signature actually covers the timestamp the gate just checked).
+/// 6. The ECDSA-P256 signature MUST verify and the requested region
+///    MUST be in the signed region-set (legacy [`verify`] checks).
+///
+/// `headers` is a flat lowercase-name → value map of the request's
+/// HTTP headers. Callers building this from a `http::HeaderMap` must
+/// lowercase the names; the function does case-insensitive lookup of
+/// `x-amz-date` only.
+///
+/// # Errors
+///
+/// Each check has a dedicated `SigV4aError` variant — see [`SigV4aError`]
+/// docs for the per-variant HTTP-status mapping the gate uses.
+#[allow(clippy::too_many_arguments)]
+// 8 args: parsed scope + headers + canonical bytes + key + region pair
+// + now + tolerance. Splitting into a builder struct would just push
+// the cohesion sideways without helping the call site (the gate is the
+// only caller and threads each through directly).
+pub fn verify_request(
+    parsed: &SigV4aAuth,
+    headers: &HashMap<String, String>,
+    canonical_request_bytes: &[u8],
+    pubkey: &VerifyingKey,
+    region_set: &str,
+    requested_region: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    skew_tolerance: chrono::Duration,
+) -> Result<(), SigV4aError> {
+    // (1) x-amz-date present?
+    let x_amz_date = lookup_header_ci(headers, "x-amz-date")
+        .ok_or(SigV4aError::MissingXAmzDate)?;
+    // (2) format check — AWS canonical: YYYYMMDDTHHMMSSZ (16 chars).
+    if x_amz_date.len() != 16 || !x_amz_date.ends_with('Z') {
+        return Err(SigV4aError::InvalidDateFormat);
+    }
+    let request_time = chrono::NaiveDateTime::parse_from_str(x_amz_date, "%Y%m%dT%H%M%SZ")
+        .map_err(|_| SigV4aError::InvalidDateFormat)?
+        .and_utc();
+
+    // (3) skew window. Compute drift as an absolute `chrono::Duration`
+    // and compare to the operator-supplied tolerance. Using
+    // `Duration::abs()` (>= 0.4.31) keeps the math overflow-safe for
+    // the year-range we care about.
+    let drift = (now - request_time).abs();
+    if drift > skew_tolerance {
+        return Err(SigV4aError::RequestTimeTooSkewed {
+            drift_secs: drift.num_seconds(),
+            tolerance_secs: skew_tolerance.num_seconds(),
+        });
+    }
+
+    // (4) date portion must match credential scope.
+    if x_amz_date[..8] != parsed.date {
+        return Err(SigV4aError::DateScopeMismatch);
+    }
+
+    // (5) x-amz-date must be in SignedHeaders.
+    if !parsed
+        .signed_headers
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case("x-amz-date"))
+    {
+        return Err(SigV4aError::XAmzDateNotSigned);
+    }
+
+    // (6) signature + region check via the existing verifier.
+    verify(
+        &CanonicalRequest::new(canonical_request_bytes),
+        &parsed.signature_der,
+        pubkey,
+        region_set,
+        requested_region,
+    )
+}
+
+/// Case-insensitive header lookup against a flat
+/// `HashMap<lowercase-name, value>`. The map is canonicalised by the
+/// caller (the `routing` middleware lowercases all header names when
+/// it snapshots them); this helper exists so unit tests can pass an
+/// arbitrarily-cased map and still get a hit.
+fn lookup_header_ci<'a>(
+    headers: &'a HashMap<String, String>,
+    name: &str,
+) -> Option<&'a String> {
+    let needle = name.to_ascii_lowercase();
+    if let Some(v) = headers.get(&needle) {
+        return Some(v);
+    }
+    // Fallback for callers that didn't pre-lowercase the keys.
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v)
 }
 
 /// Returns `true` iff `region` is listed in the comma-separated
@@ -415,18 +621,22 @@ mod tests {
     fn parse_authorization_header_rejects_sigv4_hmac() {
         // Plain SigV4 (HMAC-SHA256) Authorization header must NOT parse
         // as SigV4a — that's how `detect` keeps the two paths separate.
+        // v0.8.4 #76: parse now returns `Err(BadSignature(..))` instead
+        // of `None`; either shape signals "not for us" to the caller.
         let header = "AWS4-HMAC-SHA256 \
              Credential=AKIA/20260513/us-east-1/s3/aws4_request, \
              SignedHeaders=host, \
              Signature=deadbeef";
-        assert!(parse_authorization_header(header).is_none());
+        let err = parse_authorization_header(header).expect_err("not SigV4a");
+        assert!(matches!(err, SigV4aError::BadSignature(_)));
     }
 
     #[test]
     fn parse_authorization_header_rejects_missing_fields() {
         let header = "AWS4-ECDSA-P256-SHA256 Credential=AKIA/20260513/s3/aws4_request, \
                       SignedHeaders=host";
-        assert!(parse_authorization_header(header).is_none());
+        let err = parse_authorization_header(header).expect_err("missing Signature=");
+        assert!(matches!(err, SigV4aError::BadSignature(_)));
     }
 
     #[test]
@@ -673,5 +883,259 @@ mod tests {
             "us-east-1",
         )
         .expect("round-trip verify");
+    }
+
+    // ======================================================================
+    // v0.8.4 #76 (audit H-6) — credential-scope shape + x-amz-date freshness.
+    //
+    // Captured-request replay was the audit's H-6 finding: a stolen valid
+    // SigV4a request could be replayed indefinitely (including DELETE
+    // ops), because the verifier only checked the ECDSA signature. These
+    // tests cover the new validations:
+    //
+    // 1. credential scope must be 4 components, terminator `aws4_request`,
+    //    service `s3`, date 8-digit `YYYYMMDD`.
+    // 2. `x-amz-date` must be present, parseable, in-window, match the
+    //    scope's date, and listed in `SignedHeaders=`.
+    // ======================================================================
+
+    /// Build a fully-signed `(SigV4aAuth, headers, canonical, vk)` tuple
+    /// scoped to the given x-amz-date timestamp. Helper used by the
+    /// freshness tests so each test can dial in `now` independently.
+    fn build_signed_request(
+        x_amz_date: &str,
+        scope_date: &str,
+    ) -> (
+        SigV4aAuth,
+        HashMap<String, String>,
+        Vec<u8>,
+        VerifyingKey,
+    ) {
+        let signing = SigningKey::random(&mut OsRng);
+        let verifying = VerifyingKey::from(&signing);
+        let canonical = b"GET\n/bucket/key\n\nhost:s3.example.com\nx-amz-date:placeholder\n\nhost;x-amz-date\nUNSIGNED-PAYLOAD".to_vec();
+        let sig: Signature = signing.sign(&canonical);
+        let sig_hex = lower_hex(sig.to_der().as_bytes());
+        let header = format!(
+            "AWS4-ECDSA-P256-SHA256 \
+             Credential=AKIATEST/{scope_date}/s3/aws4_request, \
+             SignedHeaders=host;x-amz-date, \
+             Signature={sig_hex}"
+        );
+        let parsed = parse_authorization_header(&header).expect("parse");
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "s3.example.com".to_string());
+        headers.insert("x-amz-date".to_string(), x_amz_date.to_string());
+        (parsed, headers, canonical, verifying)
+    }
+
+    #[test]
+    fn sigv4a_rejects_missing_x_amz_date() {
+        let (parsed, mut headers, canonical, vk) =
+            build_signed_request("20260514T120000Z", "20260514");
+        headers.remove("x-amz-date");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-14T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let err = verify_request(
+            &parsed,
+            &headers,
+            &canonical,
+            &vk,
+            "*",
+            "us-east-1",
+            now,
+            chrono::Duration::seconds(900),
+        )
+        .expect_err("missing x-amz-date must reject");
+        assert!(matches!(err, SigV4aError::MissingXAmzDate));
+    }
+
+    #[test]
+    fn sigv4a_rejects_skew_beyond_15min_past() {
+        // Request signed at 12:00:00, "now" is 12:16:00 — 16 min drift,
+        // beyond the 15-min default tolerance.
+        let (parsed, headers, canonical, vk) =
+            build_signed_request("20260514T120000Z", "20260514");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-14T12:16:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let err = verify_request(
+            &parsed,
+            &headers,
+            &canonical,
+            &vk,
+            "*",
+            "us-east-1",
+            now,
+            chrono::Duration::seconds(900),
+        )
+        .expect_err("16min past drift must reject");
+        match err {
+            SigV4aError::RequestTimeTooSkewed {
+                drift_secs,
+                tolerance_secs,
+            } => {
+                assert_eq!(drift_secs, 960);
+                assert_eq!(tolerance_secs, 900);
+            }
+            other => panic!("expected RequestTimeTooSkewed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sigv4a_rejects_skew_beyond_15min_future() {
+        // Request signed at 12:16:00, "now" is 12:00:00 — clock skew
+        // 16 min into the future is equally rejected.
+        let (parsed, headers, canonical, vk) =
+            build_signed_request("20260514T121600Z", "20260514");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-14T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let err = verify_request(
+            &parsed,
+            &headers,
+            &canonical,
+            &vk,
+            "*",
+            "us-east-1",
+            now,
+            chrono::Duration::seconds(900),
+        )
+        .expect_err("16min future drift must reject");
+        assert!(matches!(err, SigV4aError::RequestTimeTooSkewed { .. }));
+    }
+
+    #[test]
+    fn sigv4a_rejects_malformed_credential_scope() {
+        // 3 components (missing terminator) → InvalidCredentialScope.
+        let header = "AWS4-ECDSA-P256-SHA256 \
+             Credential=AKIA/20260514/s3, \
+             SignedHeaders=host, \
+             Signature=ab";
+        let err = parse_authorization_header(header).expect_err("3 components must reject");
+        assert!(matches!(err, SigV4aError::InvalidCredentialScope));
+
+        // 5 components (looks like SigV4 with embedded region) → also reject.
+        let header = "AWS4-ECDSA-P256-SHA256 \
+             Credential=AKIA/20260514/us-east-1/s3/aws4_request, \
+             SignedHeaders=host, \
+             Signature=ab";
+        let err = parse_authorization_header(header).expect_err("5 components must reject");
+        assert!(matches!(err, SigV4aError::InvalidCredentialScope));
+    }
+
+    #[test]
+    fn sigv4a_rejects_wrong_service() {
+        // SigV4a captured against `ec2` MUST NOT verify against this
+        // S3 listener. Defends against scope-mixing replay attacks.
+        let header = "AWS4-ECDSA-P256-SHA256 \
+             Credential=AKIA/20260514/ec2/aws4_request, \
+             SignedHeaders=host, \
+             Signature=ab";
+        let err = parse_authorization_header(header).expect_err("ec2 scope must reject");
+        match err {
+            SigV4aError::WrongService { got } => assert_eq!(got, "ec2"),
+            other => panic!("expected WrongService, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sigv4a_accepts_within_skew_window() {
+        // Request signed 14 min ago — inside the 15-min window, must
+        // verify cleanly. Establishes that `verify_request` is not
+        // accidentally rejecting fresh requests.
+        let (parsed, headers, canonical, vk) =
+            build_signed_request("20260514T120000Z", "20260514");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-14T12:14:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        verify_request(
+            &parsed,
+            &headers,
+            &canonical,
+            &vk,
+            "*",
+            "us-east-1",
+            now,
+            chrono::Duration::seconds(900),
+        )
+        .expect("14min drift within window must verify");
+    }
+
+    /// Bonus coverage: terminator validation. `aws4_REQUEST` (case
+    /// variant) is treated as malformed — AWS specifies the literal
+    /// lowercase form.
+    #[test]
+    fn sigv4a_rejects_invalid_terminator() {
+        let header = "AWS4-ECDSA-P256-SHA256 \
+             Credential=AKIA/20260514/s3/AWS4_REQUEST, \
+             SignedHeaders=host, \
+             Signature=ab";
+        let err = parse_authorization_header(header).expect_err("uppercase terminator must reject");
+        assert!(matches!(err, SigV4aError::InvalidTerminator));
+    }
+
+    /// Bonus coverage: `x-amz-date` not in `SignedHeaders=` means the
+    /// signature didn't actually cover the timestamp the gate just
+    /// approved — fail closed.
+    #[test]
+    fn sigv4a_rejects_x_amz_date_not_in_signed_headers() {
+        // Build an auth header whose SignedHeaders only lists `host`.
+        let signing = SigningKey::random(&mut OsRng);
+        let verifying = VerifyingKey::from(&signing);
+        let canonical = b"x".to_vec();
+        let sig: Signature = signing.sign(&canonical);
+        let sig_hex = lower_hex(sig.to_der().as_bytes());
+        let header = format!(
+            "AWS4-ECDSA-P256-SHA256 \
+             Credential=AKIA/20260514/s3/aws4_request, \
+             SignedHeaders=host, \
+             Signature={sig_hex}"
+        );
+        let parsed = parse_authorization_header(&header).expect("parse");
+        let mut headers = HashMap::new();
+        headers.insert("x-amz-date".to_string(), "20260514T120000Z".to_string());
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-14T12:00:30Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let err = verify_request(
+            &parsed,
+            &headers,
+            &canonical,
+            &verifying,
+            "*",
+            "us-east-1",
+            now,
+            chrono::Duration::seconds(900),
+        )
+        .expect_err("x-amz-date not in SignedHeaders must reject");
+        assert!(matches!(err, SigV4aError::XAmzDateNotSigned));
+    }
+
+    /// Bonus coverage: scope date (`20260101`) ≠ `x-amz-date`'s date
+    /// portion (`20260514`) → mismatch.
+    #[test]
+    fn sigv4a_rejects_date_scope_mismatch() {
+        let (parsed, headers, canonical, vk) =
+            build_signed_request("20260514T120000Z", "20260101");
+        // now matches the x-amz-date so we get past the skew check.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-14T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let err = verify_request(
+            &parsed,
+            &headers,
+            &canonical,
+            &vk,
+            "*",
+            "us-east-1",
+            now,
+            // Wide tolerance so the skew check doesn't fire first
+            // (we want to reach the date-scope mismatch branch).
+            chrono::Duration::days(365),
+        )
+        .expect_err("scope date mismatch must reject");
+        assert!(matches!(err, SigV4aError::DateScopeMismatch));
     }
 }

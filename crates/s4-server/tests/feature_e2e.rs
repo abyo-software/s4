@@ -329,22 +329,22 @@ fn canonical_request(
     buf.into_bytes()
 }
 
-#[tokio::test]
-async fn sigv4a_verify_real_listener_e2e() {
-    // Boot the SigV4a gate with a fresh keypair under access-key-id
-    // "AKIAE2E", wrap a `HealthRouter` around a noop inner service,
-    // and bind to a random port.
-    let signing = SigningKey::random(&mut OsRng);
-    let verifying = p256::ecdsa::VerifyingKey::from(&signing);
+/// Boot a `HealthRouter` wrapping `AlwaysOk` with a SigV4a gate
+/// pre-loaded with the supplied verifying key, bind to a random
+/// 127.0.0.1 port, spawn the listener, and return `(host_addr,
+/// gate_arc)`. The gate is returned so the caller can build a fresh
+/// `Authorization` header for each request.
+async fn spawn_sigv4a_listener(
+    access_key: &str,
+    verifying: p256::ecdsa::VerifyingKey,
+) -> String {
     let mut keys = HashMap::new();
-    keys.insert("AKIAE2E".to_string(), verifying);
+    keys.insert(access_key.to_string(), verifying);
     let store = std::sync::Arc::new(SigV4aCredentialStore::from_map(keys));
     let gate = std::sync::Arc::new(SigV4aGate::new(store));
-
     let router = HealthRouter::new(AlwaysOk, None)
         .with_sigv4a_gate(std::sync::Arc::clone(&gate))
         .with_region("us-east-1");
-
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let local_addr = listener.local_addr().expect("local addr");
     let server_router = router.clone();
@@ -366,42 +366,74 @@ async fn sigv4a_verify_real_listener_e2e() {
             });
         }
     });
+    format!("127.0.0.1:{}", local_addr.port())
+}
 
-    // Build the canonical bytes the same way the middleware will, then
-    // sign over them.
-    let host = format!("127.0.0.1:{}", local_addr.port());
+/// Build a SigV4a-shaped `(authorization_header, x_amz_date_string)`
+/// pair signed over the given canonical-request bytes for a GET
+/// `/<path>` against the listener at `host`. v0.8.4 #76: the
+/// `x_amz_date` is now passed in by the caller so tests can pin a
+/// fresh-or-stale timestamp.
+fn build_sigv4a_request(
+    signing: &SigningKey,
+    access_key: &str,
+    host: &str,
+    path: &str,
+    x_amz_date: &str,
+    scope_date: &str,
+) -> String {
     let signed_headers = [
-        ("host", host.as_str()),
+        ("host", host),
         (
             "x-amz-content-sha256",
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         ),
-        ("x-amz-date", "20260513T120000Z"),
+        ("x-amz-date", x_amz_date),
         (REGION_SET_HEADER, "us-east-1"),
     ];
     let canonical = canonical_request(
         "GET",
-        "/test-bucket/key",
+        path,
         "",
         &signed_headers,
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     );
     let sig: p256::ecdsa::Signature = signing.sign(&canonical);
     let sig_hex = lower_hex(sig.to_der().as_bytes());
-
     let names: Vec<&str> = signed_headers.iter().map(|(n, _)| *n).collect();
-    let auth = format!(
+    format!(
         "AWS4-ECDSA-P256-SHA256 \
-         Credential=AKIAE2E/20260513/s3/aws4_request, \
+         Credential={access_key}/{scope_date}/s3/aws4_request, \
          SignedHeaders={}, \
          Signature={sig_hex}",
         names.join(";")
-    );
+    )
+}
+
+#[tokio::test]
+async fn sigv4a_verify_real_listener_e2e() {
+    // Boot the SigV4a gate with a fresh keypair under access-key-id
+    // "AKIAE2E", wrap a `HealthRouter` around a noop inner service,
+    // and bind to a random port.
+    let signing = SigningKey::random(&mut OsRng);
+    let verifying = p256::ecdsa::VerifyingKey::from(&signing);
+    let host = spawn_sigv4a_listener("AKIAE2E", verifying).await;
+
+    // v0.8.4 #76: stamp the request with `chrono::Utc::now()` so the
+    // gate's freshness check passes (default 15-min skew tolerance).
+    // Pre-#76 the test could hard-code any timestamp; post-#76 the
+    // production gate calls `Utc::now()` internally so the timestamp
+    // must actually be fresh.
+    let now = chrono::Utc::now();
+    let x_amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let scope_date = now.format("%Y%m%d").to_string();
+    let path = "/test-bucket/key";
+    let auth = build_sigv4a_request(&signing, "AKIAE2E", &host, path, &x_amz_date, &scope_date);
 
     let client = reqwest::Client::builder()
         .build()
         .expect("reqwest client");
-    let url = format!("http://{host}/test-bucket/key");
+    let url = format!("http://{host}{path}");
 
     // Happy path: valid signature → 200 from the inner AlwaysOk.
     let resp = client
@@ -410,7 +442,7 @@ async fn sigv4a_verify_real_listener_e2e() {
             "x-amz-content-sha256",
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         )
-        .header("x-amz-date", "20260513T120000Z")
+        .header("x-amz-date", &x_amz_date)
         .header(REGION_SET_HEADER, "us-east-1")
         .header("authorization", &auth)
         .send()
@@ -436,7 +468,7 @@ async fn sigv4a_verify_real_listener_e2e() {
             "x-amz-content-sha256",
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         )
-        .header("x-amz-date", "20260513T120000Z")
+        .header("x-amz-date", &x_amz_date)
         .header(REGION_SET_HEADER, "us-east-1")
         .header("authorization", &tampered_auth)
         .send()
@@ -451,6 +483,92 @@ async fn sigv4a_verify_real_listener_e2e() {
     assert!(
         body.contains("<Code>SignatureDoesNotMatch</Code>"),
         "403 body must surface SignatureDoesNotMatch: {body}"
+    );
+}
+
+/// v0.8.4 #76 (audit H-6) end-to-end: a SigV4a request whose
+/// `x-amz-date` is fresh verifies cleanly (200), but the same captured
+/// request body re-sent with a 30-min-stale timestamp returns 403
+/// `RequestTimeTooSkewed` — closing the captured-request replay vector.
+///
+/// Because spinning a real test 20 minutes on the wall clock is
+/// hostile to CI, the "captured" request is generated with a stamped
+/// past timestamp directly (the server's `Utc::now()` is the present);
+/// this is wire-equivalent to capturing fresh + replaying after a 20
+/// min wait, since the gate compares against `Utc::now()` not the
+/// receive timestamp.
+#[tokio::test]
+async fn sigv4a_replay_within_window_ok_old_replay_403() {
+    let signing = SigningKey::random(&mut OsRng);
+    let verifying = p256::ecdsa::VerifyingKey::from(&signing);
+    let host = spawn_sigv4a_listener("AKIAREPLAY", verifying).await;
+    let path = "/test-bucket/key";
+    let client = reqwest::Client::builder()
+        .build()
+        .expect("reqwest client");
+    let url = format!("http://{host}{path}");
+
+    // Phase 1 (fresh): now-stamped request → 200.
+    let now = chrono::Utc::now();
+    let fresh_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let scope_date = now.format("%Y%m%d").to_string();
+    let fresh_auth =
+        build_sigv4a_request(&signing, "AKIAREPLAY", &host, path, &fresh_date, &scope_date);
+    let resp = client
+        .request(HttpMethod::GET, &url)
+        .header(
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .header("x-amz-date", &fresh_date)
+        .header(REGION_SET_HEADER, "us-east-1")
+        .header("authorization", &fresh_auth)
+        .send()
+        .await
+        .expect("send fresh");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "fresh SigV4a request must verify within the skew window"
+    );
+
+    // Phase 2 (stale "replay"): same Authorization shape but the
+    // signed timestamp is 30 min in the past — beyond the 15-min
+    // default tolerance. We re-sign with the stale timestamp to keep
+    // the signature itself valid; the gate's freshness check is what
+    // must reject this, not signature verification.
+    let stale = now - chrono::Duration::seconds(1800);
+    let stale_date = stale.format("%Y%m%dT%H%M%SZ").to_string();
+    let stale_scope = stale.format("%Y%m%d").to_string();
+    let stale_auth = build_sigv4a_request(
+        &signing,
+        "AKIAREPLAY",
+        &host,
+        path,
+        &stale_date,
+        &stale_scope,
+    );
+    let resp = client
+        .request(HttpMethod::GET, &url)
+        .header(
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .header("x-amz-date", &stale_date)
+        .header(REGION_SET_HEADER, "us-east-1")
+        .header("authorization", &stale_auth)
+        .send()
+        .await
+        .expect("send stale");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "stale SigV4a request must be rejected by the freshness check"
+    );
+    let body = resp.text().await.expect("body");
+    assert!(
+        body.contains("<Code>RequestTimeTooSkewed</Code>"),
+        "stale request must surface RequestTimeTooSkewed: {body}"
     );
 }
 

@@ -274,6 +274,20 @@ struct Opt {
     #[clap(long, value_name = "DIR")]
     sigv4a_credentials: Option<std::path::PathBuf>,
 
+    /// v0.8.4 #76 (audit H-6): how far the request's `x-amz-date` may
+    /// drift from the server's clock before being rejected with HTTP
+    /// 403 `RequestTimeTooSkewed`. Default 900s = 15 min, matching
+    /// AWS S3's documented spec. Operators can widen this for
+    /// high-clock-drift environments or tighten it for compliance
+    /// regimes that demand stricter freshness — but a value of 0
+    /// effectively disables SigV4a (every request will fall outside
+    /// any non-zero drift), so it is rejected at boot.
+    ///
+    /// Has no effect when `--sigv4a-credentials` is unset (no SigV4a
+    /// gate to skew-check against).
+    #[clap(long, value_name = "SECS", default_value_t = 900)]
+    sigv4a_skew_tolerance_seconds: u32,
+
     /// v0.5 #34: enable the in-memory first-class versioning state
     /// machine (`VersioningManager`). When set, S4-server itself owns
     /// per-bucket versioning state + per-(bucket, key) version chain
@@ -906,12 +920,24 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         return Err("--sse-s4-key-rotated requires --sse-s4-key (active key) to also be set".into());
     }
     if let Some(ref dir) = opt.sigv4a_credentials {
+        // v0.8.4 #76: validate the skew tolerance — 0 would reject every
+        // SigV4a request (any non-zero drift would exceed the tolerance),
+        // making the flag effectively a "block SigV4a entirely" knob.
+        // We surface that as a startup error so the operator notices.
+        if opt.sigv4a_skew_tolerance_seconds == 0 {
+            return Err(
+                "--sigv4a-skew-tolerance-seconds must be > 0 (0 effectively blocks all SigV4a requests; \
+                 to disable SigV4a, omit --sigv4a-credentials instead)"
+                    .into(),
+            );
+        }
         let store = s4_server::sigv4a::SigV4aCredentialStore::load_dir(dir)
             .map_err(|e| format!("--sigv4a-credentials {}: {e}", dir.display()))?;
         info!(
             dir = %dir.display(),
             keys = store.len(),
-            "S4 SigV4a credential store loaded (verification gate)"
+            skew_tolerance_secs = opt.sigv4a_skew_tolerance_seconds,
+            "S4 SigV4a credential store loaded (verification gate, v0.8.4 #76 freshness ON)"
         );
         // v0.7 #47: wrap the credential store in a SigV4aGate and attach
         // it to the service. The listener-side middleware (registered
@@ -919,9 +945,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         // pulls the gate back off the service and runs verification at
         // the HTTP layer — s3s' SigV4 verifier would otherwise reject
         // every `AWS4-ECDSA-P256-SHA256` request as "unknown algorithm".
-        let gate = std::sync::Arc::new(s4_server::service::SigV4aGate::new(
-            std::sync::Arc::new(store),
-        ));
+        //
+        // v0.8.4 #76 (audit H-6): the gate also enforces an
+        // `x-amz-date` freshness window (default 15 min, AWS spec)
+        // so captured-request replay is no longer possible. Tunable
+        // via `--sigv4a-skew-tolerance-seconds`.
+        let skew = chrono::Duration::seconds(i64::from(opt.sigv4a_skew_tolerance_seconds));
+        let gate = std::sync::Arc::new(
+            s4_server::service::SigV4aGate::new(std::sync::Arc::new(store))
+                .with_skew_tolerance(skew),
+        );
         s4 = s4.with_sigv4a_gate(gate);
     }
     if let Some(ref kek_dir) = opt.kms_local_dir {
