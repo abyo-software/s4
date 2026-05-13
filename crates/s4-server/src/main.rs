@@ -1380,6 +1380,56 @@ where
     let ready_check = build_ready_check(ready_client);
     // Prometheus metrics exporter を install。/metrics endpoint で render される
     let metrics_handle = s4_server::metrics::install();
+
+    // v0.8 #50: AES-NI / NEON runtime detection. SSE-S4 (`crates/s4-server/src/sse.rs`)
+    // routes through the `aes-gcm` crate, which selects the AES-NI backend
+    // automatically on x86_64 when both the `aes` and `pclmulqdq` CPU
+    // features are present (and falls back to a constant-time software
+    // implementation otherwise). Surfacing the choice at boot + as a
+    // Prometheus gauge lets operators confirm the hardware-acceleration
+    // path is live without re-deriving it from `/proc/cpuinfo` or strace.
+    // The companion `examples/bench_sse_throughput.rs` measures the
+    // resulting MB/s gap between AES-NI and the software fallback.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let aes_ni_available =
+            std::is_x86_feature_detected!("aes") && std::is_x86_feature_detected!("pclmulqdq");
+        info!(
+            target_arch = "x86_64",
+            aes_ni_available,
+            "S4 AES-NI feature detection (x86_64 only; arm64 always uses NEON if available)"
+        );
+        let kind = if aes_ni_available { "aes-ni" } else { "software" };
+        s4_server::metrics::record_sse_aes_backend(kind);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // aarch64: the `aes-gcm` crate uses the ARMv8 AES NEON
+        // instructions when the `aes` target feature is present at
+        // compile time. Standard release builds with rustc's default
+        // aarch64 target enable this on every modern Apple Silicon /
+        // Graviton / Ampere host, so we report `"neon"` unconditionally
+        // here (rather than gating on a runtime probe — the `std`
+        // detection macro on aarch64 is gated behind unstable features
+        // and would force a nightly-only build for the gateway binary).
+        info!(
+            target_arch = "aarch64",
+            aes_ni_available = false,
+            neon_available = true,
+            "S4 AES-NI feature detection (aarch64 — NEON AES used by aes-gcm)"
+        );
+        s4_server::metrics::record_sse_aes_backend("neon");
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        info!(
+            target_arch = std::env::consts::ARCH,
+            aes_ni_available = false,
+            "S4 AES-NI feature detection (non-x86_64/aarch64 — software fallback)"
+        );
+        s4_server::metrics::record_sse_aes_backend("software");
+    }
+
     let mut routed_service =
         HealthRouter::new(service, Some(ready_check)).with_metrics(metrics_handle);
     if let Some(mgr) = cors_manager {

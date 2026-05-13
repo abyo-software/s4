@@ -88,6 +88,28 @@ pub mod names {
     /// `s4_requests_total{result="err"}` to attribute error spikes to
     /// GPU OOM versus generic backend failures.
     pub const GPU_OOM_TOTAL: &str = "s4_gpu_oom_total";
+    /// v0.8 #50: gauge stamped once at boot reflecting which AES
+    /// implementation backs SSE-S4 encrypt/decrypt on the running
+    /// host. Labels: `kind` (= `"aes-ni"` on x86_64 with the AES-NI +
+    /// PCLMULQDQ CPU features detected at runtime, `"neon"` on
+    /// aarch64 with the AES NEON extensions, `"software"` otherwise).
+    /// Always set to 1.0 — the operator filters by label to confirm
+    /// the hardware-acceleration path is live (`s4_sse_aes_backend{kind="aes-ni"} == 1`).
+    pub const SSE_AES_BACKEND: &str = "s4_sse_aes_backend";
+}
+
+/// v0.8 #50: re-export of [`names::SSE_AES_BACKEND`] at the crate root
+/// (mirroring how `record_*` helpers below sit alongside the constants
+/// they reference) so call sites that need the metric name string can
+/// import it without going through the `names` module.
+pub const SSE_AES_BACKEND: &str = names::SSE_AES_BACKEND;
+
+/// v0.8 #50: stamp the SSE AES-backend gauge at boot. `kind` is one of
+/// `"aes-ni"` / `"neon"` / `"software"` (see [`names::SSE_AES_BACKEND`]).
+/// Called exactly once from `main.rs` after [`install`] so the gauge
+/// shows up on the very first `/metrics` scrape.
+pub fn record_sse_aes_backend(kind: &'static str) {
+    metrics::gauge!(SSE_AES_BACKEND, "kind" => kind).set(1.0);
 }
 
 /// v0.8 #55: stamp metrics after a GPU compress completes.
@@ -325,6 +347,10 @@ mod tests {
         record_gpu_in_flight_dec("nvcomp-bitcomp");
         // v0.8 #55: OOM counter.
         record_gpu_oom("nvcomp-gdeflate");
+        // v0.8 #50: SSE AES-backend boot gauge — both label values so
+        // the render assertion below can grep either side.
+        record_sse_aes_backend("aes-ni");
+        record_sse_aes_backend("software");
 
         let rendered = handle.render();
         // Pre-existing assertions.
@@ -364,6 +390,14 @@ mod tests {
         // op label distinguishes throughput direction.
         assert!(rendered.contains("op=\"compress\""));
         assert!(rendered.contains("op=\"decompress\""));
+
+        // v0.8 #50: SSE AES backend gauge with `kind` label.
+        assert!(
+            rendered.contains("s4_sse_aes_backend"),
+            "missing SSE AES backend gauge in: {rendered}"
+        );
+        assert!(rendered.contains("kind=\"aes-ni\""));
+        assert!(rendered.contains("kind=\"software\""));
     }
 
     /// v0.8 #55: throughput gauge math. 10 MiB in 10 ms ≈ 1.05 GB/s

@@ -283,6 +283,43 @@ configure larger multipart chunk sizes via the AWS SDK
 Range-GET granularity). The CSV captures end-to-end PUT/GET wall-clock
 including framing overhead.
 
+### SSE throughput (AES-NI vs software fallback)
+
+S4's server-side encryption (`--sse-s4-key`) goes through the `aes-gcm`
+crate, which selects the AES-NI hardware path automatically on x86_64
+hosts where the `aes` + `pclmulqdq` CPU features are present. v0.8 #50
+adds (a) a boot log line confirming which backend is live, (b) a
+`s4_sse_aes_backend{kind="aes-ni"|"neon"|"software"}` Prometheus gauge
+stamped at startup, and (c) the `bench_sse_throughput` example below
+that measures the resulting encrypt / decrypt throughput.
+
+Numbers below are from the same Ryzen 9 9950X host as the codec table.
+Reproduce with `cargo run --release -p s4-server --example
+bench_sse_throughput` (AES-NI is the default; force the software
+backend with `RUSTFLAGS="--cfg aes_force_soft --cfg
+polyval_force_soft"` and a clean target dir).
+
+| Body size | AES-NI Encrypt | AES-NI Decrypt | Software Encrypt | Software Decrypt |
+|-----------|---------------:|---------------:|-----------------:|-----------------:|
+| 64 KiB    | 1661 MB/s      | 1692 MB/s      | 194 MB/s         | 194 MB/s         |
+| 1 MiB     | 1709 MB/s      | 1718 MB/s      | 195 MB/s         | 195 MB/s         |
+| 100 MiB   | 956 MB/s       | 925 MB/s       | 181 MB/s         | 180 MB/s         |
+
+AES-NI delivers ~8.7× throughput on 64 KiB / 1 MiB bodies (the regime
+that dominates real S3 object traffic). The 100 MiB row's narrower
+gap (~5.2×) is the buffer allocator + page-fault floor — `aes-gcm`
+uses a single contiguous `Vec` for the ciphertext, so 100 MiB cases
+charge a `mmap` per iteration that's not on the AES path. Operators
+running on hosts without AES-NI (very old / virtualized x86 or
+non-x86 hardware) should expect ~190 MB/s encrypt / decrypt as the
+sustained ceiling for SSE-S4 — still ahead of the network for most
+deployments, but worth knowing when sizing CPU headroom.
+
+**Detecting which backend is live**: the boot log emits
+`S4 AES-NI feature detection ... aes_ni_available=true` (or `false`),
+and `curl -s localhost:9100/metrics | grep s4_sse_aes_backend` shows
+the gauge with the active `kind` label.
+
 **Reproducing locally** (requires CUDA + nvCOMP):
 
 ```bash
