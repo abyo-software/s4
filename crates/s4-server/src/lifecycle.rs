@@ -77,10 +77,15 @@
 //!   stay one-liners.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::RwLock;
 
 use chrono::{DateTime, Duration, Utc};
+use s3s::S3;
+use s3s::S3Request;
+use s3s::dto::*;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 /// Whether a rule is currently being applied. Mirrors AWS S3
 /// `ExpirationStatus` (`"Enabled"` / `"Disabled"`).
@@ -553,6 +558,326 @@ pub fn evaluate_batch(
     out
 }
 
+/// Per-invocation scanner counters returned by [`run_scan_once`]. Useful
+/// for tests, the `--lifecycle-scan-interval-hours` log line, and any
+/// future `/admin/lifecycle/scan` introspection endpoint. Operators see
+/// the same numbers via Prometheus
+/// (`s4_lifecycle_actions_total{action="expire"|"transition"}`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanReport {
+    /// Number of buckets the scanner walked (= buckets with a lifecycle
+    /// configuration attached at the moment the scanner ran).
+    pub buckets_scanned: usize,
+    /// Number of distinct keys the scanner evaluated. Multi-page lists
+    /// count one key once even if the listing was paginated.
+    pub objects_evaluated: usize,
+    /// Number of objects deleted as a result of an Expiration action.
+    pub expired: usize,
+    /// Number of objects whose `x-amz-storage-class` was rewritten as a
+    /// result of a Transition action.
+    pub transitioned: usize,
+    /// Number of objects skipped because an Object Lock (Compliance,
+    /// Governance, or legal hold) was in effect. The Lock always wins
+    /// over Lifecycle, matching AWS S3 semantics.
+    pub skipped_locked: usize,
+    /// Number of objects the evaluator wanted to act on but the action
+    /// failed (e.g. backend `delete_object` returned an error). Logged
+    /// individually at WARN level; this counter exists so tests / metrics
+    /// can assert no silent loss.
+    pub action_errors: usize,
+}
+
+/// Convert an s3s `Timestamp` (`time::OffsetDateTime` underneath) into a
+/// `chrono::DateTime<Utc>` via the RFC3339 wire form. Used by the scanner
+/// to compute object age (= `now - last_modified`). Returns `None` when
+/// the stamp is unparseable, in which case the caller falls back to
+/// treating the object as freshly created (age = 0).
+fn timestamp_to_chrono_utc(ts: &Timestamp) -> Option<DateTime<Utc>> {
+    let mut buf = Vec::new();
+    ts.format(s3s::dto::TimestampFormat::DateTime, &mut buf).ok()?;
+    let s = std::str::from_utf8(&buf).ok()?;
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Build a synthetic `S3Request` with the minimum metadata the
+/// scanner-internal calls need. The lifecycle scanner is a
+/// system-internal caller (no end-user credentials, no real HTTP method
+/// / URI), so policy gates downstream see `credentials = None` /
+/// `region = None` and treat the call as anonymous-internal. Backends
+/// that do not gate internal traffic ignore these fields entirely.
+fn synthetic_request<T>(input: T, method: http::Method, uri_path: &str) -> S3Request<T> {
+    S3Request {
+        input,
+        method,
+        uri: uri_path.parse().unwrap_or_else(|_| "/".parse().expect("/")),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+/// Walk every bucket that has a lifecycle configuration attached, list
+/// its objects via `list_objects_v2` (continuation-token pagination), and
+/// for each object evaluate the rule set + execute the matching
+/// Expiration / Transition action. Object-Lock-protected objects are
+/// **skipped** (the Lock always wins over Lifecycle). Versioning chains
+/// are intentionally out of scope for v0.7 #45 — see the module-level
+/// limitations note.
+///
+/// ## error handling
+///
+/// Per-bucket / per-object failures are logged at WARN level and bumped
+/// in `ScanReport::action_errors`; the scanner does NOT abort early on a
+/// single bad object so one slow / faulty bucket can't starve every
+/// other bucket's lifecycle. The function only returns `Err(_)` when the
+/// scanner cannot make progress at all (no current usage — kept for the
+/// future case where the manager itself becomes unavailable).
+///
+/// ## scope (v0.7 #45)
+///
+/// - Current-version objects only (Versioning-enabled chains rely on
+///   `evaluate_with_flags(is_noncurrent = true)`, but walking the
+///   shadow keys requires the version chain access pattern from
+///   `versioning.rs` and is deferred to a follow-up issue).
+/// - `head_object`'s `last_modified` is used to compute age. When the
+///   backend omits the field (some S3-compatible backends do), the
+///   object is treated as age 0 and skipped — matches AWS conservative
+///   behaviour where a malformed timestamp must not silently expire data.
+/// - Tags are looked up via the attached
+///   [`crate::tagging::TagManager`] (when wired). Buckets without a
+///   tag manager pass an empty tag list to the evaluator.
+/// - Transition rewrites the object's `x-amz-storage-class` via
+///   `copy_object` (same bucket / same key, `MetadataDirective: COPY`,
+///   new `StorageClass`). Backends that ignore the storage class
+///   header silently no-op the transition; the counter still bumps to
+///   reflect "the scanner asked for a transition" (matching AWS where
+///   a no-op transition still costs a request).
+pub async fn run_scan_once<B: S3 + Send + Sync + 'static>(
+    s4: &Arc<crate::S4Service<B>>,
+) -> Result<ScanReport, String> {
+    let Some(mgr) = s4.lifecycle_manager().cloned() else {
+        // No lifecycle manager attached (e.g. operator did not set
+        // `--lifecycle-state-file`). Scan is a no-op.
+        return Ok(ScanReport::default());
+    };
+    let buckets = mgr.buckets();
+    if buckets.is_empty() {
+        return Ok(ScanReport::default());
+    }
+    let now = Utc::now();
+    let mut report = ScanReport {
+        buckets_scanned: buckets.len(),
+        ..ScanReport::default()
+    };
+    for bucket in buckets {
+        scan_bucket(s4, &mgr, &bucket, now, &mut report).await;
+    }
+    Ok(report)
+}
+
+/// Walk one bucket end-to-end. Pagination uses the `continuation_token`
+/// loop documented in
+/// <https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html>.
+async fn scan_bucket<B: S3 + Send + Sync + 'static>(
+    s4: &Arc<crate::S4Service<B>>,
+    mgr: &Arc<LifecycleManager>,
+    bucket: &str,
+    now: DateTime<Utc>,
+    report: &mut ScanReport,
+) {
+    let mut continuation: Option<String> = None;
+    loop {
+        let list_input = ListObjectsV2Input {
+            bucket: bucket.to_owned(),
+            continuation_token: continuation.clone(),
+            ..Default::default()
+        };
+        let list_req = synthetic_request(
+            list_input,
+            http::Method::GET,
+            &format!("/{bucket}?list-type=2"),
+        );
+        let resp = match s4.as_ref().list_objects_v2(list_req).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    bucket = %bucket,
+                    error = %e,
+                    "S4 lifecycle: list_objects_v2 failed; skipping bucket for this scan",
+                );
+                report.action_errors = report.action_errors.saturating_add(1);
+                return;
+            }
+        };
+        let output = resp.output;
+        let contents = output.contents.unwrap_or_default();
+        for obj in &contents {
+            let Some(key) = obj.key.as_deref() else {
+                continue;
+            };
+            // Filter out S4-internal sidecars / shadow versions early so
+            // the lifecycle scanner mirrors the same "client-visible
+            // object set" the customer sees through `list_objects_v2`.
+            // (The S4Service.list_objects_v2 handler already drops them
+            // before returning, but this is a belt-and-braces guard for
+            // any future bypass that builds the list elsewhere.)
+            if key.ends_with(".s4index") {
+                continue;
+            }
+            report.objects_evaluated = report.objects_evaluated.saturating_add(1);
+            let size = obj.size.unwrap_or(0).max(0) as u64;
+            let age = match obj.last_modified.as_ref().and_then(timestamp_to_chrono_utc) {
+                Some(lm) => now.signed_duration_since(lm),
+                None => Duration::zero(),
+            };
+            let tags: Vec<(String, String)> = s4
+                .as_ref()
+                .tag_manager()
+                .and_then(|m| m.get_object_tags(bucket, key))
+                .map(|set| set.iter().cloned().collect())
+                .unwrap_or_default();
+            let Some(action) = mgr.evaluate(bucket, key, age, size, &tags) else {
+                continue;
+            };
+            // Object-Lock-protected objects are skipped before any
+            // backend-mutating call. Lock wins over Lifecycle, full
+            // stop — matches AWS behaviour where an Expiration on a
+            // locked object is dropped, not retried.
+            if let Some(lock_mgr) = s4.as_ref().object_lock_manager()
+                && let Some(state) = lock_mgr.get(bucket, key)
+                && state.is_locked(now)
+            {
+                report.skipped_locked = report.skipped_locked.saturating_add(1);
+                continue;
+            }
+            match action {
+                LifecycleAction::Expire => match execute_expire(s4, bucket, key).await {
+                    Ok(()) => {
+                        mgr.record_action(bucket, &LifecycleAction::Expire);
+                        report.expired = report.expired.saturating_add(1);
+                    }
+                    Err(e) => {
+                        warn!(
+                            bucket = %bucket,
+                            key = %key,
+                            error = %e,
+                            "S4 lifecycle: Expire action failed",
+                        );
+                        report.action_errors = report.action_errors.saturating_add(1);
+                    }
+                },
+                LifecycleAction::Transition { storage_class } => {
+                    match execute_transition(s4, bucket, key, &storage_class).await {
+                        Ok(()) => {
+                            mgr.record_action(
+                                bucket,
+                                &LifecycleAction::Transition {
+                                    storage_class: storage_class.clone(),
+                                },
+                            );
+                            report.transitioned = report.transitioned.saturating_add(1);
+                        }
+                        Err(e) => {
+                            warn!(
+                                bucket = %bucket,
+                                key = %key,
+                                storage_class = %storage_class,
+                                error = %e,
+                                "S4 lifecycle: Transition action failed",
+                            );
+                            report.action_errors = report.action_errors.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+        if output.is_truncated.unwrap_or(false) {
+            continuation = output.next_continuation_token;
+            if continuation.is_none() {
+                // Defensive: AWS guarantees a NextContinuationToken when
+                // is_truncated=true, but a malformed backend could omit
+                // it; break to avoid an infinite loop.
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+/// Issue `delete_object` against the wrapped `S4Service`. The handler in
+/// `service.rs` runs the WORM check itself, so even if the scanner's
+/// pre-check missed (race with an MFA-Delete put-bucket-versioning), the
+/// backend refuses the delete with `AccessDenied` and the error path
+/// above bumps `action_errors` rather than silently losing data.
+async fn execute_expire<B: S3 + Send + Sync + 'static>(
+    s4: &Arc<crate::S4Service<B>>,
+    bucket: &str,
+    key: &str,
+) -> Result<(), String> {
+    let input = DeleteObjectInput {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        ..Default::default()
+    };
+    let req = synthetic_request(
+        input,
+        http::Method::DELETE,
+        &format!("/{bucket}/{key}"),
+    );
+    s4.as_ref()
+        .delete_object(req)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{e}"))
+}
+
+/// Rewrite the object's storage class via a same-key `copy_object` with
+/// `MetadataDirective: COPY` (preserves user metadata) and the new
+/// `storage_class`. Backends that ignore storage-class headers
+/// effectively no-op; the counter still records the attempt so dashboards
+/// reflect the scanner's intent.
+async fn execute_transition<B: S3 + Send + Sync + 'static>(
+    s4: &Arc<crate::S4Service<B>>,
+    bucket: &str,
+    key: &str,
+    storage_class: &str,
+) -> Result<(), String> {
+    // CopyObjectInput has dozens of `Option` fields plus three required
+    // (bucket / key / copy_source); the s3s-generated `builder()` is
+    // the path that fills the optional ones with `None` for us. The
+    // `set_*` setters return `&mut Self`, so we drive them in
+    // statement form rather than as a method chain.
+    let mut builder = CopyObjectInput::builder();
+    builder.set_bucket(bucket.to_owned());
+    builder.set_key(key.to_owned());
+    builder.set_copy_source(CopySource::Bucket {
+        bucket: bucket.to_owned().into_boxed_str(),
+        key: key.to_owned().into_boxed_str(),
+        version_id: None,
+    });
+    builder.set_metadata_directive(Some(MetadataDirective::from_static(MetadataDirective::COPY)));
+    builder.set_storage_class(Some(StorageClass::from(storage_class.to_owned())));
+    let input = builder
+        .build()
+        .map_err(|e| format!("CopyObjectInput build: {e}"))?;
+    let req = synthetic_request(
+        input,
+        http::Method::PUT,
+        &format!("/{bucket}/{key}"),
+    );
+    s4.as_ref()
+        .copy_object(req)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -892,4 +1217,278 @@ mod tests {
             Some(1)
         );
     }
+
+    // ---- v0.7 #45: scanner runner tests --------------------------------
+    //
+    // These tests stand up an in-memory `S4Service` over a tiny
+    // `ScannerMemBackend` (separate from the larger `MemoryBackend` in
+    // `tests/roundtrip.rs` so this module stays self-contained). The
+    // backend implements only the four `S3` methods the scanner touches:
+    // `put_object`, `head_object`, `delete_object`, `list_objects_v2`.
+    // Tags are exercised via the optional `with_tagging(...)` manager.
+    //
+    // Object age is faked by setting an `expire_after_days(0)` rule, so
+    // any object whose backend-recorded `last_modified` is at or before
+    // "now" matches — sidesteps the `head_object`/`Timestamp` parsing
+    // entirely (and matches the canonical "operator just put the bucket
+    // on aggressive expiration" test path).
+
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+
+    use bytes::Bytes;
+    use s3s::dto as dto2;
+    use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
+    use s4_codec::dispatcher::AlwaysDispatcher;
+    use s4_codec::passthrough::Passthrough;
+    use s4_codec::{CodecKind, CodecRegistry};
+
+    use crate::S4Service;
+    use crate::object_lock::{LockMode, ObjectLockManager, ObjectLockState};
+
+    #[derive(Default)]
+    struct ScannerMemBackend {
+        objects: StdMutex<HashMap<(String, String), ScannerStored>>,
+    }
+
+    #[derive(Clone)]
+    struct ScannerStored {
+        body: Bytes,
+        last_modified: dto2::Timestamp,
+    }
+
+    impl ScannerMemBackend {
+        fn put_now(&self, bucket: &str, key: &str, body: Bytes) {
+            self.objects.lock().unwrap().insert(
+                (bucket.to_owned(), key.to_owned()),
+                ScannerStored {
+                    body,
+                    last_modified: dto2::Timestamp::from(std::time::SystemTime::now()),
+                },
+            );
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl S3 for ScannerMemBackend {
+        async fn put_object(
+            &self,
+            req: S3Request<dto2::PutObjectInput>,
+        ) -> S3Result<S3Response<dto2::PutObjectOutput>> {
+            self.put_now(&req.input.bucket, &req.input.key, Bytes::new());
+            Ok(S3Response::new(dto2::PutObjectOutput::default()))
+        }
+
+        async fn head_object(
+            &self,
+            req: S3Request<dto2::HeadObjectInput>,
+        ) -> S3Result<S3Response<dto2::HeadObjectOutput>> {
+            let key = (req.input.bucket.clone(), req.input.key.clone());
+            let lock = self.objects.lock().unwrap();
+            let stored = lock
+                .get(&key)
+                .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey))?;
+            Ok(S3Response::new(dto2::HeadObjectOutput {
+                content_length: Some(stored.body.len() as i64),
+                last_modified: Some(stored.last_modified.clone()),
+                ..Default::default()
+            }))
+        }
+
+        async fn delete_object(
+            &self,
+            req: S3Request<dto2::DeleteObjectInput>,
+        ) -> S3Result<S3Response<dto2::DeleteObjectOutput>> {
+            let key = (req.input.bucket.clone(), req.input.key.clone());
+            self.objects.lock().unwrap().remove(&key);
+            Ok(S3Response::new(dto2::DeleteObjectOutput::default()))
+        }
+
+        async fn list_objects_v2(
+            &self,
+            req: S3Request<dto2::ListObjectsV2Input>,
+        ) -> S3Result<S3Response<dto2::ListObjectsV2Output>> {
+            let prefix = req.input.bucket.clone();
+            let lock = self.objects.lock().unwrap();
+            let mut contents: Vec<dto2::Object> = lock
+                .iter()
+                .filter(|((b, _), _)| b == &prefix)
+                .map(|((_, k), v)| dto2::Object {
+                    key: Some(k.clone()),
+                    size: Some(v.body.len() as i64),
+                    last_modified: Some(v.last_modified.clone()),
+                    ..Default::default()
+                })
+                .collect();
+            contents.sort_by(|a, b| a.key.cmp(&b.key));
+            let key_count = i32::try_from(contents.len()).unwrap_or(i32::MAX);
+            Ok(S3Response::new(dto2::ListObjectsV2Output {
+                name: Some(prefix),
+                contents: Some(contents),
+                key_count: Some(key_count),
+                is_truncated: Some(false),
+                ..Default::default()
+            }))
+        }
+
+        async fn copy_object(
+            &self,
+            _req: S3Request<dto2::CopyObjectInput>,
+        ) -> S3Result<S3Response<dto2::CopyObjectOutput>> {
+            // Transition path: scanner copies same-key with new
+            // storage_class. The mem backend doesn't track storage
+            // class, so it's a no-op success — exactly the AWS-side
+            // behaviour for a backend that ignores the field.
+            Ok(S3Response::new(dto2::CopyObjectOutput::default()))
+        }
+    }
+
+    fn make_service() -> Arc<S4Service<ScannerMemBackend>> {
+        let registry = Arc::new(
+            CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)),
+        );
+        let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
+        Arc::new(S4Service::new(
+            ScannerMemBackend::default(),
+            registry,
+            dispatcher,
+        ))
+    }
+
+    #[tokio::test]
+    async fn run_scan_once_no_lifecycle_manager_returns_empty_report() {
+        // Service has no lifecycle manager attached — scanner must
+        // no-op cleanly (operator might not have set
+        // `--lifecycle-state-file`). Also covers the empty-buckets
+        // path in `run_scan_once`.
+        let s4 = make_service();
+        let report = run_scan_once(&s4).await.expect("scan");
+        assert_eq!(report, ScanReport::default());
+
+        // And: lifecycle manager attached but no buckets configured.
+        let mgr = Arc::new(LifecycleManager::new());
+        let backend = ScannerMemBackend::default();
+        let registry = Arc::new(
+            CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)),
+        );
+        let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
+        let s4_empty = Arc::new(
+            S4Service::new(backend, registry, dispatcher).with_lifecycle(mgr),
+        );
+        let report = run_scan_once(&s4_empty).await.expect("scan empty");
+        assert_eq!(report, ScanReport::default());
+    }
+
+    #[tokio::test]
+    async fn run_scan_once_expires_matching_objects_via_backend() {
+        // Three objects: only "stale.log" matches the rule (prefix
+        // gating). The other two are written but not under the prefix,
+        // so the evaluator returns None for them.
+        let backend = ScannerMemBackend::default();
+        backend.put_now("b", "stale.log", Bytes::from_static(b"x"));
+        backend.put_now("b", "data/keep1.bin", Bytes::from_static(b"y"));
+        backend.put_now("b", "data/keep2.bin", Bytes::from_static(b"z"));
+        // Rule: any object under `stale.` prefix is expired immediately
+        // (`expire_after_days(0)` matches age >= 0d, which is every
+        // backend object).
+        let mgr = Arc::new(LifecycleManager::new());
+        let mut rule = LifecycleRule::expire_after_days("r", 0);
+        rule.filter.prefix = Some("stale.".into());
+        mgr.put("b", LifecycleConfig { rules: vec![rule] });
+        let registry = Arc::new(
+            CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)),
+        );
+        let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
+        let s4 = Arc::new(
+            S4Service::new(backend, registry, dispatcher).with_lifecycle(Arc::clone(&mgr)),
+        );
+
+        let report = run_scan_once(&s4).await.expect("scan");
+        assert_eq!(report.buckets_scanned, 1);
+        assert_eq!(report.objects_evaluated, 3);
+        assert_eq!(report.expired, 1);
+        assert_eq!(report.transitioned, 0);
+        assert_eq!(report.skipped_locked, 0);
+        assert_eq!(report.action_errors, 0);
+        // Backend post-condition: the matching key is gone, the others
+        // remain. Read back through the service's own list_objects_v2
+        // path (which is also what the customer-visible HTTP layer
+        // serves) so we exercise the same code the scanner walked.
+        let req = synthetic_request(
+            ListObjectsV2Input {
+                bucket: "b".into(),
+                ..Default::default()
+            },
+            http::Method::GET,
+            "/b?list-type=2",
+        );
+        let resp = s4
+            .as_ref()
+            .list_objects_v2(req)
+            .await
+            .expect("post-scan list");
+        let keys: Vec<String> = resp
+            .output
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|o| o.key)
+            .collect();
+        assert!(!keys.contains(&"stale.log".to_string()));
+        assert!(keys.contains(&"data/keep1.bin".to_string()));
+        assert!(keys.contains(&"data/keep2.bin".to_string()));
+        // Lifecycle action counter: one Expire bumped on bucket "b".
+        let snap = mgr.actions_snapshot();
+        assert_eq!(
+            snap.get(&("b".into(), "expire".into())).copied(),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_scan_once_skips_object_lock_protected_keys() {
+        let backend = ScannerMemBackend::default();
+        backend.put_now("b", "locked.log", Bytes::from_static(b"x"));
+        backend.put_now("b", "free.log", Bytes::from_static(b"y"));
+        let registry = Arc::new(
+            CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)),
+        );
+        let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
+        let mgr = Arc::new(LifecycleManager::new());
+        // Aggressive: every object expires immediately.
+        mgr.put(
+            "b",
+            LifecycleConfig {
+                rules: vec![LifecycleRule::expire_after_days("r", 0)],
+            },
+        );
+        let lock_mgr = Arc::new(ObjectLockManager::new());
+        // Lock retains "locked.log" until the year 2099 — Compliance
+        // mode means even Governance bypass cannot delete it.
+        let retain_until = chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
+            .expect("parse")
+            .with_timezone(&Utc);
+        lock_mgr.set(
+            "b",
+            "locked.log",
+            ObjectLockState {
+                mode: Some(LockMode::Compliance),
+                retain_until: Some(retain_until),
+                legal_hold_on: false,
+            },
+        );
+        let s4 = Arc::new(
+            S4Service::new(backend, registry, dispatcher)
+                .with_lifecycle(Arc::clone(&mgr))
+                .with_object_lock(Arc::clone(&lock_mgr)),
+        );
+
+        let report = run_scan_once(&s4).await.expect("scan");
+        assert_eq!(report.buckets_scanned, 1);
+        assert_eq!(report.objects_evaluated, 2);
+        assert_eq!(report.expired, 1, "free.log should have been expired");
+        assert_eq!(report.skipped_locked, 1, "locked.log must be skipped");
+        assert_eq!(report.action_errors, 0);
+    }
+
 }

@@ -702,6 +702,18 @@ impl<B: S3> S4Service<B> {
         self
     }
 
+    /// v0.7 #45: borrow the attached Object Lock manager (read-only —
+    /// the lifecycle scanner uses this to skip currently-locked objects
+    /// before issuing `delete_object`, since an Object Lock always wins
+    /// over Lifecycle Expiration in AWS S3 semantics). Mirrors the
+    /// shape of [`Self::lifecycle_manager`] /
+    /// [`Self::tag_manager`] — purely additive accessor, no handler
+    /// behaviour change.
+    #[must_use]
+    pub fn object_lock_manager(&self) -> Option<&Arc<crate::object_lock::ObjectLockManager>> {
+        self.object_lock.as_ref()
+    }
+
     /// v0.5 #28: attach an SSE-KMS backend. `default_key_id` is used
     /// when a PUT requests SSE-KMS without naming a specific KMS key
     /// (operators set this to mirror AWS S3's bucket-default key).

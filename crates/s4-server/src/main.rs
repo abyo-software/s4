@@ -1104,69 +1104,48 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         );
         s4 = s4.with_replication(std::sync::Arc::new(mgr));
     }
-    // v0.6 #37: wire the in-memory S3 Lifecycle configuration manager
-    // when --lifecycle-state-file is supplied. Empty / missing path
-    // starts a fresh manager, populated path is loaded as a JSON
-    // snapshot produced previously by `LifecycleManager::to_json`. The
-    // matching background scheduler (one tokio task per process) wakes
-    // every `--lifecycle-scan-interval-hours` to log the set of
-    // currently-attached buckets. Walking the source bucket via
-    // `list_objects_v2` and actually invoking `delete_object` /
-    // metadata-rewrite for each evaluated action is intentionally
-    // deferred to v0.7+: it requires a back-reference from the scheduler
-    // into `S4Service` for the bucket walk, and the test path
-    // (`S4Service::run_lifecycle_once_for_test`) already covers the
-    // evaluator end-to-end so this scheduler skeleton is enough to ship
-    // the configuration-management half of v0.6 #37 without putting a
-    // half-wired bucket-walk in front of users.
-    if let Some(ref path) = opt.lifecycle_state_file {
-        let mgr = if path.as_os_str().is_empty() || !path.exists() {
-            s4_server::lifecycle::LifecycleManager::new()
+    // v0.6 #37 + v0.7 #45: wire the in-memory S3 Lifecycle configuration
+    // manager when --lifecycle-state-file is supplied. Empty / missing
+    // path starts a fresh manager, populated path is loaded as a JSON
+    // snapshot produced previously by `LifecycleManager::to_json`.
+    //
+    // v0.7 #45: the matching background scheduler (one tokio task per
+    // process) now executes a real scan every
+    // `--lifecycle-scan-interval-hours` — see
+    // `s4_server::lifecycle::run_scan_once`. The scanner walks every
+    // bucket with a lifecycle config attached, lists its objects via
+    // `list_objects_v2`, evaluates each rule, and executes matching
+    // Expire / Transition actions through the same `S4Service` handler
+    // path the HTTP listener uses. Object-Lock-protected objects are
+    // skipped (lock wins). NoncurrentVersionExpiration walking of
+    // versioning-shadow chains is deferred to a follow-up — current
+    // versions are fully covered.
+    let lifecycle_to_scan: Option<std::sync::Arc<s4_server::lifecycle::LifecycleManager>> =
+        if let Some(ref path) = opt.lifecycle_state_file {
+            let mgr = if path.as_os_str().is_empty() || !path.exists() {
+                s4_server::lifecycle::LifecycleManager::new()
+            } else {
+                let raw = std::fs::read_to_string(path).map_err(|e| {
+                    format!("--lifecycle-state-file {}: read failed: {e}", path.display())
+                })?;
+                s4_server::lifecycle::LifecycleManager::from_json(&raw).map_err(|e| {
+                    format!(
+                        "--lifecycle-state-file {}: parse failed: {e}",
+                        path.display()
+                    )
+                })?
+            };
+            let mgr = std::sync::Arc::new(mgr);
+            info!(
+                path = %path.display(),
+                interval_hours = opt.lifecycle_scan_interval_hours,
+                "S4 Lifecycle manager attached (v0.7 #45 scanner active; current-version Expire / Transition only — NoncurrentVersionExpiration deferred)"
+            );
+            s4 = s4.with_lifecycle(std::sync::Arc::clone(&mgr));
+            Some(mgr)
         } else {
-            let raw = std::fs::read_to_string(path).map_err(|e| {
-                format!("--lifecycle-state-file {}: read failed: {e}", path.display())
-            })?;
-            s4_server::lifecycle::LifecycleManager::from_json(&raw).map_err(|e| {
-                format!(
-                    "--lifecycle-state-file {}: parse failed: {e}",
-                    path.display()
-                )
-            })?
+            None
         };
-        let mgr = std::sync::Arc::new(mgr);
-        info!(
-            path = %path.display(),
-            interval_hours = opt.lifecycle_scan_interval_hours,
-            "S4 Lifecycle manager attached (in-memory; v0.6 #37 single-instance scope; bucket-walk wiring deferred)"
-        );
-        let scheduler_mgr = std::sync::Arc::clone(&mgr);
-        let interval_hours = u64::from(opt.lifecycle_scan_interval_hours.max(1));
-        tokio::spawn(async move {
-            let mut ticker =
-                tokio::time::interval(std::time::Duration::from_secs(interval_hours * 3600));
-            // Skip the first immediate tick — the CLI already logged
-            // "manager attached" so we don't want a duplicate "tick"
-            // line in the same millisecond.
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                let buckets = scheduler_mgr.buckets();
-                if buckets.is_empty() {
-                    continue;
-                }
-                tracing::info!(
-                    bucket_count = buckets.len(),
-                    "S4 lifecycle: scheduler tick (bucket walk + per-rule action invocation deferred — call run_lifecycle_once_for_test in tests)"
-                );
-                // The future scanner will walk each bucket via
-                // list_objects_v2 + invoke delete_object /
-                // metadata-rewrite per evaluated action; today the
-                // skeleton stops here so deployments don't expire
-                // data prematurely on a half-wired path.
-            }
-        });
-        s4 = s4.with_lifecycle(mgr);
-    }
     if matches!(opt.compliance_mode, Some(ComplianceMode::Strict)) {
         s4 = s4.with_compliance_strict(true);
         s4_server::metrics::record_compliance_mode_active("strict");
@@ -1178,7 +1157,52 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // OPTIONS as a typed S3 handler — match has to happen at the hyper
     // layer instead.
     let cors_manager = s4.cors_manager().cloned();
-    run_server(s4, &sdk_conf, &opt, ready_client, cors_manager).await
+
+    // v0.7 #45: wrap `S4Service` in an Arc so the lifecycle scanner
+    // (background tokio task) and the s3s service builder share the
+    // same instance. `SharedService` is a thin newtype with a
+    // delegating `impl S3` — see `s4_server::service_arc` for the
+    // why-not-blanket-impl note.
+    let s4_arc = std::sync::Arc::new(s4);
+
+    // Spawn the v0.7 #45 lifecycle scanner if the manager is wired.
+    // The task owns its own `Arc<S4Service<...>>` clone so the listener
+    // staying up keeps the scanner alive (and vice versa); both go
+    // away together on shutdown.
+    if lifecycle_to_scan.is_some() {
+        let scan_handle = std::sync::Arc::clone(&s4_arc);
+        let interval_hours = u64::from(opt.lifecycle_scan_interval_hours.max(1));
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(interval_hours * 3600));
+            // Skip the first immediate tick — the CLI already logged
+            // "manager attached" so we don't want a duplicate "tick"
+            // line in the same millisecond.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match s4_server::lifecycle::run_scan_once(&scan_handle).await {
+                    Ok(report) => {
+                        tracing::info!(
+                            buckets_scanned = report.buckets_scanned,
+                            objects_evaluated = report.objects_evaluated,
+                            expired = report.expired,
+                            transitioned = report.transitioned,
+                            skipped_locked = report.skipped_locked,
+                            action_errors = report.action_errors,
+                            "S4 lifecycle scan complete"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("S4 lifecycle scan failed: {e}");
+                    }
+                }
+            }
+        });
+    }
+
+    let shared = s4_server::service_arc::SharedService::new(s4_arc);
+    run_server(shared, &sdk_conf, &opt, ready_client, cors_manager).await
 }
 
 /// v0.5 #32: enforce compliance-mode prerequisites at boot. Each

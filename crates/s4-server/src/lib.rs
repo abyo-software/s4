@@ -18,6 +18,7 @@ pub mod replication;
 pub mod routing;
 pub mod select;
 pub mod service;
+pub mod service_arc;
 pub mod sigv4a;
 pub mod sse;
 pub mod streaming;
