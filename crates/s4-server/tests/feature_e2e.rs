@@ -4935,3 +4935,143 @@ async fn inventory_csv_classifies_sse_kms_correctly() {
 
     let _ = shutdown_tx.send(());
 }
+
+// ===========================================================================
+// v0.8.3 #69 (audit M-2) — Lifecycle scanner aborts in-flight multipart
+// uploads past the rule's `abort_incomplete_multipart_upload_days`
+// threshold.
+// ===========================================================================
+//
+// Pre-fix M-2 behaviour: `LifecycleRule::abort_incomplete_multipart_upload_days`
+// was parsed and stored on the rule (v0.6 #37) but the scanner never
+// walked `list_multipart_uploads`, so an operator who set "abort uploads
+// idle for >= 1 day" got rule round-trip semantics with zero actual
+// cleanup — abandoned multipart uploads accumulated indefinitely on the
+// backend, paying for storage of orphaned parts.
+//
+// This E2E boots MinIO, points an `S4Service<s3s_aws::Proxy>` at it,
+// attaches a `LifecycleManager` with `abort_incomplete_multipart_upload_days = 0`
+// (any in-flight upload qualifies — the canonical "aggressive" pattern,
+// same as the v0.7 #45 `expire_after_days(0)` test), starts two real
+// multipart uploads via the raw aws-sdk-s3 client, and drives
+// `run_scan_once`. Both uploads must be aborted (the report counter
+// bumps to 2 and a follow-up `list_multipart_uploads` returns zero
+// entries).
+//
+// The "0 days" choice sidesteps the inability to age MinIO's own
+// `Initiated` timestamp backwards — same trade-off the existing
+// `lifecycle_scanner_expires_objects_via_minio_backend` test makes for
+// `last_modified`. The pure-logic age path is covered by the three
+// `evaluate_in_flight_multipart_*` unit tests in `src/lifecycle.rs`.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn lifecycle_abort_incomplete_multipart_via_minio() {
+    use s4_server::lifecycle::run_scan_once;
+
+    let fixture = start_minio().await;
+    let aws_client = build_aws_client(&fixture.endpoint_url).await;
+    let bucket = "s4-lc-mp-69";
+    ensure_bucket(&aws_client, bucket).await;
+
+    // Initiate two real multipart uploads via the raw aws-sdk-s3
+    // client. Neither upload uploads any parts or completes — they
+    // sit in MinIO's in-flight multipart table waiting to be either
+    // completed, aborted, or (per audit M-2) reaped by the lifecycle
+    // scanner.
+    let mut initiated_upload_ids: Vec<String> = Vec::new();
+    for key in ["uploads/big-1.bin", "uploads/big-2.bin"] {
+        let resp = aws_client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect("create multipart upload");
+        let upload_id = resp
+            .upload_id()
+            .expect("MinIO must return UploadId")
+            .to_owned();
+        initiated_upload_ids.push(upload_id);
+    }
+    initiated_upload_ids.sort();
+
+    // Pre-condition sanity: MinIO reports both uploads.
+    let pre = aws_client
+        .list_multipart_uploads()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("pre-scan list");
+    assert_eq!(
+        pre.uploads().len(),
+        2,
+        "MinIO must report both in-flight uploads pre-scan; got {pre:?}"
+    );
+
+    // Build the S4Service with a Lifecycle manager. Rule:
+    // `abort_incomplete_multipart_upload_days = 0` → every in-flight
+    // upload qualifies for abort.
+    let proxy = s3s_aws::Proxy::from(aws_client.clone());
+    let mgr = Arc::new(LifecycleManager::new());
+    let rule = LifecycleRule {
+        id: "e2e-mp-abort".into(),
+        status: s4_server::lifecycle::LifecycleStatus::Enabled,
+        filter: s4_server::lifecycle::LifecycleFilter {
+            prefix: Some("uploads/".into()),
+            tags: Vec::new(),
+            object_size_greater_than: None,
+            object_size_less_than: None,
+        },
+        expiration_days: None,
+        expiration_date: None,
+        transitions: Vec::new(),
+        noncurrent_version_expiration_days: None,
+        abort_incomplete_multipart_upload_days: Some(0),
+    };
+    mgr.put(bucket, LifecycleConfig { rules: vec![rule] });
+    let s4 = Arc::new(
+        S4Service::new(
+            proxy,
+            make_registry(),
+            Arc::new(AlwaysDispatcher(CodecKind::Passthrough)),
+        )
+        .with_lifecycle(Arc::clone(&mgr)),
+    );
+
+    // Drive the v0.8.3 #69 scanner end-to-end.
+    let report = run_scan_once(&s4).await.expect("scan");
+    eprintln!("v0.8.3 #69 E2E scan report: {report:?}");
+    assert_eq!(report.buckets_scanned, 1);
+    assert_eq!(
+        report.aborted_multipart, 2,
+        "both in-flight multipart uploads must be aborted; got {report:?}"
+    );
+    assert_eq!(report.action_errors, 0);
+    assert_eq!(report.expired, 0);
+    assert_eq!(report.transitioned, 0);
+
+    // Backend post-condition: ListMultipartUploads on MinIO must
+    // return zero entries — both uploads were genuinely aborted on
+    // the backend, not just bookkeeping in S4.
+    let post = aws_client
+        .list_multipart_uploads()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("post-scan list");
+    assert_eq!(
+        post.uploads().len(),
+        0,
+        "MinIO must report zero in-flight uploads after scan; got {post:?}"
+    );
+
+    // The lifecycle manager's per-bucket counter records two aborts
+    // under the new `abort_incomplete_multipart` label.
+    let snap = mgr.actions_snapshot();
+    assert_eq!(
+        snap.get(&(bucket.into(), "abort_incomplete_multipart".into()))
+            .copied(),
+        Some(2),
+        "snapshot must record 2 abort_incomplete_multipart actions; got {snap:?}"
+    );
+}

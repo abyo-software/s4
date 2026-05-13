@@ -261,6 +261,13 @@ pub enum LifecycleAction {
     /// Move the object to a different storage class (`Transition`). The
     /// inner string is the AWS wire form (e.g. `"GLACIER_IR"`).
     Transition { storage_class: String },
+    /// v0.8.3 #69 (audit M-2): abort an in-flight multipart upload that
+    /// has been initiated longer ago than the rule's
+    /// `abort_incomplete_multipart_upload_days`. The inner string is the
+    /// backend-issued `upload_id` (so the scanner can route the
+    /// `AbortMultipartUpload` call without re-listing). Same wire
+    /// semantic as AWS S3 `AbortIncompleteMultipartUpload`.
+    AbortMultipartUpload { upload_id: String },
 }
 
 impl LifecycleAction {
@@ -271,8 +278,27 @@ impl LifecycleAction {
         match self {
             Self::Expire => "expire",
             Self::Transition { .. } => "transition",
+            Self::AbortMultipartUpload { .. } => "abort_incomplete_multipart",
         }
     }
+}
+
+/// v0.8.3 #69: one in-flight multipart upload the lifecycle scanner
+/// considers for abort. Mirrors the (subset of) `MultipartUpload` fields
+/// the rule evaluator needs (key, upload_id, initiated). `tags` is kept
+/// in the shape the existing object-path evaluator uses
+/// (`Vec<(String, String)>`) so a future enhancement that surfaces
+/// upload-time tags from `MultipartStateStore` can flow through the
+/// same filter check without API churn — AWS S3 itself does not attach
+/// tags to in-flight multipart uploads, so for the scanner-driven path
+/// the slice is always empty (the filter's prefix / size predicates
+/// still apply via [`LifecycleFilter::matches`], passing size = 0).
+#[derive(Clone, Debug)]
+pub struct MultipartUploadCandidate {
+    pub upload_id: String,
+    pub key: String,
+    pub initiated: DateTime<Utc>,
+    pub tags: Vec<(String, String)>,
 }
 
 /// snapshot のシリアライズ format。`to_json` / `from_json` 用。
@@ -481,6 +507,54 @@ impl LifecycleManager {
         None
     }
 
+    /// v0.8.3 #69 (audit M-2): evaluate one in-flight multipart upload
+    /// against the bucket's rules. Returns
+    /// [`LifecycleAction::AbortMultipartUpload`] when at least one
+    /// `Enabled` rule (a) accepts the upload's key via its filter and
+    /// (b) carries an `abort_incomplete_multipart_upload_days`
+    /// threshold whose age (`now - initiated`) is currently met.
+    /// Returns `None` otherwise (no matching rule, no
+    /// abort-multipart-upload-days set, or the upload is too young).
+    ///
+    /// Filter matching reuses [`LifecycleFilter::matches`] with
+    /// `object_size = 0` — in-flight uploads have no assembled size
+    /// yet (the parts are stored independently in the backend), so
+    /// any rule whose filter sets `object_size_greater_than` /
+    /// `object_size_less_than` is treated as if the upload were
+    /// 0 bytes. AWS S3 itself does not gate
+    /// `AbortIncompleteMultipartUpload` on size; this matches the
+    /// AWS semantic (size predicates simply do not apply to the
+    /// abort path) for the typical filter shape (no size predicate).
+    /// Operators wanting size-gated abort can carry the upload's
+    /// declared part length on the `MultipartUploadCandidate` in a
+    /// follow-up issue — the API extension is additive.
+    #[must_use]
+    pub fn evaluate_in_flight_multipart(
+        &self,
+        bucket: &str,
+        upload: &MultipartUploadCandidate,
+        now: DateTime<Utc>,
+    ) -> Option<LifecycleAction> {
+        let cfg = self.get(bucket)?;
+        for rule in &cfg.rules {
+            if rule.status != LifecycleStatus::Enabled {
+                continue;
+            }
+            if !rule.filter.matches(&upload.key, 0, &upload.tags) {
+                continue;
+            }
+            if let Some(days) = rule.abort_incomplete_multipart_upload_days {
+                let age = now.signed_duration_since(upload.initiated);
+                if age >= Duration::days(i64::from(days)) {
+                    return Some(LifecycleAction::AbortMultipartUpload {
+                        upload_id: upload.upload_id.clone(),
+                    });
+                }
+            }
+        }
+        None
+    }
+
     /// Stamp the per-bucket action counter and bump the matching
     /// Prometheus counter. Called by the future scanner after a successful
     /// delete / metadata rewrite.
@@ -580,6 +654,15 @@ pub struct ScanReport {
     /// Governance, or legal hold) was in effect. The Lock always wins
     /// over Lifecycle, matching AWS S3 semantics.
     pub skipped_locked: usize,
+    /// v0.8.3 #69 (audit M-2): number of in-flight multipart uploads
+    /// the scanner aborted as a result of an
+    /// `AbortIncompleteMultipartUpload` action. Pair with the
+    /// Prometheus counter
+    /// `s4_lifecycle_actions_total{action="abort_incomplete_multipart"}`.
+    /// Only counts successful aborts — a backend
+    /// `abort_multipart_upload` failure bumps `action_errors` instead
+    /// (matching the existing Expire / Transition error-path).
+    pub aborted_multipart: usize,
     /// Number of objects the evaluator wanted to act on but the action
     /// failed (e.g. backend `delete_object` returned an error). Logged
     /// individually at WARN level; this counter exists so tests / metrics
@@ -676,6 +759,15 @@ pub async fn run_scan_once<B: S3 + Send + Sync + 'static>(
     };
     for bucket in buckets {
         scan_bucket(s4, &mgr, &bucket, now, &mut report).await;
+        // v0.8.3 #69 (audit M-2): walk in-flight multipart uploads for
+        // the same bucket and abort any whose `Initiated` time is past
+        // the rule's `abort_incomplete_multipart_upload_days` threshold.
+        // Run after the object walk so the (typically smaller) multipart
+        // pass still happens even if the object walk hit a transient
+        // backend error mid-stream (per-bucket failure isolation —
+        // matching the existing one-bad-bucket-doesn't-starve-others
+        // policy).
+        scan_in_flight_multipart_uploads(s4, &mgr, &bucket, now, &mut report).await;
     }
     Ok(report)
 }
@@ -805,6 +897,29 @@ async fn scan_bucket<B: S3 + Send + Sync + 'static>(
                         }
                     }
                 }
+                // v0.8.3 #69 (audit M-2): the per-key path's
+                // `evaluate(...)` only ever returns Expire /
+                // Transition (the AbortMultipartUpload variant comes
+                // from the in-flight multipart walker further down,
+                // which uses `evaluate_in_flight_multipart`). Match
+                // exhaustiveness still requires an arm; logging at
+                // warn keeps the control-flow honest if the
+                // evaluator ever grows a path that surfaces an
+                // abort here (e.g. someone wires a future evaluator
+                // that returns abort for a regular object key — the
+                // arm prevents silent dispatch and the warn surfaces
+                // the misuse).
+                LifecycleAction::AbortMultipartUpload { upload_id } => {
+                    warn!(
+                        bucket = %bucket,
+                        key = %key,
+                        upload_id = %upload_id,
+                        "S4 lifecycle: AbortMultipartUpload returned for a key path; \
+                         this is unexpected — the per-key evaluator should only \
+                         emit Expire / Transition. Dropping action.",
+                    );
+                    report.action_errors = report.action_errors.saturating_add(1);
+                }
             }
         }
         if output.is_truncated.unwrap_or(false) {
@@ -819,6 +934,195 @@ async fn scan_bucket<B: S3 + Send + Sync + 'static>(
             break;
         }
     }
+}
+
+/// v0.8.3 #69 (audit M-2): walk every in-flight multipart upload for
+/// `bucket` via `list_multipart_uploads` (key-marker / upload-id-marker
+/// pagination) and abort any whose `Initiated` time is older than the
+/// rule's `abort_incomplete_multipart_upload_days` threshold. Successful
+/// aborts bump `report.aborted_multipart` AND (`mgr.record_action`)
+/// `s4_lifecycle_actions_total{action="abort_incomplete_multipart"}` so
+/// operator dashboards see the same signal whether they look at
+/// in-process counters or Prometheus.
+///
+/// On a successful abort the entry in `MultipartStateStore` (which
+/// holds the per-upload SSE-C key bytes / tag set / object-lock recipe
+/// captured at `CreateMultipartUpload` time) is also dropped — same
+/// shape as the user-facing `abort_multipart_upload` handler in
+/// `service.rs`. Without the drop the abandoned upload's `Zeroizing<[u8;
+/// 32]>` SSE-C key would linger in `multipart_state` until the
+/// `sweep_stale` background tick (v0.8.2 #62) reaped it on TTL.
+///
+/// Per-page / per-upload backend failures are logged at WARN and bumped
+/// in `report.action_errors`; the loop does NOT abort the bucket — one
+/// bad upload must not prevent the rest of the bucket's stale uploads
+/// from being cleaned up. Mirrors the same isolation policy
+/// `scan_bucket` uses for `list_objects_v2` failures.
+async fn scan_in_flight_multipart_uploads<B: S3 + Send + Sync + 'static>(
+    s4: &Arc<crate::S4Service<B>>,
+    mgr: &Arc<LifecycleManager>,
+    bucket: &str,
+    now: DateTime<Utc>,
+    report: &mut ScanReport,
+) {
+    let mut key_marker: Option<String> = None;
+    let mut upload_id_marker: Option<String> = None;
+    loop {
+        let list_input = ListMultipartUploadsInput {
+            bucket: bucket.to_owned(),
+            key_marker: key_marker.clone(),
+            upload_id_marker: upload_id_marker.clone(),
+            ..Default::default()
+        };
+        let list_req = synthetic_request(
+            list_input,
+            http::Method::GET,
+            &format!("/{bucket}?uploads"),
+        );
+        let resp = match s4.as_ref().list_multipart_uploads(list_req).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    bucket = %bucket,
+                    error = %e,
+                    "S4 lifecycle: list_multipart_uploads failed; \
+                     skipping bucket multipart sweep for this scan",
+                );
+                report.action_errors = report.action_errors.saturating_add(1);
+                return;
+            }
+        };
+        let output = resp.output;
+        let uploads = output.uploads.unwrap_or_default();
+        for upload in &uploads {
+            let Some(upload_id) = upload.upload_id.as_deref() else {
+                continue;
+            };
+            let Some(key) = upload.key.as_deref() else {
+                continue;
+            };
+            // `Initiated` is `Option<Timestamp>`; absent or
+            // unparseable → treat as "freshly initiated" (age 0)
+            // and skip. Matches the conservative `last_modified`
+            // handling in `scan_bucket` — never abort an upload
+            // whose age we cannot determine.
+            let Some(initiated) = upload
+                .initiated
+                .as_ref()
+                .and_then(timestamp_to_chrono_utc)
+            else {
+                continue;
+            };
+            let candidate = MultipartUploadCandidate {
+                upload_id: upload_id.to_owned(),
+                key: key.to_owned(),
+                initiated,
+                tags: Vec::new(),
+            };
+            let Some(action) = mgr.evaluate_in_flight_multipart(bucket, &candidate, now)
+            else {
+                continue;
+            };
+            let LifecycleAction::AbortMultipartUpload { upload_id: action_upload_id } =
+                action
+            else {
+                // The evaluator is contractually
+                // AbortMultipartUpload-only on this path; this arm
+                // exists only to satisfy match exhaustiveness if a
+                // future rev returns a different variant. Treat as
+                // an error so the divergence is observable.
+                warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    upload_id = %upload_id,
+                    "S4 lifecycle: evaluate_in_flight_multipart returned \
+                     non-Abort action; dropping",
+                );
+                report.action_errors = report.action_errors.saturating_add(1);
+                continue;
+            };
+            match execute_abort_multipart(s4, bucket, key, &action_upload_id).await {
+                Ok(()) => {
+                    mgr.record_action(
+                        bucket,
+                        &LifecycleAction::AbortMultipartUpload {
+                            upload_id: action_upload_id.clone(),
+                        },
+                    );
+                    report.aborted_multipart =
+                        report.aborted_multipart.saturating_add(1);
+                    // Drop the per-upload state so the
+                    // (Zeroizing-wrapped) SSE-C key bytes / tag
+                    // recipe / object-lock recipe go away
+                    // immediately rather than waiting for the
+                    // hourly `sweep_stale` tick. Idempotent —
+                    // `remove(...)` on a missing key is a no-op
+                    // (some uploads may not have been registered
+                    // here, e.g. a server restart between Create
+                    // and the lifecycle sweep).
+                    s4.as_ref()
+                        .multipart_state()
+                        .remove(&action_upload_id);
+                }
+                Err(e) => {
+                    warn!(
+                        bucket = %bucket,
+                        key = %key,
+                        upload_id = %action_upload_id,
+                        error = %e,
+                        "S4 lifecycle: AbortMultipartUpload action failed",
+                    );
+                    report.action_errors = report.action_errors.saturating_add(1);
+                }
+            }
+        }
+        if output.is_truncated.unwrap_or(false) {
+            // AWS guarantees both NextKeyMarker and (when present)
+            // NextUploadIdMarker on a truncated response. Defensive
+            // break when neither moved (avoid infinite loop on a
+            // misbehaving backend).
+            let next_key = output.next_key_marker;
+            let next_upload_id = output.next_upload_id_marker;
+            if next_key == key_marker && next_upload_id == upload_id_marker {
+                break;
+            }
+            key_marker = next_key;
+            upload_id_marker = next_upload_id;
+        } else {
+            break;
+        }
+    }
+}
+
+/// v0.8.3 #69 (audit M-2): issue `abort_multipart_upload` against the
+/// wrapped `S4Service`. The handler in `service.rs` does the
+/// `multipart_state.remove(...)` itself before forwarding to the
+/// backend; we additionally `remove` from the lifecycle scanner side
+/// (in [`scan_in_flight_multipart_uploads`]) to defensively cover the
+/// case where the backend abort succeeds but the response routing
+/// shortens early.
+async fn execute_abort_multipart<B: S3 + Send + Sync + 'static>(
+    s4: &Arc<crate::S4Service<B>>,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) -> Result<(), String> {
+    let input = AbortMultipartUploadInput {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        upload_id: upload_id.to_owned(),
+        ..Default::default()
+    };
+    let req = synthetic_request(
+        input,
+        http::Method::DELETE,
+        &format!("/{bucket}/{key}?uploadId={upload_id}"),
+    );
+    s4.as_ref()
+        .abort_multipart_upload(req)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{e}"))
 }
 
 /// Issue `delete_object` against the wrapped `S4Service`. The handler in
@@ -1221,11 +1525,115 @@ mod tests {
                 storage_class: "GLACIER".into(),
             },
         );
+        m.record_action(
+            "b",
+            &LifecycleAction::AbortMultipartUpload {
+                upload_id: "u-xyz".into(),
+            },
+        );
         let snap = m.actions_snapshot();
         assert_eq!(snap.get(&("b".into(), "expire".into())).copied(), Some(2));
         assert_eq!(
             snap.get(&("b".into(), "transition".into())).copied(),
             Some(1)
+        );
+        assert_eq!(
+            snap.get(&("b".into(), "abort_incomplete_multipart".into()))
+                .copied(),
+            Some(1),
+            "v0.8.3 #69: AbortMultipartUpload metric_label must bump \
+             `abort_incomplete_multipart` counter",
+        );
+    }
+
+    // ---- v0.8.3 #69 (audit M-2): AbortIncompleteMultipartUpload --------
+    //
+    // Three unit tests covering the `evaluate_in_flight_multipart`
+    // path: (a) age past threshold → AbortMultipartUpload, (b) age
+    // before threshold → None, (c) the rule is `Disabled` → None
+    // (a Disabled rule must never fire even on a stale upload).
+    //
+    // Test fixtures fake `now` and `initiated` so the assertion is
+    // deterministic regardless of when the test runs.
+
+    fn abort_rule(id: &str, days: u32) -> LifecycleRule {
+        LifecycleRule {
+            id: id.into(),
+            status: LifecycleStatus::Enabled,
+            filter: LifecycleFilter::default(),
+            expiration_days: None,
+            expiration_date: None,
+            transitions: Vec::new(),
+            noncurrent_version_expiration_days: None,
+            abort_incomplete_multipart_upload_days: Some(days),
+        }
+    }
+
+    /// Upload age 8 days, rule threshold 7 days → AbortMultipartUpload
+    /// fires with the upload's `upload_id`.
+    #[test]
+    fn evaluate_in_flight_multipart_aborts_past_threshold() {
+        let m = manager_with("b", vec![abort_rule("r", 7)]);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-14T00:00:00Z")
+            .expect("parse now")
+            .with_timezone(&Utc);
+        let initiated = now - Duration::days(8);
+        let candidate = MultipartUploadCandidate {
+            upload_id: "u-stale".into(),
+            key: "uploads/big.bin".into(),
+            initiated,
+            tags: Vec::new(),
+        };
+        let action = m.evaluate_in_flight_multipart("b", &candidate, now);
+        assert_eq!(
+            action,
+            Some(LifecycleAction::AbortMultipartUpload {
+                upload_id: "u-stale".into(),
+            }),
+        );
+    }
+
+    /// Upload age 1 day, rule threshold 7 days → no fire (upload is
+    /// fresh enough to keep around).
+    #[test]
+    fn evaluate_in_flight_multipart_keeps_recent_upload() {
+        let m = manager_with("b", vec![abort_rule("r", 7)]);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-14T00:00:00Z")
+            .expect("parse now")
+            .with_timezone(&Utc);
+        let initiated = now - Duration::days(1);
+        let candidate = MultipartUploadCandidate {
+            upload_id: "u-fresh".into(),
+            key: "uploads/big.bin".into(),
+            initiated,
+            tags: Vec::new(),
+        };
+        let action = m.evaluate_in_flight_multipart("b", &candidate, now);
+        assert_eq!(action, None);
+    }
+
+    /// `Disabled` rule must never fire even when the upload is well
+    /// past the threshold — Disabled means the operator is staging the
+    /// rule (preview / dry-run), the action must wait for Enable.
+    #[test]
+    fn evaluate_in_flight_multipart_skips_disabled_rule() {
+        let mut rule = abort_rule("r", 1);
+        rule.status = LifecycleStatus::Disabled;
+        let m = manager_with("b", vec![rule]);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-14T00:00:00Z")
+            .expect("parse now")
+            .with_timezone(&Utc);
+        let initiated = now - Duration::days(365);
+        let candidate = MultipartUploadCandidate {
+            upload_id: "u-ancient".into(),
+            key: "uploads/big.bin".into(),
+            initiated,
+            tags: Vec::new(),
+        };
+        let action = m.evaluate_in_flight_multipart("b", &candidate, now);
+        assert_eq!(
+            action, None,
+            "Disabled rule must not abort even a 365-day-old upload",
         );
     }
 
@@ -1260,12 +1668,28 @@ mod tests {
     #[derive(Default)]
     struct ScannerMemBackend {
         objects: StdMutex<HashMap<(String, String), ScannerStored>>,
+        /// v0.8.3 #69: in-flight multipart uploads keyed by
+        /// `(bucket, upload_id)`. Tests seed entries via
+        /// `put_multipart_upload(...)` so the lifecycle scanner's
+        /// `list_multipart_uploads` walk has something to consume.
+        multipart_uploads: StdMutex<HashMap<(String, String), ScannerMultipart>>,
     }
 
     #[derive(Clone)]
     struct ScannerStored {
         body: Bytes,
         last_modified: dto2::Timestamp,
+    }
+
+    /// v0.8.3 #69: minimal multipart-upload record the test backend
+    /// returns from `list_multipart_uploads`. `initiated` is a
+    /// `chrono::DateTime<Utc>` so tests can fake an old upload by
+    /// passing `Utc::now() - Duration::days(N)` directly (no
+    /// SystemTime arithmetic).
+    #[derive(Clone)]
+    struct ScannerMultipart {
+        key: String,
+        initiated: chrono::DateTime<Utc>,
     }
 
     impl ScannerMemBackend {
@@ -1275,6 +1699,24 @@ mod tests {
                 ScannerStored {
                     body,
                     last_modified: dto2::Timestamp::from(std::time::SystemTime::now()),
+                },
+            );
+        }
+
+        /// v0.8.3 #69: seed an in-flight multipart upload the
+        /// lifecycle scanner can then walk + abort.
+        fn put_multipart_upload(
+            &self,
+            bucket: &str,
+            upload_id: &str,
+            key: &str,
+            initiated: chrono::DateTime<Utc>,
+        ) {
+            self.multipart_uploads.lock().unwrap().insert(
+                (bucket.to_owned(), upload_id.to_owned()),
+                ScannerMultipart {
+                    key: key.to_owned(),
+                    initiated,
                 },
             );
         }
@@ -1351,6 +1793,57 @@ mod tests {
             // class, so it's a no-op success — exactly the AWS-side
             // behaviour for a backend that ignores the field.
             Ok(S3Response::new(dto2::CopyObjectOutput::default()))
+        }
+
+        // ---- v0.8.3 #69: multipart abort path -----------------------
+        //
+        // The lifecycle scanner walks `list_multipart_uploads` per
+        // bucket and calls `abort_multipart_upload` on every upload
+        // whose `Initiated` time is past the rule's threshold. The
+        // test backend returns the seeded entries on listing and
+        // drops them on abort so post-conditions are observable.
+
+        async fn list_multipart_uploads(
+            &self,
+            req: S3Request<dto2::ListMultipartUploadsInput>,
+        ) -> S3Result<S3Response<dto2::ListMultipartUploadsOutput>> {
+            let bucket = req.input.bucket.clone();
+            let lock = self.multipart_uploads.lock().unwrap();
+            let mut uploads: Vec<dto2::MultipartUpload> = lock
+                .iter()
+                .filter(|((b, _), _)| b == &bucket)
+                .map(|((_, upload_id), v)| {
+                    let st: std::time::SystemTime = v.initiated.into();
+                    dto2::MultipartUpload {
+                        upload_id: Some(upload_id.clone()),
+                        key: Some(v.key.clone()),
+                        initiated: Some(dto2::Timestamp::from(st)),
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            // Stable order so test assertions on count + post-condition
+            // do not race on the HashMap iteration order.
+            uploads.sort_by(|a, b| a.upload_id.cmp(&b.upload_id));
+            Ok(S3Response::new(dto2::ListMultipartUploadsOutput {
+                bucket: Some(bucket),
+                uploads: Some(uploads),
+                is_truncated: Some(false),
+                ..Default::default()
+            }))
+        }
+
+        async fn abort_multipart_upload(
+            &self,
+            req: S3Request<dto2::AbortMultipartUploadInput>,
+        ) -> S3Result<S3Response<dto2::AbortMultipartUploadOutput>> {
+            let bucket = req.input.bucket.clone();
+            let upload_id = req.input.upload_id.clone();
+            self.multipart_uploads
+                .lock()
+                .unwrap()
+                .remove(&(bucket, upload_id));
+            Ok(S3Response::new(dto2::AbortMultipartUploadOutput::default()))
         }
     }
 
@@ -1635,4 +2128,89 @@ mod tests {
         );
     }
 
+    /// v0.8.3 #69 (audit M-2): end-to-end test of the multipart sweep.
+    /// Two in-flight uploads are seeded — `u-stale` initiated 8 days
+    /// ago, `u-fresh` initiated 1 hour ago. The lifecycle rule sets
+    /// `abort_incomplete_multipart_upload_days = 7`. The scanner must
+    /// abort `u-stale` (bumping `report.aborted_multipart`) but leave
+    /// `u-fresh` alone. Object walk is a no-op (no objects seeded), so
+    /// the report's expire / transition counters stay at zero.
+    #[tokio::test]
+    async fn run_scan_once_aborts_stale_multipart_upload() {
+        let backend = ScannerMemBackend::default();
+        let bucket = "lc-mp-69";
+        let now = Utc::now();
+        backend.put_multipart_upload(bucket, "u-stale", "uploads/big.bin", now - Duration::days(8));
+        backend.put_multipart_upload(bucket, "u-fresh", "uploads/fresh.bin", now - Duration::hours(1));
+
+        let registry = Arc::new(
+            CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)),
+        );
+        let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
+        let mgr = Arc::new(LifecycleManager::new());
+        let mut rule = LifecycleRule {
+            id: "abort-7d".into(),
+            status: LifecycleStatus::Enabled,
+            filter: LifecycleFilter::default(),
+            expiration_days: None,
+            expiration_date: None,
+            transitions: Vec::new(),
+            noncurrent_version_expiration_days: None,
+            abort_incomplete_multipart_upload_days: Some(7),
+        };
+        rule.filter.prefix = Some("uploads/".into());
+        mgr.put(bucket, LifecycleConfig { rules: vec![rule] });
+        let s4 = Arc::new(
+            S4Service::new(backend, registry, dispatcher).with_lifecycle(Arc::clone(&mgr)),
+        );
+
+        let report = run_scan_once(&s4).await.expect("scan");
+        assert_eq!(report.buckets_scanned, 1);
+        assert_eq!(
+            report.aborted_multipart, 1,
+            "u-stale must be aborted; got {report:?}",
+        );
+        assert_eq!(report.action_errors, 0);
+        assert_eq!(report.expired, 0);
+        assert_eq!(report.transitioned, 0);
+
+        // Backend post-condition via the wire-side
+        // `list_multipart_uploads` path: only the fresh upload
+        // (`u-fresh`) survives — `u-stale` was aborted by the
+        // scanner.
+        let post_req = synthetic_request(
+            ListMultipartUploadsInput {
+                bucket: bucket.into(),
+                ..Default::default()
+            },
+            http::Method::GET,
+            &format!("/{bucket}?uploads"),
+        );
+        let post = s4
+            .as_ref()
+            .list_multipart_uploads(post_req)
+            .await
+            .expect("post-scan list_multipart_uploads");
+        let remaining_ids: Vec<String> = post
+            .output
+            .uploads
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|u| u.upload_id)
+            .collect();
+        assert_eq!(
+            remaining_ids,
+            vec!["u-fresh".to_string()],
+            "exactly u-fresh must remain after the sweep; got {remaining_ids:?}",
+        );
+
+        // Counter snapshot agrees with the report.
+        let snap = mgr.actions_snapshot();
+        assert_eq!(
+            snap.get(&(bucket.into(), "abort_incomplete_multipart".into()))
+                .copied(),
+            Some(1),
+            "v0.8.3 #69: abort_incomplete_multipart counter must be 1",
+        );
+    }
 }
