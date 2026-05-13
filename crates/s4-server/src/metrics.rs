@@ -141,6 +141,19 @@ pub mod names {
     /// statuses HashMap would grow unbounded and inflate the JSON
     /// snapshot persisted by `to_json`).
     pub const REPLICATION_STATUS_SWEPT_TOTAL: &str = "s4_replication_status_swept_total";
+    /// v0.8.3 #68 (M-1 audit fix): counter bumped each time the
+    /// replication dispatcher PUT-ed a replica whose source carried
+    /// Object Lock state (`mode` / `retain_until` / `legal_hold_on`)
+    /// but the destination-side `S4Service` has no
+    /// `ObjectLockManager` attached, so the propagation could not be
+    /// committed and the destination operator can freely DELETE the
+    /// replica. Operators alert on a non-zero rate to catch DR
+    /// configurations whose destination silently drops the source's
+    /// WORM posture. Pair with the WARN log line emitted once per
+    /// `(source_bucket, dest_bucket)` pair so dashboards have both
+    /// per-pair signal (log) and aggregate volume (counter).
+    pub const REPLICATION_LOCK_PROPAGATION_SKIPPED_TOTAL: &str =
+        "s4_replication_lock_propagation_skipped_total";
 }
 
 /// v0.8 #50: re-export of [`names::SSE_AES_BACKEND`] at the crate root
@@ -296,6 +309,17 @@ pub fn record_replication_replicated(bucket: &str, dest: &str) {
         "dest" => dest.to_owned(),
     )
     .increment(1);
+}
+
+/// v0.8.3 #68 (audit M-1): bumped each time the replication dispatcher
+/// committed a replica PUT whose source carried Object Lock state but
+/// the destination side has no `ObjectLockManager` attached, so the
+/// WORM posture could not propagate. Unlabelled — the per-(src, dst)
+/// pair detail lives on the WARN log line emitted once per pair (the
+/// pair count is operator-bounded but unlabelled here keeps Prometheus
+/// cardinality flat under workloads with many replication rules).
+pub fn record_replication_lock_propagation_skipped() {
+    metrics::counter!(names::REPLICATION_LOCK_PROPAGATION_SKIPPED_TOTAL).increment(1);
 }
 
 /// v0.6 #37: bumped each time the lifecycle scanner executes an action

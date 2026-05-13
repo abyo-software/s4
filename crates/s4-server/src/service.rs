@@ -664,23 +664,46 @@ impl<B: S3> S4Service<B> {
         let destination_key_override = pending_version
             .filter(|pv| pv.versioned_response)
             .map(|pv| versioned_shadow_key(source_key, &pv.version_id));
+        // v0.8.3 #68 (audit M-1): capture the source object's Object
+        // Lock state so the dispatcher can decorate the destination
+        // PUT with the matching AWS-wire lock headers. Without this,
+        // a Compliance / Governance / legal-hold protected source
+        // would replicate to a destination where DELETE succeeds
+        // (the WORM posture would only hold on the source).
+        let source_lock_state = self
+            .object_lock
+            .as_ref()
+            .and_then(|mgr| mgr.get(source_bucket, source_key));
+        // v0.8.3 #68: hand the destination-side ObjectLockManager to
+        // the dispatcher closure so we can persist the propagated
+        // lock state on successful destination PUT (the destination
+        // PUT below bypasses S4Service::put_object — we drive the
+        // backend directly — so the explicit_lock_mode commit block
+        // in put_object never fires for replicas. We replay it here
+        // against the destination key.)
+        let dest_lock_mgr = self.object_lock.as_ref().map(Arc::clone);
         let mgr_cl = Arc::clone(mgr);
         let backend = Arc::clone(&self.backend);
         let body_cl = body.clone();
         let metadata_cl = metadata.clone();
         let source_bucket_cl = source_bucket.to_owned();
         let source_key_cl = source_key.to_owned();
+        let source_lock_state_for_closure = source_lock_state.clone();
+        let source_bucket_for_warn = source_bucket.to_owned();
         tokio::spawn(async move {
             let do_put = move |dest_bucket: String,
                                dest_key: String,
                                dest_body: bytes::Bytes,
                                dest_meta: Option<std::collections::HashMap<String, String>>| {
                 let backend = Arc::clone(&backend);
+                let dest_lock_mgr = dest_lock_mgr.clone();
+                let lock_state = source_lock_state_for_closure.clone();
+                let warn_src = source_bucket_for_warn.clone();
                 async move {
                     let req = S3Request {
                         input: PutObjectInput {
-                            bucket: dest_bucket,
-                            key: dest_key,
+                            bucket: dest_bucket.clone(),
+                            key: dest_key.clone(),
                             body: Some(bytes_to_blob(dest_body)),
                             metadata: dest_meta,
                             ..Default::default()
@@ -694,11 +717,35 @@ impl<B: S3> S4Service<B> {
                         service: None,
                         trailing_headers: None,
                     };
-                    backend
+                    let put_result = backend
                         .put_object(req)
                         .await
                         .map(|_| ())
-                        .map_err(|e| format!("destination put_object: {e}"))
+                        .map_err(|e| format!("destination put_object: {e}"));
+                    // v0.8.3 #68: on successful destination PUT,
+                    // persist the propagated lock state into the
+                    // destination's ObjectLockManager so a subsequent
+                    // DELETE on the destination is refused. Three cases:
+                    //   - PUT failed     → skip (no replica to protect)
+                    //   - lock_state None → nothing to propagate
+                    //   - dest manager None (operator misconfig)
+                    //                     → log warn-once + bump skip metric
+                    if put_result.is_ok()
+                        && let Some(state) = lock_state
+                    {
+                        match dest_lock_mgr {
+                            Some(ref mgr) => {
+                                mgr.set(&dest_bucket, &dest_key, state);
+                            }
+                            None => {
+                                crate::replication::warn_lock_propagation_skipped(
+                                    &warn_src,
+                                    &dest_bucket,
+                                );
+                            }
+                        }
+                    }
+                    put_result
                 }
             };
             crate::replication::replicate_object(
@@ -711,6 +758,7 @@ impl<B: S3> S4Service<B> {
                 mgr_cl,
                 generation,
                 destination_key_override,
+                source_lock_state,
             )
             .await;
         });

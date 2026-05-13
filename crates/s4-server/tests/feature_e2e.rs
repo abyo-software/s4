@@ -5075,3 +5075,178 @@ async fn lifecycle_abort_incomplete_multipart_via_minio() {
         "snapshot must record 2 abort_incomplete_multipart actions; got {snap:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// v0.8.3 #68 (audit M-1): Object Lock × Replication — lock state
+// propagation to the destination bucket.
+// ---------------------------------------------------------------------------
+//
+// Setup: a single S4 listener with both `with_object_lock` AND
+// `with_replication` (and `with_versioning` so PutObjectLockConfiguration
+// passes the manager-attached preflight). Source bucket gets a
+// Compliance(30d) default. PUT to source → poll dest for the replica →
+// HEAD dest must succeed; DELETE on dest must fail with AccessDenied
+// (the destination's lock state was propagated from the source).
+//
+// Pre-fix audit M-1 behaviour: replica landed on dest with no lock
+// state, so the destination operator could DELETE freely — the WORM
+// posture was source-only and "cross-bucket DR keeps WORM" did not hold.
+
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn replication_propagates_compliance_lock_to_destination() {
+    let minio = start_minio().await;
+    let spawned = spawn_s4_with_options(
+        &minio.endpoint_url,
+        S4TestOpts::default()
+            .with_replication()
+            .with_object_lock()
+            .with_versioning(),
+    )
+    .await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    ensure_bucket(&backend_client, "lock-repl-src").await;
+    ensure_bucket(&backend_client, "lock-repl-dst").await;
+    let s4_client = build_aws_client_v2(&spawned.endpoint_url);
+
+    // 1) Configure source-bucket Object Lock: Compliance default, 30d.
+    s4_client
+        .put_object_lock_configuration()
+        .bucket("lock-repl-src")
+        .object_lock_configuration(
+            aws_sdk_s3::types::ObjectLockConfiguration::builder()
+                .object_lock_enabled(aws_sdk_s3::types::ObjectLockEnabled::Enabled)
+                .rule(
+                    aws_sdk_s3::types::ObjectLockRule::builder()
+                        .default_retention(
+                            aws_sdk_s3::types::DefaultRetention::builder()
+                                .mode(aws_sdk_s3::types::ObjectLockRetentionMode::Compliance)
+                                .days(30)
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect("PutObjectLockConfiguration on source");
+
+    // 2) Configure replication src → dst (no prefix / tag filter).
+    s4_client
+        .put_bucket_replication()
+        .bucket("lock-repl-src")
+        .replication_configuration(
+            aws_sdk_s3::types::ReplicationConfiguration::builder()
+                .role("arn:aws:iam::000000000000:role/s4-test")
+                .rules(
+                    aws_sdk_s3::types::ReplicationRule::builder()
+                        .id("rule-all")
+                        .priority(1)
+                        .status(aws_sdk_s3::types::ReplicationRuleStatus::Enabled)
+                        .filter(
+                            aws_sdk_s3::types::ReplicationRuleFilter::builder()
+                                .prefix(String::new())
+                                .build(),
+                        )
+                        .destination(
+                            aws_sdk_s3::types::Destination::builder()
+                                .bucket("lock-repl-dst")
+                                .build()
+                                .expect("destination"),
+                        )
+                        .build()
+                        .expect("rule"),
+                )
+                .build()
+                .expect("replication configuration"),
+        )
+        .send()
+        .await
+        .expect("PutBucketReplication");
+
+    // 3) PUT to source — bucket-default Compliance(30d) auto-applies on
+    // the source key, replication fires on a detached task carrying the
+    // captured lock state.
+    let payload = bytes::Bytes::from_static(b"WORM-protected DR payload");
+    s4_client
+        .put_object()
+        .bucket("lock-repl-src")
+        .key("worm.bin")
+        .body(payload.clone().into())
+        .send()
+        .await
+        .expect("put src");
+
+    // 4) Poll the destination bucket for the replica — cap at 5s. Use
+    // the backend client directly (bypasses the gateway, so the HEAD
+    // shows the underlying replica regardless of any S4-side lock).
+    let mut found = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match backend_client
+            .head_object()
+            .bucket("lock-repl-dst")
+            .key("worm.bin")
+            .send()
+            .await
+        {
+            Ok(_) => {
+                found = true;
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+    assert!(
+        found,
+        "replica must land in lock-repl-dst within 5s",
+    );
+
+    // 5) GET on the destination through the gateway must succeed (the
+    // body is unaffected by lock state — only mutation is gated).
+    let got = s4_client
+        .get_object()
+        .bucket("lock-repl-dst")
+        .key("worm.bin")
+        .send()
+        .await
+        .expect("GET on locked replica must succeed");
+    let body = got.body.collect().await.expect("collect body").into_bytes();
+    assert_eq!(body, payload, "replica body must match source payload");
+
+    // 6) The crux: DELETE on the destination through the gateway must
+    // be refused with AccessDenied because the propagated Compliance
+    // lock is in effect. Pre-fix M-1 behaviour: DELETE succeeded
+    // (replica was unprotected on the destination).
+    let err = s4_client
+        .delete_object()
+        .bucket("lock-repl-dst")
+        .key("worm.bin")
+        .send()
+        .await
+        .expect_err("Compliance lock propagated to dest must block DELETE");
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("AccessDenied") || dbg.contains("403"),
+        "DELETE on locked replica must surface AccessDenied / 403; got: {dbg}"
+    );
+    // And bypass=true must also be refused — Compliance is one-way
+    // even on the destination side.
+    let err = s4_client
+        .delete_object()
+        .bucket("lock-repl-dst")
+        .key("worm.bin")
+        .bypass_governance_retention(true)
+        .send()
+        .await
+        .expect_err("Compliance ignores bypass header on the destination too");
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("AccessDenied") || dbg.contains("403"),
+        "DELETE-with-bypass on Compliance-locked replica must still surface \
+         AccessDenied / 403; got: {dbg}"
+    );
+
+    let _ = spawned.shutdown.send(());
+}

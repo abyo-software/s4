@@ -595,6 +595,41 @@ fn filter_matches(
 const RETRY_ATTEMPTS: u32 = 3;
 const RETRY_BASE_MS: u64 = 50;
 
+/// v0.8.3 #68 (audit M-1): emit a single WARN log line per
+/// `(source_bucket, dest_bucket)` pair the first time we observe a
+/// replication PUT that wanted to propagate Object Lock state but the
+/// destination side has no `ObjectLockManager` attached. The metric
+/// (`s4_replication_lock_propagation_skipped_total`) bumps every time
+/// (so dashboards see the rate); the log is dedup'd because operators
+/// only need to know once that the configuration is asymmetric.
+///
+/// The dedup set lives in a process-static `Mutex<HashSet<(src, dst)>>`
+/// — bounded by the (#source × #destination) pair count, which is
+/// always small (operator-declared rules, not per-key).
+pub fn warn_lock_propagation_skipped(source_bucket: &str, dest_bucket: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let key = (source_bucket.to_owned(), dest_bucket.to_owned());
+    let first_time = {
+        let mut guard = seen.lock().expect("warn-once HashSet Mutex poisoned");
+        guard.insert(key)
+    };
+    if first_time {
+        tracing::warn!(
+            source_bucket = %source_bucket,
+            dest_bucket = %dest_bucket,
+            "S4 replication: source carries Object Lock state but destination \
+             bucket has no ObjectLockManager attached — replica will be freely \
+             deletable on the destination (WORM posture is source-only). Attach \
+             an ObjectLockManager via S4Service::with_object_lock() on the \
+             destination-side gateway to honour cross-bucket WORM."
+        );
+    }
+    crate::metrics::record_replication_lock_propagation_skipped();
+}
+
 /// Replicate one source-bucket object to the rule's destination bucket.
 ///
 /// The caller supplies a `do_put` callback that performs the actual
@@ -636,11 +671,27 @@ const RETRY_BASE_MS: u64 = 50;
 ///   under the same shadow path the source uses (= a `?versionId=`
 ///   GET on the destination resolves through the same shadow-key
 ///   lookup as the source).
-// 9 args is the post-#61 wire-shape: rule + (source_bucket, source_key,
-// body, metadata) + do_put + manager + (generation, dest_override). A
-// shape struct would split the call site without buying anything; the
-// caller (`spawn_replication_if_matched`) constructs every field
-// inline, so the indirection is pure noise.
+///
+/// ## v0.8.3 #68 — Object Lock state propagation (audit M-1)
+///
+/// `source_lock_state` carries the source object's WORM posture
+/// (`mode + retain_until + legal_hold_on`) at PUT time. When `Some`,
+/// the destination PUT is decorated with the AWS-wire lock headers
+/// (`x-amz-object-lock-mode`, `x-amz-object-lock-retain-until-date`,
+/// `x-amz-object-lock-legal-hold`) on the metadata map so the
+/// destination side's `put_object` (or its caller) can persist the
+/// same lock state on the replica. Without this, a Compliance /
+/// Governance / legal-hold protected source had a destination
+/// replica that the destination operator could freely DELETE — the
+/// "WORM compliance posture survives DR" guarantee leaked.
+///
+/// `None` (no lock state on the source) keeps the legacy behaviour:
+/// no extra headers, replica is freely deletable on the destination.
+// 10 args is the post-#68 wire-shape: rule + (source_bucket, source_key,
+// body, metadata) + do_put + manager + (generation, dest_override) +
+// source_lock_state. A shape struct would split the call site without
+// buying anything; the caller (`spawn_replication_if_matched`)
+// constructs every field inline, so the indirection is pure noise.
 #[allow(clippy::too_many_arguments)]
 pub async fn replicate_object<F, Fut>(
     rule: ReplicationRule,
@@ -652,6 +703,7 @@ pub async fn replicate_object<F, Fut>(
     manager: Arc<ReplicationManager>,
     generation: u64,
     destination_key_override: Option<String>,
+    source_lock_state: Option<crate::object_lock::ObjectLockState>,
 ) where
     F: Fn(String, String, bytes::Bytes, Option<HashMap<String, String>>) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
@@ -667,6 +719,35 @@ pub async fn replicate_object<F, Fut>(
     );
     if let Some(ref sc) = rule.destination_storage_class {
         replica_meta.insert("x-amz-storage-class".to_owned(), sc.clone());
+    }
+    // v0.8.3 #68 (audit M-1): propagate the source's Object Lock
+    // posture as AWS-wire lock headers attached to the destination
+    // PUT's metadata map. The destination side reads these and
+    // persists the same lock state on the replica so a DR setup keeps
+    // the WORM guarantee end-to-end (Compliance / Governance / legal
+    // hold cannot be silently bypassed by deleting on the destination).
+    if let Some(ref lock) = source_lock_state {
+        if let Some(mode) = lock.mode {
+            replica_meta.insert(
+                "x-amz-object-lock-mode".to_owned(),
+                mode.as_aws_str().to_owned(),
+            );
+        }
+        if let Some(retain_until) = lock.retain_until {
+            // ISO-8601 / RFC-3339 — the AWS wire form for
+            // `x-amz-object-lock-retain-until-date`.
+            replica_meta.insert(
+                "x-amz-object-lock-retain-until-date".to_owned(),
+                retain_until.to_rfc3339(),
+            );
+        }
+        // Always emit the legal-hold flag when any lock state is
+        // present so an explicit "OFF" is propagated too (an absent
+        // header is ambiguous with "no opinion" on the destination).
+        replica_meta.insert(
+            "x-amz-object-lock-legal-hold".to_owned(),
+            if lock.legal_hold_on { "ON" } else { "OFF" }.to_owned(),
+        );
     }
 
     let dest_bucket = rule.destination_bucket.clone();
@@ -1049,6 +1130,7 @@ mod tests {
             Arc::clone(&mgr),
             mgr.next_generation(),
             None,
+            None,
         )
         .await;
 
@@ -1097,6 +1179,7 @@ mod tests {
             do_put,
             Arc::clone(&mgr),
             mgr.next_generation(),
+            None,
             None,
         )
         .await;
@@ -1394,6 +1477,136 @@ mod tests {
         assert_eq!(
             n, 0,
             "freshly-defaulted recorded_at must survive a 1h-TTL sweep"
+        );
+    }
+
+    // ----- v0.8.3 #68: Object Lock state propagation unit tests (audit M-1) -----
+
+    /// When the source object carried an Object Lock state, the
+    /// dispatcher must inject the AWS-wire lock headers
+    /// (`x-amz-object-lock-mode`, `-retain-until-date`, `-legal-hold`)
+    /// into the destination PUT's metadata map so the destination side
+    /// can persist the same WORM posture on the replica.
+    #[tokio::test]
+    async fn replicate_with_source_lock_state_attaches_headers() {
+        type Captured = Vec<(String, String, bytes::Bytes, Option<HashMap<String, String>>)>;
+        let mgr = Arc::new(ReplicationManager::new());
+        let captured: Arc<Mutex<Captured>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_cl = Arc::clone(&captured);
+
+        let do_put = move |dest: String,
+                           key: String,
+                           body: bytes::Bytes,
+                           meta: Option<HashMap<String, String>>| {
+            let captured = Arc::clone(&captured_cl);
+            async move {
+                captured.lock().unwrap().push((dest, key, body, meta));
+                Ok::<(), String>(())
+            }
+        };
+
+        let retain_until = Utc::now() + chrono::Duration::days(30);
+        let lock_state = crate::object_lock::ObjectLockState {
+            mode: Some(crate::object_lock::LockMode::Compliance),
+            retain_until: Some(retain_until),
+            legal_hold_on: true,
+        };
+
+        replicate_object(
+            rule("r-locked", 1, true, None, &[], "dst"),
+            "src".into(),
+            "worm.bin".into(),
+            bytes::Bytes::from_static(b"locked-payload"),
+            None,
+            do_put,
+            Arc::clone(&mgr),
+            mgr.next_generation(),
+            None,
+            Some(lock_state),
+        )
+        .await;
+
+        let cap = captured.lock().unwrap();
+        assert_eq!(cap.len(), 1, "do_put must run exactly once on success");
+        let meta = cap[0].3.as_ref().expect("metadata stamped");
+        assert_eq!(
+            meta.get("x-amz-object-lock-mode").map(String::as_str),
+            Some("COMPLIANCE"),
+            "Compliance mode header must be propagated"
+        );
+        let stamped_until = meta
+            .get("x-amz-object-lock-retain-until-date")
+            .expect("retain-until header must be propagated");
+        // RFC-3339 round-trip: parse back and compare with the source
+        // retain_until (1s slack for sub-second truncation).
+        let parsed: chrono::DateTime<chrono::FixedOffset> =
+            chrono::DateTime::parse_from_rfc3339(stamped_until)
+                .expect("retain-until must be RFC-3339");
+        let diff = (parsed.with_timezone(&Utc) - retain_until).num_seconds().abs();
+        assert!(diff <= 1, "retain-until off by {diff}s");
+        assert_eq!(
+            meta.get("x-amz-object-lock-legal-hold").map(String::as_str),
+            Some("ON"),
+            "legal hold state must be propagated as ON"
+        );
+        // The REPLICA stamp must still be present alongside the lock
+        // headers (lock propagation must not displace the replica
+        // marker that lets HEAD distinguish replica-vs-direct PUT).
+        assert_eq!(
+            meta.get("x-amz-replication-status").map(String::as_str),
+            Some("REPLICA"),
+        );
+    }
+
+    /// Symmetric: no source lock state → no lock headers leak into
+    /// the destination metadata (legacy behaviour preserved for the
+    /// non-WORM PUT path).
+    #[tokio::test]
+    async fn replicate_without_source_lock_state_no_headers_added() {
+        type Captured = Vec<(String, String, bytes::Bytes, Option<HashMap<String, String>>)>;
+        let mgr = Arc::new(ReplicationManager::new());
+        let captured: Arc<Mutex<Captured>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_cl = Arc::clone(&captured);
+
+        let do_put = move |dest: String,
+                           key: String,
+                           body: bytes::Bytes,
+                           meta: Option<HashMap<String, String>>| {
+            let captured = Arc::clone(&captured_cl);
+            async move {
+                captured.lock().unwrap().push((dest, key, body, meta));
+                Ok::<(), String>(())
+            }
+        };
+
+        replicate_object(
+            rule("r-plain", 1, true, None, &[], "dst"),
+            "src".into(),
+            "plain.bin".into(),
+            bytes::Bytes::from_static(b"plain-payload"),
+            None,
+            do_put,
+            Arc::clone(&mgr),
+            mgr.next_generation(),
+            None,
+            None,
+        )
+        .await;
+
+        let cap = captured.lock().unwrap();
+        let meta = cap[0].3.as_ref().expect("metadata stamped");
+        assert!(
+            meta.get("x-amz-object-lock-mode").is_none(),
+            "no lock state ⇒ no mode header (got {:?})",
+            meta.get("x-amz-object-lock-mode")
+        );
+        assert!(
+            meta.get("x-amz-object-lock-retain-until-date").is_none(),
+            "no lock state ⇒ no retain-until header"
+        );
+        assert!(
+            meta.get("x-amz-object-lock-legal-hold").is_none(),
+            "no lock state ⇒ no legal-hold header"
         );
     }
 }
