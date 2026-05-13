@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.3] — 2026-05-14
+
+Operational hardening + audit MEDIUM-class sweep. Six issues
+(#65–#70) closing the remaining v0.8.2-deferred audit findings:
+1 CRITICAL (lifecycle ↔ object-lock interaction not enforced),
+2 HIGH (replication status leak, inventory KMS mis-classification),
+2 MEDIUM (lock state on replicas, lifecycle multipart-abort), 1 doc
+sweep.
+
+### Fixed
+
+- **Lifecycle scanner consults Object Lock** (#65 / audit C-2) —
+  scanner now HEAD-checks each object's lock state via
+  `ObjectLockManager::get(bucket, key)` before delete / metadata-
+  rewrite. Locked objects increment `ScanReport.skipped_locked` and
+  bump `s4_lifecycle_actions_total{action="skipped_locked"}` so a
+  Compliance-locked object that "should" expire is now visible in
+  the metric stream instead of failing silently at the backend.
+- **Replication: status HashMap growth bounded** (#66 / audit H-5) —
+  `ReplicationStatusEntry` gains a `recorded_at: DateTime<Utc>`
+  field; new `sweep_stale(now, max_age)` drops terminal-state
+  entries (Completed / Failed) older than the threshold. Pending
+  entries are never swept (still in-flight). New CLI flag
+  `--replication-status-ttl-hours <N>` (default 168 = 7 days, long
+  enough for an on-call rotation to investigate failures). Hourly
+  background sweep + `s4_replication_status_swept_total` counter.
+  Snapshot back-compat via `serde(default)` for the new field.
+- **Inventory: SSE-KMS encryption_status classification** (#67 /
+  audit H-7) — `encryption_status_from_head` now checks
+  `server_side_encryption == "aws:kms"` BEFORE `ssekms_key_id` (the
+  HEAD response carries the former, not the latter). SSE-KMS
+  objects in the daily inventory CSV are now correctly labelled
+  `SSE-KMS` instead of being misclassified as `SSE-S4`.
+- **Object Lock state propagated to replicated objects** (#68 /
+  audit M-1) — `replicate_object` now carries an
+  `Option<ObjectLockState>` parameter; `spawn_replication_if_matched`
+  captures the source's lock state and the destination PUT replays
+  the WORM mode / retain-until-date / legal-hold via headers. When
+  the destination has no `ObjectLockManager`, log WARN once per
+  (src, dst) pair + bump `s4_replication_lock_propagation_skipped_total`.
+  Closes the "WORM at source, deletable at destination" gap.
+- **Lifecycle AbortIncompleteMultipartUpload — actually fires** (#69
+  / audit M-2) — `LifecycleAction::AbortMultipartUpload { upload_id }`
+  added; new `evaluate_in_flight_multipart` evaluator branch; scanner
+  walks `list_multipart_uploads` per bucket and aborts uploads past
+  the configured age. Successful abort drops the entry from
+  `MultipartStateStore` (immediate `Zeroizing` wipe of any SSE-C key
+  bytes still held).
+
+### Documentation (#70)
+
+- `--lifecycle-state-file` docstring rewritten — was still claiming
+  "actual ... invocation deferred to v0.7+" even though v0.7 #45 +
+  v0.8.3 #65 / #69 shipped the full scanner. Now cites the real
+  post-v0.8.3 status (walk + execute + lock-skip + multipart abort,
+  with NoncurrentVersionExpiration as the only remaining deferred
+  rule shape).
+- `notifications::EventType::ObjectRemovedDeleteMarker` doc clarified
+  — fires for both Enabled and Suspended versioning state; Suspended
+  also physically deletes the prior null version (consumers cannot
+  tell from the event type alone).
+- README S3 Select GPU caveat (audit M-4): no change — README has no
+  S3 Select section, so there's no false claim to caveat.
+
+### Test posture (post-v0.8.3)
+
+- Workspace tests: 537 pass / 47 ignored (Docker-gated). Was 523/43
+  in v0.8.2.
+- All four 2026-05-14 audit-track findings (Codex CLI crypto + Codex
+  multipart-concurrency + cross-feature interaction + docs drift)
+  closed across v0.8.2 + v0.8.3. Remaining open INFO-class findings
+  carry no security or correctness risk.
+
 ## [0.8.2] — 2026-05-14
 
 Security hotfix from a deep four-track audit (Codex CLI on
