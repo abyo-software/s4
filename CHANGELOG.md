@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] — 2026-05-14
+
+Security hotfix from a deep four-track audit (Codex CLI on
+crypto + concurrency, internal cross-feature interaction matrix,
+docs-vs-implementation drift). **Three CRITICAL data-integrity /
+silent-corruption fixes plus four HIGH crypto / DoS / leak fixes.**
+Any production deployment that uses replication, multipart × SSE-C,
+or audit-log-based compliance evidence should upgrade.
+
+### Fixed (data integrity)
+
+- **Replication: generation token + shadow-key destination** (#61) —
+  v0.6 #40 stamped status by `(source_bucket, source_key)` only with
+  no per-PUT generation. Two PUTs to the same key spawned concurrent
+  replication tasks; an older retry could clobber the destination
+  with stale bytes after the newer one finished. Source PUT also
+  routed via the shadow key on Enabled-versioning buckets but the
+  destination wrote under the logical key — destination version
+  chains lost the new version. Fix: monotonic `AtomicU64` generation
+  per PUT, CAS-style status update, shadow-key destination when source
+  is versioned. Snapshot back-compat via `serde(untagged)`.
+- **Multipart: SSE-C key consistency on `UploadPart`** (#62 / H-1) —
+  v0.8.0 BUG-10 stripped SSE-C headers to stop backend forwarding,
+  but never checked the part's key against the
+  `CreateMultipartUpload` context's key. A client could send
+  part 1 with key-A and part 2 with key-B; both accepted, plaintext
+  silently corrupted on GET. Now `parse_customer_key_headers` runs
+  on every part and the resulting MD5 is compared to the Create
+  context's MD5; mismatch / omission / partial header set all
+  return `400 InvalidArgument`.
+
+### Fixed (security / DoS / leak)
+
+- **Audit log: terminal HMAC marker + cross-file authentication**
+  (#63 / H-2 + H-3) — v0.5 #31 emitted a hash-chained HMAC per line
+  but had no end-of-file marker; an attacker could truncate the
+  newest entries without `verify-audit-log` flagging a break. The
+  `# prev_file_tail=` cross-file hint was also trusted from the file
+  itself, enabling splice / replay. Now: every batch file ends with
+  `# eof_hmac=<hex>` (HMAC of the chain state at file close); the
+  `Drop` impl flushes a marker on graceful shutdown.
+  `verify-audit-log` gains `--require-eof-hmac` (strict mode) and
+  `--expected-prev-tail <hex>` (operator-supplied authenticated
+  tail). `VerifyReport` adds `unsigned_eof` and `unsigned_prev_tail`
+  flags so tooling can flag pre-v0.8.2 logs without failing them.
+- **Chunked SSE: pre-validate chunk_size × chunk_count before
+  alloc** (#64 / H-4) — `decrypt_chunked_buffered` allocated
+  `chunk_size * chunk_count` before validating the body actually
+  contained that much ciphertext. A malicious / corrupted S4E5/S4E6
+  header could trigger huge allocation or u64 overflow / panic
+  before authentication failure was reached. Now uses
+  `checked_mul`, caps at a caller-supplied `max_body_bytes` (default
+  5 GiB), and rejects with the new `SseError::ChunkFrameTooLarge` /
+  `ChunkFrameTruncated` variants. Service.rs API unchanged via
+  `decrypt_chunked_buffered_default` wrapper. Includes a fuzz
+  regression test (100k random bodies × 5 cap variants — no panic).
+- **Multipart: abandoned-upload TTL + SSE-C key zeroize** (#62 /
+  H-6) — `MultipartStateStore::by_upload_id` had no TTL or sweep, and
+  the SSE-C key bytes were stored as bare `[u8; 32]`. Clients that
+  initiated multipart but never completed/aborted left raw 32-byte
+  customer keys in process memory indefinitely, leaking on core
+  dump / swap-out. Now: `Zeroizing<[u8; 32]>` for the SSE-C key (auto
+  -wipes on `remove()` / `sweep_stale()` / process exit); new
+  `--multipart-abandoned-ttl-hours` flag (default 24, AWS S3 spec
+  value); hourly `tokio::time::interval` sweep task; new metric
+  `s4_multipart_abandoned_uploads_total`.
+
+### Notes
+
+- **From v0.8.0 / v0.8.1**: any deployment that uses SSE-C with
+  multipart, or relies on replication for cross-bucket DR, should
+  upgrade. The audit-log fixes are recommended for compliance
+  deployments that treat the log as evidence.
+- **Asymmetric versioning** (source Enabled, destination Suspended)
+  for replication is documented out-of-scope and emits warnings.
+
 ## [0.8.1] — 2026-05-13
 
 Security hotfix surfaced by a post-v0.8.0 audit of v0.4–v0.8 quality
