@@ -78,6 +78,25 @@ repository variables:
 The workflow checks for these variables before running and fails with a
 clear message if any are missing.
 
+### AWS KMS E2E (opt-in)
+
+Set additionally for the KMS E2E workflow
+([`.github/workflows/aws-kms-e2e.yml`](../../.github/workflows/aws-kms-e2e.yml),
+v0.8.1 #60). When any of these are unset the workflow no-ops with a
+`::notice::` (matching the `aws-e2e.yml` gating pattern):
+
+| Variable name | Value |
+|---|---|
+| `AWS_KMS_REGION` | e.g. `us-east-1` |
+| `AWS_KMS_ROLE_ARN` | IAM role with `kms:GenerateDataKey` + `kms:Decrypt` on the test key |
+| `AWS_KMS_TEST_KEY_ID` | alias or KMS key id (alias `alias/s4-test` recommended) |
+
+The role's trust policy should mirror the S3 E2E role (GitHub OIDC,
+`sub: repo:abyo-software/s4:*`); the inline policy needs only
+`kms:GenerateDataKey` and `kms:Decrypt` scoped to the single test key
+ARN. Provisioning is currently manual — a Terraform module to mirror
+`infra/aws-e2e/main.tf` for KMS is tracked separately.
+
 ## Running the workflow
 
 The workflow runs:

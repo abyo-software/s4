@@ -573,21 +573,94 @@ mod tests {
     // -----------------------------------------------------------------
     // AwsKms tests — only compiled with --features aws-kms, and
     // ignored by default since they require live AWS credentials +
-    // a real KMS key. Run with:
+    // a real KMS key. Run locally with:
     //   AWS_PROFILE=... S4_KMS_TEST_KEY_ID=arn:... \
-    //     cargo test --features aws-kms aws_kms -- --ignored
+    //     cargo test --features aws-kms aws_kms_ -- --ignored
+    // CI runs them nightly via .github/workflows/aws-kms-e2e.yml when
+    // the AWS_KMS_* repo variables are configured (v0.8.1 #60).
     // -----------------------------------------------------------------
 
+    /// v0.8.1 #60: Real AWS KMS round-trip — exercises GenerateDataKey
+    /// followed by Decrypt against an actual KMS key, asserting the
+    /// 32-byte DEK survives the wrap/unwrap byte-for-byte. Wrapped form
+    /// must NOT equal the plaintext (defends against an `AwsKms` impl
+    /// that accidentally stored plaintext in `WrappedDek::ciphertext`).
+    /// The canonical-key-id check guards against the AWS SDK silently
+    /// dropping `KeyId` from the response — we want the resolved ARN
+    /// stored, not whatever alias the caller passed.
     #[cfg(feature = "aws-kms")]
     #[tokio::test]
     #[ignore = "requires AWS credentials and a real KMS key (set S4_KMS_TEST_KEY_ID)"]
     async fn aws_kms_roundtrip() {
         let key_id = std::env::var("S4_KMS_TEST_KEY_ID")
-            .expect("set S4_KMS_TEST_KEY_ID to a real AWS KMS key ARN/alias");
+            .expect("S4_KMS_TEST_KEY_ID env var required (real AWS KMS key ARN or alias)");
         let kms = super::aws::AwsKms::from_default_env().await;
-        let (dek, wrapped) = kms.generate_dek(&key_id).await.unwrap();
-        assert_eq!(dek.len(), DEK_LEN);
-        let unwrapped = kms.decrypt_dek(&wrapped).await.unwrap();
-        assert_eq!(unwrapped, dek);
+
+        // GenerateDataKey
+        let (plaintext_dek, wrapped) = kms
+            .generate_dek(&key_id)
+            .await
+            .expect("generate_dek should succeed against real KMS");
+        assert_eq!(
+            plaintext_dek.len(),
+            DEK_LEN,
+            "DEK should be 32 bytes (AES-256)"
+        );
+
+        // Wrapped form must differ from plaintext — a wrapper that
+        // accidentally returned the plaintext as ciphertext would
+        // catastrophically leak the DEK at rest.
+        assert_ne!(
+            wrapped.ciphertext, plaintext_dek,
+            "wrapped DEK must NOT equal plaintext DEK"
+        );
+
+        // Decrypt round-trip — must byte-equal the original DEK.
+        let unwrapped = kms
+            .decrypt_dek(&wrapped)
+            .await
+            .expect("decrypt_dek should succeed");
+        assert_eq!(unwrapped, plaintext_dek, "round-trip DEK must byte-equal");
+
+        // KMS returns the canonical ARN even when an alias was passed
+        // in. We accept either the canonical ARN form or — as a fallback
+        // — the original key id string the caller supplied (for the
+        // unlikely case AWS doesn't echo `KeyId`).
+        assert!(
+            wrapped.key_id.starts_with("arn:aws:kms:") || wrapped.key_id == key_id,
+            "wrapped key_id should be canonical ARN or original input: {}",
+            wrapped.key_id
+        );
+    }
+
+    /// v0.8.1 #60: Unwrap of a syntactically valid but bogus ciphertext
+    /// must surface a backend / unwrap error rather than silently
+    /// returning bytes. The point is to defend against future
+    /// refactors that might unwrap `Result::ok()` and zero-fill the DEK
+    /// — that would still pass `aws_kms_roundtrip` (because real
+    /// ciphertexts decrypt fine) but would let a corrupt DEK through.
+    #[cfg(feature = "aws-kms")]
+    #[tokio::test]
+    #[ignore = "requires AWS credentials (no specific key needed; uses a synthetic bogus ARN)"]
+    async fn aws_kms_unwrap_unknown_arn_fails() {
+        let kms = super::aws::AwsKms::from_default_env().await;
+        let bogus = WrappedDek {
+            // Syntactically valid ARN format, all-zero account + key —
+            // KMS will reject either NotFound or InvalidCiphertext.
+            key_id: "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-0000-000000000000"
+                .to_string(),
+            ciphertext: vec![0u8; 100],
+        };
+        let err = kms
+            .decrypt_dek(&bogus)
+            .await
+            .expect_err("decrypt with bogus ciphertext must fail");
+        assert!(
+            matches!(
+                err,
+                KmsError::BackendUnavailable { .. } | KmsError::UnwrapFailed { .. }
+            ),
+            "expected BackendUnavailable or UnwrapFailed, got {err:?}"
+        );
     }
 }

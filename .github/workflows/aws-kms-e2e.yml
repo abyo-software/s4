@@ -1,0 +1,107 @@
+name: AWS KMS E2E
+
+# Real AWS KMS integration test for the `aws-kms` feature gate (v0.8.1
+# #60). v0.6 #28 wired up `crate::kms::aws::AwsKms` against the AWS SDK,
+# but until now CI only verified `cargo build --features aws-kms`
+# succeeds — actual GenerateDataKey / Decrypt round-trip against a real
+# KMS key was unverified. This workflow closes that gap.
+#
+# Companion to `aws-e2e.yml` (real S3 bucket, issue #3 / #15). KMS is
+# split into its own workflow because:
+#   - hot path concern separation — KMS auth issues should be obvious in
+#     the run name, not buried inside an "AWS S3 E2E" run
+#   - different opt-in variables (test KMS key vs test bucket); the two
+#     can be enabled / disabled independently
+#   - cron staggered to 05:00 UTC so the two nightlies don't pile onto
+#     AWS API quotas at the same minute
+#
+# Triggers:
+#   - nightly at 05:00 UTC (cron, staggered from aws-e2e.yml at 04:00)
+#   - manual via workflow_dispatch
+#   - on PRs with the `aws-kms-e2e` label (reviewers opt-in per PR)
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize]
+
+jobs:
+  aws-kms-e2e:
+    name: AWS KMS roundtrip (real key)
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'aws-kms-e2e'))
+    permissions:
+      id-token: write
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pre-flight — opt-in variable check (no-op skip if missing)
+        id: check
+        run: |
+          set -eu
+          missing=""
+          [ -n "${{ vars.AWS_KMS_REGION }}" ]      || missing="$missing AWS_KMS_REGION"
+          [ -n "${{ vars.AWS_KMS_ROLE_ARN }}" ]    || missing="$missing AWS_KMS_ROLE_ARN"
+          [ -n "${{ vars.AWS_KMS_TEST_KEY_ID }}" ] || missing="$missing AWS_KMS_TEST_KEY_ID"
+          if [ -n "$missing" ]; then
+            echo "::notice::AWS KMS E2E is opt-in; skipping (set$missing in Settings → Secrets and variables → Actions → Variables tab to enable). See infra/aws-e2e/README.md."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.check.outputs.configured == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - if: steps.check.outputs.configured == 'true'
+        name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - if: steps.check.outputs.configured == 'true'
+        name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_KMS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_KMS_REGION }}
+          role-session-name: s4-aws-kms-e2e-${{ github.run_id }}
+
+      - if: steps.check.outputs.configured == 'true'
+        name: Run AWS KMS E2E tests
+        env:
+          S4_KMS_TEST_KEY_ID: ${{ vars.AWS_KMS_TEST_KEY_ID }}
+          AWS_REGION: ${{ vars.AWS_KMS_REGION }}
+          RUST_LOG: info,aws_smithy_runtime=warn,aws_config=warn
+        run: |
+          cargo test --release -p s4-server --features aws-kms aws_kms_ \
+            -- --ignored --test-threads=1 --nocapture
+
+      - name: Open issue on failure
+        if: failure() && github.event_name == 'schedule' && steps.check.outputs.configured == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `AWS KMS E2E nightly failure — ${new Date().toISOString().slice(0,10)}`;
+            const body = [
+              `Nightly aws-kms-e2e workflow failed.`,
+              ``,
+              `**Run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              `**Commit:** ${context.sha}`,
+              ``,
+              `Likely causes: AWS API change, KMS rate limit, IAM/role permission drift, or the s4 AwsKms wrapper drift against aws-sdk-kms.`,
+              `Re-run via workflow_dispatch first (transient AWS errors / throttling are not unheard of).`,
+              ``,
+              `🤖 auto-opened by .github/workflows/aws-kms-e2e.yml`,
+            ].join("\n");
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title, body,
+              labels: ["aws-kms-e2e", "ci-failure"],
+            });
