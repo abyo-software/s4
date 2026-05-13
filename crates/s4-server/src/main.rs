@@ -456,16 +456,17 @@ struct Opt {
     /// enable without restoring, pass any path whose file is missing
     /// or empty.
     ///
-    /// **Note (v0.6 #37 scope):** the background scheduler currently
-    /// only logs the bucket list — actual list_objects_v2 walking +
-    /// delete_object / metadata-rewrite invocation per evaluated
-    /// rule is deferred to v0.7+. The test path
-    /// (`S4Service::run_lifecycle_once_for_test`) already exercises
-    /// the evaluator end-to-end, so this v0.6 #37 wiring ships the
-    /// configuration-management half without putting a half-wired
-    /// bucket-walk in front of users.
-    /// `AbortIncompleteMultipartUpload` is parsed and round-trips
-    /// through PutBucketLifecycleConfiguration but is not enforced.
+    /// **Scanner status (post-v0.8.3):** the background scheduler
+    /// walks every bucket whose lifecycle config exists, lists each
+    /// object via `list_objects_v2`, evaluates the rules, and
+    /// executes Expire (delete) / Transition (copy_object with new
+    /// storage class) — Object-Lock-protected objects are skipped
+    /// (lock wins, surfaced via `s4_lifecycle_actions_total{action="skipped_locked"}`).
+    /// `AbortIncompleteMultipartUpload` rules also fire — the scanner
+    /// walks `list_multipart_uploads` and aborts any upload past the
+    /// configured age. NoncurrentVersionExpiration on versioned
+    /// buckets is the only rule shape still deferred (needs the
+    /// version-chain walker).
     #[clap(long, value_name = "PATH")]
     lifecycle_state_file: Option<std::path::PathBuf>,
 

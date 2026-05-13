@@ -65,8 +65,19 @@ pub enum EventType {
     /// `s3:ObjectRemoved:Delete` — hard delete on a non-versioned bucket, or
     /// a specific-version DELETE on any bucket.
     ObjectRemovedDelete,
-    /// `s3:ObjectRemoved:DeleteMarkerCreated` — versioned-bucket DELETE that
-    /// pushes a delete marker without removing prior version bytes.
+    /// `s3:ObjectRemoved:DeleteMarkerCreated` — DELETE on a bucket with
+    /// versioning state Enabled OR Suspended.
+    ///
+    /// **Enabled**: pushes a delete marker only; prior version bytes
+    /// survive and are still reachable via `?versionId=`.
+    ///
+    /// **Suspended**: pushes a delete marker AND physically deletes
+    /// the prior null version (the `null` version is overwritten by
+    /// the marker — AWS S3 spec). Subscribers cannot tell from the
+    /// event type alone whether a prior version still exists; if the
+    /// distinction matters, query versioning state via
+    /// `GetBucketVersioning` or rely on the receiving system's chain
+    /// awareness.
     ObjectRemovedDeleteMarker,
 }
 
