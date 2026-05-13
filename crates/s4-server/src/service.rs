@@ -4387,21 +4387,28 @@ impl<B: S3> S3 for S4Service<B> {
         // and forward as upload_part. For non-framed sources (S4-untouched
         // raw objects), passthrough is correct and we keep the original
         // (cheaper) code path.
+        // v0.8.4 #74: propagate the optional `?versionId=<vid>` from the
+        // copy-source header. Without this, a versioned source bucket
+        // copy that pins a specific old version would silently fall
+        // back to "latest", assembling wrong bytes into the destination
+        // multipart object (silent data corruption).
         let CopySource::Bucket {
             bucket: src_bucket,
             key: src_key,
-            ..
+            version_id: src_version_id,
         } = &req.input.copy_source
         else {
             return self.backend.upload_part_copy(req).await;
         };
         let src_bucket = src_bucket.to_string();
         let src_key = src_key.to_string();
+        let src_version_id: Option<String> = src_version_id.as_deref().map(str::to_owned);
 
         // Probe metadata to decide whether the source needs S4-aware copy.
         let head_input = HeadObjectInput {
             bucket: src_bucket.clone(),
             key: src_key.clone(),
+            version_id: src_version_id.clone(),
             ..Default::default()
         };
         let head_req = S3Request {
@@ -4436,10 +4443,12 @@ impl<B: S3> S3 for S4Service<B> {
 
         // GET source via S4 (handles decompression + sidecar partial fetch
         // when range is present). The result is the requested user-visible
-        // byte range, fully decompressed.
+        // byte range, fully decompressed. version_id is propagated so
+        // pinned-version copies fetch the exact version requested.
         let mut get_input = GetObjectInput {
             bucket: src_bucket.clone(),
             key: src_key.clone(),
+            version_id: src_version_id.clone(),
             ..Default::default()
         };
         get_input.range = source_range;

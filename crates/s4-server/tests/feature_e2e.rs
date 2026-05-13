@@ -5409,3 +5409,252 @@ async fn tagging_header_validation_rejects_empty_key() {
 
     let _ = spawned.shutdown.send(());
 }
+
+// ---------------------------------------------------------------------------
+// v0.8.4 #74 — `upload_part_copy` propagates `?versionId=` from the copy
+// source header into the internal HEAD + GET issued by the S4-aware copy
+// path.
+// ---------------------------------------------------------------------------
+//
+// Pre-#74 bug (audit H-3): `upload_part_copy` destructured `CopySource::
+// Bucket { bucket, key, .. }` and discarded `version_id`. The HEAD that
+// decides "needs S4-aware copy?" and the subsequent GET that fetches
+// source bytes both ran without `version_id`, so a copy that pinned an
+// old version (`x-amz-copy-source: src/key?versionId=<v1>`) silently
+// fell back to "latest" and assembled the wrong bytes into the
+// destination multipart object — silent data corruption.
+//
+// Reproduction outline (this test):
+//   1. PUT v1 = "alpha bytes" (large enough to be framed-v2 under
+//      CpuZstd) to a versioned source bucket; record `vid_v1`.
+//   2. PUT v2 = "beta bytes" (overwrites latest, gets `vid_v2`).
+//   3. CreateMultipartUpload to a separate destination key.
+//   4. UploadPartCopy with `copy_source = src/key?versionId=<vid_v1>`.
+//   5. CompleteMultipartUpload.
+//   6. GET destination — body MUST equal "alpha bytes" (NOT "beta
+//      bytes"). Pre-#74 it was "beta bytes" (latest wins).
+//
+// The source object goes through the framed-v2 (`s4-framed: true`) path
+// because the listener uses `AlwaysDispatcher(CpuZstd)` — so the HEAD
+// in `upload_part_copy` returns `needs_s4_copy = true` and exercises the
+// S4-aware HEAD+GET branch where the bug lived.
+
+/// Spawn an S4 listener whose dispatcher always picks `CpuZstd` (so PUTs
+/// get framed-v2). Used by the v0.8.4 #74 regression test below; the
+/// generic `spawn_s4_with_options` helper uses `Passthrough` which does
+/// NOT trigger framing and would skip the buggy code path entirely.
+///
+/// Note: we deliberately do NOT attach S4's `VersioningManager` here.
+/// The test relies on MinIO's native bucket versioning (enabled via the
+/// wire) so that `version_id` round-trips through the s3s_aws::Proxy →
+/// MinIO path that `upload_part_copy` actually exercises (HEAD + GET on
+/// the source). Attaching the gateway VersioningManager would mint
+/// shadow-key versions that MinIO does not know about, defeating the
+/// regression check (the HEAD would 404 NoSuchVersion at MinIO).
+async fn spawn_s4_cpu_zstd_no_versioning_mgr(backend_endpoint: &str) -> SpawnedS4 {
+    let backend_client = build_aws_client_v2(backend_endpoint);
+    let proxy = s3s_aws::Proxy::from(backend_client);
+    let registry = std::sync::Arc::new(
+        CodecRegistry::new(CodecKind::CpuZstd)
+            .with(std::sync::Arc::new(Passthrough))
+            .with(std::sync::Arc::new(CpuZstd::default())),
+    );
+    let dispatcher = std::sync::Arc::new(AlwaysDispatcher(CodecKind::CpuZstd));
+    let s4 = S4Service::new(proxy, registry, dispatcher);
+
+    let mut svc = S3ServiceBuilder::new(s4);
+    svc.set_auth(SimpleAuth::from_single(MINIO_USER, MINIO_PASS));
+    let service = svc.build();
+    let router = HealthRouterV2::new(service, None);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let local = listener.local_addr().expect("local addr");
+    let endpoint_url = format!("http://{local}");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let http_server = ConnBuilderV2::new(TokioExecV2::new());
+        let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+        let mut shutdown_rx = std::pin::pin!(shutdown_rx);
+        loop {
+            tokio::select! {
+                accept = listener.accept() => match accept {
+                    Ok((socket, _)) => {
+                        let conn = http_server
+                            .serve_connection(TokioIoV2::new(socket), router.clone());
+                        let conn = graceful.watch(conn.into_owned());
+                        tokio::spawn(async move { let _ = conn.await; });
+                    }
+                    Err(e) => { eprintln!("accept: {e}"); continue; }
+                },
+                _ = shutdown_rx.as_mut() => break,
+            }
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), graceful.shutdown()).await;
+    });
+
+    SpawnedS4 {
+        endpoint_url,
+        shutdown: shutdown_tx,
+        mfa_manager: None,
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn upload_part_copy_propagates_source_version_id() {
+    let minio = start_minio().await;
+    let spawned = spawn_s4_cpu_zstd_no_versioning_mgr(&minio.endpoint_url).await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    ensure_bucket(&backend_client, "upcp-vsrc").await;
+    ensure_bucket(&backend_client, "upcp-vdst").await;
+    let s4_client = build_aws_client_v2(&spawned.endpoint_url);
+
+    // Enable versioning on the source bucket directly on MinIO (the
+    // listener carries no S4 VersioningManager — see comment on
+    // `spawn_s4_cpu_zstd_no_versioning_mgr`). This makes MinIO mint
+    // native object version IDs, which the gateway then forwards
+    // verbatim through `?versionId=` on HEAD/GET via the proxy.
+    backend_client
+        .put_bucket_versioning()
+        .bucket("upcp-vsrc")
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("PutBucketVersioning(Enabled) on upcp-vsrc (backend)");
+
+    // Build distinct payloads large enough that CpuZstd actually
+    // produces a framed-v2 body (so `is_framed_v2_object` returns true
+    // in `upload_part_copy` and the HEAD/GET S4 branch is exercised).
+    // The two payloads must be byte-distinguishable so the wrong-version
+    // failure is unambiguous.
+    let alpha_byte = b'A';
+    let beta_byte = b'B';
+    let payload_size = 256 * 1024; // 256 KiB — enough for framing
+    let alpha_bytes = bytes::Bytes::from(vec![alpha_byte; payload_size]);
+    let beta_bytes = bytes::Bytes::from(vec![beta_byte; payload_size]);
+    assert_ne!(alpha_bytes, beta_bytes);
+
+    // 1) PUT v1 = "alpha bytes"
+    let put_v1 = s4_client
+        .put_object()
+        .bucket("upcp-vsrc")
+        .key("k")
+        .body(alpha_bytes.clone().into())
+        .send()
+        .await
+        .expect("put v1 (alpha)");
+    let vid_v1 = put_v1
+        .version_id()
+        .expect("v1 must mint a version_id")
+        .to_string();
+
+    // 2) PUT v2 = "beta bytes" (overwrites latest)
+    let put_v2 = s4_client
+        .put_object()
+        .bucket("upcp-vsrc")
+        .key("k")
+        .body(beta_bytes.clone().into())
+        .send()
+        .await
+        .expect("put v2 (beta)");
+    let vid_v2 = put_v2
+        .version_id()
+        .expect("v2 must mint a version_id")
+        .to_string();
+    assert_ne!(vid_v1, vid_v2, "v1 and v2 must have distinct version_ids");
+
+    // Sanity: GET ?versionId=v1 returns alpha (proves v1 is preserved
+    // in the chain so the upload_part_copy below has a real version to
+    // pin to). If this fails, the bug is upstream of the fix scope.
+    let g1 = s4_client
+        .get_object()
+        .bucket("upcp-vsrc")
+        .key("k")
+        .version_id(&vid_v1)
+        .send()
+        .await
+        .expect("GET ?versionId=v1");
+    let g1_body = g1.body.collect().await.expect("body").into_bytes();
+    assert_eq!(
+        g1_body, alpha_bytes,
+        "pre-condition: ?versionId=v1 must return alpha bytes"
+    );
+
+    // 3) Start a destination multipart upload on a separate bucket+key.
+    let create = s4_client
+        .create_multipart_upload()
+        .bucket("upcp-vdst")
+        .key("dest")
+        .send()
+        .await
+        .expect("create_multipart_upload on upcp-vdst");
+    let upload_id = create.upload_id().expect("upload_id").to_string();
+
+    // 4) UploadPartCopy with copy_source = "upcp-vsrc/k?versionId=<v1>".
+    // Pre-#74: version_id was discarded, so the source GET returned v2
+    // (latest = beta). Post-#74: v1 (alpha) is fetched.
+    let copy_source = format!("upcp-vsrc/k?versionId={vid_v1}");
+    let upcp = s4_client
+        .upload_part_copy()
+        .bucket("upcp-vdst")
+        .key("dest")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .copy_source(copy_source)
+        .send()
+        .await
+        .expect("upload_part_copy with versioned source");
+    let etag = upcp
+        .copy_part_result
+        .as_ref()
+        .and_then(|r| r.e_tag.clone())
+        .expect("upload_part_copy must return CopyPartResult.e_tag");
+
+    // 5) CompleteMultipartUpload.
+    s4_client
+        .complete_multipart_upload()
+        .bucket("upcp-vdst")
+        .key("dest")
+        .upload_id(&upload_id)
+        .multipart_upload(
+            aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                .set_parts(Some(vec![
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .e_tag(etag)
+                        .part_number(1)
+                        .build(),
+                ]))
+                .build(),
+        )
+        .send()
+        .await
+        .expect("complete_multipart_upload");
+
+    // 6) GET the destination — the body MUST equal alpha bytes.
+    // Pre-#74 this was beta bytes (silent data corruption — the wrong
+    // source version was assembled into the multipart destination).
+    let dest = s4_client
+        .get_object()
+        .bucket("upcp-vdst")
+        .key("dest")
+        .send()
+        .await
+        .expect("get destination");
+    let dest_body = dest.body.collect().await.expect("body").into_bytes();
+    assert_eq!(
+        dest_body, alpha_bytes,
+        "v0.8.4 #74 regression: upload_part_copy must propagate ?versionId \
+         to the source HEAD+GET so the pinned-version copy lands the right \
+         bytes in the destination. Pre-fix, the destination would carry \
+         beta bytes (latest source version) — silent data corruption."
+    );
+
+    let _ = spawned.shutdown.send(());
+}
