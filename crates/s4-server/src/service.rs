@@ -78,11 +78,14 @@ pub struct S4Service<B: S3> {
     rate_limits: Option<crate::rate_limit::SharedRateLimits>,
     /// v0.4 #20: optional S3-style access log emitter.
     access_log: Option<crate::access_log::SharedAccessLog>,
-    /// v0.4 #21: optional server-side encryption key (AES-256-GCM).
-    /// When set, every PUT body gets wrapped in S4E1 after the compress
-    /// and framing steps; every GET that smells like S4E1 gets
-    /// decrypted before frame parsing.
-    sse_key: Option<crate::sse::SharedSseKey>,
+    /// v0.4 #21 / v0.5 #29: optional server-side encryption keyring
+    /// (AES-256-GCM). When set, every PUT body gets wrapped in S4E2
+    /// (with the keyring's active key id) after the compress + framing
+    /// steps; every GET that sniffs as S4E1/S4E2 is decrypted before
+    /// frame parsing. A `with_sse_key(...)` call wraps the supplied
+    /// key in a 1-slot keyring so single-key (v0.4) operators get the
+    /// same behaviour they had before, just on the v2 frame.
+    sse_keyring: Option<crate::sse::SharedSseKeyring>,
 }
 
 impl<B: S3> S4Service<B> {
@@ -103,18 +106,31 @@ impl<B: S3> S4Service<B> {
             secure_transport: false,
             rate_limits: None,
             access_log: None,
-            sse_key: None,
+            sse_keyring: None,
         }
     }
 
-    /// v0.4 #21: attach a server-side encryption key. When set, S4 wraps
-    /// every PUT body with AES-256-GCM (S4E1 wire format) AFTER
-    /// compression + framing, and unwraps it on GET before frame parse.
-    /// Encrypt-after-compress preserves the codec ratio (encrypted bytes
-    /// don't compress).
+    /// v0.4 #21 (kept for back-compat): attach a single SSE-S4 key.
+    /// Internally wraps it in a 1-slot keyring with id=1 active, so
+    /// new objects ride the v0.5 S4E2 frame while previously-written
+    /// S4E1 bytes (this same key) still decrypt via the keyring's S4E1
+    /// fallback path. Operators wanting true rotation should call
+    /// [`Self::with_sse_keyring`] instead.
     #[must_use]
     pub fn with_sse_key(mut self, key: crate::sse::SharedSseKey) -> Self {
-        self.sse_key = Some(key);
+        let keyring = crate::sse::SseKeyring::new(1, key);
+        self.sse_keyring = Some(std::sync::Arc::new(keyring));
+        self
+    }
+
+    /// v0.5 #29: attach a multi-key SSE-S4 keyring. PUT encrypts under
+    /// the active key (S4E2 frame stamped with that key's id); GET
+    /// dispatches on the body's magic — S4E1 falls back to trying every
+    /// key in the ring (active first) so v0.4 objects survive a
+    /// migration; S4E2 looks up the explicit key_id from the header.
+    #[must_use]
+    pub fn with_sse_keyring(mut self, keyring: crate::sse::SharedSseKeyring) -> Self {
+        self.sse_keyring = Some(keyring);
         self
     }
 
@@ -758,16 +774,20 @@ impl<B: S3> S3 for S4Service<B> {
             } else {
                 None
             };
-            // v0.4 #21: encrypt-after-compress. Wraps the post-framing
-            // body with AES-256-GCM (S4E1) when --sse-s4-key is set.
-            // Sidecar is built from the *unencrypted* framed body so the
-            // S4F2 frame iterator can still parse it post-decrypt on GET.
-            let body_to_send = if let Some(key) = self.sse_key.as_ref() {
+            // v0.4 #21 / v0.5 #29: encrypt-after-compress. Wraps the
+            // post-framing body with AES-256-GCM under the keyring's
+            // active key (S4E2 frame). The `s4-encrypted` metadata flag
+            // stays the same (`aes-256-gcm`) regardless of which frame
+            // version is in use — the wire frame's magic carries that
+            // detail. Sidecar is built from the *unencrypted* framed
+            // body so the S4F2 frame iterator can still parse it
+            // post-decrypt on GET.
+            let body_to_send = if let Some(keyring) = self.sse_keyring.as_ref() {
                 req.input
                     .metadata
                     .get_or_insert_with(Default::default)
                     .insert("s4-encrypted".into(), "aes-256-gcm".into());
-                crate::sse::encrypt(key, &compressed)
+                crate::sse::encrypt_v2(&compressed, keyring)
             } else {
                 compressed.clone()
             };
@@ -881,7 +901,7 @@ impl<B: S3> S3 for S4Service<B> {
             // are opaque to the codec; this also forces the buffered
             // path because AES-GCM needs the full body for tag verify.
             let blob = if is_sse_encrypted(&resp.output.metadata) {
-                let key = self.sse_key.as_ref().ok_or_else(|| {
+                let keyring = self.sse_keyring.as_ref().ok_or_else(|| {
                     S3Error::with_message(
                         S3ErrorCode::InvalidRequest,
                         "object is SSE-S4 encrypted but no --sse-s4-key is configured on this gateway",
@@ -890,7 +910,7 @@ impl<B: S3> S3 for S4Service<B> {
                 let body = collect_blob(blob, self.max_body_bytes)
                     .await
                     .map_err(internal("collect SSE-encrypted body"))?;
-                let plain = crate::sse::decrypt(key, &body).map_err(|e| {
+                let plain = crate::sse::decrypt(&body, keyring).map_err(|e| {
                     S3Error::with_message(
                         S3ErrorCode::InternalError,
                         format!("SSE-S4 decrypt failed: {e}"),

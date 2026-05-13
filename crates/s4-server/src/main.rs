@@ -178,12 +178,26 @@ struct Opt {
 
     /// Optional server-side encryption key for SSE-S4 (AES-256-GCM).
     /// Path to a 32-byte key file (raw bytes, 64-char hex, or 44-char
-    /// base64). When set, every PUT body gets wrapped with S4E1 after
-    /// compression + framing; every GET that's flagged `s4-encrypted`
-    /// gets decrypted before frame parse. The compress-then-encrypt
-    /// order preserves the codec's compression ratio.
+    /// base64). When set, every PUT body gets wrapped with S4E2 (under
+    /// id=1, the default active slot) after compression + framing;
+    /// every GET that's flagged `s4-encrypted` gets decrypted before
+    /// frame parse. The compress-then-encrypt order preserves the
+    /// codec's compression ratio.
     #[clap(long)]
     sse_s4_key: Option<std::path::PathBuf>,
+
+    /// v0.5 #29: additional retired keys for SSE-S4 rotation. Format
+    /// `id=N,key=<path>`. Repeatable — pass once per old key kept
+    /// around for decryption. Combined with `--sse-s4-key` (which
+    /// becomes the active id=1 slot), the gateway will encrypt every
+    /// new PUT under id=1 and still decrypt any S4E2 body whose
+    /// header points at one of the rotated ids. To rotate properly
+    /// (active = a fresh id), supply the new key as `--sse-s4-key`
+    /// and move the previous key over to
+    /// `--sse-s4-key-rotated id=2,key=/path/to/old.key` (or any id
+    /// other than 1).
+    #[clap(long, value_name = "id=N,key=PATH")]
+    sse_s4_key_rotated: Vec<String>,
 
     /// Optional S3-style access-log destination directory. When set,
     /// every completed PUT / GET / DELETE / List request is buffered
@@ -352,6 +366,43 @@ fn build_dispatcher(choice: DispatcherChoice, default: CodecKind) -> Arc<dyn Cod
     }
 }
 
+/// v0.5 #29: parse a `--sse-s4-key-rotated id=N,key=PATH` value into
+/// `(id, path)`. Order-independent; both fields required. Errors carry
+/// enough context that the operator can fix the typo without `--help`.
+fn parse_rotated_key_spec(
+    spec: &str,
+) -> Result<(u16, std::path::PathBuf), Box<dyn Error + Send + Sync + 'static>> {
+    let mut id: Option<u16> = None;
+    let mut path: Option<std::path::PathBuf> = None;
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (k, v) = part
+            .split_once('=')
+            .ok_or_else(|| format!("expected `key=value` pair, got {part:?}"))?;
+        match k.trim() {
+            "id" => {
+                id = Some(
+                    v.trim()
+                        .parse::<u16>()
+                        .map_err(|e| format!("id must be a u16: {e}"))?,
+                );
+            }
+            "key" => {
+                path = Some(std::path::PathBuf::from(v.trim()));
+            }
+            other => {
+                return Err(format!("unknown field {other:?} (expected `id` or `key`)").into());
+            }
+        }
+    }
+    let id = id.ok_or("missing required `id=N`")?;
+    let path = path.ok_or("missing required `key=PATH`")?;
+    Ok((id, path))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     let opt = Opt::parse();
@@ -405,10 +456,30 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     let listener_secure = opt.tls_cert.is_some() || opt.acme.is_some();
     s4 = s4.with_secure_transport(listener_secure);
     if let Some(ref key_path) = opt.sse_s4_key {
-        let key = s4_server::sse::SseKey::from_path(key_path)
+        let active = s4_server::sse::SseKey::from_path(key_path)
             .map_err(|e| format!("--sse-s4-key {}: {e}", key_path.display()))?;
-        info!(path = %key_path.display(), "S4 SSE-S4 key loaded (AES-256-GCM)");
-        s4 = s4.with_sse_key(std::sync::Arc::new(key));
+        info!(path = %key_path.display(), "S4 SSE-S4 active key loaded (AES-256-GCM, id=1)");
+        // v0.5 #29: active key always lives at id=1 (the default slot).
+        // Retired keys come in via --sse-s4-key-rotated id=N,key=<path>.
+        let mut keyring = s4_server::sse::SseKeyring::new(1, std::sync::Arc::new(active));
+        for spec in &opt.sse_s4_key_rotated {
+            let (id, path) = parse_rotated_key_spec(spec)
+                .map_err(|e| format!("--sse-s4-key-rotated {spec:?}: {e}"))?;
+            if id == 1 {
+                return Err(
+                    "--sse-s4-key-rotated id=1 collides with active id=1 (use a different id; --sse-s4-key supplies id=1)"
+                        .into(),
+                );
+            }
+            let k = s4_server::sse::SseKey::from_path(&path).map_err(|e| {
+                format!("--sse-s4-key-rotated id={id} key {}: {e}", path.display())
+            })?;
+            info!(id, path = %path.display(), "S4 SSE-S4 retired key loaded");
+            keyring.add(id, std::sync::Arc::new(k));
+        }
+        s4 = s4.with_sse_keyring(std::sync::Arc::new(keyring));
+    } else if !opt.sse_s4_key_rotated.is_empty() {
+        return Err("--sse-s4-key-rotated requires --sse-s4-key (active key) to also be set".into());
     }
     if let Some(ref dir) = opt.access_log {
         let dest = s4_server::access_log::AccessLogDest { dir: dir.clone() };

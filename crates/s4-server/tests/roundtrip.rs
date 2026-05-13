@@ -681,10 +681,20 @@ async fn sse_s4_roundtrip_and_tamper_detection() {
             .clone();
         (s.body, s.metadata)
     };
+    // v0.5 #29: `with_sse_key` now wraps the supplied key in a 1-slot
+    // keyring (id=1 active) and writes the S4E2 frame so single-key
+    // operators automatically get the rotation-ready format. The
+    // gateway's GET path still decrypts S4E1 bodies via the keyring's
+    // legacy fallback (covered by `legacy_s4e1_object_decrypts_under_v05_keyring`).
     assert_eq!(
         &stored_body[..4],
-        b"S4E1",
-        "encrypted body must start with S4E1 magic"
+        b"S4E2",
+        "encrypted body must start with S4E2 magic"
+    );
+    assert_eq!(
+        u16::from_be_bytes([stored_body[5], stored_body[6]]),
+        1,
+        "with_sse_key uses id=1 as the active slot"
     );
     let meta = stored_meta.as_ref().expect("must have metadata");
     assert_eq!(
@@ -760,6 +770,213 @@ async fn sse_s4_get_without_key_errors() {
         "expected key-missing error, got {dbg}"
     );
     let _ = backend_view;
+}
+
+/// v0.5 #29: end-to-end key rotation. A 2-key keyring (id=2 active,
+/// id=1 retired) must (a) write S4E2 frames stamped with id=2,
+/// (b) round-trip those bodies, and (c) after a second rotation
+/// (id=3 active, ring also has 1 and 2), still decrypt the older
+/// objects under their original ids.
+#[tokio::test]
+async fn sse_s4_keyring_rotation_e2e() {
+    use s4_server::sse::{SseKey, SseKeyring};
+
+    let backend = MemoryBackend::new();
+    let backend_view = backend.shared();
+
+    let k1 = Arc::new(SseKey::from_bytes(&[1u8; 32]).unwrap());
+    let k2 = Arc::new(SseKey::from_bytes(&[2u8; 32]).unwrap());
+    let k3 = Arc::new(SseKey::from_bytes(&[3u8; 32]).unwrap());
+
+    // ----- Wave 1: keyring active=2, retired=1.
+    let mut ring_v1 = SseKeyring::new(2, Arc::clone(&k2));
+    ring_v1.add(1, Arc::clone(&k1));
+    let s4_v1 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    )
+    .with_sse_keyring(Arc::new(ring_v1));
+
+    let payload_a =
+        Bytes::from(b"object encrypted under active=2 (rotation wave 1)".repeat(20));
+    s4_v1
+        .put_object(put_request("bucket", "obj_a", payload_a.clone()))
+        .await
+        .expect("put obj_a");
+
+    // Backend snapshot: must be S4E2 with key_id=2 (BE).
+    {
+        let inner = backend_view.lock().unwrap();
+        let stored = inner
+            .get(&("bucket".into(), "obj_a".into()))
+            .expect("obj_a stored");
+        assert_eq!(&stored.body[..4], b"S4E2", "active=2 must write S4E2");
+        let id = u16::from_be_bytes([stored.body[5], stored.body[6]]);
+        assert_eq!(id, 2, "object stamped with active key_id");
+        let meta = stored
+            .metadata
+            .as_ref()
+            .expect("metadata must include s4-encrypted");
+        assert_eq!(
+            meta.get("s4-encrypted").map(String::as_str),
+            Some("aes-256-gcm"),
+            "metadata flag stays the same regardless of S4E1 vs S4E2"
+        );
+    }
+
+    // GET round-trip ok with the same keyring.
+    let resp_a = s4_v1
+        .get_object(get_request("bucket", "obj_a"))
+        .await
+        .expect("get obj_a v1");
+    assert_eq!(read_back(resp_a).await, payload_a);
+
+    // ----- Wave 2: rotate to active=3, retire 1 and 2.
+    let backend = s4_v1.into_backend();
+    let mut ring_v2 = SseKeyring::new(3, Arc::clone(&k3));
+    ring_v2.add(1, Arc::clone(&k1));
+    ring_v2.add(2, Arc::clone(&k2));
+    let s4_v2 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    )
+    .with_sse_keyring(Arc::new(ring_v2));
+
+    // Old obj_a (key_id=2) must still decrypt.
+    let resp_a = s4_v2
+        .get_object(get_request("bucket", "obj_a"))
+        .await
+        .expect("get obj_a v2 (rotated)");
+    assert_eq!(
+        read_back(resp_a).await,
+        payload_a,
+        "old key_id=2 object must still decrypt under v2 keyring"
+    );
+
+    // New PUT must be encrypted under active=3.
+    let payload_c = Bytes::from(b"object encrypted under active=3 (rotation wave 2)".repeat(20));
+    s4_v2
+        .put_object(put_request("bucket", "obj_c", payload_c.clone()))
+        .await
+        .expect("put obj_c");
+    {
+        let inner = backend_view.lock().unwrap();
+        let stored = inner
+            .get(&("bucket".into(), "obj_c".into()))
+            .expect("obj_c stored");
+        assert_eq!(&stored.body[..4], b"S4E2");
+        let id = u16::from_be_bytes([stored.body[5], stored.body[6]]);
+        assert_eq!(id, 3, "rotated active=3 must stamp new objects with 3");
+    }
+    let resp_c = s4_v2
+        .get_object(get_request("bucket", "obj_c"))
+        .await
+        .expect("get obj_c v2");
+    assert_eq!(read_back(resp_c).await, payload_c);
+
+    // Mint a third object under wave 2 but inject id=1 by writing it
+    // through a single-key keyring (active=1) so we can confirm the
+    // wave-2 ring decrypts arbitrary retired-id S4E2 bodies.
+    let backend = s4_v2.into_backend();
+    let ring_id1_only = SseKeyring::new(1, Arc::clone(&k1));
+    let s4_id1 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    )
+    .with_sse_keyring(Arc::new(ring_id1_only));
+    let payload_b = Bytes::from(b"object encrypted under id=1 (legacy retired)".repeat(20));
+    s4_id1
+        .put_object(put_request("bucket", "obj_b", payload_b.clone()))
+        .await
+        .expect("put obj_b under id=1");
+    {
+        let inner = backend_view.lock().unwrap();
+        let stored = inner
+            .get(&("bucket".into(), "obj_b".into()))
+            .expect("obj_b stored");
+        let id = u16::from_be_bytes([stored.body[5], stored.body[6]]);
+        assert_eq!(id, 1, "obj_b must be stamped with id=1");
+    }
+    let backend = s4_id1.into_backend();
+    // Now route GET through the wave-2 keyring (active=3, also has 1,2).
+    let mut ring_v2_again = SseKeyring::new(3, Arc::clone(&k3));
+    ring_v2_again.add(1, Arc::clone(&k1));
+    ring_v2_again.add(2, Arc::clone(&k2));
+    let s4_v2b = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    )
+    .with_sse_keyring(Arc::new(ring_v2_again));
+    let resp_b = s4_v2b
+        .get_object(get_request("bucket", "obj_b"))
+        .await
+        .expect("get obj_b under wave-2 ring");
+    assert_eq!(
+        read_back(resp_b).await,
+        payload_b,
+        "id=1 object must decrypt via wave-2 keyring"
+    );
+}
+
+/// v0.5 #29 back-compat: an S4E1-framed object (written by v0.4) must
+/// decrypt unchanged through a v0.5 gateway whose keyring has the
+/// original key as the active id=1 slot. Exercises the keyring's S4E1
+/// fallback branch via the GET path end-to-end.
+#[tokio::test]
+async fn legacy_s4e1_object_decrypts_under_v05_keyring() {
+    use s4_server::sse::{SseKey, SseKeyring};
+
+    let backend = MemoryBackend::new();
+    let backend_view = backend.shared();
+    let key = Arc::new(SseKey::from_bytes(&[42u8; 32]).unwrap());
+
+    // Hand-craft an S4E1 body (the v0.4 wire format) by going through
+    // the low-level `sse::encrypt` and writing it directly into the
+    // backend with the s4-encrypted metadata flag plus a real codec
+    // manifest so the GET path actually exercises the SSE branch.
+    let plaintext = Bytes::from(b"v0.4 vintage encrypted object".repeat(20));
+    let raw_compressed = zstd::stream::encode_all(plaintext.as_ref(), 3).unwrap();
+    let s4e1_body = s4_server::sse::encrypt(&key, &raw_compressed);
+    assert_eq!(&s4e1_body[..4], b"S4E1", "preflight: must be the v1 frame");
+
+    let mut meta = Metadata::default();
+    meta.insert("s4-codec".into(), "cpu-zstd".into());
+    meta.insert("s4-original-size".into(), plaintext.len().to_string());
+    meta.insert(
+        "s4-compressed-size".into(),
+        raw_compressed.len().to_string(),
+    );
+    meta.insert(
+        "s4-crc32c".into(),
+        crc32c::crc32c(&plaintext).to_string(),
+    );
+    meta.insert("s4-encrypted".into(), "aes-256-gcm".into());
+    backend_view.lock().unwrap().insert(
+        ("bucket".into(), "legacy_enc".into()),
+        StoredObject {
+            body: s4e1_body,
+            metadata: Some(meta),
+            content_type: None,
+        },
+    );
+
+    // v0.5 gateway with a 1-slot keyring (id=1 active = the original key).
+    let ring = SseKeyring::new(1, Arc::clone(&key));
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    )
+    .with_sse_keyring(Arc::new(ring));
+    let resp = s4
+        .get_object(get_request("bucket", "legacy_enc"))
+        .await
+        .expect("get legacy S4E1 via v0.5 keyring");
+    assert_eq!(read_back(resp).await, plaintext);
 }
 
 /// v0.2 #4 back-compat: a v0.1 object stored as raw compressed bytes (no
