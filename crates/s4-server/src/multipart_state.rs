@@ -26,9 +26,12 @@
 //! (5 MiB+ each), so the lock is never the bottleneck.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::RwLock;
 
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
+use tokio::sync::Mutex;
 
 use crate::object_lock::LockMode;
 use crate::tagging::TagSet;
@@ -101,6 +104,28 @@ pub struct MultipartUploadContext {
 /// gateway-internal).
 pub struct MultipartStateStore {
     by_upload_id: RwLock<HashMap<String, MultipartUploadContext>>,
+    /// v0.8.1 #59: per-(bucket, key) `Mutex` used to serialize Complete
+    /// operations on the same logical key. The race window the lock
+    /// closes lives inside `service::complete_multipart_upload` between
+    /// `backend.get_object` (assembled body fetch for the SSE encrypt
+    /// re-PUT, BUG-5 fix) and `backend.put_object` (encrypted body
+    /// write-back). Two concurrent Completes with different `upload_id`
+    /// but the same `(bucket, key)` could otherwise interleave their
+    /// GET / encrypt / PUT triples and overwrite each other.
+    ///
+    /// `DashMap` is used because the lock acquisition path is itself
+    /// `O(1)` and contention between *different* keys must not block;
+    /// `DashMap`'s sharded design preserves that property whereas a
+    /// single `RwLock<HashMap<_,_>>` would serialise even unrelated
+    /// keys' lock-lookup. The stored `Arc<Mutex<()>>` is what the
+    /// caller actually awaits on — the `DashMap` itself is just a
+    /// concurrent index into those mutexes.
+    ///
+    /// Cleanup is best-effort (`prune_completion_locks`); the entry
+    /// for a one-shot key is dropped once both the in-flight Complete
+    /// returns and the prune sweep observes only the `DashMap`'s own
+    /// `Arc` reference.
+    completion_locks: DashMap<(String, String), Arc<Mutex<()>>>,
 }
 
 impl MultipartStateStore {
@@ -111,6 +136,7 @@ impl MultipartStateStore {
     pub fn new() -> Self {
         Self {
             by_upload_id: RwLock::new(HashMap::new()),
+            completion_locks: DashMap::new(),
         }
     }
 
@@ -145,6 +171,51 @@ impl MultipartStateStore {
             .write()
             .expect("multipart-state by_upload_id RwLock poisoned")
             .remove(upload_id);
+    }
+
+    /// v0.8.1 #59: get-or-create the per-(bucket, key) `Mutex` used to
+    /// serialise `complete_multipart_upload` invocations on the same
+    /// logical key. Caller does `lock.lock().await` and holds the
+    /// guard for the duration of its critical section (GET assembled
+    /// body → encrypt → PUT encrypted body → version-id mint → object-
+    /// lock apply → tagging persist → replication enqueue).
+    ///
+    /// Returns an `Arc<Mutex<()>>` so the caller can drop the
+    /// `DashMap` shard's read lock immediately and only retain the
+    /// mutex itself across the await point — `DashMap`'s shard guard
+    /// is `!Send`, so we must not hold it through an `await`.
+    pub fn completion_lock(&self, bucket: &str, key: &str) -> Arc<Mutex<()>> {
+        let k = (bucket.to_owned(), key.to_owned());
+        self.completion_locks
+            .entry(k)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .value()
+            .clone()
+    }
+
+    /// v0.8.1 #59: best-effort cleanup of stale completion-lock
+    /// entries. A `(bucket, key)` entry is "stale" once no concurrent
+    /// Complete is referencing its `Arc<Mutex<()>>` — we detect that
+    /// by `Arc::strong_count == 1` (only the `DashMap` itself holds a
+    /// reference). Called from `complete_multipart_upload` after the
+    /// guarded section returns, so a steady-state workload of unique
+    /// keys never accumulates locks.
+    ///
+    /// The retain predicate is `> 1` (keep entries with outstanding
+    /// borrowers), so prune is safe to invoke concurrently with other
+    /// `completion_lock` callers — at worst the prune sees the entry
+    /// during a brief window where the borrower has cloned but not yet
+    /// taken `lock()`, and the entry survives until the next sweep.
+    pub fn prune_completion_locks(&self) {
+        self.completion_locks
+            .retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+
+    /// Test-only: how many completion-lock entries the store currently
+    /// holds. Used by `prune_completion_locks_removes_unreferenced`.
+    #[cfg(test)]
+    fn completion_locks_len(&self) -> usize {
+        self.completion_locks.len()
     }
 
     /// Test-only: how many in-flight uploads the store is currently
@@ -217,6 +288,108 @@ mod tests {
             }
             other => panic!("expected SseC variant, got {other:?}"),
         }
+    }
+
+    /// v0.8.1 #59: `completion_lock(bucket, key)` must return the
+    /// **same** `Arc<Mutex<()>>` for repeated calls on the same key,
+    /// otherwise concurrent Completes on the same key would each grab
+    /// a distinct mutex and the serialisation would silently degrade
+    /// to no-op. We compare `Arc::as_ptr()` rather than equality on
+    /// the inner `()` because two distinct `Mutex<()>` instances would
+    /// have different addresses but compare equal under `==` (unit
+    /// type).
+    #[test]
+    fn completion_lock_returns_same_arc_for_same_key() {
+        let store = MultipartStateStore::new();
+        let a = store.completion_lock("bucket-a", "key/x");
+        let b = store.completion_lock("bucket-a", "key/x");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "completion_lock(same bucket, same key) must return identical Arc"
+        );
+    }
+
+    /// v0.8.1 #59: locks for distinct `(bucket, key)` tuples must be
+    /// independent — concurrent Completes on different keys must not
+    /// serialise on each other. We acquire two locks back-to-back
+    /// (`try_lock` so the assertion is deterministic and doesn't
+    /// depend on a runtime); both must succeed without contention.
+    /// Also exercises bucket-vs-key disjointness: same key under two
+    /// different buckets must NOT alias.
+    #[tokio::test]
+    async fn completion_lock_distinct_keys_independent() {
+        let store = MultipartStateStore::new();
+        let a = store.completion_lock("bucket-a", "shared/key");
+        let b = store.completion_lock("bucket-b", "shared/key");
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "completion_lock with different bucket must yield different Arc"
+        );
+        // Hold the first lock and acquire the second under the same
+        // task — must NOT deadlock and must NOT block. `try_lock`
+        // returns `Ok(MutexGuard)` when uncontended, `Err` otherwise.
+        let guard_a = a.try_lock().expect("lock on bucket-a/shared/key must be free");
+        let guard_b = b.try_lock().expect("lock on bucket-b/shared/key must be free");
+        // Same key, same bucket from a third call must alias `a` and
+        // therefore be contended (a's guard is held above).
+        let a2 = store.completion_lock("bucket-a", "shared/key");
+        assert!(
+            Arc::ptr_eq(&a, &a2),
+            "completion_lock for the same (bucket, key) must alias"
+        );
+        assert!(
+            a2.try_lock().is_err(),
+            "completion_lock alias must observe the held guard as contended"
+        );
+        drop(guard_a);
+        drop(guard_b);
+    }
+
+    /// v0.8.1 #59: `prune_completion_locks` must drop entries whose
+    /// only `Arc` is the `DashMap`'s own (i.e. no in-flight Complete is
+    /// holding a reference). After we acquire a lock then drop the
+    /// returned `Arc`, the `strong_count` falls to 1 and prune must
+    /// retire the entry so a steady-state workload of unique keys
+    /// doesn't accumulate. Conversely, an entry with an outstanding
+    /// `Arc` reference must survive prune.
+    #[test]
+    fn prune_completion_locks_removes_unreferenced() {
+        let store = MultipartStateStore::new();
+        // Acquire-and-drop: simulates a Complete that finished and let
+        // its `Arc<Mutex<()>>` go out of scope. `strong_count == 1`
+        // afterwards (only the `DashMap` retains it).
+        {
+            let _lock = store.completion_lock("b", "ephemeral");
+        }
+        assert_eq!(
+            store.completion_locks_len(),
+            1,
+            "lock entry must be present immediately after acquire-drop"
+        );
+        store.prune_completion_locks();
+        assert_eq!(
+            store.completion_locks_len(),
+            0,
+            "prune must retire entries with strong_count == 1"
+        );
+
+        // Negative case: an outstanding `Arc` must NOT be pruned —
+        // pruning a still-borrowed entry would let a concurrent
+        // Complete miss the serialisation point.
+        let held = store.completion_lock("b", "in-flight");
+        store.prune_completion_locks();
+        assert_eq!(
+            store.completion_locks_len(),
+            1,
+            "prune must keep entries with outstanding Arc borrowers"
+        );
+        drop(held);
+        store.prune_completion_locks();
+        assert_eq!(
+            store.completion_locks_len(),
+            0,
+            "prune must retire the entry once the borrower drops"
+        );
     }
 
     /// 8 threads each register 250 distinct upload_ids and immediately

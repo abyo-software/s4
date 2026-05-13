@@ -3628,3 +3628,228 @@ async fn gpu_auto_detect_picks_nvcomp_for_large_object() {
 
     let _ = shutdown_tx.send(());
 }
+
+// ---------------------------------------------------------------------------
+// v0.8.1 #59 — Multipart Complete atomic per (bucket, key).
+// ---------------------------------------------------------------------------
+//
+// v0.8 #54 BUG-5 fix added a GET-assembled-body → SSE-encrypt → PUT-back
+// triple inside `service::complete_multipart_upload` (so multipart objects
+// land on disk encrypted instead of plaintext). Without
+// per-`(bucket, key)` serialisation, two concurrent Completes for
+// **different `upload_id`** but the **same logical key** can interleave
+// their triples:
+//
+//   Client A: GET(assembled_A_plaintext)       →    encrypt    →    PUT(enc_A)
+//   Client B:                              GET(assembled_A or B?) → encrypt → PUT(enc_B → overwrites A)
+//
+// In the worst case neither client's assembled body lands intact (a
+// "torn body" — the bytes on disk are A's encrypt of B's plaintext, or
+// vice versa). v0.8.1 #59 closes this with an `Arc<Mutex<()>>` keyed
+// on `(bucket, key)` taken at the head of `complete_multipart_upload`
+// and held to function exit.
+//
+// This test drives 4 concurrent Completes against the same
+// `(bucket, key)` with 4 distinct payloads, then asserts the final
+// object body is **byte-identical to exactly one of the 4 candidates**
+// (not a Frankenstein splice). S3 spec also permits the gateway to
+// return a 4xx for the losers (single-winner Complete semantic) — we
+// accept either: the invariant is "no torn body".
+//
+// SSE-S4 is NOT enabled here on purpose. The race window the lock
+// closes is the GET → modify → PUT triple, which BUG-5 fix introduced
+// on the SSE path. Without SSE the gateway still GETs the assembled
+// body to build the sidecar index — the same window, same race shape.
+// We exercise the SSE-disabled variant to keep the test focused on
+// the lock alone (the SSE × multipart interaction is already covered
+// by `multipart_sse_s4_round_trip` etc. above).
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn multipart_concurrent_complete_no_torn_body() {
+    // 4 concurrent Completes is the smallest fan-out where a buggy
+    // server reliably loses a race in CI within a few seconds. Bumping
+    // beyond ~8 risks MinIO container throttling without strengthening
+    // the assertion.
+    const FANOUT: usize = 4;
+
+    let minio = start_minio().await;
+    let spawned = spawn_s4_with_options(&minio.endpoint_url, S4TestOpts::default()).await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    let bucket = "mp-race-complete";
+    ensure_bucket(&backend_client, bucket).await;
+    let s4_client = std::sync::Arc::new(build_aws_client_v2(&spawned.endpoint_url));
+
+    let key = "shared/object";
+
+    // Per-Complete payloads keyed by a per-upload byte tag so a torn
+    // body (any window from a different upload than the surviving one)
+    // is detectable on inspection. Each part is exactly 5 MiB so it
+    // satisfies S3's non-final-part minimum (matches the sizing
+    // convention in `do_3part_multipart_upload`).
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+    fn make_payload(upload_idx: usize) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(PART_SIZE * 2);
+        let pattern = format!("RACE-UPLOAD-{upload_idx:02}-payload-block ");
+        while buf.len() < PART_SIZE * 2 {
+            buf.extend_from_slice(pattern.as_bytes());
+        }
+        buf.truncate(PART_SIZE * 2);
+        buf
+    }
+    // Stage 1: Create + UploadPart × 2 for FANOUT separate upload_ids
+    // sequentially, so by Stage 2 every upload is fully primed and the
+    // ONLY thing we race is `complete_multipart_upload`.
+    let mut primed: Vec<(String, Vec<aws_sdk_s3::types::CompletedPart>, Vec<u8>)> =
+        Vec::with_capacity(FANOUT);
+    for upload_idx in 0..FANOUT {
+        let create = s4_client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("create_multipart_upload [{upload_idx}] failed: {e:?}"));
+        let upload_id = create.upload_id().expect("upload_id").to_string();
+        let payload = make_payload(upload_idx);
+        let part1 = bytes::Bytes::copy_from_slice(&payload[..PART_SIZE]);
+        let part2 = bytes::Bytes::copy_from_slice(&payload[PART_SIZE..]);
+        let mut completed_parts = Vec::with_capacity(2);
+        for (pn, body) in [(1i32, part1), (2i32, part2)] {
+            let resp = s4_client
+                .upload_part()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .part_number(pn)
+                .body(body.into())
+                .send()
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("upload_part [{upload_idx}] pn={pn} failed: {e:?}")
+                });
+            completed_parts.push(
+                aws_sdk_s3::types::CompletedPart::builder()
+                    .e_tag(resp.e_tag().unwrap_or_default())
+                    .part_number(pn)
+                    .build(),
+            );
+        }
+        primed.push((upload_id, completed_parts, payload));
+    }
+    // Snapshot the candidate payloads so the assertion phase can match
+    // the post-race body against each one without consuming `primed`.
+    let candidates: Vec<Vec<u8>> = primed.iter().map(|(_, _, p)| p.clone()).collect();
+
+    // Stage 2: race the FANOUT Completes. `JoinSet` keeps the futures
+    // pinned and lets us collect Ok / Err in completion order without
+    // imposing an artificial barrier (the race is between `lock.await`
+    // re-entries).
+    let mut joinset: tokio::task::JoinSet<
+        Result<usize, (usize, String)>,
+    > = tokio::task::JoinSet::new();
+    for (upload_idx, (upload_id, parts, _)) in primed.into_iter().enumerate() {
+        let s4 = std::sync::Arc::clone(&s4_client);
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+        joinset.spawn(async move {
+            let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                .set_parts(Some(parts))
+                .build();
+            match s4
+                .complete_multipart_upload()
+                .bucket(&bucket)
+                .key(&key)
+                .upload_id(&upload_id)
+                .multipart_upload(completed)
+                .send()
+                .await
+            {
+                Ok(_) => Ok(upload_idx),
+                Err(e) => Err((upload_idx, format!("{e:?}"))),
+            }
+        });
+    }
+    let mut winners: Vec<usize> = Vec::new();
+    let mut losers: Vec<(usize, String)> = Vec::new();
+    while let Some(res) = joinset.join_next().await {
+        match res.expect("join task panicked") {
+            Ok(idx) => winners.push(idx),
+            Err((idx, dbg)) => losers.push((idx, dbg)),
+        }
+    }
+    assert_eq!(
+        winners.len() + losers.len(),
+        FANOUT,
+        "all {FANOUT} Complete tasks must terminate (no hangs)"
+    );
+    assert!(
+        !winners.is_empty(),
+        "at least one Complete must succeed (got {} losers, debugs: {:?})",
+        losers.len(),
+        losers
+    );
+    // S3 spec allows either:
+    //   (a) every Complete returns Ok (the gateway treats Complete-on-
+    //       same-key as last-write-wins), in which case the surviving
+    //       body must be ONE candidate's payload;
+    //   (b) one Complete wins, the rest 4xx (e.g. NoSuchUpload because
+    //       the backend already drained the parts under the winner's
+    //       upload_id).
+    // Either is race-free as long as the post-race GET body matches
+    // EXACTLY one candidate — the assertion that closes the bug.
+    let losers_ok = losers.iter().all(|(_, dbg)| {
+        // Acceptable error shapes when the backend / gateway rejects
+        // a contender: NoSuchUpload (parts already consumed by the
+        // winner), InvalidPart (manifest mismatch under last-writer-
+        // wins), or any 4xx generally. Reject 5xx surfaced to the
+        // client (would mean the lock fix turned a logical race into
+        // a server-side panic / poisoned mutex).
+        !dbg.contains("InternalError") && !dbg.contains("ServiceError unhandled")
+    });
+    assert!(
+        losers_ok,
+        "loser Completes must surface 4xx (or succeed under last-write-wins), \
+         not 5xx: {losers:?}"
+    );
+
+    // Stage 3: GET the final object via the S4 gateway and assert the
+    // body is byte-identical to ONE of the candidate payloads.
+    let got = s4_client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("post-race GET");
+    let got_bytes = got.body.collect().await.expect("collect").into_bytes();
+    let matched_idx: Option<usize> = candidates
+        .iter()
+        .position(|cand| cand.len() == got_bytes.len() && cand.as_slice() == got_bytes.as_ref());
+    assert!(
+        matched_idx.is_some(),
+        "v0.8.1 #59 race regression: post-race body matches NONE of the \
+         {FANOUT} candidate payloads (length={}). This is a torn body — \
+         concurrent Completes interleaved their GET-assembled → PUT-back \
+         triples without serialisation.",
+        got_bytes.len()
+    );
+    // Belt-and-braces: surfaces the case where the gateway 200s upload N
+    // but the on-disk bytes are upload M's. Body integrity is preserved
+    // (one full candidate, no splice) but the response shape is
+    // inconsistent with the on-disk state — log loudly without failing
+    // because the spec permits last-write-wins semantics to differ
+    // between gateways. The `winners` vec captures who returned `Ok`.
+    let matched_idx = matched_idx.expect("matched payload index");
+    if !winners.is_empty() && !winners.contains(&matched_idx) {
+        eprintln!(
+            "v0.8.1 #59 partial race: surviving body is upload #{matched_idx} but \
+             that upload's Complete response was an Err (winners={winners:?}, \
+             losers={:?}). Body integrity is preserved (one full candidate, no \
+             splice) but the gateway response shape is inconsistent with the \
+             on-disk state.",
+            losers.iter().map(|(i, _)| *i).collect::<Vec<_>>()
+        );
+    }
+
+    let _ = spawned.shutdown.send(());
+}

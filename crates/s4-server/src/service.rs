@@ -3576,6 +3576,17 @@ impl<B: S3> S3 for S4Service<B> {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
         let upload_id = req.input.upload_id.clone();
+        // v0.8.1 #59: serialise concurrent Complete invocations on the
+        // same `(bucket, key)`. The race window the lock closes is the
+        // GET-assembled-body → encrypt → PUT-encrypted-body triple
+        // below (BUG-5 fix); without serialisation, two Completes for
+        // different `upload_id` but the same logical key could each
+        // read the other's plaintext assembled body and overwrite the
+        // peer's encrypted result. The guard is held to function exit
+        // (drop on `Ok` / `Err`), covering version-id mint, object-
+        // lock apply, tagging persist, and replication enqueue too.
+        let completion_lock = self.multipart_state.completion_lock(&bucket, &key);
+        let _completion_guard = completion_lock.lock().await;
         // v0.8 #54 — fetch the per-upload context captured on Create.
         // `None` means an abandoned / unknown upload_id (gateway
         // crashed between Create and Complete, or pre-v0.8 state
@@ -3961,6 +3972,16 @@ impl<B: S3> S3 for S4Service<B> {
             );
             self.multipart_state.remove(upload_id.as_str());
         }
+        // v0.8.1 #59 janitor: best-effort sweep of stale completion
+        // locks while we are still on the critical path of a single
+        // Complete (so steady-state workloads of unique keys don't
+        // accumulate `DashMap` entries). The sweep only retires
+        // entries whose `Arc::strong_count == 1`, so any other in-
+        // flight Complete on a different key keeps its lock alive.
+        // Our own `_completion_guard` keeps `bucket`/`key`'s entry
+        // alive across this call; it's reaped on the next Complete or
+        // the next caller-driven prune.
+        self.multipart_state.prune_completion_locks();
         Ok(resp)
     }
     async fn abort_multipart_upload(
