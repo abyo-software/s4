@@ -493,6 +493,35 @@ struct Opt {
     #[clap(long, value_name = "N", default_value_t = 24)]
     multipart_abandoned_ttl_hours: u32,
 
+    /// v0.8.3 #66 (H-5 audit fix): drop terminal-state replication
+    /// entries (`Completed` / `Failed`) older than this many hours.
+    /// Without this knob the per-(bucket, key) `statuses` HashMap on
+    /// `ReplicationManager` grows unbounded under workloads with many
+    /// unique keys, inflating the JSON snapshot persisted by
+    /// `to_json` and leaking memory across restart cycles.
+    ///
+    /// The default of 168 h (= 7 days) is chosen to balance two
+    /// constraints:
+    ///   * **long enough to investigate failures** — operators alerted
+    ///     on a `FAILED` stamp need time to drill into the cause; a
+    ///     1-day TTL would erase the evidence trail before a midweek
+    ///     incident is triaged on the following Monday morning. 7
+    ///     days covers one full on-call rotation week.
+    ///   * **short enough to bound the in-memory + on-disk state** —
+    ///     even a steady 1k-keys-per-hour replication rate retains
+    ///     only ~168k entries (≈ 50 MiB JSON snapshot at ~300 bytes
+    ///     per entry), an order of magnitude smaller than the
+    ///     unbounded growth pre-#66.
+    ///
+    /// `Pending` entries are **never swept** regardless of age — they
+    /// represent in-flight replications whose dispatcher task is
+    /// racing toward a terminal stamp; dropping the `Pending` would
+    /// lose the eventual outcome. Setting to `0` disables the sweep
+    /// entirely (not recommended — restores the pre-#66 unbounded
+    /// growth behaviour).
+    #[clap(long, value_name = "N", default_value_t = 168)]
+    replication_status_ttl_hours: u32,
+
     /// v0.5 #32: regulated-industry posture switch. `strict` enforces
     /// at boot the presence of TLS (--tls-cert/--tls-key OR --acme,
     /// forced to TLS 1.3-only), --access-log + --audit-log-hmac-key
@@ -1348,6 +1377,53 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
                 }
             }
         });
+    }
+
+    // v0.8.3 #66 (H-5 audit fix): spawn the replication-status sweep
+    // task. Mirrors the multipart sweep above — hourly cadence, TTL is
+    // the operator-tunable knob (`--replication-status-ttl-hours`,
+    // default 168 h = 7 days). Only fires when a `ReplicationManager`
+    // is attached (= the operator passed `--replication-state-file`);
+    // otherwise the `statuses` HashMap doesn't exist and there's
+    // nothing to sweep. A TTL of 0 disables the sweep entirely (the
+    // pre-#66 unbounded-growth behaviour).
+    if let Some(repl_mgr) = s4_arc.replication_manager() {
+        if opt.replication_status_ttl_hours == 0 {
+            tracing::warn!(
+                "S4 replication-status sweep DISABLED \
+                 (--replication-status-ttl-hours=0). The per-(bucket, key) \
+                 status HashMap will grow unbounded across multi-key workloads."
+            );
+        } else {
+            let mgr = std::sync::Arc::clone(repl_mgr);
+            let ttl_hours = i64::from(opt.replication_status_ttl_hours);
+            tracing::info!(
+                ttl_hours,
+                "S4 replication-status sweep active (hourly tick, TTL configurable via --replication-status-ttl-hours; Pending entries never swept)"
+            );
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_secs(3600));
+                // Skip the immediate tick — a freshly-booted process
+                // can't have any terminal entries past TTL yet (any
+                // restored snapshot entries got `recorded_at = now`
+                // via the `#[serde(default)]` fallback).
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    let max_age = chrono::Duration::hours(ttl_hours);
+                    let n = mgr.sweep_stale(chrono::Utc::now(), max_age);
+                    if n > 0 {
+                        tracing::info!(
+                            swept_count = n,
+                            ttl_hours,
+                            "S4 replication-status sweep pruned terminal entries (Completed / Failed past TTL)"
+                        );
+                        s4_server::metrics::record_replication_status_swept(n as u64);
+                    }
+                }
+            });
+        }
     }
 
     let shared = s4_server::service_arc::SharedService::new(s4_arc);

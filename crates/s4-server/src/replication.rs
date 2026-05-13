@@ -54,6 +54,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Per-(bucket, key) replication state, surfaced as the
@@ -152,10 +153,31 @@ pub struct ReplicationConfig {
 /// newer PUT is silently dropped, so the destination bucket never gets
 /// rolled back to older bytes. See [`ReplicationManager::next_generation`]
 /// + [`ReplicationManager::record_status_if_newer`].
+///
+/// ## v0.8.3 #66 — `recorded_at` for sweep + TTL (H-5 audit fix)
+///
+/// Each stamp records the wall-clock time the entry was last updated.
+/// The hourly sweep task ([`ReplicationManager::sweep_stale`]) drops
+/// terminal entries (`Completed` / `Failed`) older than the operator-
+/// configured TTL, bounding the otherwise-unbounded growth of the
+/// `statuses` map under workloads with many unique keys. `Pending`
+/// entries are never swept (they are still in-flight and dropping them
+/// would lose the eventual `Completed` / `Failed` stamp the dispatcher
+/// is racing toward). Pre-#66 snapshots without `recorded_at` deserialise
+/// with `Utc::now()` (= "freshly observed at restart") which delays
+/// the first sweep by one TTL cycle but never drops a still-relevant
+/// entry early.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplicationStatusEntry {
     pub status: ReplicationStatus,
     pub generation: u64,
+    /// v0.8.3 #66: when the entry was last updated. The sweep drops
+    /// terminal entries (Completed / Failed) older than the operator-
+    /// configured TTL. Pending entries are never swept (still in-flight).
+    /// Pre-#66 snapshots default to `Utc::now()` so legacy entries get
+    /// one full TTL window of grace before becoming sweep-eligible.
+    #[serde(default = "Utc::now")]
+    pub recorded_at: DateTime<Utc>,
 }
 
 /// JSON snapshot — `bucket -> ReplicationConfig`. Mirrors the shape of
@@ -202,9 +224,13 @@ impl StatusOrEntry {
     fn into_entry(self) -> ReplicationStatusEntry {
         match self {
             Self::Entry(e) => e,
+            // v0.8.3 #66: pre-#61 snapshots have no `recorded_at`; stamp
+            // `Utc::now()` so the first sweep tick sees them as freshly
+            // observed and gives them one full TTL window of grace.
             Self::Status(s) => ReplicationStatusEntry {
                 status: s,
                 generation: 0,
+                recorded_at: Utc::now(),
             },
         }
     }
@@ -424,6 +450,10 @@ impl ReplicationManager {
                 ReplicationStatusEntry {
                     status,
                     generation: 0,
+                    // v0.8.3 #66: stamp now so a subsequent sweep can
+                    // age this entry out once it reaches a terminal
+                    // state and exceeds the configured TTL.
+                    recorded_at: Utc::now(),
                 },
             );
     }
@@ -458,18 +488,66 @@ impl ReplicationManager {
             .statuses
             .write()
             .expect("replication state RwLock poisoned");
+        let now = Utc::now();
         let entry = map
             .entry((bucket.to_owned(), key.to_owned()))
             .or_insert(ReplicationStatusEntry {
                 status: ReplicationStatus::Pending,
                 generation: 0,
+                // v0.8.3 #66: stamp at insertion; will be overwritten
+                // immediately below when the CAS accepts.
+                recorded_at: now,
             });
         if generation < entry.generation {
             return false;
         }
         entry.generation = generation;
         entry.status = status;
+        // v0.8.3 #66: refresh the timestamp on every accepted stamp so
+        // a Pending → Completed transition (same generation) resets
+        // the sweep clock — the TTL is measured from the **last**
+        // terminal stamp, not the first observation.
+        entry.recorded_at = now;
         true
+    }
+
+    /// v0.8.3 #66 (H-5 audit fix): drop terminal-state entries
+    /// (`Completed` / `Failed`) older than `max_age`. `Pending` entries
+    /// are never swept because they are still in-flight — the
+    /// dispatcher is racing toward a terminal stamp and dropping the
+    /// `Pending` would lose the eventual outcome (and let the entry
+    /// re-emerge under the original key with no recorded history).
+    /// `Replica` entries can theoretically appear here through legacy
+    /// paths and are likewise preserved (the destination-side stamp is
+    /// not produced by `record_status_if_newer` in the current code,
+    /// but the conservative filter keeps any future use loss-free).
+    ///
+    /// Cutoff is `now - max_age` rather than `Utc::now() - max_age` so
+    /// callers can drive the clock deterministically in tests.
+    ///
+    /// Returns the number of entries removed (operators dashboard via
+    /// `s4_replication_status_swept_total`).
+    pub fn sweep_stale(&self, now: DateTime<Utc>, max_age: chrono::Duration) -> usize {
+        let mut map = self
+            .statuses
+            .write()
+            .expect("replication state RwLock poisoned");
+        let cutoff = now - max_age;
+        let stale: Vec<(String, String)> = map
+            .iter()
+            .filter(|(_, e)| {
+                matches!(
+                    e.status,
+                    ReplicationStatus::Completed | ReplicationStatus::Failed
+                ) && e.recorded_at < cutoff
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        let count = stale.len();
+        for k in stale {
+            map.remove(&k);
+        }
+        count
     }
 
     /// Look up the recorded replication status for `(bucket, key)`.
@@ -1162,5 +1240,160 @@ mod tests {
             1,
             ReplicationStatus::Pending,
         ));
+    }
+
+    // ----- v0.8.3 #66: sweep + TTL unit tests (H-5 audit fix) -----
+
+    /// Helper: install a `(bucket, key)` entry with an explicit
+    /// `recorded_at` so the sweep test can pin the clock at a known
+    /// offset from "now". Bypasses `record_status_if_newer` because
+    /// that always stamps with `Utc::now()`.
+    fn install_entry_with_recorded_at(
+        mgr: &ReplicationManager,
+        bucket: &str,
+        key: &str,
+        status: ReplicationStatus,
+        recorded_at: DateTime<Utc>,
+    ) {
+        mgr.statuses
+            .write()
+            .expect("replication state RwLock poisoned")
+            .insert(
+                (bucket.to_owned(), key.to_owned()),
+                ReplicationStatusEntry {
+                    status,
+                    generation: 1,
+                    recorded_at,
+                },
+            );
+    }
+
+    #[test]
+    fn sweep_stale_drops_completed_past_ttl() {
+        // Three terminal entries: Completed -10h, Failed -10h, Completed -1h.
+        // sweep_stale(now, 5h) → drops the two -10h entries, keeps the
+        // recent Completed.
+        let mgr = ReplicationManager::new();
+        let now = Utc::now();
+        install_entry_with_recorded_at(
+            &mgr,
+            "src",
+            "old-completed",
+            ReplicationStatus::Completed,
+            now - chrono::Duration::hours(10),
+        );
+        install_entry_with_recorded_at(
+            &mgr,
+            "src",
+            "old-failed",
+            ReplicationStatus::Failed,
+            now - chrono::Duration::hours(10),
+        );
+        install_entry_with_recorded_at(
+            &mgr,
+            "src",
+            "recent-completed",
+            ReplicationStatus::Completed,
+            now - chrono::Duration::hours(1),
+        );
+
+        let n = mgr.sweep_stale(now, chrono::Duration::hours(5));
+        assert_eq!(n, 2, "two terminal entries past 5h TTL must be swept");
+        assert!(
+            mgr.lookup_status("src", "old-completed").is_none(),
+            "Completed past TTL must be removed"
+        );
+        assert!(
+            mgr.lookup_status("src", "old-failed").is_none(),
+            "Failed past TTL must be removed"
+        );
+        assert_eq!(
+            mgr.lookup_status("src", "recent-completed"),
+            Some(ReplicationStatus::Completed),
+            "Completed within TTL must survive"
+        );
+    }
+
+    #[test]
+    fn sweep_stale_keeps_pending_regardless_of_age() {
+        // A Pending entry stamped 100h ago is **still in-flight**
+        // (the dispatcher is racing toward a terminal stamp). Sweeping
+        // it would lose the eventual Completed/Failed outcome and let
+        // a stale generation re-emerge under the original key with no
+        // recorded history.
+        let mgr = ReplicationManager::new();
+        let now = Utc::now();
+        install_entry_with_recorded_at(
+            &mgr,
+            "src",
+            "ancient-pending",
+            ReplicationStatus::Pending,
+            now - chrono::Duration::hours(100),
+        );
+
+        let n = mgr.sweep_stale(now, chrono::Duration::hours(5));
+        assert_eq!(n, 0, "Pending entries must never be swept");
+        assert_eq!(
+            mgr.lookup_status("src", "ancient-pending"),
+            Some(ReplicationStatus::Pending),
+            "ancient Pending must still be present"
+        );
+    }
+
+    #[test]
+    fn recorded_at_back_compat_default_now_on_deserialize() {
+        // A pre-#66 snapshot whose status entries omit `recorded_at`
+        // must deserialise with `recorded_at = Utc::now()` (= "freshly
+        // observed at restart"). This delays the first sweep by one
+        // TTL window but never drops a still-relevant entry early.
+        // Use the v0.8.2 #61 entry shape (status + generation, no
+        // recorded_at) to verify the `#[serde(default = "Utc::now")]`
+        // applies on inner-entry deserialisation too.
+        let pre_66_json = r#"{
+            "by_bucket": {},
+            "statuses": [
+                [["src", "k"], { "status": "Completed", "generation": 7 }]
+            ],
+            "next_generation": 8
+        }"#;
+        let before = Utc::now();
+        let mgr = ReplicationManager::from_json(pre_66_json)
+            .expect("pre-#66 snapshot with no `recorded_at` must deserialise");
+        let after = Utc::now();
+
+        // Status preserved.
+        assert_eq!(
+            mgr.lookup_status("src", "k"),
+            Some(ReplicationStatus::Completed),
+        );
+
+        // recorded_at defaulted to Utc::now() at deserialise time —
+        // peek the inner entry to verify the timestamp is in the
+        // [before, after] window of the from_json call.
+        let entries = mgr
+            .statuses
+            .read()
+            .expect("replication state RwLock poisoned");
+        let entry = entries
+            .get(&("src".to_owned(), "k".to_owned()))
+            .expect("entry must exist");
+        assert!(
+            entry.recorded_at >= before && entry.recorded_at <= after,
+            "recorded_at default must be Utc::now() at deserialise time \
+             (got {:?}, expected within [{:?}, {:?}])",
+            entry.recorded_at,
+            before,
+            after
+        );
+        assert_eq!(entry.generation, 7, "generation must round-trip");
+
+        // A sweep with TTL 1h immediately after must NOT drop this
+        // entry (recorded_at ≈ now, well within TTL).
+        drop(entries);
+        let n = mgr.sweep_stale(Utc::now(), chrono::Duration::hours(1));
+        assert_eq!(
+            n, 0,
+            "freshly-defaulted recorded_at must survive a 1h-TTL sweep"
+        );
     }
 }

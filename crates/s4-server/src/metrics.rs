@@ -25,6 +25,22 @@ pub fn install() -> PrometheusHandle {
         .expect("metrics recorder install (must be called once at startup)")
 }
 
+/// v0.8.3 #65 (audit C-2): shared test-only handle to the
+/// process-global Prometheus recorder. The recorder slot is a
+/// `PrometheusBuilder::install_recorder()` singleton, so multiple
+/// tests in the same binary that need to grep the rendered output
+/// MUST go through this helper instead of calling [`install`]
+/// directly — otherwise the first test wins and every subsequent
+/// `install()` panics with `FailedToSetGlobalRecorder`. Returns a
+/// cloned [`PrometheusHandle`]; `.render()` is cheap so each caller
+/// can render on demand.
+#[cfg(test)]
+pub(crate) fn test_metrics_handle() -> PrometheusHandle {
+    use std::sync::OnceLock;
+    static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+    HANDLE.get_or_init(install).clone()
+}
+
 /// metrics 名 (constant にして typo 防止 + リネーム集中管理)
 pub mod names {
     pub const REQUESTS_TOTAL: &str = "s4_requests_total";
@@ -115,6 +131,16 @@ pub mod names {
     /// upload state (and, for SSE-C uploads, raw 32-byte customer
     /// keys before the `Zeroizing<[u8; 32]>` Drop wipes them).
     pub const MULTIPART_ABANDONED_UPLOADS_TOTAL: &str = "s4_multipart_abandoned_uploads_total";
+    /// v0.8.3 #66 (H-5 audit fix): counter bumped each time the
+    /// replication-status sweep drops one or more terminal-state
+    /// (Completed / Failed) entries from `ReplicationManager::statuses`.
+    /// The increment is the per-tick batch count returned by
+    /// `ReplicationManager::sweep_stale`. Operators dashboard this
+    /// counter to confirm the TTL knob is actually pruning entries
+    /// under high-cardinality workloads (= without the sweep, the
+    /// statuses HashMap would grow unbounded and inflate the JSON
+    /// snapshot persisted by `to_json`).
+    pub const REPLICATION_STATUS_SWEPT_TOTAL: &str = "s4_replication_status_swept_total";
 }
 
 /// v0.8 #50: re-export of [`names::SSE_AES_BACKEND`] at the crate root
@@ -150,6 +176,18 @@ pub fn record_sse_streaming_chunk(op: &'static str) {
 /// the zero rate is the steady state).
 pub fn record_multipart_abandoned(count: u64) {
     metrics::counter!(names::MULTIPART_ABANDONED_UPLOADS_TOTAL).increment(count);
+}
+
+/// v0.8.3 #66 (H-5 audit fix): bump the replication-status sweep
+/// counter by the per-tick batch count. Called from the hourly sweep
+/// task spawned in `main.rs` whenever
+/// `ReplicationManager::sweep_stale` reports a non-zero number of
+/// pruned terminal entries. `count == 0` ticks intentionally skip the
+/// call site (the counter only moves on non-trivial sweeps so the
+/// zero rate is the steady state — mirrors the
+/// [`record_multipart_abandoned`] convention).
+pub fn record_replication_status_swept(count: u64) {
+    metrics::counter!(names::REPLICATION_STATUS_SWEPT_TOTAL).increment(count);
 }
 
 /// v0.8 #55: stamp metrics after a GPU compress completes.
@@ -266,6 +304,18 @@ pub fn record_replication_replicated(bucket: &str, dest: &str) {
 /// in-process counter in sync with this Prometheus counter so a
 /// `/metrics` scrape and an admin introspection of `actions_snapshot()`
 /// agree.
+///
+/// ## known `action` labels
+///
+/// - `"expire"` — Expiration fired (object DELETEd by the scanner).
+/// - `"transition"` — Transition fired (object storage-class rewritten).
+/// - `"noncurrent_expire"` — NoncurrentVersionExpiration fired.
+/// - `"skipped_locked"` (v0.8.3 #65, audit C-2) — scanner evaluator
+///   returned an action but the per-(bucket, key) Object Lock state was
+///   live, so the backend-mutating call was skipped. Observability
+///   counterpart of `ScanReport::skipped_locked`; lets operators alert
+///   on the "lifecycle wanted to act but Object Lock vetoed" path
+///   (previously a silent skip).
 pub fn record_lifecycle_action(bucket: &str, action: &'static str) {
     metrics::counter!(
         names::LIFECYCLE_ACTIONS_TOTAL,
