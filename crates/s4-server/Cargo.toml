@@ -139,6 +139,12 @@ base32 = "0.5"
 # the byte-stream so the resulting URI is always parseable, and fall back
 # to a typed `S3Error` if anything still fails.
 percent-encoding = "2"
+# v0.8.1 #58: zeroize SSE-KMS DEK plaintext on drop. Defense in depth —
+# guards against process memory dumps / swap-out / core dumps leaking the
+# 32-byte AES-256 DEK after it leaves scope. `Zeroizing<T>` is a thin
+# wrapper that calls `T::zeroize()` in its `Drop`, so the existing call
+# sites that go through `Deref<Target=T>` keep compiling untouched.
+zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [dev-dependencies]
 tempfile = "3"

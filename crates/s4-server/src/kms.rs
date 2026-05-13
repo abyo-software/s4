@@ -39,6 +39,7 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use async_trait::async_trait;
 use rand::RngCore;
+use zeroize::Zeroizing;
 
 const KEK_LEN: usize = 32;
 const DEK_LEN: usize = 32;
@@ -117,13 +118,24 @@ pub trait KmsBackend: Send + Sync + std::fmt::Debug {
     /// ARN surfaces as [`KmsError::BackendUnavailable`] (the AWS SDK
     /// returns NotFound but we don't want callers leaking ARN existence
     /// to clients).
-    async fn generate_dek(&self, key_id: &str) -> Result<(Vec<u8>, WrappedDek), KmsError>;
+    ///
+    /// v0.8.1 #58: returns the plaintext DEK as `Zeroizing<Vec<u8>>` so
+    /// the backing bytes are wiped on `Drop` (defense in depth against
+    /// memory dumps / swap-out / core dumps). Callers can keep using
+    /// `&dek`, `dek.len()`, etc. unchanged via `Deref<Target=Vec<u8>>`.
+    /// `WrappedDek::ciphertext` is intentionally NOT zeroized — it's
+    /// already encrypted under the KEK and persisted at rest.
+    async fn generate_dek(
+        &self,
+        key_id: &str,
+    ) -> Result<(Zeroizing<Vec<u8>>, WrappedDek), KmsError>;
 
     /// Unwrap a stored DEK ciphertext back to plaintext for the
-    /// decrypt path. The 32-byte plaintext must be zeroed by the
-    /// caller after use (callers in this crate hold it in a stack
-    /// `[u8; 32]` for the duration of one GET).
-    async fn decrypt_dek(&self, wrapped: &WrappedDek) -> Result<Vec<u8>, KmsError>;
+    /// decrypt path. v0.8.1 #58: returns `Zeroizing<Vec<u8>>` so the
+    /// plaintext is wiped on `Drop`; callers in this crate also copy
+    /// it into a stack `[u8; 32]` (also `Zeroizing`-wrapped at the
+    /// `service.rs` call sites) for the duration of one GET.
+    async fn decrypt_dek(&self, wrapped: &WrappedDek) -> Result<Zeroizing<Vec<u8>>, KmsError>;
 }
 
 /// File-based KEK store for dev / on-prem deployments.
@@ -236,9 +248,16 @@ impl LocalKms {
 
 #[async_trait]
 impl KmsBackend for LocalKms {
-    async fn generate_dek(&self, key_id: &str) -> Result<(Vec<u8>, WrappedDek), KmsError> {
+    async fn generate_dek(
+        &self,
+        key_id: &str,
+    ) -> Result<(Zeroizing<Vec<u8>>, WrappedDek), KmsError> {
         let kek = self.kek(key_id)?;
-        let mut dek = vec![0u8; DEK_LEN];
+        // v0.8.1 #58: wrap the DEK plaintext in `Zeroizing` so the
+        // underlying `Vec<u8>` heap allocation is wiped on `Drop`.
+        // The returned `Zeroizing<Vec<u8>>` derefs to `Vec<u8>` so
+        // callers' `&dek` / `dek.len()` keep working unchanged.
+        let mut dek: Zeroizing<Vec<u8>> = Zeroizing::new(vec![0u8; DEK_LEN]);
         rand::rngs::OsRng.fill_bytes(&mut dek);
 
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(kek));
@@ -257,7 +276,10 @@ impl KmsBackend for LocalKms {
             .expect("aes-gcm encrypt cannot fail with a 32-byte key");
 
         // Layout: nonce || ct_with_tag (the latter already contains
-        // the 16-byte trailing tag from the aes-gcm crate).
+        // the 16-byte trailing tag from the aes-gcm crate). The wrapped
+        // ciphertext is intentionally NOT `Zeroizing` — it's an
+        // encrypted blob that lives at rest in the S4E4 frame, so
+        // wiping it on drop would just be busywork.
         let mut wrapped = Vec::with_capacity(WRAP_NONCE_LEN + ct_with_tag.len());
         wrapped.extend_from_slice(&nonce_bytes);
         wrapped.extend_from_slice(&ct_with_tag);
@@ -271,7 +293,7 @@ impl KmsBackend for LocalKms {
         ))
     }
 
-    async fn decrypt_dek(&self, wrapped: &WrappedDek) -> Result<Vec<u8>, KmsError> {
+    async fn decrypt_dek(&self, wrapped: &WrappedDek) -> Result<Zeroizing<Vec<u8>>, KmsError> {
         let kek = self.kek(&wrapped.key_id)?;
         if wrapped.ciphertext.len() < LOCAL_WRAP_MIN_LEN {
             return Err(KmsError::WrappedDekTooShort {
@@ -294,7 +316,10 @@ impl KmsBackend for LocalKms {
             .map_err(|_| KmsError::UnwrapFailed {
                 key_id: wrapped.key_id.clone(),
             })?;
-        Ok(dek)
+        // v0.8.1 #58: rewrap the freshly-decrypted plaintext into
+        // `Zeroizing` immediately so any panic between here and the
+        // caller's stack `[u8; 32]` copy still wipes the heap bytes.
+        Ok(Zeroizing::new(dek))
     }
 }
 
@@ -311,6 +336,7 @@ pub mod aws {
     //! blob AWS returns, so we don't double-wrap.
     use super::{KmsBackend, KmsError, WrappedDek};
     use async_trait::async_trait;
+    use zeroize::Zeroizing;
 
     /// AWS KMS-backed KEK store. The `key_id` passed to
     /// [`KmsBackend::generate_dek`] is forwarded as `KeyId` to AWS —
@@ -347,7 +373,10 @@ pub mod aws {
 
     #[async_trait]
     impl KmsBackend for AwsKms {
-        async fn generate_dek(&self, key_id: &str) -> Result<(Vec<u8>, WrappedDek), KmsError> {
+        async fn generate_dek(
+            &self,
+            key_id: &str,
+        ) -> Result<(Zeroizing<Vec<u8>>, WrappedDek), KmsError> {
             let resp = self
                 .client
                 .generate_data_key()
@@ -358,12 +387,16 @@ pub mod aws {
                 .map_err(|e| KmsError::BackendUnavailable {
                     message: format!("GenerateDataKey({key_id}): {e}"),
                 })?;
-            let dek = resp
+            let dek_vec = resp
                 .plaintext
                 .ok_or_else(|| KmsError::BackendUnavailable {
                     message: format!("GenerateDataKey({key_id}): missing Plaintext in response"),
                 })?
                 .into_inner();
+            // v0.8.1 #58: wrap immediately on receipt from AWS so any
+            // early-return (or panic) between here and the caller's
+            // copy_from_slice still wipes the DEK on drop.
+            let dek = Zeroizing::new(dek_vec);
             let ciphertext = resp
                 .ciphertext_blob
                 .ok_or_else(|| KmsError::BackendUnavailable {
@@ -384,7 +417,7 @@ pub mod aws {
             ))
         }
 
-        async fn decrypt_dek(&self, wrapped: &WrappedDek) -> Result<Vec<u8>, KmsError> {
+        async fn decrypt_dek(&self, wrapped: &WrappedDek) -> Result<Zeroizing<Vec<u8>>, KmsError> {
             let resp = self
                 .client
                 .decrypt()
@@ -397,13 +430,14 @@ pub mod aws {
                 .map_err(|e| KmsError::BackendUnavailable {
                     message: format!("Decrypt({}): {e}", wrapped.key_id),
                 })?;
-            let dek = resp
+            let dek_vec = resp
                 .plaintext
                 .ok_or_else(|| KmsError::BackendUnavailable {
                     message: format!("Decrypt({}): missing Plaintext in response", wrapped.key_id),
                 })?
                 .into_inner();
-            Ok(dek)
+            // v0.8.1 #58: same Zeroizing-on-receipt pattern as generate_dek.
+            Ok(Zeroizing::new(dek_vec))
         }
     }
 }
@@ -610,17 +644,22 @@ mod tests {
         // Wrapped form must differ from plaintext — a wrapper that
         // accidentally returned the plaintext as ciphertext would
         // catastrophically leak the DEK at rest.
+        // v0.8.1 #58: `plaintext_dek` is now `Zeroizing<Vec<u8>>`;
+        // deref via `&*` to compare against the bare `Vec<u8>`
+        // ciphertext field.
         assert_ne!(
-            wrapped.ciphertext, plaintext_dek,
+            wrapped.ciphertext, *plaintext_dek,
             "wrapped DEK must NOT equal plaintext DEK"
         );
 
         // Decrypt round-trip — must byte-equal the original DEK.
+        // Both sides are `Zeroizing<Vec<u8>>`; deref both for the
+        // `PartialEq<Vec<u8>>` impl.
         let unwrapped = kms
             .decrypt_dek(&wrapped)
             .await
             .expect("decrypt_dek should succeed");
-        assert_eq!(unwrapped, plaintext_dek, "round-trip DEK must byte-equal");
+        assert_eq!(*unwrapped, *plaintext_dek, "round-trip DEK must byte-equal");
 
         // KMS returns the canonical ARN even when an alias was passed
         // in. We accept either the canonical ARN form or — as a fallback
@@ -662,5 +701,84 @@ mod tests {
             ),
             "expected BackendUnavailable or UnwrapFailed, got {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.1 #58: DEK zeroize on drop tests.
+    //
+    // The first two tests are compile-time type assertions disguised
+    // as runtime checks — they confirm the trait method returns
+    // `Zeroizing<Vec<u8>>` rather than a bare `Vec<u8>`. If a future
+    // refactor accidentally widens the return type back to `Vec<u8>`,
+    // the explicit `let _: Zeroizing<Vec<u8>> = ...` binding fails to
+    // compile.
+    //
+    // The third test is a best-effort smoke check that drop wipes the
+    // backing memory. We intentionally rely on the `zeroize` crate's
+    // own test suite for the strong guarantee — modern allocators
+    // routinely re-use freed allocations, so reading the same heap
+    // pointer post-drop is undefined behaviour. This test only
+    // confirms `Zeroizing` wrap compiles and integrates with our DEK
+    // shape; the security claim is "we use the canonical zeroize
+    // primitive correctly", not "this test proves the bytes are
+    // gone".
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn local_kms_generate_dek_returns_zeroizing() {
+        let tmp = TempDir::new().unwrap();
+        write_kek(tmp.path(), "z", &[7u8; KEK_LEN]);
+        let kms = LocalKms::open(tmp.path().to_path_buf()).unwrap();
+        // Compile-time check: the explicit type binding fails if
+        // `generate_dek` regresses to returning a bare `Vec<u8>`.
+        let (dek, _wrapped): (Zeroizing<Vec<u8>>, WrappedDek) =
+            kms.generate_dek("z").await.unwrap();
+        // Functional sanity: `Deref<Target=Vec<u8>>` lets us call
+        // `.len()` and treat the value as a byte slice unchanged.
+        assert_eq!(dek.len(), DEK_LEN);
+        // `&*dek` derefs to `&Vec<u8>`, which auto-coerces to `&[u8]`.
+        let _slice: &[u8] = &dek;
+    }
+
+    #[tokio::test]
+    async fn local_kms_decrypt_dek_returns_zeroizing() {
+        let tmp = TempDir::new().unwrap();
+        write_kek(tmp.path(), "z", &[11u8; KEK_LEN]);
+        let kms = LocalKms::open(tmp.path().to_path_buf()).unwrap();
+        let (dek_in, wrapped) = kms.generate_dek("z").await.unwrap();
+        // Compile-time check on the decrypt path.
+        let dek_out: Zeroizing<Vec<u8>> = kms.decrypt_dek(&wrapped).await.unwrap();
+        assert_eq!(dek_out.len(), DEK_LEN);
+        // Round-trip: the unwrapped DEK matches the freshly generated one.
+        // `&*dek_in` and `&*dek_out` both deref to `&Vec<u8>` for `==`.
+        assert_eq!(&*dek_out, &*dek_in);
+    }
+
+    #[tokio::test]
+    async fn dek_zeroized_on_drop_smoke() {
+        // Best-effort: build a `Zeroizing<Vec<u8>>` populated with a
+        // sentinel pattern, hand its inner bytes through `&*` to
+        // confirm the deref chain works, then explicitly drop and
+        // verify the wrapper's `Drop` runs without panicking. The
+        // strong guarantee that the bytes are wiped is provided by
+        // the `zeroize` crate's own tests; we only assert that our
+        // chosen wrapping type integrates cleanly.
+        let mut z: Zeroizing<Vec<u8>> = Zeroizing::new(vec![0u8; DEK_LEN]);
+        for (i, b) in z.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_add(1);
+        }
+        // Pre-drop: bytes should be the sentinel pattern.
+        assert_eq!(z[0], 1);
+        assert_eq!(z[DEK_LEN - 1], DEK_LEN as u8);
+        // Explicit drop runs `Zeroize::zeroize` on the inner Vec,
+        // which writes zeros to every byte and then frees the
+        // allocation. We can't safely re-read the freed memory
+        // (UB on a strict reading; flaky in practice because
+        // jemalloc / glibc reuse arenas), so the assertion is
+        // simply that drop completes without panic.
+        drop(z);
+        // If we got here, `Zeroizing<Vec<u8>>` ran its Drop impl.
+        // `zeroize` crate tests prove the bytes are zeroed; this
+        // test proves we're using the right wrapper.
     }
 }

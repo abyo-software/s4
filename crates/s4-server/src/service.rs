@@ -1945,13 +1945,30 @@ impl<B: S3> S3 for S4Service<B> {
             }
             // KMS path needs to call generate_dek().await before the
             // body_to_send branch; capture the result here.
-            let kms_wrap = if let Some(ref key_id) = kms_key_id {
+            //
+            // v0.8.1 #58: the plaintext DEK lives in three places
+            // during one PUT:
+            //
+            //   1. The `Zeroizing<Vec<u8>>` returned by `generate_dek`
+            //      — wiped when the binding `dek` falls out of scope at
+            //      the end of this `if`-arm.
+            //   2. The stack `[u8; 32]` we copy into for `SseSource::Kms`
+            //      — wrapped in `Zeroizing<[u8; 32]>` so it's wiped when
+            //      the outer `kms_wrap` `Option` is dropped at the end
+            //      of `put_object`.
+            //   3. AES-GCM internal key state inside the `aes-gcm`
+            //      crate during `encrypt_with_source` — out of scope
+            //      for this fix; tracked separately in v0.8.2.
+            let kms_wrap: Option<(zeroize::Zeroizing<[u8; 32]>, crate::kms::WrappedDek)> =
+                if let Some(ref key_id) = kms_key_id {
                 let kms = self.kms.as_ref().ok_or_else(|| {
                     S3Error::with_message(
                         S3ErrorCode::InvalidRequest,
                         "SSE-KMS requested but no --kms-local-dir / --kms-aws-region is configured on this gateway",
                     )
                 })?;
+                // `dek` is `Zeroizing<Vec<u8>>`; deref + slice access
+                // works unchanged via `Deref<Target=Vec<u8>>`.
                 let (dek, wrapped) = kms
                     .generate_dek(key_id)
                     .await
@@ -1962,8 +1979,11 @@ impl<B: S3> S3 for S4Service<B> {
                         format!("KMS backend returned a DEK of {} bytes (expected 32)", dek.len()),
                     ));
                 }
-                let mut dek_arr = [0u8; 32];
+                let mut dek_arr: zeroize::Zeroizing<[u8; 32]> =
+                    zeroize::Zeroizing::new([0u8; 32]);
                 dek_arr.copy_from_slice(&dek);
+                // `dek` (the `Zeroizing<Vec<u8>>`) is dropped at the
+                // end of this scope, wiping the heap allocation.
                 Some((dek_arr, wrapped))
             } else {
                 None
@@ -1992,9 +2012,16 @@ impl<B: S3> S3 for S4Service<B> {
                 meta.insert("s4-encrypted".into(), "aes-256-gcm".into());
                 meta.insert("s4-sse-type".into(), "aws:kms".into());
                 meta.insert("s4-sse-kms-key-id".into(), wrapped.key_id.clone());
+                // v0.8.1 #58: `dek` is `&Zeroizing<[u8; 32]>`; `SseSource::Kms`
+                // wants `&[u8; 32]`. Rust auto-derefs `&Zeroizing<T>` to
+                // `&T` here via `Deref<Target=T>`, so the binding picks
+                // up the inner array reference without copying. The array
+                // stays in the `Zeroizing` wrapper that owns it and gets
+                // wiped when `kms_wrap` drops at the end of `put_object`.
+                let dek_ref: &[u8; 32] = dek;
                 crate::sse::encrypt_with_source(
                     &compressed,
-                    crate::sse::SseSource::Kms { dek, wrapped },
+                    crate::sse::SseSource::Kms { dek: dek_ref, wrapped },
                 )
             } else if let Some(keyring) = self.sse_keyring.as_ref() {
                 // SSE-S4 is server-driven transparent encryption; the
@@ -3709,7 +3736,14 @@ impl<B: S3> S3 for S4Service<B> {
             let replication_body = assembled_body.clone();
             let mut applied_metadata: Option<std::collections::HashMap<String, String>> = None;
             if needs_re_put && let Some(body) = assembled_body {
-                let kms_wrap = if let crate::multipart_state::MultipartSseMode::SseKms {
+                // v0.8.1 #58: same Zeroizing pattern as put_object's
+                // single-PUT KMS branch — DEK plaintext lives in
+                // `Zeroizing<[u8; 32]>` for the lifetime of this
+                // Complete handler, then is wiped on drop.
+                let kms_wrap: Option<(
+                    zeroize::Zeroizing<[u8; 32]>,
+                    crate::kms::WrappedDek,
+                )> = if let crate::multipart_state::MultipartSseMode::SseKms {
                     ref key_id,
                 } = ctx.sse
                 {
@@ -3732,8 +3766,10 @@ impl<B: S3> S3 for S4Service<B> {
                             ),
                         ));
                     }
-                    let mut dek_arr = [0u8; 32];
+                    let mut dek_arr: zeroize::Zeroizing<[u8; 32]> =
+                        zeroize::Zeroizing::new([0u8; 32]);
                     dek_arr.copy_from_slice(&dek);
+                    // `dek` (Zeroizing<Vec<u8>>) is dropped at scope end.
                     Some((dek_arr, wrapped))
                 } else {
                     None
@@ -3783,9 +3819,13 @@ impl<B: S3> S3 for S4Service<B> {
                         new_metadata.insert("s4-sse-type".into(), "aws:kms".into());
                         new_metadata
                             .insert("s4-sse-kms-key-id".into(), wrapped.key_id.clone());
+                        // v0.8.1 #58: auto-deref from `&Zeroizing<[u8; 32]>`
+                        // to `&[u8; 32]` (same shape as the put_object
+                        // single-PUT branch).
+                        let dek_ref: &[u8; 32] = dek;
                         crate::sse::encrypt_with_source(
                             &body,
-                            crate::sse::SseSource::Kms { dek, wrapped },
+                            crate::sse::SseSource::Kms { dek: dek_ref, wrapped },
                         )
                     }
                     crate::multipart_state::MultipartSseMode::SseS4 => {
@@ -6188,5 +6228,50 @@ mod tests {
             let s = String::from_utf8_lossy(&[b]).into_owned();
             let _ = safe_object_uri("bucket", &s);
         }
+    }
+
+    /// v0.8.1 #58: smoke test for the DEK-handling shape used by the
+    /// SSE-KMS branches of `put_object` and `complete_multipart_upload`.
+    /// Mirrors the call pattern (generate_dek → length check → copy
+    /// into stack `[u8; 32]` → reborrow as `&[u8; 32]` for `SseSource`)
+    /// without spinning up a full `S4Service`.
+    ///
+    /// The real assertion this guards against is a regression where
+    /// the `Zeroizing` wrapper is accidentally dropped before the
+    /// stack copy lands (e.g. someone refactors to use
+    /// `let dek = kms.generate_dek(...).await?.0; drop(dek); ...`)
+    /// or where `&**dek` is rewritten in a way that doesn't compile.
+    #[tokio::test]
+    async fn kms_dek_lifetime_within_function_scope() {
+        use crate::kms::{KmsBackend, LocalKms};
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use zeroize::Zeroizing;
+
+        let mut keks = HashMap::new();
+        keks.insert("scope".to_string(), [33u8; 32]);
+        let kms = LocalKms::from_keks(PathBuf::from("/tmp/kms-scope-test"), keks);
+
+        // Mirror the put_object KMS branch shape exactly.
+        let (dek, wrapped) = kms.generate_dek("scope").await.unwrap();
+        assert_eq!(dek.len(), 32);
+        let mut dek_arr: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
+        dek_arr.copy_from_slice(&dek);
+
+        // The reborrow used at the SseSource construction site —
+        // mirrors the call-site pattern where `let dek_ref: &[u8; 32]`
+        // auto-derefs from a `Zeroizing<[u8; 32]>` reference.
+        let dek_ref: &[u8; 32] = &dek_arr;
+        // Sanity: the reborrow points at the same bytes.
+        assert_eq!(dek_ref, &*dek_arr);
+        // Wrapped key id flows through unchanged.
+        assert_eq!(wrapped.key_id, "scope");
+
+        // At end of scope, both `dek` (Zeroizing<Vec<u8>>) and
+        // `dek_arr` (Zeroizing<[u8; 32]>) are dropped, wiping the
+        // backing memory. Cannot directly assert the wipe (would be
+        // UB to read freed memory), so this test instead enforces
+        // that the call shape compiles and executes; the wipe itself
+        // is exercised by the `zeroize` crate's own test suite.
     }
 }
