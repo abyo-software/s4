@@ -3210,3 +3210,283 @@ async fn lifecycle_evaluate_via_run_lifecycle_once_for_test() {
         s4_server::lifecycle::LifecycleAction::Transition { .. }
     ));
 }
+
+// =========================================================================
+// v0.6 #42: MFA Delete enforcement integration tests.
+//
+// Both E2E tests build an `S4Service` with `with_versioning(...)` +
+// `with_mfa_delete(...)` attached, set the bucket's MFA-Delete state to
+// Enabled directly through the manager (the `PutBucketVersioning` MFA
+// gate is exercised by the unit tests in `mfa.rs`), and drive
+// `delete_object` through the public S3 trait. The first test confirms
+// a missing `x-amz-mfa` header is denied with 403 AccessDenied; the
+// second mints a fresh TOTP code from the same secret and confirms the
+// DELETE succeeds.
+// =========================================================================
+
+fn current_unix_secs_for_test() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn mfa_delete_blocks_when_enabled_and_no_header() {
+    let backend = MemoryBackend::new();
+    let v_mgr = Arc::new(s4_server::versioning::VersioningManager::new());
+    let mfa_mgr = Arc::new(s4_server::mfa::MfaDeleteManager::new());
+    // 16-byte raw secret encoded as un-padded base32 (RFC 6238 minimum).
+    let secret_b32 = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+    mfa_mgr.set_default_secret(s4_server::mfa::MfaSecret {
+        secret_base32: secret_b32.to_owned(),
+        serial: "TOKEN-A".to_owned(),
+    });
+    mfa_mgr.set_bucket_state("bucket", true);
+    v_mgr.set_state("bucket", s4_server::versioning::VersioningState::Enabled);
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    )
+    .with_versioning(Arc::clone(&v_mgr))
+    .with_mfa_delete(Arc::clone(&mfa_mgr));
+
+    let payload = Bytes::from_static(b"protected");
+    s4.put_object(put_request("bucket", "obj", payload))
+        .await
+        .expect("put");
+
+    let err = s4
+        .delete_object(delete_request("bucket", "obj"))
+        .await
+        .expect_err("MFA Delete must reject missing header");
+    assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+}
+
+#[tokio::test]
+async fn mfa_delete_allows_when_correct_totp_supplied() {
+    use totp_rs::{Algorithm, TOTP};
+
+    let backend = MemoryBackend::new();
+    let v_mgr = Arc::new(s4_server::versioning::VersioningManager::new());
+    let mfa_mgr = Arc::new(s4_server::mfa::MfaDeleteManager::new());
+    let secret_b32 = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+    mfa_mgr.set_default_secret(s4_server::mfa::MfaSecret {
+        secret_base32: secret_b32.to_owned(),
+        serial: "TOKEN-A".to_owned(),
+    });
+    mfa_mgr.set_bucket_state("bucket", true);
+    v_mgr.set_state("bucket", s4_server::versioning::VersioningState::Enabled);
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::CpuZstd),
+        make_dispatcher(CodecKind::CpuZstd),
+    )
+    .with_versioning(Arc::clone(&v_mgr))
+    .with_mfa_delete(Arc::clone(&mfa_mgr));
+
+    let payload = Bytes::from_static(b"protected");
+    s4.put_object(put_request("bucket", "obj", payload))
+        .await
+        .expect("put");
+
+    // Mint a fresh TOTP code from the *same* secret + current wall clock,
+    // matching the verifier's view of "now". ±1 step skew gives ample
+    // headroom against the small interval between generate / verify.
+    let raw = base32::decode(
+        base32::Alphabet::Rfc4648 { padding: false },
+        secret_b32,
+    )
+    .expect("decode test secret");
+    let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, raw).expect("totp");
+    let code = totp.generate(current_unix_secs_for_test());
+    let header_value = format!("TOKEN-A {code}");
+
+    let mut req = delete_request("bucket", "obj");
+    req.input.mfa = Some(header_value);
+    let resp = s4
+        .delete_object(req)
+        .await
+        .expect("MFA Delete must accept valid TOTP");
+    // Versioned bucket DELETE without explicit version-id pushes a
+    // delete marker; response surfaces `delete_marker = true`.
+    assert_eq!(resp.output.delete_marker, Some(true));
+}
+
+// =========================================================================
+// v0.6 #40: Cross-bucket replication.
+// =========================================================================
+
+#[tokio::test]
+async fn replication_put_object_replicates_to_destination_bucket() {
+    use std::sync::atomic::Ordering;
+
+    let backend = MemoryBackend::new();
+    let inner = backend.shared();
+    let mgr = Arc::new(s4_server::replication::ReplicationManager::new());
+    let s4 = S4Service::new(
+        backend,
+        make_registry(CodecKind::Passthrough),
+        make_dispatcher(CodecKind::Passthrough),
+    )
+    .with_replication(Arc::clone(&mgr));
+
+    // PutBucketReplication: src "bucket-A" → dst "bucket-B", no
+    // prefix / tag filter (= matches every key). Status Enabled.
+    let put_repl_input = PutBucketReplicationInput {
+        bucket: "bucket-A".into(),
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+        token: None,
+        replication_configuration: ReplicationConfiguration {
+            role: "arn:aws:iam::000000000000:role/s4-test".into(),
+            rules: vec![ReplicationRule {
+                delete_marker_replication: None,
+                destination: Destination {
+                    access_control_translation: None,
+                    account: None,
+                    bucket: "bucket-B".into(),
+                    encryption_configuration: None,
+                    metrics: None,
+                    replication_time: None,
+                    storage_class: None,
+                },
+                existing_object_replication: None,
+                filter: Some(ReplicationRuleFilter {
+                    and: None,
+                    prefix: Some(String::new()),
+                    tag: None,
+                }),
+                id: Some("rule-all".into()),
+                prefix: None,
+                priority: Some(1),
+                source_selection_criteria: None,
+                status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+            }],
+        },
+    };
+    let put_repl_req = S3Request {
+        input: put_repl_input,
+        method: http::Method::PUT,
+        uri: "/bucket-A?replication".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    s4.put_bucket_replication(put_repl_req)
+        .await
+        .expect("PutBucketReplication");
+
+    // GET round-trips the configuration.
+    let get_repl_input = GetBucketReplicationInput {
+        bucket: "bucket-A".into(),
+        expected_bucket_owner: None,
+    };
+    let get_repl_req = S3Request {
+        input: get_repl_input,
+        method: http::Method::GET,
+        uri: "/bucket-A?replication".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let get_repl_resp = s4
+        .get_bucket_replication(get_repl_req)
+        .await
+        .expect("GetBucketReplication");
+    let cfg = get_repl_resp
+        .output
+        .replication_configuration
+        .expect("replication configuration round-trips");
+    assert_eq!(cfg.rules.len(), 1);
+    assert_eq!(cfg.rules[0].destination.bucket, "bucket-B");
+
+    // PUT an object on the source bucket — replication fires async.
+    let payload = Bytes::from_static(b"replication payload");
+    s4.put_object(put_request("bucket-A", "key-1", payload.clone()))
+        .await
+        .expect("source put_object");
+
+    // Wait for the detached replication task — cap at 2s.
+    for _ in 0..100 {
+        let has_replica = inner
+            .lock()
+            .unwrap()
+            .contains_key(&("bucket-B".to_owned(), "key-1".to_owned()));
+        if has_replica {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let replica_present = inner
+        .lock()
+        .unwrap()
+        .contains_key(&("bucket-B".to_owned(), "key-1".to_owned()));
+    assert!(
+        replica_present,
+        "destination bucket-B/key-1 must materialise after async replication"
+    );
+
+    // The replica is stamped with REPLICA in its metadata.
+    let replica_meta = inner
+        .lock()
+        .unwrap()
+        .get(&("bucket-B".to_owned(), "key-1".to_owned()))
+        .expect("replica object")
+        .metadata
+        .clone();
+    let replica_meta = replica_meta.expect("replica metadata present");
+    assert_eq!(
+        replica_meta.get("x-amz-replication-status").map(String::as_str),
+        Some("REPLICA"),
+        "replica metadata must carry x-amz-replication-status: REPLICA"
+    );
+
+    // Manager records (source, key) → Completed; HEAD on the source
+    // surfaces it as `x-amz-replication-status` on the response.
+    assert_eq!(
+        mgr.lookup_status("bucket-A", "key-1"),
+        Some(s4_server::replication::ReplicationStatus::Completed),
+        "source side must flip to COMPLETED"
+    );
+    assert_eq!(
+        mgr.dropped_total.load(Ordering::Relaxed),
+        0,
+        "no drops on a happy-path replication"
+    );
+
+    let head_input = HeadObjectInput {
+        bucket: "bucket-A".into(),
+        key: "key-1".into(),
+        ..Default::default()
+    };
+    let head_req = S3Request {
+        input: head_input,
+        method: http::Method::HEAD,
+        uri: "/bucket-A/key-1".parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let head_resp = s4.head_object(head_req).await.expect("head_object");
+    let echoed = head_resp
+        .output
+        .replication_status
+        .expect("HEAD must echo x-amz-replication-status");
+    assert_eq!(
+        echoed.as_str(),
+        "COMPLETED",
+        "HEAD A/key-1 must surface COMPLETED on the source"
+    );
+}

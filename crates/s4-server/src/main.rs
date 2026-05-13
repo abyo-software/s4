@@ -276,6 +276,32 @@ struct Opt {
     #[clap(long, value_name = "PATH")]
     object_lock_state_file: Option<std::path::PathBuf>,
 
+    /// v0.6 #42: enable the in-memory MFA-Delete enforcement manager
+    /// (`MfaDeleteManager`). When set, every DELETE / DELETE-version /
+    /// delete-marker / `PutBucketVersioning` request against a bucket
+    /// whose MFA-Delete state is `Enabled` requires a valid
+    /// `x-amz-mfa: <serial> <code>` header (RFC 6238 6-digit TOTP);
+    /// missing or invalid tokens return HTTP 403 `AccessDenied`. The
+    /// optional path argument names a JSON snapshot file that's loaded
+    /// at startup if present (produced previously by
+    /// `MfaDeleteManager::to_json`); SIGUSR1-driven dump-back is a
+    /// future hook. Pass `--mfa-delete-state-file ""` (empty path) to
+    /// enable the manager with no snapshot to load. Pair with
+    /// `--mfa-default-secret-file <PATH>` to install a gateway-wide
+    /// shared secret applied to every MFA-Delete-enabled bucket that
+    /// lacks an explicit per-bucket override.
+    #[clap(long, value_name = "PATH")]
+    mfa_delete_state_file: Option<std::path::PathBuf>,
+
+    /// v0.6 #42: install a gateway-wide default MFA secret. The file
+    /// must contain exactly one line of the form
+    /// `<base32_secret> <serial>` (single ASCII space, no surrounding
+    /// quotes); the secret is RFC 4648 un-padded base32 and must be at
+    /// least 128 bits long (16 bytes raw → 26 base32 chars). Has no
+    /// effect unless `--mfa-delete-state-file` is also set.
+    #[clap(long, value_name = "PATH")]
+    mfa_default_secret_file: Option<std::path::PathBuf>,
+
     /// v0.6 #38: enable the in-memory CORS bucket-configuration manager
     /// (`CorsManager`). When set, S4-server itself owns per-bucket CORS
     /// rules — `PutBucketCors` / `GetBucketCors` / `DeleteBucketCors`
@@ -367,6 +393,30 @@ struct Opt {
     /// with no snapshot to load.
     #[clap(long, value_name = "PATH")]
     tagging_state_file: Option<std::path::PathBuf>,
+
+    /// v0.6 #40: enable the in-memory cross-bucket replication manager
+    /// (`ReplicationManager`). When set, S4-server itself owns per-bucket
+    /// replication rules — `PutBucketReplication` / `GetBucketReplication` /
+    /// `DeleteBucketReplication` route through the manager (replacing the
+    /// previous backend-passthrough behaviour), and every successful
+    /// `put_object` whose key matches an enabled rule is asynchronously
+    /// PUT to the rule's destination bucket on a detached tokio task.
+    /// The replica is stamped with `x-amz-replication-status: REPLICA`,
+    /// the source-side per-key status flips
+    /// `PENDING → COMPLETED` (or `FAILED` after the 3-attempt retry
+    /// budget). HEAD / GET on the source key echo the recorded status as
+    /// `x-amz-replication-status`. The optional path argument names a
+    /// JSON snapshot file (`ReplicationManager::to_json` /
+    /// `from_json`) — pass `--replication-state-file ""` (empty path) to
+    /// enable the manager with no snapshot to load.
+    ///
+    /// **Note (v0.6 #40 scope):** single-instance only — the source and
+    /// destination buckets must live on the same `S4Service`. Real
+    /// cross-region (multi-instance) replication is a v0.7+ follow-up.
+    /// Delete-marker replication, replication metrics (RTC), and KMS
+    /// key-id rewriting on the replica are also out of scope.
+    #[clap(long, value_name = "PATH")]
+    replication_state_file: Option<std::path::PathBuf>,
 
     /// v0.6 #37: enable the in-memory S3 Lifecycle configuration
     /// manager (`LifecycleManager`). When set, S4-server itself owns
@@ -797,6 +847,64 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         );
         s4 = s4.with_object_lock(std::sync::Arc::new(mgr));
     }
+    // v0.6 #42: wire the in-memory MFA-Delete enforcement manager when
+    // --mfa-delete-state-file is supplied. Same shape as the versioning /
+    // object-lock flags: empty / missing path starts a fresh manager,
+    // populated path is loaded as a JSON snapshot (produced previously by
+    // `MfaDeleteManager::to_json`). When --mfa-default-secret-file is
+    // also set, its `<base32_secret> <serial>` line installs a gateway-
+    // wide default secret on top of (or in addition to) any per-bucket
+    // overrides loaded from the JSON snapshot.
+    if let Some(ref path) = opt.mfa_delete_state_file {
+        let mgr = if path.as_os_str().is_empty() || !path.exists() {
+            s4_server::mfa::MfaDeleteManager::new()
+        } else {
+            let raw = std::fs::read_to_string(path).map_err(|e| {
+                format!(
+                    "--mfa-delete-state-file {}: read failed: {e}",
+                    path.display()
+                )
+            })?;
+            s4_server::mfa::MfaDeleteManager::from_json(&raw).map_err(|e| {
+                format!(
+                    "--mfa-delete-state-file {}: parse failed: {e}",
+                    path.display()
+                )
+            })?
+        };
+        if let Some(ref secret_path) = opt.mfa_default_secret_file {
+            let raw = std::fs::read_to_string(secret_path).map_err(|e| {
+                format!(
+                    "--mfa-default-secret-file {}: read failed: {e}",
+                    secret_path.display()
+                )
+            })?;
+            let line = raw.lines().next().unwrap_or("").trim();
+            let mut parts = line.splitn(2, ' ');
+            let secret_b32 = parts.next().unwrap_or("").trim();
+            let serial = parts.next().unwrap_or("").trim();
+            if secret_b32.is_empty() || serial.is_empty() {
+                return Err(format!(
+                    "--mfa-default-secret-file {}: expected `<base32_secret> <serial>` on the first line",
+                    secret_path.display()
+                )
+                .into());
+            }
+            mgr.set_default_secret(s4_server::mfa::MfaSecret {
+                secret_base32: secret_b32.to_owned(),
+                serial: serial.to_owned(),
+            });
+            info!(
+                path = %secret_path.display(),
+                "S4 MFA-Delete default secret loaded (RFC 6238 SHA-1, ±1 step skew)"
+            );
+        }
+        info!(
+            path = %path.display(),
+            "S4 MFA-Delete manager attached (in-memory; v0.6 #42 single-instance scope)"
+        );
+        s4 = s4.with_mfa_delete(std::sync::Arc::new(mgr));
+    }
     // v0.6 #38: wire the in-memory CORS bucket-configuration manager
     // when --cors-state-file is supplied. Same shape as the versioning /
     // object-lock flags: empty / missing path starts a fresh manager,
@@ -964,6 +1072,37 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             "S4 Tagging manager attached (in-memory; v0.6 #39 single-instance scope)"
         );
         s4 = s4.with_tagging(std::sync::Arc::new(mgr));
+    }
+    // v0.6 #40: wire the in-memory cross-bucket replication manager
+    // when --replication-state-file is supplied. Same shape as the
+    // versioning / object-lock / notifications / tagging flags — empty
+    // / missing path starts a fresh manager, populated path is loaded
+    // as a JSON snapshot produced previously by
+    // `ReplicationManager::to_json`. The matching dispatcher itself
+    // runs inside `put_object` on detached tokio tasks, so no extra
+    // background scheduler is needed here.
+    if let Some(ref path) = opt.replication_state_file {
+        let mgr = if path.as_os_str().is_empty() || !path.exists() {
+            s4_server::replication::ReplicationManager::new()
+        } else {
+            let raw = std::fs::read_to_string(path).map_err(|e| {
+                format!(
+                    "--replication-state-file {}: read failed: {e}",
+                    path.display()
+                )
+            })?;
+            s4_server::replication::ReplicationManager::from_json(&raw).map_err(|e| {
+                format!(
+                    "--replication-state-file {}: parse failed: {e}",
+                    path.display()
+                )
+            })?
+        };
+        info!(
+            path = %path.display(),
+            "S4 replication manager attached (in-memory; v0.6 #40 single-instance scope; same-S4Service source/destination only)"
+        );
+        s4 = s4.with_replication(std::sync::Arc::new(mgr));
     }
     // v0.6 #37: wire the in-memory S3 Lifecycle configuration manager
     // when --lifecycle-state-file is supplied. Empty / missing path

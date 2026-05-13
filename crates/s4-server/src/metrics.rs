@@ -47,6 +47,63 @@ pub mod names {
     /// `"transition"` / `"noncurrent_expire"`). Cardinality bounded by
     /// (#buckets × 3).
     pub const LIFECYCLE_ACTIONS_TOTAL: &str = "s4_lifecycle_actions_total";
+    /// v0.6 #40: bumped each time the cross-bucket replication
+    /// dispatcher exhausts its retry budget on a destination PUT.
+    /// Label `bucket` is the source bucket. Cardinality bounded by
+    /// (#source-buckets-with-replication-rules).
+    pub const REPLICATION_DROPPED_TOTAL: &str = "s4_replication_dropped_total";
+    /// v0.6 #40: bumped each time the cross-bucket replication
+    /// dispatcher succeeds in PUT-ing a replica to the destination
+    /// bucket. Labels: `bucket` (source), `dest` (destination).
+    /// Cardinality bounded by (#source × #destination) pairs that
+    /// actually fire.
+    pub const REPLICATION_REPLICATED_TOTAL: &str = "s4_replication_replicated_total";
+    /// v0.6 #42: bumped each time the MFA-Delete gate refuses a
+    /// DELETE / DELETE-version / delete-marker / `PutBucketVersioning`
+    /// request because the `x-amz-mfa` header was missing, malformed,
+    /// or carried an invalid serial / TOTP code. Label: `bucket`
+    /// (cardinality bounded by # of MFA-Delete-protected buckets).
+    pub const MFA_DELETE_DENIALS_TOTAL: &str = "s4_mfa_delete_denials_total";
+}
+
+/// v0.6 #42: bump the MFA-Delete denial counter for `bucket` (covers all
+/// `MfaError` variants: missing header, malformed header, serial
+/// mismatch, invalid TOTP code). The handler still returns the
+/// appropriate S3 error (`AccessDenied` / 400) before this fires; the
+/// counter is purely operational visibility, paired with
+/// `s4_requests_total{op="delete", result="err"}` so an operator can
+/// attribute spikes in delete failures to MFA gating versus other refusals.
+pub fn record_mfa_delete_denial(bucket: &str) {
+    metrics::counter!(
+        names::MFA_DELETE_DENIALS_TOTAL,
+        "bucket" => bucket.to_owned(),
+    )
+    .increment(1);
+}
+
+/// v0.6 #40: bumped each time the replication dispatcher exhausts its
+/// retry budget on a destination PUT. The label `bucket` is the source
+/// (= the bucket whose replication rule matched), so dashboards split
+/// drops by the rule's owning bucket. Pair with [`record_replication_replicated`]
+/// for the success counter.
+pub fn record_replication_drop(bucket: &str) {
+    metrics::counter!(
+        names::REPLICATION_DROPPED_TOTAL,
+        "bucket" => bucket.to_owned(),
+    )
+    .increment(1);
+}
+
+/// v0.6 #40: bumped on each successful destination PUT made by the
+/// replication dispatcher. `bucket` is the source bucket (rule owner)
+/// and `dest` is the destination bucket the rule pointed at.
+pub fn record_replication_replicated(bucket: &str, dest: &str) {
+    metrics::counter!(
+        names::REPLICATION_REPLICATED_TOTAL,
+        "bucket" => bucket.to_owned(),
+        "dest" => dest.to_owned(),
+    )
+    .increment(1);
 }
 
 /// v0.6 #37: bumped each time the lifecycle scanner executes an action

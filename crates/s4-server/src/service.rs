@@ -65,7 +65,11 @@ struct AccessLogPreamble {
 }
 
 pub struct S4Service<B: S3> {
-    backend: B,
+    /// Wrapped in `Arc` so the v0.6 #40 cross-bucket replication
+    /// dispatcher can clone it into a detached `tokio::spawn` task
+    /// (Arc::clone is cheap; backend trait methods take `&self` so no
+    /// other handler is affected by the indirection).
+    backend: Arc<B>,
     registry: Arc<CodecRegistry>,
     dispatcher: Arc<dyn CodecDispatcher>,
     max_body_bytes: usize,
@@ -172,6 +176,34 @@ pub struct S4Service<B: S3> {
     /// On a successful PUT the parsed tags are persisted; on a
     /// successful DELETE the matching tag entry is dropped.
     tagging: Option<Arc<crate::tagging::TagManager>>,
+    /// v0.6 #40: optional first-class cross-bucket replication manager.
+    /// When `Some(...)`, S4-server itself owns per-bucket replication
+    /// rules; `PutBucketReplication` / `GetBucketReplication` /
+    /// `DeleteBucketReplication` route through the manager (replacing
+    /// the previous backend-passthrough behaviour). On every successful
+    /// `put_object` the manager's rule list is consulted; the
+    /// highest-priority matching enabled rule wins, the per-key status
+    /// is recorded as `Pending`, and the source body and metadata are
+    /// handed to a detached tokio task that PUTs to the destination
+    /// bucket through the same backend. The replica is stamped with
+    /// `x-amz-replication-status: REPLICA` in its metadata; the
+    /// source-side status is updated to `Completed` on success or
+    /// `Failed` after the 3-attempt retry budget is exhausted (drop
+    /// counter bumps in either-side case so dashboards see the loss).
+    /// `head_object` / `get_object` echo the recorded status back as
+    /// `x-amz-replication-status` so consumers can poll progress.
+    /// Limited to single-instance (same `S4Service`) replication; true
+    /// cross-region (multi-instance) is a v0.7+ follow-up.
+    replication: Option<Arc<crate::replication::ReplicationManager>>,
+    /// v0.6 #42: optional MFA-Delete enforcement layer. When `Some(...)`,
+    /// every DELETE / DELETE-version / delete-marker / `PutBucketVersioning`
+    /// request against a bucket whose MFA-Delete state is `Enabled`
+    /// must carry `x-amz-mfa: <serial> <code>` (RFC 6238 6-digit TOTP);
+    /// missing or invalid tokens return HTTP 403 `AccessDenied`. When
+    /// `None` (default), the gate is a no-op so existing v0.4 / v0.5
+    /// deployments are unaffected until they explicitly call
+    /// `with_mfa_delete(...)`.
+    mfa_delete: Option<Arc<crate::mfa::MfaDeleteManager>>,
     /// v0.5 #32: when `true`, every PUT must carry an SSE indicator
     /// (`x-amz-server-side-encryption`, the SSE-C customer-key headers,
     /// or be matched against a configured server-managed keyring/KMS).
@@ -190,7 +222,7 @@ impl<B: S3> S4Service<B> {
         dispatcher: Arc<dyn CodecDispatcher>,
     ) -> Self {
         Self {
-            backend,
+            backend: Arc::new(backend),
             registry,
             dispatcher,
             max_body_bytes: Self::DEFAULT_MAX_BODY_BYTES,
@@ -208,6 +240,8 @@ impl<B: S3> S4Service<B> {
             notifications: None,
             lifecycle: None,
             tagging: None,
+            replication: None,
+            mfa_delete: None,
             compliance_strict: false,
         }
     }
@@ -356,6 +390,153 @@ impl<B: S3> S4Service<B> {
             version_id,
             format!("S4-{}", uuid::Uuid::new_v4()),
         ));
+    }
+
+    /// v0.6 #40: attach the in-memory cross-bucket replication manager.
+    /// Once set, `put_bucket_replication` / `get_bucket_replication` /
+    /// `delete_bucket_replication` route through the manager (replacing
+    /// the previous backend-passthrough behaviour); a successful
+    /// `put_object` whose key matches an enabled rule fires a detached
+    /// tokio task that PUTs the same body + metadata to the rule's
+    /// destination bucket, stamping the replica with
+    /// `x-amz-replication-status: REPLICA`. Failures after the retry
+    /// budget bump the manager's `dropped_total` counter and are
+    /// surfaced in the `s4_replication_dropped_total` Prometheus
+    /// counter; successes bump `s4_replication_replicated_total`.
+    #[must_use]
+    pub fn with_replication(
+        mut self,
+        mgr: Arc<crate::replication::ReplicationManager>,
+    ) -> Self {
+        self.replication = Some(mgr);
+        self
+    }
+
+    /// v0.6 #40: borrow the attached replication manager (test /
+    /// introspection — used by the metrics layer to read
+    /// `dropped_total`).
+    #[must_use]
+    pub fn replication_manager(
+        &self,
+    ) -> Option<&Arc<crate::replication::ReplicationManager>> {
+        self.replication.as_ref()
+    }
+
+    /// v0.6 #40: internal helper used by the PUT handlers to fire a
+    /// detached cross-bucket replication task. No-op when no manager
+    /// is attached, the source backend PUT failed, or no rule on the
+    /// source bucket matches the (key, tags) tuple. The `body` is the
+    /// post-compression / post-encryption `Bytes` that was sent to
+    /// the source backend (refcount-cloned), and `metadata` is the
+    /// metadata map that already includes the manifest /
+    /// `s4-encrypted` markers — the replica decodes through the same
+    /// path. The destination PUT runs through `Arc<B>::put_object`.
+    fn spawn_replication_if_matched(
+        &self,
+        source_bucket: &str,
+        source_key: &str,
+        request_tags: &Option<crate::tagging::TagSet>,
+        body: &bytes::Bytes,
+        metadata: &Option<std::collections::HashMap<String, String>>,
+        backend_ok: bool,
+    ) where
+        B: Send + Sync + 'static,
+    {
+        if !backend_ok {
+            return;
+        }
+        let Some(mgr) = self.replication.as_ref() else {
+            return;
+        };
+        // Pull the request's tags into the (k, v) shape the matcher
+        // expects. The tagging manager would have the canonical
+        // post-PUT view but at this point in the pipeline it's
+        // already been written above; for the rule-match decision
+        // the request's tags are sufficient (= the tags this PUT
+        // applies, S3 PutObject is full-replace on tags).
+        let object_tags: Vec<(String, String)> = request_tags
+            .as_ref()
+            .map(|ts| ts.iter().cloned().collect())
+            .unwrap_or_default();
+        let Some(rule) = mgr.match_rule(source_bucket, source_key, &object_tags) else {
+            return;
+        };
+        // Eagerly mark the source key as Pending so a HEAD between
+        // the source PUT returning and the spawned task completing
+        // surfaces the in-flight state.
+        mgr.record_status(
+            source_bucket,
+            source_key,
+            crate::replication::ReplicationStatus::Pending,
+        );
+        let mgr_cl = Arc::clone(mgr);
+        let backend = Arc::clone(&self.backend);
+        let body_cl = body.clone();
+        let metadata_cl = metadata.clone();
+        let source_bucket_cl = source_bucket.to_owned();
+        let source_key_cl = source_key.to_owned();
+        tokio::spawn(async move {
+            let do_put = move |dest_bucket: String,
+                               dest_key: String,
+                               dest_body: bytes::Bytes,
+                               dest_meta: Option<std::collections::HashMap<String, String>>| {
+                let backend = Arc::clone(&backend);
+                async move {
+                    let req = S3Request {
+                        input: PutObjectInput {
+                            bucket: dest_bucket,
+                            key: dest_key,
+                            body: Some(bytes_to_blob(dest_body)),
+                            metadata: dest_meta,
+                            ..Default::default()
+                        },
+                        method: http::Method::PUT,
+                        uri: "/".parse().unwrap(),
+                        headers: http::HeaderMap::new(),
+                        extensions: http::Extensions::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                        trailing_headers: None,
+                    };
+                    backend
+                        .put_object(req)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| format!("destination put_object: {e}"))
+                }
+            };
+            crate::replication::replicate_object(
+                rule,
+                source_bucket_cl,
+                source_key_cl,
+                body_cl,
+                metadata_cl,
+                do_put,
+                mgr_cl,
+            )
+            .await;
+        });
+    }
+
+    /// v0.6 #42: attach the in-memory MFA-Delete enforcement manager.
+    /// Once set, every DELETE / DELETE-version / delete-marker /
+    /// `PutBucketVersioning` request against a bucket whose MFA-Delete
+    /// state is `Enabled` requires a valid `x-amz-mfa: <serial> <code>`
+    /// header (RFC 6238 6-digit TOTP); the gate is a no-op for buckets
+    /// where MFA-Delete is `Disabled` (S3 default).
+    #[must_use]
+    pub fn with_mfa_delete(mut self, mgr: Arc<crate::mfa::MfaDeleteManager>) -> Self {
+        self.mfa_delete = Some(mgr);
+        self
+    }
+
+    /// v0.6 #42: borrow the attached MFA-Delete manager (test /
+    /// introspection — used by the snapshot path in `main.rs` to call
+    /// `to_json` for restart-recoverable state).
+    #[must_use]
+    pub fn mfa_delete_manager(&self) -> Option<&Arc<crate::mfa::MfaDeleteManager>> {
+        self.mfa_delete.as_ref()
     }
 
     /// v0.6 #38: attach the in-memory CORS configuration manager. Once
@@ -744,9 +925,14 @@ impl<B: S3> S4Service<B> {
         }
     }
 
-    /// テスト用: backend を取り戻す (test helper、production では使わない)
+    /// テスト用: backend を取り戻す (test helper、production では使わない).
+    /// v0.6 #40 で `backend` が `Arc<B>` 化したので `Arc::try_unwrap` で
+    /// 1-clone の場合のみ返す。共有されている (= replication dispatcher が
+    /// 同じ Arc を持っていて未完了) 場合は `Err` を返さず panic させる
+    /// (test 用途専用 helper の caller 契約を維持)。
     pub fn into_backend(self) -> B {
-        self.backend
+        Arc::try_unwrap(self.backend)
+            .unwrap_or_else(|_| panic!("into_backend: backend Arc still shared (replication dispatcher in flight?)"))
     }
 
     /// 必要 frame だけを backend に Range GET し、frame parse + decompress + slice
@@ -994,6 +1180,46 @@ pub fn versioned_shadow_key(key: &str, version_id: &str) -> String {
 /// scan; both list_objects filter and the GET passthrough check use this.
 fn is_versioning_shadow_key(key: &str) -> bool {
     key.contains(".__s4ver__/")
+}
+
+/// v0.6 #42: wall-clock seconds since the UNIX epoch — fed to
+/// `mfa::check_mfa` so the TOTP verifier can match the client's
+/// authenticator app's view of "now". Falls back to `0` on the
+/// (impossible-in-practice) clock-before-1970 path so the verifier
+/// rejects rather than panicking.
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// v0.6 #42: translate an `MfaError` into the matching S3 wire error.
+///
+/// - `Missing` / `SerialMismatch` / `InvalidCode` → `403 AccessDenied`
+///   (S3 spec for MFA Delete: every gating failure surfaces as
+///   `AccessDenied`, not a separate `MFA*` code).
+/// - `Malformed` → `400 InvalidRequest` (the request itself is
+///   syntactically broken, not a permission issue).
+fn mfa_error_to_s3(e: crate::mfa::MfaError) -> S3Error {
+    match e {
+        crate::mfa::MfaError::Missing => S3Error::with_message(
+            S3ErrorCode::AccessDenied,
+            "MFA token required for this operation",
+        ),
+        crate::mfa::MfaError::Malformed => S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "malformed x-amz-mfa header",
+        ),
+        crate::mfa::MfaError::SerialMismatch => S3Error::with_message(
+            S3ErrorCode::AccessDenied,
+            "MFA serial does not match configured device",
+        ),
+        crate::mfa::MfaError::InvalidCode => S3Error::with_message(
+            S3ErrorCode::AccessDenied,
+            "invalid MFA code",
+        ),
+    }
 }
 
 fn is_multipart_object(metadata: &Option<Metadata>) -> bool {
@@ -1571,6 +1797,12 @@ impl<B: S3> S3 for S4Service<B> {
             } else {
                 compressed.clone()
             };
+            // v0.6 #40: capture the about-to-be-sent body + metadata so
+            // the replication dispatcher (run after the source PUT
+            // succeeds) can hand the same backend bytes to the
+            // destination bucket. `Bytes` clone is cheap (refcounted).
+            let replication_body = body_to_send.clone();
+            let replication_metadata = req.input.metadata.clone();
             req.input.body = Some(bytes_to_blob(body_to_send));
             // v0.5 #34: pre-allocate a version-id when the bucket is
             // Enabled, then redirect the backend storage key to the
@@ -1770,6 +2002,22 @@ impl<B: S3> S3 for S4Service<B> {
             {
                 mgr.put_object_tags(&put_bucket, &put_key, tags);
             }
+            // v0.6 #40: cross-bucket replication fire-point. On
+            // successful source PUT, consult the replication manager;
+            // when an enabled rule matches, mark the source key
+            // `Pending` and spawn a detached task that PUTs the same
+            // backend bytes + metadata to the rule's destination
+            // bucket. The dispatcher itself records `Completed` /
+            // `Failed` and bumps the drop counter on retry-budget
+            // exhaustion.
+            self.spawn_replication_if_matched(
+                &put_bucket,
+                &put_key,
+                &request_tags,
+                &replication_body,
+                &replication_metadata,
+                backend_resp.is_ok(),
+            );
             return backend_resp;
         }
         // Body-less PUT (rare: zero-length object). Mirror the body-full
@@ -1885,6 +2133,16 @@ impl<B: S3> S3 for S4Service<B> {
         {
             mgr.put_object_tags(&put_bucket, &put_key, tags);
         }
+        // v0.6 #40: cross-bucket replication for the zero-length PUT
+        // branch — same shape as the body-bearing branch above.
+        self.spawn_replication_if_matched(
+            &put_bucket,
+            &put_key,
+            &request_tags,
+            &bytes::Bytes::new(),
+            &None,
+            backend_resp.is_ok(),
+        );
         backend_resp
     }
 
@@ -2225,6 +2483,14 @@ impl<B: S3> S3 for S4Service<B> {
                 "S4 get completed (buffered)"
             );
         }
+        // v0.6 #40: echo the recorded `x-amz-replication-status` so
+        // consumers can poll progress (PENDING / COMPLETED / FAILED).
+        if let Some(mgr) = self.replication.as_ref()
+            && let Some(status) = mgr.lookup_status(&get_bucket, &get_key)
+        {
+            resp.output.replication_status =
+                Some(s3s::dto::ReplicationStatus::from(status.as_aws_str().to_owned()));
+        }
         Ok(resp)
     }
 
@@ -2257,6 +2523,10 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
+        // v0.6 #40: capture bucket/key before req is consumed so the
+        // replication-status echo can look the entry up.
+        let head_bucket = req.input.bucket.clone();
+        let head_key = req.input.key.clone();
         let mut resp = self.backend.head_object(req).await?;
         if let Some(manifest) = extract_manifest(&resp.output.metadata) {
             // 客側には decompress 後の意味のある content_length / checksum を返す。
@@ -2270,6 +2540,14 @@ impl<B: S3> S3 for S4Service<B> {
             resp.output.checksum_sha256 = None;
             resp.output.e_tag = None;
         }
+        // v0.6 #40: echo `x-amz-replication-status` (PENDING / COMPLETED
+        // / FAILED) so consumers can poll progress without a GET.
+        if let Some(mgr) = self.replication.as_ref()
+            && let Some(status) = mgr.lookup_status(&head_bucket, &head_key)
+        {
+            resp.output.replication_status =
+                Some(s3s::dto::ReplicationStatus::from(status.as_aws_str().to_owned()));
+        }
         Ok(resp)
     }
     async fn delete_object(
@@ -2280,6 +2558,21 @@ impl<B: S3> S3 for S4Service<B> {
         let key = req.input.key.clone();
         self.enforce_rate_limit(&req, &bucket)?;
         self.enforce_policy(&req, "s3:DeleteObject", &bucket, Some(&key))?;
+        // v0.6 #42: MFA Delete enforcement. When the bucket has
+        // MFA-Delete = Enabled, every DELETE / DELETE-version /
+        // delete-marker form needs `x-amz-mfa: <serial> <code>` (RFC 6238
+        // 6-digit TOTP). Runs *before* the WORM / versioning routers so
+        // a missing token is denied for free regardless of which delete
+        // path the request would otherwise take.
+        if let Some(mgr) = self.mfa_delete.as_ref()
+            && mgr.is_enabled(&bucket)
+        {
+            let header = req.input.mfa.as_deref();
+            if let Err(e) = crate::mfa::check_mfa(&bucket, header, mgr, current_unix_secs()) {
+                crate::metrics::record_mfa_delete_denial(&bucket);
+                return Err(mfa_error_to_s3(e));
+            }
+        }
         // v0.5 #30: refuse the delete while a WORM lock is in effect.
         // Compliance can never be bypassed; Governance can be overridden
         // via `x-amz-bypass-governance-retention: true`; legal hold
@@ -2465,6 +2758,20 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        // v0.6 #42: MFA Delete applies once to the whole batch (S3 spec:
+        // when MFA-Delete is on the bucket, a missing / invalid token
+        // fails the entire DeleteObjects request, not per-object).
+        if let Some(mgr) = self.mfa_delete.as_ref()
+            && mgr.is_enabled(&req.input.bucket)
+        {
+            let header = req.input.mfa.as_deref();
+            if let Err(e) =
+                crate::mfa::check_mfa(&req.input.bucket, header, mgr, current_unix_secs())
+            {
+                crate::metrics::record_mfa_delete_denial(&req.input.bucket);
+                return Err(mfa_error_to_s3(e));
+            }
+        }
         self.backend.delete_objects(req).await
     }
     async fn copy_object(
@@ -3334,6 +3641,52 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        // v0.6 #42: MFA gating on the `PutBucketVersioning` request
+        // itself. S3 spec: when the request body carries an
+        // `MfaDelete` element (either `Enabled` or `Disabled`), the
+        // request must include a valid `x-amz-mfa` token — both for
+        // the *first* enable (so the operator can't quietly side-step
+        // the gate by never enabling it) and for any subsequent
+        // change (so a leaked credential alone can't disable MFA
+        // Delete to bypass it on subsequent DELETEs). Requests that
+        // omit the `MfaDelete` element entirely (i.e. they flip only
+        // `Status`) skip this gate, matching AWS.
+        if let Some(mgr) = self.mfa_delete.as_ref()
+            && let Some(target_enabled) = req
+                .input
+                .versioning_configuration
+                .mfa_delete
+                .as_ref()
+                .map(|m| m.as_str().eq_ignore_ascii_case("Enabled"))
+        {
+            let bucket = req.input.bucket.clone();
+            let header = req.input.mfa.as_deref();
+            let secret = mgr.lookup_secret(&bucket);
+            let verified = match (header, secret.as_ref()) {
+                (Some(h), Some(s)) => match crate::mfa::parse_mfa_header(h) {
+                    Ok((serial, code)) => {
+                        serial == s.serial
+                            && crate::mfa::verify_totp(
+                                &s.secret_base32,
+                                &code,
+                                current_unix_secs(),
+                            )
+                    }
+                    Err(_) => false,
+                },
+                _ => false,
+            };
+            if !verified {
+                crate::metrics::record_mfa_delete_denial(&bucket);
+                let err = if header.is_none() {
+                    crate::mfa::MfaError::Missing
+                } else {
+                    crate::mfa::MfaError::InvalidCode
+                };
+                return Err(mfa_error_to_s3(err));
+            }
+            mgr.set_bucket_state(&bucket, target_enabled);
+        }
         // v0.5 #34: stash the new state in the manager, then forward to
         // the backend so any downstream that *also* tracks state
         // (e.g. a real S3 backend) stays in sync. Manager-attached but
@@ -3684,23 +4037,43 @@ impl<B: S3> S3 for S4Service<B> {
         self.backend.delete_bucket_website(req).await
     }
 
-    // ---- Bucket replication ----
+    // ---- Bucket replication (v0.6 #40) ----
     async fn get_bucket_replication(
         &self,
         req: S3Request<GetBucketReplicationInput>,
     ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
+        if let Some(mgr) = self.replication.as_ref() {
+            return match mgr.get(&req.input.bucket) {
+                Some(cfg) => Ok(S3Response::new(GetBucketReplicationOutput {
+                    replication_configuration: Some(replication_to_dto(&cfg)),
+                })),
+                None => Err(S3Error::with_message(
+                    S3ErrorCode::Custom("ReplicationConfigurationNotFoundError".into()),
+                    format!("no replication configuration on bucket {}", req.input.bucket),
+                )),
+            };
+        }
         self.backend.get_bucket_replication(req).await
     }
     async fn put_bucket_replication(
         &self,
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
+        if let Some(mgr) = self.replication.as_ref() {
+            let cfg = replication_from_dto(&req.input.replication_configuration);
+            mgr.put(&req.input.bucket, cfg);
+            return Ok(S3Response::new(PutBucketReplicationOutput::default()));
+        }
         self.backend.put_bucket_replication(req).await
     }
     async fn delete_bucket_replication(
         &self,
         req: S3Request<DeleteBucketReplicationInput>,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
+        if let Some(mgr) = self.replication.as_ref() {
+            mgr.delete(&req.input.bucket);
+            return Ok(S3Response::new(DeleteBucketReplicationOutput::default()));
+        }
         self.backend.delete_bucket_replication(req).await
     }
 
@@ -4271,6 +4644,174 @@ fn filter_to_dto(
             filter_rules: Some(rules),
         }),
     })
+}
+
+// ---------------------------------------------------------------------------
+// v0.6 #40: Convert between the s3s-typed `ReplicationConfiguration` (the
+// wire surface) and our internal `crate::replication::ReplicationConfig`.
+// AWS's `ReplicationRuleFilter` is a sum type — `Prefix | Tag | And { Prefix,
+// Tags }`; we flatten it into the single `(prefix, tag-vec)` representation
+// the matcher needs. Sub-blocks v0.6 #40 does not implement
+// (DeleteMarkerReplication / SourceSelectionCriteria / ReplicationTime /
+// Metrics / EncryptionConfiguration) round-trip as `None` on GET — operators
+// who set them on PUT see them silently dropped, mirroring "feature not
+// supported in this release" semantics.
+// ---------------------------------------------------------------------------
+
+fn replication_from_dto(
+    dto: &ReplicationConfiguration,
+) -> crate::replication::ReplicationConfig {
+    let rules = dto
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(idx, r)| {
+            let id = r
+                .id
+                .as_ref()
+                .map(|s| s.as_str().to_owned())
+                .unwrap_or_else(|| format!("rule-{idx}"));
+            let priority = r.priority.unwrap_or(0).max(0) as u32;
+            let status_enabled = r.status.as_str() == ReplicationRuleStatus::ENABLED;
+            let filter = replication_filter_from_dto(r.filter.as_ref(), r.prefix.as_deref());
+            let destination_bucket = r.destination.bucket.clone();
+            let destination_storage_class = r
+                .destination
+                .storage_class
+                .as_ref()
+                .map(|s| s.as_str().to_owned());
+            crate::replication::ReplicationRule {
+                id,
+                priority,
+                status_enabled,
+                filter,
+                destination_bucket,
+                destination_storage_class,
+            }
+        })
+        .collect();
+    crate::replication::ReplicationConfig {
+        role: dto.role.clone(),
+        rules,
+    }
+}
+
+fn replication_to_dto(
+    cfg: &crate::replication::ReplicationConfig,
+) -> ReplicationConfiguration {
+    let rules = cfg
+        .rules
+        .iter()
+        .map(|r| {
+            let status = if r.status_enabled {
+                ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED)
+            } else {
+                ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED)
+            };
+            let destination = Destination {
+                access_control_translation: None,
+                account: None,
+                bucket: r.destination_bucket.clone(),
+                encryption_configuration: None,
+                metrics: None,
+                replication_time: None,
+                storage_class: r
+                    .destination_storage_class
+                    .as_ref()
+                    .map(|s| StorageClass::from(s.clone())),
+            };
+            let filter = Some(replication_filter_to_dto(&r.filter));
+            ReplicationRule {
+                delete_marker_replication: None,
+                destination,
+                existing_object_replication: None,
+                filter,
+                id: Some(r.id.clone()),
+                prefix: None,
+                priority: Some(r.priority as i32),
+                source_selection_criteria: None,
+                status,
+            }
+        })
+        .collect();
+    ReplicationConfiguration {
+        role: cfg.role.clone(),
+        rules,
+    }
+}
+
+fn replication_filter_from_dto(
+    f: Option<&ReplicationRuleFilter>,
+    rule_level_prefix: Option<&str>,
+) -> crate::replication::ReplicationFilter {
+    let mut prefix: Option<String> = rule_level_prefix.map(str::to_owned);
+    let mut tags: Vec<(String, String)> = Vec::new();
+    if let Some(f) = f {
+        if let Some(p) = f.prefix.as_ref()
+            && prefix.is_none()
+        {
+            prefix = Some(p.clone());
+        }
+        if let Some(t) = f.tag.as_ref()
+            && let (Some(k), Some(v)) = (t.key.as_ref(), t.value.as_ref())
+        {
+            tags.push((k.clone(), v.clone()));
+        }
+        if let Some(and) = f.and.as_ref() {
+            if let Some(p) = and.prefix.as_ref()
+                && prefix.is_none()
+            {
+                prefix = Some(p.clone());
+            }
+            if let Some(ts) = and.tags.as_ref() {
+                for t in ts {
+                    if let (Some(k), Some(v)) = (t.key.as_ref(), t.value.as_ref()) {
+                        tags.push((k.clone(), v.clone()));
+                    }
+                }
+            }
+        }
+    }
+    crate::replication::ReplicationFilter { prefix, tags }
+}
+
+fn replication_filter_to_dto(
+    f: &crate::replication::ReplicationFilter,
+) -> ReplicationRuleFilter {
+    if f.tags.is_empty() {
+        ReplicationRuleFilter {
+            and: None,
+            prefix: f.prefix.clone(),
+            tag: None,
+        }
+    } else if f.tags.len() == 1 && f.prefix.is_none() {
+        let (k, v) = &f.tags[0];
+        ReplicationRuleFilter {
+            and: None,
+            prefix: None,
+            tag: Some(Tag {
+                key: Some(k.clone()),
+                value: Some(v.clone()),
+            }),
+        }
+    } else {
+        let tags: Vec<Tag> = f
+            .tags
+            .iter()
+            .map(|(k, v)| Tag {
+                key: Some(k.clone()),
+                value: Some(v.clone()),
+            })
+            .collect();
+        ReplicationRuleFilter {
+            and: Some(ReplicationRuleAndOperator {
+                prefix: f.prefix.clone(),
+                tags: Some(tags),
+            }),
+            prefix: None,
+            tag: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
