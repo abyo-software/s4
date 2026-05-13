@@ -4,6 +4,7 @@ pub mod access_log;
 pub mod acme;
 pub mod audit_log;
 pub mod blob;
+pub mod kms;
 pub mod metrics;
 pub mod policy;
 pub mod rate_limit;

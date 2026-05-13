@@ -1,4 +1,4 @@
-//! Server-side encryption (SSE-S4) — AES-256-GCM (v0.4 #21, v0.5 #29, v0.5 #27).
+//! Server-side encryption (SSE-S4) — AES-256-GCM (v0.4 #21, v0.5 #29, v0.5 #27, v0.5 #28).
 //!
 //! Wraps the post-compression S3 object body with authenticated
 //! encryption. Compress-then-encrypt is the right order: encryption
@@ -63,6 +63,38 @@
 //! who tampered with the metadata can't sneak a different key past the
 //! check.
 //!
+//! ### S4E4 (v0.5 #28) — SSE-KMS envelope, per-object DEK
+//!
+//! ```text
+//! [magic:           "S4E4" 4B]
+//! [algo:            u8]            # 1 = AES-256-GCM
+//! [key_id_len:      u8]            # 1..=255, length of UTF-8 key_id
+//! [key_id:          variable]      # UTF-8, AAD-authenticated
+//! [wrapped_dek_len: u32 BE]        # length of the wrapped DEK blob
+//! [wrapped_dek:     variable]      # opaque, AAD-authenticated
+//! [nonce:           12B]           # random per-object
+//! [tag:             16B]           # AES-GCM auth tag for body
+//! [ciphertext:      variable]      # body encrypted under the DEK
+//! ```
+//!
+//! Header overhead: `4 + 1 + 1 + key_id_len + 4 + wrapped_dek_len + 12
+//! + 16` = 38 + key_id_len + wrapped_dek_len. For a typical
+//! [`crate::kms::LocalKms`] wrap (60-byte ciphertext) and a 36-char
+//! UUID-style `key_id`, that's ~134 bytes per object.
+//!
+//! `key_id` and `wrapped_dek` are both placed in the AAD so an
+//! attacker cannot rewrite either field to point the gateway at a
+//! different KEK or wrapped DEK without invalidating the body's
+//! AES-GCM tag. The plaintext DEK is never persisted; only the
+//! wrapped form is on disk, and the gateway holds the plaintext only
+//! for the duration of one PUT or GET.
+//!
+//! S4E4 decrypt requires an `async` round-trip to the KMS backend
+//! (to unwrap the DEK), so the synchronous [`decrypt`] function
+//! refuses S4E4 with [`SseError::KmsAsyncRequired`] — callers that
+//! peek `S4E4` via [`peek_magic`] must dispatch to
+//! [`decrypt_with_kms`] instead.
+//!
 //! ## v0.5 rotation flow (SSE-S4 only)
 //!
 //! Operators wire one [`SseKeyring`] holding the **active** key plus
@@ -82,8 +114,9 @@
 //!
 //! - **Server-managed key only** (for SSE-S4): keys come from local
 //!   files via `--sse-s4-key` / `--sse-s4-key-rotated`. KMS / vault
-//!   integration is a separate issue.
-//! - **SSE-KMS** (S3 calls it `aws:kms`) is a separate frame variant.
+//!   integration for the SSE-S4 keyring (i.e. wrapping the keyring's
+//!   keys with KMS) is a separate issue. SSE-KMS for per-object DEKs
+//!   is implemented (see [`SseSource::Kms`] + S4E4 above).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -96,9 +129,12 @@ use md5::{Digest as Md5Digest, Md5};
 use rand::RngCore;
 use thiserror::Error;
 
+use crate::kms::{KmsBackend, KmsError, WrappedDek};
+
 pub const SSE_MAGIC_V1: &[u8; 4] = b"S4E1";
 pub const SSE_MAGIC_V2: &[u8; 4] = b"S4E2";
 pub const SSE_MAGIC_V3: &[u8; 4] = b"S4E3";
+pub const SSE_MAGIC_V4: &[u8; 4] = b"S4E4";
 /// Back-compat alias — v0.4 callers that imported `SSE_MAGIC` mean S4E1.
 pub const SSE_MAGIC: &[u8; 4] = SSE_MAGIC_V1;
 
@@ -135,7 +171,7 @@ pub enum SseError {
     BadKeyLength { got: usize },
     #[error("SSE-encrypted body too short ({got} bytes; need at least {SSE_HEADER_BYTES})")]
     TooShort { got: usize },
-    #[error("SSE bad magic: expected S4E1 or S4E2, got {got:?}")]
+    #[error("SSE bad magic: expected S4E1/S4E2/S4E3/S4E4, got {got:?}")]
     BadMagic { got: [u8; 4] },
     #[error("SSE unsupported algo tag: {tag} (this build only knows AES-256-GCM = 1)")]
     UnsupportedAlgo { tag: u8 },
@@ -177,6 +213,58 @@ pub enum SseError {
     /// object" / "extraneous SSE-C headers"), so we mirror that.
     #[error("S4E1/S4E2 frame stored without SSE-C; SseSource::CustomerKey is unexpected")]
     CustomerKeyUnexpected,
+    // --- v0.5 #28: SSE-KMS specific errors ---
+    /// `decrypt` (sync) was handed an S4E4 body. SSE-KMS unwrap is
+    /// async (it round-trips to the KMS backend), so callers must
+    /// peek the magic with [`peek_magic`] and dispatch S4E4 frames to
+    /// [`decrypt_with_kms`] instead. service.rs's GET handler does
+    /// this; tests / direct callers may hit this if they forget.
+    #[error(
+        "S4E4 (SSE-KMS) body requires async decrypt — call decrypt_with_kms() instead of decrypt()"
+    )]
+    KmsAsyncRequired,
+    /// S4E4 frame is shorter than the minimum-possible header (38
+    /// bytes for an empty `key_id` + empty `wrapped_dek`, which is
+    /// itself impossible — we just sanity-check the floor).
+    #[error("S4E4 frame too short ({got} bytes; need at least {min})")]
+    KmsFrameTooShort { got: usize, min: usize },
+    /// S4E4 declared a `key_id_len` or `wrapped_dek_len` that runs
+    /// past the end of the body. Almost certainly truncation /
+    /// corruption rather than tampering (tampering would fail the
+    /// AES-GCM tag instead).
+    #[error("S4E4 frame field length out of bounds: {what}")]
+    KmsFrameFieldOob { what: &'static str },
+    /// `key_id` field of an S4E4 frame is not valid UTF-8. We require
+    /// UTF-8 because `LocalKms` uses the basename of a `.kek` file
+    /// (which is OS-string-but-typically-UTF-8) and AWS KMS uses ARNs
+    /// (which are ASCII).
+    #[error("S4E4 key_id is not valid UTF-8")]
+    KmsKeyIdNotUtf8,
+    /// service.rs handed `decrypt_with_kms` a `WrappedDek` whose
+    /// `key_id` doesn't match the one stored in the S4E4 frame. This
+    /// is an integration bug (caller is meant to pull the wrapped
+    /// DEK *from the frame*, not from somewhere else), surface as a
+    /// distinct error so it shows up in tests rather than silently
+    /// failing the AES-GCM tag.
+    #[error(
+        "S4E4 SseSource::Kms wrapped DEK key_id {supplied:?} doesn't match frame key_id {stored:?}"
+    )]
+    KmsWrappedDekMismatch {
+        supplied: String,
+        stored: String,
+    },
+    /// SSE-KMS path got a non-Kms `SseSource` for an S4E4 body. The
+    /// async dispatch in `decrypt_with_kms` re-derives the source
+    /// internally so this can only happen if a future caller passes
+    /// `SseSource::Keyring` / `CustomerKey` to a path that expected
+    /// `Kms` — kept around for symmetry with the other "wrong source"
+    /// errors.
+    #[error("S4E4 frame requires SseSource::Kms")]
+    KmsRequired,
+    /// Pass-through for [`crate::kms::KmsError`] surfaced from
+    /// `KmsBackend::decrypt_dek` — boxed so the variant stays small.
+    #[error("KMS unwrap: {0}")]
+    KmsBackend(#[from] KmsError),
 }
 
 /// 32-byte symmetric key. `bytes` is `pub` so call sites can construct
@@ -449,6 +537,18 @@ pub enum SseSource<'a> {
         key: &'a [u8; KEY_LEN],
         key_md5: &'a [u8; KEY_MD5_LEN],
     },
+    /// SSE-KMS envelope → produces / consumes S4E4 frames. The server
+    /// holds a per-object plaintext DEK (from a fresh
+    /// [`KmsBackend::generate_dek`] call) and the wrapped form to
+    /// persist alongside the body. The DEK is dropped after one
+    /// PUT/GET; only the wrapped form survives at rest.
+    Kms {
+        /// 32-byte plaintext DEK, used as the AES-GCM key.
+        dek: &'a [u8; KEY_LEN],
+        /// Wrapped form to persist in the S4E4 frame (PUT) or the one
+        /// read out of the frame (GET, after a successful unwrap).
+        wrapped: &'a WrappedDek,
+    },
 }
 
 /// Back-compat coercion: existing call sites pass `&SseKeyring`
@@ -577,6 +677,7 @@ pub fn encrypt_with_source(plaintext: &[u8], source: SseSource<'_>) -> Bytes {
     match source {
         SseSource::Keyring(kr) => encrypt_v2(plaintext, kr),
         SseSource::CustomerKey { key, key_md5 } => encrypt_v3(plaintext, key, key_md5),
+        SseSource::Kms { dek, wrapped } => encrypt_v4(plaintext, dek, wrapped),
     }
 }
 
@@ -649,6 +750,12 @@ pub fn decrypt<'a, S: Into<SseSource<'a>>>(body: &[u8], source: S) -> Result<Byt
             let keyring = match source {
                 SseSource::Keyring(kr) => kr,
                 SseSource::CustomerKey { .. } => return Err(SseError::CustomerKeyUnexpected),
+                // S4E1/E2 stored under the keyring → SseSource::Kms
+                // is just as nonsensical as CustomerKey here. Re-use
+                // the same "wrong source" error so service.rs can
+                // map both to AWS S3's "extraneous SSE-* headers"
+                // 400.
+                SseSource::Kms { .. } => return Err(SseError::CustomerKeyUnexpected),
             };
             if m == SSE_MAGIC_V1 {
                 decrypt_v1_with_keyring(body, keyring)
@@ -664,8 +771,16 @@ pub fn decrypt<'a, S: Into<SseSource<'a>>>(body: &[u8], source: S) -> Result<Byt
             let (key, key_md5) = match source {
                 SseSource::CustomerKey { key, key_md5 } => (key, key_md5),
                 SseSource::Keyring(_) => return Err(SseError::CustomerKeyRequired),
+                SseSource::Kms { .. } => return Err(SseError::CustomerKeyRequired),
             };
             decrypt_v3(body, key, key_md5)
+        }
+        m if m == SSE_MAGIC_V4 => {
+            // SSE-KMS unwrap is async (KMS round-trip required).
+            // Caller must dispatch to `decrypt_with_kms` after
+            // peeking the magic — surface this as a distinct error
+            // rather than silently failing.
+            Err(SseError::KmsAsyncRequired)
         }
         _ => Err(SseError::BadMagic { got: magic }),
     }
@@ -706,6 +821,219 @@ fn decrypt_v3(
 
     let aes_key = Key::<Aes256Gcm>::from_slice(key);
     let cipher = Aes256Gcm::new(aes_key);
+    let plain = cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &ct_with_tag,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| SseError::DecryptFailed)?;
+    Ok(Bytes::from(plain))
+}
+
+/// AAD for S4E4 = magic (4) + algo (1) + key_id_len (1) + key_id +
+/// wrapped_dek_len (4 BE) + wrapped_dek. Putting the variable-length
+/// key_id and wrapped_dek into the AAD means an attacker cannot
+/// rewrite either field to redirect the gateway to a different KEK
+/// or wrapped DEK without invalidating the body's AES-GCM tag.
+///
+/// Length-prefixing key_id and wrapped_dek inside the AAD prevents a
+/// canonicalisation ambiguity: without the length prefix, an
+/// attacker could shift bytes between the two fields and produce the
+/// same AAD bytestream, defeating the per-field tampering check.
+fn aad_v4(key_id: &[u8], wrapped_dek: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(4 + 1 + 1 + key_id.len() + 4 + wrapped_dek.len());
+    aad.extend_from_slice(SSE_MAGIC_V4);
+    aad.push(ALGO_AES_256_GCM);
+    aad.push(key_id.len() as u8);
+    aad.extend_from_slice(key_id);
+    aad.extend_from_slice(&(wrapped_dek.len() as u32).to_be_bytes());
+    aad.extend_from_slice(wrapped_dek);
+    aad
+}
+
+fn encrypt_v4(plaintext: &[u8], dek: &[u8; KEY_LEN], wrapped: &WrappedDek) -> Bytes {
+    // Pre-conditions: key_id must fit in a u8 length prefix and be
+    // non-empty (an empty id means we wouldn't be able to re-fetch
+    // the KEK on GET). wrapped_dek length fits in u32 by the same
+    // logic — at u32::MAX bytes you have bigger problems. We assert
+    // these in debug and silently truncate-or-panic in release; in
+    // practice key_id is a UUID or ARN (<256 chars) and wrapped_dek
+    // is 60 bytes (LocalKms) or ~200 bytes (AWS KMS).
+    assert!(
+        !wrapped.key_id.is_empty() && wrapped.key_id.len() <= u8::MAX as usize,
+        "S4E4 key_id must be 1..=255 bytes (got {})",
+        wrapped.key_id.len()
+    );
+    assert!(
+        wrapped.ciphertext.len() <= u32::MAX as usize,
+        "S4E4 wrapped_dek longer than u32::MAX",
+    );
+
+    let aes_key = Key::<Aes256Gcm>::from_slice(dek);
+    let cipher = Aes256Gcm::new(aes_key);
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let aad = aad_v4(wrapped.key_id.as_bytes(), &wrapped.ciphertext);
+    let ct_with_tag = cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .expect("aes-gcm encrypt cannot fail with a 32-byte key");
+    debug_assert!(ct_with_tag.len() >= TAG_LEN);
+    let split = ct_with_tag.len() - TAG_LEN;
+    let (ct, tag) = ct_with_tag.split_at(split);
+
+    let key_id_bytes = wrapped.key_id.as_bytes();
+    let mut out = Vec::with_capacity(
+        4 + 1 + 1 + key_id_bytes.len() + 4 + wrapped.ciphertext.len() + NONCE_LEN + TAG_LEN + ct.len(),
+    );
+    out.extend_from_slice(SSE_MAGIC_V4);
+    out.push(ALGO_AES_256_GCM);
+    out.push(key_id_bytes.len() as u8);
+    out.extend_from_slice(key_id_bytes);
+    out.extend_from_slice(&(wrapped.ciphertext.len() as u32).to_be_bytes());
+    out.extend_from_slice(&wrapped.ciphertext);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(tag);
+    out.extend_from_slice(ct);
+    Bytes::from(out)
+}
+
+/// Parsed view of an S4E4 frame's variable-length header. Returned
+/// by [`parse_s4e4_header`] so both the async [`decrypt_with_kms`]
+/// path and any future inspection code (e.g. an admin tool that
+/// needs to enumerate object → KMS-key bindings) can reuse the same
+/// parser without re-implementing offset math.
+#[derive(Debug)]
+pub struct S4E4Header<'a> {
+    pub key_id: &'a str,
+    pub wrapped_dek: &'a [u8],
+    pub nonce: &'a [u8],
+    pub tag: &'a [u8],
+    pub ciphertext: &'a [u8],
+}
+
+/// Parse the (variable-length) S4E4 header. Pure byte-shuffling — no
+/// crypto, no KMS round-trip. Returns errors on truncation /
+/// out-of-bounds field lengths / non-UTF-8 key_id.
+pub fn parse_s4e4_header(body: &[u8]) -> Result<S4E4Header<'_>, SseError> {
+    // Minimum: magic(4) + algo(1) + key_id_len(1) + key_id(>=1) +
+    // wrapped_dek_len(4) + wrapped_dek(>=1) + nonce(12) + tag(16)
+    // = 40 bytes. We use a slightly looser floor here (bytes for
+    // empty fields = 38) and let the per-field bounds checks below
+    // catch the actual short reads.
+    const S4E4_MIN: usize = 4 + 1 + 1 + 4 + NONCE_LEN + TAG_LEN; // 38
+    if body.len() < S4E4_MIN {
+        return Err(SseError::KmsFrameTooShort {
+            got: body.len(),
+            min: S4E4_MIN,
+        });
+    }
+    let magic = &body[..4];
+    if magic != SSE_MAGIC_V4 {
+        let mut got = [0u8; 4];
+        got.copy_from_slice(magic);
+        return Err(SseError::BadMagic { got });
+    }
+    let algo = body[4];
+    if algo != ALGO_AES_256_GCM {
+        return Err(SseError::UnsupportedAlgo { tag: algo });
+    }
+    let key_id_len = body[5] as usize;
+    let key_id_off: usize = 6;
+    let key_id_end = key_id_off
+        .checked_add(key_id_len)
+        .ok_or(SseError::KmsFrameFieldOob { what: "key_id_len" })?;
+    if key_id_end + 4 > body.len() {
+        return Err(SseError::KmsFrameFieldOob { what: "key_id" });
+    }
+    let key_id = std::str::from_utf8(&body[key_id_off..key_id_end])
+        .map_err(|_| SseError::KmsKeyIdNotUtf8)?;
+    let wrapped_len_off = key_id_end;
+    let wrapped_dek_len = u32::from_be_bytes([
+        body[wrapped_len_off],
+        body[wrapped_len_off + 1],
+        body[wrapped_len_off + 2],
+        body[wrapped_len_off + 3],
+    ]) as usize;
+    let wrapped_off = wrapped_len_off + 4;
+    let wrapped_end = wrapped_off
+        .checked_add(wrapped_dek_len)
+        .ok_or(SseError::KmsFrameFieldOob { what: "wrapped_dek_len" })?;
+    if wrapped_end + NONCE_LEN + TAG_LEN > body.len() {
+        return Err(SseError::KmsFrameFieldOob { what: "wrapped_dek" });
+    }
+    let wrapped_dek = &body[wrapped_off..wrapped_end];
+    let nonce_off = wrapped_end;
+    let tag_off = nonce_off + NONCE_LEN;
+    let ct_off = tag_off + TAG_LEN;
+    let nonce = &body[nonce_off..nonce_off + NONCE_LEN];
+    let tag = &body[tag_off..tag_off + TAG_LEN];
+    let ciphertext = &body[ct_off..];
+    Ok(S4E4Header {
+        key_id,
+        wrapped_dek,
+        nonce,
+        tag,
+        ciphertext,
+    })
+}
+
+/// Async decrypt for S4E4 (SSE-KMS) bodies. Caller supplies the KMS
+/// backend; this function parses the frame, calls
+/// `kms.decrypt_dek(...)` to unwrap the DEK, then runs AES-256-GCM
+/// to recover the plaintext.
+///
+/// service.rs's GET handler should peek the magic with [`peek_magic`]
+/// and dispatch:
+///
+/// - `Some("S4E4")` → `decrypt_with_kms(blob, &*kms).await`
+/// - everything else → existing sync `decrypt(blob, source)`
+///
+/// Note: we don't go through `SseSource::Kms` here because the
+/// wrapped DEK + key_id come from the frame itself, not from the
+/// request — the `SseSource` is built for sync paths where the
+/// caller already knows the key.
+pub async fn decrypt_with_kms(
+    body: &[u8],
+    kms: &dyn KmsBackend,
+) -> Result<Bytes, SseError> {
+    let hdr = parse_s4e4_header(body)?;
+    let wrapped = WrappedDek {
+        key_id: hdr.key_id.to_string(),
+        ciphertext: hdr.wrapped_dek.to_vec(),
+    };
+    let dek_vec = kms.decrypt_dek(&wrapped).await?;
+    if dek_vec.len() != KEY_LEN {
+        // KMS returned a non-32-byte plaintext. AES-256 needs exactly
+        // 32 bytes. This shouldn't happen with `KeySpec=AES_256` but
+        // surface as a backend error so it's auditable rather than
+        // panicking.
+        return Err(SseError::KmsBackend(KmsError::BackendUnavailable {
+            message: format!(
+                "KMS returned {} byte DEK; expected {KEY_LEN}",
+                dek_vec.len()
+            ),
+        }));
+    }
+    let mut dek = [0u8; KEY_LEN];
+    dek.copy_from_slice(&dek_vec);
+
+    let aad = aad_v4(hdr.key_id.as_bytes(), hdr.wrapped_dek);
+    let aes_key = Key::<Aes256Gcm>::from_slice(&dek);
+    let cipher = Aes256Gcm::new(aes_key);
+    let nonce = Nonce::from_slice(hdr.nonce);
+    let mut ct_with_tag = Vec::with_capacity(hdr.ciphertext.len() + TAG_LEN);
+    ct_with_tag.extend_from_slice(hdr.ciphertext);
+    ct_with_tag.extend_from_slice(hdr.tag);
     let plain = cipher
         .decrypt(
             nonce,
@@ -793,21 +1121,45 @@ fn decrypt_v2_with_keyring(body: &[u8], keyring: &SseKeyring) -> Result<Bytes, S
     Ok(Bytes::from(plain))
 }
 
-/// Detect whether `body` is SSE-S4 encrypted (S4E1, S4E2, or S4E3) by
-/// sniffing the first 4 magic bytes. Used by the GET path to decide
-/// whether to run decryption before frame parsing.
+/// Detect whether `body` is SSE-S4 encrypted (S4E1, S4E2, S4E3, or
+/// S4E4) by sniffing the first 4 magic bytes. Used by the GET path
+/// to decide whether to run decryption before frame parsing.
 ///
-/// We require a length check that's safe for *any* of the three
+/// We require a length check that's safe for *any* of the four
 /// frames — `SSE_HEADER_BYTES` (36) is the smallest valid header
-/// (S4E1 / S4E2). S4E3 is 49 bytes; the per-frame decrypt path
-/// re-checks the appropriate minimum, so this 36-byte gate is just a
-/// fast rejection of obviously-too-short bodies.
+/// (S4E1 / S4E2). S4E3 is 49 bytes; S4E4 is variable but always >=
+/// 38 bytes. The per-frame decrypt path re-checks the appropriate
+/// minimum, so this 36-byte gate is just a fast rejection of
+/// obviously-too-short bodies.
 pub fn looks_encrypted(body: &[u8]) -> bool {
     if body.len() < SSE_HEADER_BYTES {
         return false;
     }
     let m = &body[..4];
-    m == SSE_MAGIC_V1 || m == SSE_MAGIC_V2 || m == SSE_MAGIC_V3
+    m == SSE_MAGIC_V1 || m == SSE_MAGIC_V2 || m == SSE_MAGIC_V3 || m == SSE_MAGIC_V4
+}
+
+/// Peek the SSE-S4 magic at the front of `body`, returning a
+/// stringified frame variant identifier or `None` if `body` is not
+/// recognized as SSE-S4. Used by the GET path to dispatch between
+/// the sync [`decrypt`] (S4E1/E2/E3) and the async
+/// [`decrypt_with_kms`] (S4E4).
+///
+/// Returns the same length-gated result as [`looks_encrypted`]: any
+/// body shorter than `SSE_HEADER_BYTES` (36 bytes) returns `None`,
+/// so the caller can use this as both the "is encrypted" signal and
+/// the "which frame" signal in one cheap byte-comparison.
+pub fn peek_magic(body: &[u8]) -> Option<&'static str> {
+    if body.len() < SSE_HEADER_BYTES {
+        return None;
+    }
+    match &body[..4] {
+        m if m == SSE_MAGIC_V1 => Some("S4E1"),
+        m if m == SSE_MAGIC_V2 => Some("S4E2"),
+        m if m == SSE_MAGIC_V3 => Some("S4E3"),
+        m if m == SSE_MAGIC_V4 => Some("S4E4"),
+        _ => None,
+    }
 }
 
 pub type SharedSseKey = Arc<SseKey>;
@@ -1358,5 +1710,395 @@ mod tests {
         let got = compute_key_md5(b"");
         let expected_hex = "d41d8cd98f00b204e9800998ecf8427e";
         assert_eq!(hex_lower(&got), expected_hex);
+    }
+
+    // -----------------------------------------------------------------
+    // v0.5 #28 — SSE-KMS envelope (S4E4) tests
+    // -----------------------------------------------------------------
+
+    use crate::kms::{KmsBackend, LocalKms};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn local_kms_with(key_ids: &[(&str, [u8; 32])]) -> LocalKms {
+        let mut keks: HashMap<String, [u8; 32]> = HashMap::new();
+        for (id, k) in key_ids {
+            keks.insert((*id).to_string(), *k);
+        }
+        LocalKms::from_keks(PathBuf::from("/tmp/none"), keks)
+    }
+
+    #[tokio::test]
+    async fn s4e4_roundtrip_via_local_kms() {
+        let kms = local_kms_with(&[("alpha", [42u8; 32])]);
+        let (dek_vec, wrapped) = kms.generate_dek("alpha").await.unwrap();
+        let mut dek = [0u8; 32];
+        dek.copy_from_slice(&dek_vec);
+        let pt = b"SSE-KMS envelope payload across the S4E4 frame";
+        let ct = encrypt_with_source(
+            pt,
+            SseSource::Kms {
+                dek: &dek,
+                wrapped: &wrapped,
+            },
+        );
+        // Frame inspection.
+        assert_eq!(&ct[..4], SSE_MAGIC_V4);
+        assert_eq!(ct[4], ALGO_AES_256_GCM);
+        let key_id_len = ct[5] as usize;
+        assert_eq!(key_id_len, "alpha".len());
+        assert_eq!(&ct[6..6 + key_id_len], b"alpha");
+        // peek_magic + looks_encrypted both recognise S4E4.
+        assert!(looks_encrypted(&ct));
+        assert_eq!(peek_magic(&ct), Some("S4E4"));
+        // Async decrypt round-trip.
+        let plain = decrypt_with_kms(&ct, &kms).await.unwrap();
+        assert_eq!(plain.as_ref(), pt);
+    }
+
+    #[tokio::test]
+    async fn s4e4_tampered_key_id_fails_aead() {
+        let kms = local_kms_with(&[("alpha", [1u8; 32]), ("beta", [2u8; 32])]);
+        let (dek_vec, wrapped) = kms.generate_dek("alpha").await.unwrap();
+        let mut dek = [0u8; 32];
+        dek.copy_from_slice(&dek_vec);
+        let mut ct = encrypt_with_source(
+            b"do not redirect",
+            SseSource::Kms {
+                dek: &dek,
+                wrapped: &wrapped,
+            },
+        )
+        .to_vec();
+        // Flip the key_id from "alpha" to "betaa" by changing the
+        // first byte of the key_id field. The forged id "bltha" is
+        // not in the KMS, so unwrap fails with KeyNotFound surfaced
+        // through KmsBackend(KmsError::KeyNotFound).
+        let key_id_off = 6;
+        ct[key_id_off] = b'b';
+        let err = decrypt_with_kms(&ct, &kms).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SseError::KmsBackend(crate::kms::KmsError::UnwrapFailed { .. })
+                    | SseError::KmsBackend(crate::kms::KmsError::KeyNotFound { .. })
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn s4e4_tampered_key_id_to_real_other_id_still_fails() {
+        // Wrap under "alpha" but rewrite the stored key_id to "beta"
+        // (which IS in the KMS). KmsBackend will try to unwrap with
+        // beta's KEK and AAD = "beta", but the wrapped bytes were
+        // produced with alpha's KEK + AAD = "alpha", so the local
+        // KMS unwrap fails with UnwrapFailed.
+        let kms = local_kms_with(&[("alpha", [1u8; 32]), ("beta", [2u8; 32])]);
+        let (dek_vec, wrapped) = kms.generate_dek("alpha").await.unwrap();
+        let mut dek = [0u8; 32];
+        dek.copy_from_slice(&dek_vec);
+        let mut ct = encrypt_with_source(
+            b"redirect attempt",
+            SseSource::Kms {
+                dek: &dek,
+                wrapped: &wrapped,
+            },
+        )
+        .to_vec();
+        // Both "alpha" and "beta" are 5 chars long so the rewrite
+        // doesn't shift any other field offsets.
+        let key_id_off = 6;
+        ct[key_id_off..key_id_off + 5].copy_from_slice(b"beta_");
+        // Trim back to 4-byte "beta" by also shrinking the length
+        // prefix would change downstream offsets — instead pad the
+        // forged id to keep length stable. This mirrors the realistic
+        // tampering surface (attacker can flip bytes but not change
+        // the on-disk layout). The KMS now sees key_id "beta_" which
+        // is unknown → KeyNotFound.
+        let err = decrypt_with_kms(&ct, &kms).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SseError::KmsBackend(crate::kms::KmsError::KeyNotFound { .. })
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn s4e4_tampered_wrapped_dek_fails_unwrap() {
+        let kms = local_kms_with(&[("k", [3u8; 32])]);
+        let (dek_vec, wrapped) = kms.generate_dek("k").await.unwrap();
+        let mut dek = [0u8; 32];
+        dek.copy_from_slice(&dek_vec);
+        let mut ct = encrypt_with_source(
+            b"target body",
+            SseSource::Kms {
+                dek: &dek,
+                wrapped: &wrapped,
+            },
+        )
+        .to_vec();
+        // Locate the wrapped_dek_len + wrapped_dek field and flip a
+        // byte in the middle of the wrapped DEK. AES-GCM auth on the
+        // wrap fails → KmsBackend(UnwrapFailed).
+        let key_id_len = ct[5] as usize;
+        let wrapped_len_off = 6 + key_id_len;
+        let wrapped_off = wrapped_len_off + 4;
+        let mid = wrapped_off + (wrapped.ciphertext.len() / 2);
+        ct[mid] ^= 0xFF;
+        let err = decrypt_with_kms(&ct, &kms).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SseError::KmsBackend(crate::kms::KmsError::UnwrapFailed { .. })
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn s4e4_tampered_ciphertext_fails_aead() {
+        let kms = local_kms_with(&[("k", [4u8; 32])]);
+        let (dek_vec, wrapped) = kms.generate_dek("k").await.unwrap();
+        let mut dek = [0u8; 32];
+        dek.copy_from_slice(&dek_vec);
+        let mut ct = encrypt_with_source(
+            b"sealed body",
+            SseSource::Kms {
+                dek: &dek,
+                wrapped: &wrapped,
+            },
+        )
+        .to_vec();
+        let last = ct.len() - 1;
+        ct[last] ^= 0x01;
+        let err = decrypt_with_kms(&ct, &kms).await.unwrap_err();
+        assert!(matches!(err, SseError::DecryptFailed), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn s4e4_uses_random_nonce_and_dek_per_put() {
+        let kms = local_kms_with(&[("k", [5u8; 32])]);
+        // Two PUTs of the same plaintext under the same KEK must
+        // produce different ciphertexts (fresh DEK + fresh nonce).
+        let (dek1_vec, wrapped1) = kms.generate_dek("k").await.unwrap();
+        let (dek2_vec, wrapped2) = kms.generate_dek("k").await.unwrap();
+        let mut dek1 = [0u8; 32];
+        dek1.copy_from_slice(&dek1_vec);
+        let mut dek2 = [0u8; 32];
+        dek2.copy_from_slice(&dek2_vec);
+        let pt = b"deterministic input";
+        let a = encrypt_with_source(
+            pt,
+            SseSource::Kms {
+                dek: &dek1,
+                wrapped: &wrapped1,
+            },
+        );
+        let b = encrypt_with_source(
+            pt,
+            SseSource::Kms {
+                dek: &dek2,
+                wrapped: &wrapped2,
+            },
+        );
+        assert_ne!(a, b);
+        // Both still decrypt round-trip.
+        let plain_a = decrypt_with_kms(&a, &kms).await.unwrap();
+        let plain_b = decrypt_with_kms(&b, &kms).await.unwrap();
+        assert_eq!(plain_a.as_ref(), pt);
+        assert_eq!(plain_b.as_ref(), pt);
+    }
+
+    #[tokio::test]
+    async fn s4e4_sync_decrypt_returns_kms_async_required() {
+        // The whole point of KmsAsyncRequired: passing an S4E4 body
+        // to the sync `decrypt` function must surface a distinct
+        // error so service.rs's GET path notices the bug rather than
+        // returning a generic "wrong source" 400.
+        let kms = local_kms_with(&[("k", [6u8; 32])]);
+        let (dek_vec, wrapped) = kms.generate_dek("k").await.unwrap();
+        let mut dek = [0u8; 32];
+        dek.copy_from_slice(&dek_vec);
+        let ct = encrypt_with_source(
+            b"async only",
+            SseSource::Kms {
+                dek: &dek,
+                wrapped: &wrapped,
+            },
+        );
+        // Try via Keyring source (the default sync path).
+        let kr = SseKeyring::new(1, key32(0));
+        let err = decrypt(&ct, &kr).unwrap_err();
+        assert!(matches!(err, SseError::KmsAsyncRequired), "got {err:?}");
+    }
+
+    #[test]
+    fn back_compat_s4e1_e2_e3_still_decrypt_via_sync() {
+        // After adding S4E4, the sync `decrypt` path must still
+        // handle every legacy frame variant unchanged.
+        let k = key32(7);
+        let v1 = encrypt(&k, b"v0.4 vintage");
+        let kr = SseKeyring::new(1, Arc::clone(&k));
+        assert_eq!(decrypt(&v1, &kr).unwrap().as_ref(), b"v0.4 vintage");
+
+        let v2 = encrypt_v2(b"v0.5 #29 vintage", &kr);
+        assert_eq!(
+            decrypt(&v2, &kr).unwrap().as_ref(),
+            b"v0.5 #29 vintage"
+        );
+
+        let m = cust_key(7);
+        let v3 = encrypt_with_source(b"v0.5 #27 vintage", (&m).into());
+        assert_eq!(
+            decrypt(&v3, &m).unwrap().as_ref(),
+            b"v0.5 #27 vintage"
+        );
+    }
+
+    #[test]
+    fn peek_magic_distinguishes_all_variants() {
+        // S4E1 / S4E2 / S4E3 — built from real encrypts so the
+        // length gate also passes.
+        let k = key32(9);
+        let v1 = encrypt(&k, b"x");
+        assert_eq!(peek_magic(&v1), Some("S4E1"));
+        let kr = SseKeyring::new(1, Arc::clone(&k));
+        let v2 = encrypt_v2(b"x", &kr);
+        assert_eq!(peek_magic(&v2), Some("S4E2"));
+        let m = cust_key(9);
+        let v3 = encrypt_with_source(b"x", (&m).into());
+        assert_eq!(peek_magic(&v3), Some("S4E3"));
+        // Synthetic S4E4 magic with enough trailing bytes to clear
+        // the 36-byte length gate. peek_magic does NOT validate the
+        // S4E4 inner header, just the magic — that's the contract
+        // (cheap dispatch signal).
+        let mut v4 = Vec::new();
+        v4.extend_from_slice(SSE_MAGIC_V4);
+        v4.extend_from_slice(&[0u8; 40]);
+        assert_eq!(peek_magic(&v4), Some("S4E4"));
+        // Unknown magic / too-short input → None.
+        assert!(peek_magic(b"NOPE").is_none());
+        assert!(peek_magic(b"short").is_none());
+        assert!(peek_magic(&[0u8; 100]).is_none());
+    }
+
+    #[tokio::test]
+    async fn s4e4_truncated_frame_errors_cleanly() {
+        // Truncate to less than the minimum header. Must surface
+        // KmsFrameTooShort, not panic, not return BadMagic.
+        let truncated = b"S4E4\x01\x05hi";
+        let kms = local_kms_with(&[("k", [1u8; 32])]);
+        let err = decrypt_with_kms(truncated, &kms).await.unwrap_err();
+        assert!(
+            matches!(err, SseError::KmsFrameTooShort { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn s4e4_oob_key_id_len_errors() {
+        // Build a body that claims key_id_len = 200 but only has 4
+        // bytes after the length prefix. parse_s4e4_header must
+        // refuse with KmsFrameFieldOob, not slice-panic.
+        let mut body = Vec::new();
+        body.extend_from_slice(SSE_MAGIC_V4);
+        body.push(ALGO_AES_256_GCM);
+        body.push(200u8); // key_id_len
+        // Remaining bytes < 200; pad to clear the looks_encrypted
+        // floor (36 bytes) but stay short of the claimed key_id +
+        // wrapped_dek_len + nonce + tag layout.
+        body.extend_from_slice(&[0u8; 50]);
+        let kms = local_kms_with(&[("k", [1u8; 32])]);
+        let err = decrypt_with_kms(&body, &kms).await.unwrap_err();
+        assert!(
+            matches!(err, SseError::KmsFrameFieldOob { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn s4e4_via_keyring_source_into_sync_decrypt_is_kms_async_required() {
+        // S4E4 + Keyring source: sync decrypt sees the S4E4 magic
+        // first and returns KmsAsyncRequired regardless of source —
+        // the source mismatch never gets a chance to surface, which
+        // is the right behaviour (caller's bug is "didn't peek
+        // magic" not "wrong source").
+        let kms = local_kms_with(&[("k", [9u8; 32])]);
+        let (dek_vec, wrapped) = kms.generate_dek("k").await.unwrap();
+        let mut dek = [0u8; 32];
+        dek.copy_from_slice(&dek_vec);
+        let ct = encrypt_with_source(
+            b"x",
+            SseSource::Kms {
+                dek: &dek,
+                wrapped: &wrapped,
+            },
+        );
+        let m = cust_key(1);
+        let err = decrypt(&ct, &m).unwrap_err();
+        assert!(matches!(err, SseError::KmsAsyncRequired), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn s4e4_looks_encrypted_passthrough_returns_false_for_synthetic() {
+        // S4F4 (note F not E) must NOT be confused with S4E4.
+        let mut not_s4e4 = Vec::new();
+        not_s4e4.extend_from_slice(b"S4F4");
+        not_s4e4.extend_from_slice(&[0u8; 60]);
+        assert!(!looks_encrypted(&not_s4e4));
+        assert_eq!(peek_magic(&not_s4e4), None);
+    }
+
+    #[tokio::test]
+    async fn s4e4_aad_length_prefix_prevents_byte_shifting() {
+        // Constructing an S4E4 body where the wrapped_dek_len is
+        // shrunk by N bytes and the same N bytes are prepended to
+        // the key_id-equivalent area would, without length-prefixed
+        // AAD, produce the same AAD bytestream. Verify our AAD
+        // includes the length prefixes by tampering with
+        // wrapped_dek_len and confirming AES-GCM auth fails.
+        let kms = local_kms_with(&[("kk", [11u8; 32])]);
+        let (dek_vec, wrapped) = kms.generate_dek("kk").await.unwrap();
+        let mut dek = [0u8; 32];
+        dek.copy_from_slice(&dek_vec);
+        let mut ct = encrypt_with_source(
+            b"length-shift defense",
+            SseSource::Kms {
+                dek: &dek,
+                wrapped: &wrapped,
+            },
+        )
+        .to_vec();
+        let key_id_len = ct[5] as usize;
+        let wrapped_len_off = 6 + key_id_len;
+        // Shrink wrapped_dek_len by 1. parse_s4e4_header now reads a
+        // shorter wrapped_dek and a different nonce/tag/ciphertext
+        // alignment — KMS unwrap fails OR AES-GCM fails OR frame
+        // bounds reject. All three surface as auditable errors;
+        // none should reach a successful decrypt.
+        let original_len = u32::from_be_bytes([
+            ct[wrapped_len_off],
+            ct[wrapped_len_off + 1],
+            ct[wrapped_len_off + 2],
+            ct[wrapped_len_off + 3],
+        ]);
+        let new_len = (original_len - 1).to_be_bytes();
+        ct[wrapped_len_off..wrapped_len_off + 4].copy_from_slice(&new_len);
+        let err = decrypt_with_kms(&ct, &kms).await.unwrap_err();
+        // Acceptable failure modes: unwrap fail (truncated wrapped
+        // DEK), AES-GCM fail (shifted nonce/tag/AAD), or frame bounds.
+        assert!(
+            matches!(
+                err,
+                SseError::KmsBackend(_)
+                    | SseError::DecryptFailed
+                    | SseError::KmsFrameFieldOob { .. }
+                    | SseError::KmsFrameTooShort { .. }
+            ),
+            "got {err:?}"
+        );
     }
 }

@@ -28,6 +28,12 @@ default = []
 # Enable GPU compression via nvCOMP. Requires CUDA + NVCOMP_HOME at build time
 # and a CUDA-capable GPU at runtime. Propagates to s4-codec/nvcomp-gpu.
 nvcomp-gpu = ["s4-codec/nvcomp-gpu"]
+# v0.5 #28: SSE-KMS envelope encryption with AWS KMS as the KEK backend.
+# Off by default to keep the default build from pulling the entire
+# aws-sdk-kms tree. Enable with `--features aws-kms` when deploying with
+# AWS KMS for KEK custody. The default-features `LocalKms` (file-backed
+# KEKs) is always available for dev / on-prem.
+aws-kms = ["dep:aws-sdk-kms"]
 
 [[bin]]
 name = "s4"
@@ -91,6 +97,11 @@ ecdsa = "0.16"
 # (`chrono` の `clock` + `serde` features 限定) のため。
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 uuid = { version = "1", features = ["v4"] }
+# v0.5 #28: SSE-KMS envelope encryption — optional AWS KMS backend.
+# `LocalKms` (file-backed KEKs) is always compiled in; the AWS backend
+# is gated behind the `aws-kms` cargo feature so the default `cargo
+# build` doesn't pull aws-sdk-kms.
+aws-sdk-kms = { version = "1", optional = true }
 
 s4-codec = { path = "../s4-codec", version = "0.4.0" }
 s4-config = { path = "../s4-config", version = "0.4.0" }
