@@ -1930,6 +1930,121 @@ impl<B: S3> S3 for S4Service<B> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// v0.5 #33: SigV4a (asymmetric ECDSA-P256) integration hook.
+//
+// Kept as a self-contained block at the bottom of the file so it doesn't
+// touch the existing `S4Service` struct, `new()`, or any of the per-op
+// handlers above. The hook is wired in by the binary at server-build time
+// as a hyper middleware layer (see `main.rs`), NOT inside `S4Service`.
+//
+// Lifecycle:
+//   1. `SigV4aGate::new(store)` is constructed once at boot from the
+//      operator-supplied credential directory.
+//   2. For each incoming request, `SigV4aGate::pre_route(&req,
+//      &requested_region, &canonical_request_bytes)` is invoked BEFORE
+//      the request hits the S3 framework. If the request claims SigV4a
+//      and verifies, control returns to the framework. Otherwise a 403
+//      `SignatureDoesNotMatch` is produced.
+//   3. Plain SigV4 (HMAC-SHA256) requests pass through untouched.
+// ---------------------------------------------------------------------------
+
+/// Gate that fronts the S3 service path with SigV4a verification (v0.5 #33).
+///
+/// Wraps a [`crate::sigv4a::SigV4aCredentialStore`] and exposes a single
+/// `pre_route` entry point that returns `Ok(())` for both
+/// "request is plain SigV4 — pass through" and "request is SigV4a and
+/// verified", and an `Err(...)` containing a 403-equivalent diagnostic
+/// otherwise. Cheap to clone (the inner store is `Arc`-backed).
+#[derive(Debug, Clone)]
+pub struct SigV4aGate {
+    store: crate::sigv4a::SharedSigV4aCredentialStore,
+}
+
+impl SigV4aGate {
+    #[must_use]
+    pub fn new(store: crate::sigv4a::SharedSigV4aCredentialStore) -> Self {
+        Self { store }
+    }
+
+    /// Inspect an incoming HTTP request. Behaviour:
+    ///
+    /// - Not SigV4a (no `X-Amz-Region-Set` and no SigV4a `Authorization`
+    ///   prefix) → returns `Ok(())`; the framework's existing SigV4
+    ///   path handles the request.
+    /// - SigV4a + valid signature + region match → `Ok(())`.
+    /// - SigV4a + unknown access-key-id → `Err` with `InvalidAccessKeyId`.
+    /// - SigV4a + bad signature / region mismatch → `Err` with
+    ///   `SignatureDoesNotMatch`.
+    ///
+    /// `canonical_request_bytes` is the SigV4a string-to-sign (or
+    /// canonical-request bytes; the caller decides) that the framework
+    /// has already produced for this request. Keeping it as a parameter
+    /// instead of rebuilding it inside the hook avoids duplicating the
+    /// canonicalisation logic.
+    pub fn pre_route<B>(
+        &self,
+        req: &http::Request<B>,
+        requested_region: &str,
+        canonical_request_bytes: &[u8],
+    ) -> Result<(), SigV4aGateError> {
+        if !crate::sigv4a::detect(req) {
+            return Ok(());
+        }
+        let auth_hdr = req
+            .headers()
+            .get(http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or(SigV4aGateError::MissingAuthorization)?;
+        let parsed = crate::sigv4a::parse_authorization_header(auth_hdr)
+            .ok_or(SigV4aGateError::MalformedAuthorization)?;
+        let region_set = req
+            .headers()
+            .get(crate::sigv4a::REGION_SET_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("*");
+        let key = self
+            .store
+            .get(&parsed.access_key_id)
+            .ok_or_else(|| SigV4aGateError::UnknownAccessKey(parsed.access_key_id.clone()))?;
+        crate::sigv4a::verify(
+            &crate::sigv4a::CanonicalRequest::new(canonical_request_bytes),
+            &parsed.signature_der,
+            key,
+            region_set,
+            requested_region,
+        )
+        .map_err(SigV4aGateError::Verify)?;
+        Ok(())
+    }
+}
+
+/// Failure modes from [`SigV4aGate::pre_route`]. All variants map to
+/// HTTP 403 with one of the two AWS-standard error codes
+/// (`InvalidAccessKeyId` or `SignatureDoesNotMatch`).
+#[derive(Debug, thiserror::Error)]
+pub enum SigV4aGateError {
+    #[error("missing Authorization header")]
+    MissingAuthorization,
+    #[error("malformed SigV4a Authorization header")]
+    MalformedAuthorization,
+    #[error("unknown SigV4a access-key-id: {0}")]
+    UnknownAccessKey(String),
+    #[error("SigV4a verification failed: {0}")]
+    Verify(#[source] crate::sigv4a::SigV4aError),
+}
+
+impl SigV4aGateError {
+    /// AWS S3 error code that should accompany a 403 response.
+    #[must_use]
+    pub fn s3_error_code(&self) -> &'static str {
+        match self {
+            Self::UnknownAccessKey(_) => "InvalidAccessKeyId",
+            _ => "SignatureDoesNotMatch",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
