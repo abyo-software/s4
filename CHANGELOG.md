@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-05-13
+
+Eight v0.5 milestone issues delivered (#27–#34). Theme: **regulated-
+industry posture**. Three new on-disk encryption frames (`S4E2` / `S4E3`
+/ `S4E4`), full Object Lock (WORM) enforcement, tamper-evident audit
+log chain, in-server versioning state machine, SigV4a signature
+verification, and a single `--compliance-mode strict` flag that
+bundles them into a regulated-industry deploy.
+
+### Added
+
+- **SSE-C — customer-provided keys** (#27) — `x-amz-server-side-encryption-customer-{algorithm,key,key-MD5}`
+  request headers. Server encrypts on PUT and decrypts on GET without
+  ever persisting the key (only an MD5 fingerprint as metadata, kept
+  in the AAD of the new `S4E3` frame so substitution is detected).
+- **SSE-KMS envelope encryption** (#28) — `--kms-local-dir <DIR>` opens
+  a file-based KEK store (`LocalKms`); `--features aws-kms` adds an
+  `AwsKms` backend that calls `GenerateDataKey` / `Decrypt`. Per-object
+  DEKs ride in the new `S4E4` frame (key-id + wrapped-DEK in AAD).
+  `--kms-default-key-id` mirrors AWS's bucket-default key behaviour.
+- **SSE-S4 key rotation** (#29) — new `S4E2` frame stamps a 2-byte
+  key-id; `--sse-s4-key-rotated id=N,key=PATH` (repeatable) keeps
+  retired keys around for decryption while the active key (`--sse-s4-key`,
+  always id=1) handles new writes. v0.4 `S4E1` bodies decrypt unchanged
+  via the keyring's tries-each-key fallback.
+- **Object Lock (WORM) enforcement** (#30) — `--object-lock-state-file <PATH>`
+  attaches an in-memory `ObjectLockManager`. DELETE and overwrite-PUT
+  for objects under retention or legal hold are rejected with 403
+  AccessDenied. Modes: `GOVERNANCE` (override-able with
+  `x-amz-bypass-governance-retention`), `COMPLIANCE` (no override
+  until `retain-until` expires). Bucket defaults auto-apply on PUT.
+- **Audit log HMAC chain** (#31) — `--audit-log-hmac-key <SPEC>` appends
+  a hash-linked HMAC-SHA256 to every access-log line. New
+  `s4 verify-audit-log <FILE> --hmac-key <SPEC>` subcommand walks the
+  chain and reports the first break. Cross-file rotation links via
+  `# prev_file_tail=<hex>` headers so verification spans hourly files.
+- **Compliance mode bundle** (#32) — `--compliance-mode strict` refuses
+  to start unless TLS, audit-signed access log, SSE, and Object Lock
+  are all configured; forces TLS down to 1.3-only; and at runtime
+  rejects every PUT that doesn't declare SSE. Sets the gauge
+  `s4_compliance_mode_active{mode="strict"}` to 1 for fleet-wide
+  alerting.
+- **SigV4a signature verification** (#33) — `--sigv4a-credentials <DIR>`
+  loads ECDSA P-256 PEM public keys (one `<access_key_id>.pem` per
+  caller). Detects `AWS4-ECDSA-P256-SHA256` authorization, verifies
+  the canonical request bytes, and checks `X-Amz-Region-Set` membership.
+  SigV4 (the existing HMAC-based path) keeps working unchanged.
+- **First-class versioning state machine** (#34) —
+  `--versioning-state-file <PATH>` attaches an in-memory
+  `VersioningManager`. PUTs to Enabled buckets generate UUIDv4
+  version-ids and persist bytes under shadow keys
+  (`<key>.__s4ver__/<vid>`); GETs route on `?versionId=` query;
+  DELETE without version-id creates a delete marker; explicit
+  version-id DELETE removes a single revision. ListObjectVersions
+  paginates the chain with `IsLatest` flags.
+
+### Changed
+
+- Workspace bumped to 0.5.0.
+- `S4Service::with_sse_key` (v0.4) now wraps the key in a 1-slot
+  keyring internally so v0.4 deployments transparently ride the new
+  S4E2 frame on writes (S4E1 reads still work via the keyring's
+  fallback).
+
+### Notes
+
+- **SSE-KMS scope cuts** (deferred): per-object DEK zeroize, request-
+  scoped DEK reuse for ≥1200 ops/sec/region (above the AWS KMS rate
+  limit), PKCS#11 / HSM backends.
+- **SigV4a integration**: the credential store loads at boot, but
+  full middleware glue (canonical-request bytes from the s3s framework
+  into the verifier) is the follow-up to v0.5 #33. Operators flagging
+  this on get a startup-time validation of the credential dir today.
+- **Versioning / Object Lock persistence**: in-memory only; JSON
+  snapshot is operator-managed via `to_json` / `from_json` (not yet
+  wired to a SIGUSR1 dump-back hook). Multi-instance replication is
+  deferred to a future milestone.
+
 ## [0.4.0] — 2026-05-13
 
 Twelve v0.4 milestone issues delivered (#15–#26). Theme: **production

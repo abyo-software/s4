@@ -34,7 +34,7 @@ crate-type = ["cdylib", "rlib"]
 # (`multipart::FrameIter`), and the `*_blocking` decode helpers added in this
 # same change. Pinning by path keeps in-repo changes aligned; pinning by
 # version protects against accidental dep skew when published.
-s4-codec = { path = "../s4-codec", version = "0.4.0" }
+s4-codec = { path = "../s4-codec", version = "0.5.0" }
 bytes = { workspace = true }
 crc32c = { workspace = true }
 wasm-bindgen = "0.2"

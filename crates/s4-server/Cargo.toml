@@ -103,8 +103,8 @@ uuid = { version = "1", features = ["v4"] }
 # build` doesn't pull aws-sdk-kms.
 aws-sdk-kms = { version = "1", optional = true }
 
-s4-codec = { path = "../s4-codec", version = "0.4.0" }
-s4-config = { path = "../s4-config", version = "0.4.0" }
+s4-codec = { path = "../s4-codec", version = "0.5.0" }
+s4-config = { path = "../s4-config", version = "0.5.0" }
 
 [dev-dependencies]
 tempfile = "3"
