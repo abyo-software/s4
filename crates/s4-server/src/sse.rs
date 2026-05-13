@@ -318,7 +318,37 @@ pub enum SseError {
         "S4E6 chunk_count {got} exceeds 24-bit max ({max}) — pick a larger --sse-chunk-size"
     )]
     ChunkCountTooLarge { got: u32, max: u32 },
+    // --- v0.8.2 #64: pre-allocation guard for chunked SSE frames ---
+    /// `parse_chunked_header` rejected an S4E5 / S4E6 frame because
+    /// the declared `chunk_size × chunk_count` (or the on-disk total
+    /// after adding per-chunk tag overhead and the fixed header) is
+    /// either:
+    ///
+    /// 1. arithmetically nonsensical (the multiplication / addition
+    ///    overflows u64 on a 64-bit host), or
+    /// 2. larger than the gateway's configured `max_body_bytes`
+    ///    (default 5 GiB — AWS S3's single-object PUT ceiling).
+    ///
+    /// This is the **DoS guard** for the chunked path: without it, a
+    /// 24-byte malicious header that claims `chunk_size = u32::MAX`
+    /// and `chunk_count = u32::MAX` would have caused the buffered
+    /// decrypt path to attempt a multi-PB `Vec::with_capacity` (or
+    /// integer-overflow into a tiny alloc + later out-of-bounds
+    /// panic) before any cryptographic work happened. Surface as a
+    /// distinct variant — never echo the offending sizes back to the
+    /// client (kept as a `&'static str` `details` field for operator
+    /// audit logs only) so the response isn't a tampering oracle.
+    #[error("S4E5/S4E6 chunked frame declares an over-large size: {details}")]
+    ChunkFrameTooLarge { details: &'static str },
 }
+
+/// Default cap on a single chunked-SSE frame's declared plaintext
+/// size, used by [`decrypt_chunked_buffered_default`] and the
+/// streaming pre-validation path. Mirrors AWS S3's 5 GiB single-object
+/// PUT ceiling — anything larger is unreachable on the AWS-compatible
+/// API surface and is therefore safe to reject pre-alloc as a malformed
+/// / malicious header (v0.8.2 #64).
+pub const DEFAULT_MAX_BODY_BYTES: usize = 5 * 1024 * 1024 * 1024;
 
 /// 32-byte symmetric key. `bytes` is `pub` so call sites can construct
 /// keys directly from already-validated bytes (e.g. KMS-decrypted DEKs)
@@ -850,7 +880,13 @@ pub fn decrypt<'a, S: Into<SseSource<'a>>>(body: &[u8], source: S) -> Result<Byt
                 }
                 SseSource::Kms { .. } => return Err(SseError::CustomerKeyUnexpected),
             };
-            decrypt_chunked_buffered(body, keyring)
+            // v0.8.2 #64: route through the back-compat wrapper so
+            // the public `decrypt` signature stays stable while the
+            // pre-allocation guard runs against the gateway's
+            // 5 GiB single-object cap. Bespoke callers (e.g. tests
+            // or future API surfaces that want a tighter limit) can
+            // call `decrypt_chunked_buffered` directly.
+            decrypt_chunked_buffered_default(body, keyring)
         }
         _ => Err(SseError::BadMagic { got: magic }),
     }
@@ -1655,7 +1691,10 @@ pub fn parse_s4e6_header(blob: &[u8]) -> Result<S4E6Header<'_>, SseError> {
     })
 }
 
-fn parse_chunked_header(body: &[u8]) -> Result<ChunkedHeader, SseError> {
+fn parse_chunked_header(
+    body: &[u8],
+    max_body_bytes: usize,
+) -> Result<ChunkedHeader, SseError> {
     if body.len() < 4 {
         return Err(SseError::ChunkFrameTruncated { what: "magic" });
     }
@@ -1711,6 +1750,76 @@ fn parse_chunked_header(body: &[u8]) -> Result<ChunkedHeader, SseError> {
             ChunkedSalt::V6(s)
         }
     };
+
+    // v0.8.2 #64 — DoS guard. Pre-validate the declared
+    // (chunk_size × chunk_count) plaintext size in u64 before *any*
+    // downstream allocation or chunk-walk loop. Rejects:
+    //   1. arithmetic that would overflow u64 (e.g. chunk_size =
+    //      u32::MAX, chunk_count = u32::MAX → 2^64 ≫ u64::MAX),
+    //   2. a body that is *larger* than the maximum a header with
+    //      these declared sizes could plausibly carry (i.e. trailing
+    //      bytes after the final chunk → corruption / append attack),
+    //      and
+    //   3. a plaintext size larger than the caller's configured
+    //      `max_body_bytes` (default 5 GiB).
+    //
+    // We do NOT require the body to be `>= max_total` here — the
+    // final chunk may legitimately hold fewer than `chunk_size`
+    // plaintext bytes (encoder uses
+    // `chunk_count = ceil(plaintext.len() / chunk_size)`, so the last
+    // chunk holds the remainder). The walker handles that
+    // variable-length tail; truncation of the final chunk's tag /
+    // ciphertext surfaces as `ChunkFrameTruncated` once the walker
+    // gets there. The pre-alloc guard's job is the *upper-bound*
+    // checks: kill obviously-impossible shapes before we
+    // `Vec::with_capacity(chunk_size × chunk_count)`.
+    //
+    // All paths return concrete error variants; nothing panics on
+    // adversarial input. The error strings carry only constant
+    // operator-readable labels (no echoed numbers) so the response is
+    // not a tampering oracle for the attacker.
+    let chunk_size_u64 = chunk_size as u64;
+    let chunk_count_u64 = chunk_count as u64;
+    let expected_plain_size = chunk_size_u64
+        .checked_mul(chunk_count_u64)
+        .ok_or(SseError::ChunkFrameTooLarge {
+            details: "chunk_size * chunk_count overflows u64",
+        })?;
+    let per_chunk_overhead = S4E5_PER_CHUNK_OVERHEAD as u64; // = 16 (AES-GCM tag)
+    let total_tag_overhead = per_chunk_overhead.checked_mul(chunk_count_u64).ok_or(
+        SseError::ChunkFrameTooLarge {
+            details: "tag_len * chunk_count overflows u64",
+        },
+    )?;
+    let max_total = expected_plain_size
+        .checked_add(total_tag_overhead)
+        .and_then(|t| t.checked_add(header_bytes as u64))
+        .ok_or(SseError::ChunkFrameTooLarge {
+            details: "header + plaintext + tag overhead overflows u64",
+        })?;
+    // Body cannot be *larger* than what the declared geometry could
+    // legitimately produce. Any extra bytes past the final chunk are
+    // either trailing junk (corruption) or an append attack — kill
+    // them here so the walker doesn't even start verifying chunks
+    // for an obviously-malformed body. (The walker's own end-of-loop
+    // `cursor != body.len()` check also catches this; the pre-alloc
+    // guard saves the chunk-walk worth of AES-GCM verifies in the
+    // hostile case.)
+    if (body.len() as u64) > max_total {
+        return Err(SseError::ChunkFrameTruncated {
+            what: "trailing bytes past declared chunk geometry",
+        });
+    }
+    // The actual DoS guard: cap on declared plaintext. If the header
+    // claims more than the operator's configured single-object
+    // ceiling, refuse before the buffered path's
+    // `Vec::with_capacity(chunk_size * chunk_count)` runs.
+    if expected_plain_size > max_body_bytes as u64 {
+        return Err(SseError::ChunkFrameTooLarge {
+            details: "declared plaintext exceeds gateway max_body_bytes",
+        });
+    }
+
     Ok(ChunkedHeader {
         variant,
         key_id,
@@ -1776,9 +1885,10 @@ fn decrypt_chunked_chunk(
 fn walk_chunked<F: FnMut(Bytes) -> Result<(), SseError>>(
     body: &[u8],
     keyring: &SseKeyring,
+    max_body_bytes: usize,
     mut emit: F,
 ) -> Result<(), SseError> {
-    let hdr = parse_chunked_header(body)?;
+    let hdr = parse_chunked_header(body, max_body_bytes)?;
     let key = keyring
         .get(hdr.key_id)
         .ok_or(SseError::KeyNotInKeyring { id: hdr.key_id })?;
@@ -1844,14 +1954,43 @@ fn walk_chunked<F: FnMut(Bytes) -> Result<(), SseError>>(
 /// point of S4E5/S4E6 streaming, but useful for callers that already
 /// need the whole body — e.g. server-side restream-rewrite paths or
 /// unit tests). Accepts both S4E5 (legacy) and S4E6 (current) bodies.
-fn decrypt_chunked_buffered(body: &[u8], keyring: &SseKeyring) -> Result<Bytes, SseError> {
-    let hdr = parse_chunked_header(body)?;
+///
+/// `max_body_bytes` (v0.8.2 #64) caps the declared plaintext size in
+/// the header **before any allocation**. A malicious / corrupted
+/// frame that claims a multi-PB plaintext is rejected as
+/// [`SseError::ChunkFrameTooLarge`] with no `Vec::with_capacity` call
+/// behind it. Callers without a bespoke cap should use
+/// [`decrypt_chunked_buffered_default`] (5 GiB cap).
+pub fn decrypt_chunked_buffered(
+    body: &[u8],
+    keyring: &SseKeyring,
+    max_body_bytes: usize,
+) -> Result<Bytes, SseError> {
+    let hdr = parse_chunked_header(body, max_body_bytes)?;
+    // Header is validated above: chunk_size * chunk_count fits u64
+    // and is ≤ max_body_bytes (≤ 5 GiB on this gateway), so the
+    // `as usize` casts cannot truncate on a 64-bit host. The
+    // `Vec::with_capacity` is therefore bounded by the same cap that
+    // protects the rest of the gateway from oversized PUTs / GETs.
     let mut out = Vec::with_capacity(hdr.chunk_size as usize * hdr.chunk_count as usize);
-    walk_chunked(body, keyring, |chunk| {
+    walk_chunked(body, keyring, max_body_bytes, |chunk| {
         out.extend_from_slice(&chunk);
         Ok(())
     })?;
     Ok(Bytes::from(out))
+}
+
+/// Back-compat wrapper around [`decrypt_chunked_buffered`] that uses
+/// [`DEFAULT_MAX_BODY_BYTES`] (5 GiB — AWS S3's single-object PUT
+/// ceiling). Provided so the existing `decrypt(body, keyring)`
+/// dispatcher and call sites that don't have a bespoke cap can keep
+/// their signature unchanged after the v0.8.2 #64 pre-allocation
+/// guard landed.
+pub fn decrypt_chunked_buffered_default(
+    body: &[u8],
+    keyring: &SseKeyring,
+) -> Result<Bytes, SseError> {
+    decrypt_chunked_buffered(body, keyring, DEFAULT_MAX_BODY_BYTES)
 }
 
 /// v0.8 #52 (S4E5) / v0.8.1 #57 (S4E6): stream-decrypt API for
@@ -1891,7 +2030,16 @@ pub fn decrypt_chunked_stream(
     // the owned `Aes256Gcm` cipher, then store that in the stream
     // state.
     let prelude = (|| {
-        let hdr = parse_chunked_header(&body)?;
+        // v0.8.2 #64: streaming path is naturally memory-bounded
+        // (one chunk-worth of plaintext at a time), so we don't cap
+        // the *declared* total here — the per-chunk loop already
+        // bounds memory by `chunk_size`. The truncation /
+        // arithmetic-overflow checks inside `parse_chunked_header`
+        // still run regardless of `max_body_bytes`, which is what
+        // protects the streaming path from the same DoS class as the
+        // buffered path (the overflow / declared-vs-actual length
+        // mismatches are independent of the gateway cap).
+        let hdr = parse_chunked_header(&body, usize::MAX)?;
         let key = keyring
             .get(hdr.key_id)
             .ok_or(SseError::KeyNotInKeyring { id: hdr.key_id })?;
@@ -3470,6 +3618,252 @@ mod tests {
         assert!(
             matches!(err, SseError::ChunkAuthFailed { chunk_index: 0 }),
             "got {err:?}",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.8.2 #64: pre-allocation guard for chunked SSE frames
+    //
+    // The buffered decrypt path used to call `Vec::with_capacity(chunk_size
+    // * chunk_count)` *before* validating either factor. A 24-byte malicious
+    // S4E6 header could declare a multi-PB plaintext and trigger an instant
+    // OOM / panic on a tiny ciphertext. Verify the guard rejects every
+    // adversarial header pattern before any allocation happens.
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal S4E6 header with attacker-controlled chunk_size /
+    /// chunk_count (no chunks attached — the body is exactly 24 bytes).
+    /// Used by the DoS tests below to synthesize malicious frames without
+    /// running an encrypt.
+    fn synth_s4e6_header(chunk_size: u32, chunk_count: u32) -> Vec<u8> {
+        let mut blob = Vec::with_capacity(S4E6_HEADER_BYTES);
+        blob.extend_from_slice(SSE_MAGIC_V6);
+        blob.push(ALGO_AES_256_GCM);
+        blob.extend_from_slice(&1_u16.to_be_bytes()); // key_id = 1
+        blob.push(0); // reserved
+        blob.extend_from_slice(&chunk_size.to_be_bytes());
+        blob.extend_from_slice(&chunk_count.to_be_bytes());
+        blob.extend_from_slice(&[0u8; 8]); // 8-byte salt
+        debug_assert_eq!(blob.len(), S4E6_HEADER_BYTES);
+        blob
+    }
+
+    #[test]
+    fn s4e6_header_claims_huge_size_rejected_pre_alloc() {
+        // 1 GiB chunk_size × 100 chunks = 100 GiB declared plaintext, but
+        // the body the attacker actually shipped is only 100 bytes. The
+        // pre-alloc guard's cap arm fires (100 GiB > 5 GiB default cap)
+        // *before* the walker / `Vec::with_capacity(100 GiB)` — surfaces
+        // as ChunkFrameTooLarge.
+        let kr = keyring_single(0x01);
+        let chunk_size: u32 = 1 << 30; // 1 GiB
+        let chunk_count: u32 = 100;
+        let mut blob = synth_s4e6_header(chunk_size, chunk_count);
+        // Pad with 100 random bytes — the attack model: tiny payload,
+        // monster header.
+        blob.extend_from_slice(&[0u8; 100]);
+        let err = decrypt_chunked_buffered_default(&blob, &kr).unwrap_err();
+        assert!(
+            matches!(err, SseError::ChunkFrameTooLarge { .. }),
+            "expected ChunkFrameTooLarge (declared 100 GiB > 5 GiB cap), got {err:?}",
+        );
+        // Same input, tighter caller-supplied cap (1 MiB): still
+        // ChunkFrameTooLarge. No panic, no OOM either way.
+        let err2 = decrypt_chunked_buffered(&blob, &kr, 1024 * 1024).unwrap_err();
+        assert!(
+            matches!(err2, SseError::ChunkFrameTooLarge { .. }),
+            "expected ChunkFrameTooLarge under tighter cap, got {err2:?}",
+        );
+    }
+
+    #[test]
+    fn s4e6_header_chunk_size_x_chunk_count_overflows_u64() {
+        // chunk_size = u32::MAX, chunk_count > 1 → product > u64 cap?
+        // No — u32::MAX * u32::MAX fits in u64 (~2^64). To force u64
+        // overflow we'd need both > 2^32. But chunk_count is capped to
+        // 16M (S4E6_MAX_CHUNK_COUNT) by the earlier check, so the
+        // realistic adversarial maximum is u32::MAX * 16M ≈ 2^56 — well
+        // under u64::MAX. The overflow path is therefore *theoretically*
+        // unreachable on S4E6 (24-bit chunk_count cap protects it), but
+        // we still test it via S4E5 which has no 24-bit cap on
+        // chunk_count: a 4-byte salt frame with chunk_size = u32::MAX
+        // and chunk_count = u32::MAX gives 2^64 - 2^33 + 1 — fits u64
+        // but adding the 16-byte tag overhead × u32::MAX chunks
+        // overflows. Verify ChunkFrameTooLarge surfaces.
+        let kr = keyring_single(0x02);
+        // Synthesize an S4E5 header (20 bytes) with maximally
+        // adversarial chunk_size + chunk_count.
+        let mut blob = Vec::with_capacity(S4E5_HEADER_BYTES);
+        blob.extend_from_slice(SSE_MAGIC_V5);
+        blob.push(ALGO_AES_256_GCM);
+        blob.extend_from_slice(&1_u16.to_be_bytes());
+        blob.push(0);
+        blob.extend_from_slice(&u32::MAX.to_be_bytes()); // chunk_size = 2^32 - 1
+        blob.extend_from_slice(&u32::MAX.to_be_bytes()); // chunk_count = 2^32 - 1
+        blob.extend_from_slice(&[0u8; 4]); // 4-byte S4E5 salt
+        debug_assert_eq!(blob.len(), S4E5_HEADER_BYTES);
+        let err = decrypt_chunked_buffered_default(&blob, &kr).unwrap_err();
+        assert!(
+            matches!(err, SseError::ChunkFrameTooLarge { .. }),
+            "expected ChunkFrameTooLarge for u64 overflow, got {err:?}",
+        );
+
+        // Also smoke the same input through `parse_chunked_header`
+        // directly (the streaming path) — must error, never panic.
+        let direct = parse_chunked_header(&blob, usize::MAX).unwrap_err();
+        assert!(
+            matches!(direct, SseError::ChunkFrameTooLarge { .. }),
+            "streaming path: expected ChunkFrameTooLarge, got {direct:?}",
+        );
+    }
+
+    #[test]
+    fn s4e6_header_within_max_body_bytes_passes() {
+        // 1 MiB chunk_size × 100 chunks = 100 MiB declared plaintext —
+        // well under the 5 GiB default cap. The header validation must
+        // NOT reject this; instead it falls through to chunk-walk +
+        // AES-GCM verify (which then fails on this synthetic frame
+        // because we didn't write any ciphertext, so we expect
+        // ChunkFrameTruncated *not* ChunkFrameTooLarge).
+        let kr = keyring_single(0x03);
+        let chunk_size: u32 = 1024 * 1024; // 1 MiB
+        let chunk_count: u32 = 100;
+        let mut blob = synth_s4e6_header(chunk_size, chunk_count);
+        // Append the full declared chunk array so the truncation arm
+        // doesn't fire — 100 chunks × (16 B tag + 1 MiB ct) = 100 MiB
+        // + 1.6 KiB tags. We write zeros; AES-GCM verify will fail on
+        // chunk 0, but that proves the pre-alloc guard *let it through*.
+        let chunk_array_size =
+            (chunk_count as usize) * (S4E6_PER_CHUNK_OVERHEAD + chunk_size as usize);
+        blob.resize(blob.len() + chunk_array_size, 0);
+        let err =
+            decrypt_chunked_buffered(&blob, &kr, DEFAULT_MAX_BODY_BYTES).unwrap_err();
+        // The guard let it through (we got past parse_chunked_header)
+        // and AES-GCM tag verify failed on chunk 0 — that's the right
+        // failure mode. ChunkFrameTooLarge would mean the cap fired
+        // (a regression of this test). KeyNotInKeyring would mean the
+        // header parsed but the key id (1) wasn't present (also a
+        // regression — the keyring has id=1 active). Anything else is
+        // a guard-too-strict bug.
+        assert!(
+            matches!(err, SseError::ChunkAuthFailed { chunk_index: 0 }),
+            "expected ChunkAuthFailed (guard let it through), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn s4e6_header_exceeds_max_body_bytes_rejected() {
+        // 1 MiB × 6000 chunks = 6 GiB declared plaintext > 5 GiB cap.
+        // Must reject as ChunkFrameTooLarge before any alloc. We don't
+        // attach the 6 GiB chunk array to the body — the cap arm only
+        // looks at the declared `chunk_size × chunk_count`, not the
+        // actual body length, so a tiny body suffices to exercise the
+        // cap.
+        let kr = keyring_single(0x04);
+        let chunk_size: u32 = 1024 * 1024; // 1 MiB
+        let chunk_count: u32 = 6000;
+        let blob = synth_s4e6_header(chunk_size, chunk_count);
+        // Body is exactly the 24-byte header, no chunks attached.
+        // body.len() = 24 ≤ max_total (~6 GiB) so the trailing-bytes
+        // check does NOT fire; the 6 GiB > 5 GiB cap check does.
+        let err = decrypt_chunked_buffered(&blob, &kr, DEFAULT_MAX_BODY_BYTES).unwrap_err();
+        assert!(
+            matches!(err, SseError::ChunkFrameTooLarge { .. }),
+            "expected ChunkFrameTooLarge (6 GiB declared > 5 GiB cap), got {err:?}",
+        );
+
+        // Directly exercise the cap arm with a tighter cap (1 MiB)
+        // and a 100 MiB declared plaintext that fits fully in the
+        // body, so the cap is unambiguously the deciding factor.
+        let chunk_size_b: u32 = 1024 * 1024; // 1 MiB
+        let chunk_count_b: u32 = 100;
+        let mut blob_b = synth_s4e6_header(chunk_size_b, chunk_count_b);
+        let pad_b =
+            (chunk_count_b as usize) * (S4E6_PER_CHUNK_OVERHEAD + chunk_size_b as usize);
+        blob_b.resize(blob_b.len() + pad_b, 0);
+        // Cap = 1 MiB, declared plaintext = 100 MiB → ChunkFrameTooLarge.
+        let err_b = decrypt_chunked_buffered(&blob_b, &kr, 1024 * 1024).unwrap_err();
+        assert!(
+            matches!(err_b, SseError::ChunkFrameTooLarge { .. }),
+            "expected ChunkFrameTooLarge (cap < declared), got {err_b:?}",
+        );
+    }
+
+    #[test]
+    fn s4e6_random_header_never_panics() {
+        // DoS regression — feed 100k random byte sequences shaped like
+        // chunked SSE headers to `parse_chunked_header`. Every result
+        // must be Ok or Err; no panic, no OOM. This exercises the
+        // arithmetic-overflow + truncation arms of the v0.8.2 #64
+        // guard against adversarial inputs the previous unit tests
+        // didn't enumerate.
+        //
+        // We use a fixed seed (deterministic) rather than proptest
+        // here so the test is repeatable across CI runs without
+        // pulling in shrink machinery for a pure no-panic property.
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(0xC0FF_EE64_6464_64DE);
+        let mut max_body_bytes_choices = [
+            0_usize,
+            1024,
+            1024 * 1024,
+            DEFAULT_MAX_BODY_BYTES,
+            usize::MAX,
+        ]
+        .iter()
+        .copied()
+        .cycle();
+        for _ in 0..100_000 {
+            // Body length in [0, 256] — tiny on purpose: most random
+            // bytes won't be a valid header, but we want the parser
+            // to robustly reject every shape (truncated, wrong magic,
+            // wrong algo, declared-vs-actual mismatch, overflow).
+            let body_len = rng.gen_range(0..=256_usize);
+            let mut body = vec![0u8; body_len];
+            rng.fill(body.as_mut_slice());
+            // Bias 1/4 of trials toward valid magic so the deeper
+            // arithmetic paths get exercised, not just the BadMagic
+            // early-out.
+            if body_len >= 4 && rng.gen_bool(0.25) {
+                if rng.gen_bool(0.5) {
+                    body[..4].copy_from_slice(SSE_MAGIC_V5);
+                } else {
+                    body[..4].copy_from_slice(SSE_MAGIC_V6);
+                }
+            }
+            let max_cap = max_body_bytes_choices.next().unwrap();
+            // The contract: never panic, never alloc more than
+            // `max_cap` worth of memory. We assert only no-panic
+            // here; OOM behavior is implicit (the function returns
+            // Err before any large alloc).
+            let _ = parse_chunked_header(&body, max_cap);
+        }
+    }
+
+    // Bonus: an extreme-overflow case the guard is specifically
+    // hardened against — chunk_count = u32::MAX with the per-chunk
+    // overhead multiplication forced to overflow u64. Catches a
+    // future refactor that would replace `checked_mul` with `*`.
+    #[test]
+    fn s4e5_extreme_overflow_chunk_count_u32_max() {
+        let kr = keyring_single(0x05);
+        // u32::MAX chunk_size × u32::MAX chunk_count overflows u64
+        // when adding the 16 * u32::MAX tag overhead. (Strictly:
+        // chunk_size × chunk_count = (2^32-1)^2 ≈ 2^64 - 2^33 + 1
+        // — already u64-saturating; the +tag step then overflows.)
+        // The guard's `checked_add` chain must catch this.
+        let mut blob = Vec::with_capacity(S4E5_HEADER_BYTES);
+        blob.extend_from_slice(SSE_MAGIC_V5);
+        blob.push(ALGO_AES_256_GCM);
+        blob.extend_from_slice(&1_u16.to_be_bytes());
+        blob.push(0);
+        blob.extend_from_slice(&u32::MAX.to_be_bytes());
+        blob.extend_from_slice(&u32::MAX.to_be_bytes());
+        blob.extend_from_slice(&[0u8; 4]);
+        let err = decrypt_chunked_buffered_default(&blob, &kr).unwrap_err();
+        assert!(
+            matches!(err, SseError::ChunkFrameTooLarge { .. }),
+            "expected ChunkFrameTooLarge for extreme overflow, got {err:?}",
         );
     }
 }
