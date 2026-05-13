@@ -923,13 +923,42 @@ async fn scan_bucket<B: S3 + Send + Sync + 'static>(
             }
         }
         if output.is_truncated.unwrap_or(false) {
-            continuation = output.next_continuation_token;
-            if continuation.is_none() {
-                // Defensive: AWS guarantees a NextContinuationToken when
-                // is_truncated=true, but a malformed backend could omit
-                // it; break to avoid an infinite loop.
+            // v0.8.4 #78 (audit M3): pagination guard hardening. AWS
+            // guarantees `NextContinuationToken` when `is_truncated=true`
+            // and that the token always advances, but a malformed
+            // backend (or a third-party S3 emulator with a buggy
+            // listing implementation) can break either invariant. Two
+            // failure modes are now caught explicitly with a
+            // `tracing::warn` so operators see the divergence rather
+            // than spinning forever:
+            //   1. `is_truncated=true` with `next_continuation_token=None`
+            //   2. `next_continuation_token` repeats the previous value
+            //      (caller would re-issue the identical request → same
+            //      page → infinite loop)
+            // Either condition exits the pagination loop for this scan
+            // tick; the next scheduled tick re-enters from the start
+            // marker, so transient backend bugs self-recover.
+            let next = output.next_continuation_token.clone();
+            if next.is_none() {
+                warn!(
+                    bucket = %bucket,
+                    "S4 lifecycle: list_objects_v2 pagination stuck — \
+                     is_truncated=true but next_continuation_token \
+                     missing; breaking loop to avoid spin",
+                );
                 break;
             }
+            if next == continuation {
+                warn!(
+                    bucket = %bucket,
+                    token = ?continuation,
+                    "S4 lifecycle: list_objects_v2 pagination stuck — \
+                     same continuation_token repeated; breaking loop \
+                     to avoid spin",
+                );
+                break;
+            }
+            continuation = next;
         } else {
             break;
         }
@@ -1077,13 +1106,40 @@ async fn scan_in_flight_multipart_uploads<B: S3 + Send + Sync + 'static>(
             }
         }
         if output.is_truncated.unwrap_or(false) {
-            // AWS guarantees both NextKeyMarker and (when present)
-            // NextUploadIdMarker on a truncated response. Defensive
-            // break when neither moved (avoid infinite loop on a
-            // misbehaving backend).
-            let next_key = output.next_key_marker;
-            let next_upload_id = output.next_upload_id_marker;
+            // v0.8.4 #78 (audit M3): pagination guard hardening — same
+            // shape as the `scan_bucket` continuation-token guard above
+            // but for the (key_marker, upload_id_marker) pair. AWS
+            // guarantees `NextKeyMarker` (and `NextUploadIdMarker` when
+            // an in-flight upload boundary lands inside a key) on
+            // truncated responses, but a malformed backend can:
+            //   1. set `is_truncated=true` and omit BOTH next markers
+            //      (the next iteration re-issues the same request →
+            //      same page → infinite loop), or
+            //   2. echo the same marker pair back (same outcome).
+            // Both modes warn-log and break — the next scheduled scan
+            // re-enters from the original markers, so a transient
+            // backend bug self-recovers.
+            let next_key = output.next_key_marker.clone();
+            let next_upload_id = output.next_upload_id_marker.clone();
+            if next_key.is_none() && next_upload_id.is_none() {
+                warn!(
+                    bucket = %bucket,
+                    "S4 lifecycle: list_multipart_uploads pagination \
+                     stuck — is_truncated=true but both \
+                     next_key_marker and next_upload_id_marker \
+                     missing; breaking loop to avoid spin",
+                );
+                break;
+            }
             if next_key == key_marker && next_upload_id == upload_id_marker {
+                warn!(
+                    bucket = %bucket,
+                    key_marker = ?key_marker,
+                    upload_id_marker = ?upload_id_marker,
+                    "S4 lifecycle: list_multipart_uploads pagination \
+                     stuck — same (key_marker, upload_id_marker) pair \
+                     repeated; breaking loop to avoid spin",
+                );
                 break;
             }
             key_marker = next_key;
@@ -2212,5 +2268,215 @@ mod tests {
             Some(1),
             "v0.8.3 #69: abort_incomplete_multipart counter must be 1",
         );
+    }
+
+    // ---- v0.8.4 #78 (audit M3): pagination guard hardening ------------
+    //
+    // The two backends below intentionally return malformed truncated
+    // responses on the FIRST call to the offending list endpoint:
+    //   * `MalformedListObjectsBackend.list_objects_v2` returns
+    //     `is_truncated=true, next_continuation_token=None`
+    //   * `MalformedListMultipartBackend.list_multipart_uploads`
+    //     returns `is_truncated=true, next_key_marker=None,
+    //     next_upload_id_marker=None`
+    // Each backend tracks call count via a `StdMutex<u32>`. If the
+    // pagination guard fails to break, the second iteration re-issues
+    // the same request and the backend `panic!()`s — turning the
+    // infinite loop into a deterministic test failure (and avoiding
+    // the alternative "test hangs forever" outcome which would block
+    // CI).
+    //
+    // Both backends pair the malformed list with a benign no-op for
+    // the OTHER list endpoint so `run_scan_once` (which always invokes
+    // both `scan_bucket` and `scan_in_flight_multipart_uploads`) does
+    // not collide with the path under test.
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Backend whose `list_objects_v2` is malformed (`is_truncated=true`
+    /// with `next_continuation_token=None`); `list_multipart_uploads`
+    /// is a benign empty non-truncated response. A second
+    /// `list_objects_v2` call panics — proving the v0.8.4 #78 guard
+    /// short-circuits the pagination loop.
+    #[derive(Default)]
+    struct MalformedListObjectsBackend {
+        list_calls: AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl S3 for MalformedListObjectsBackend {
+        async fn list_objects_v2(
+            &self,
+            req: S3Request<dto2::ListObjectsV2Input>,
+        ) -> S3Result<S3Response<dto2::ListObjectsV2Output>> {
+            let n = self.list_calls.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                n == 0,
+                "v0.8.4 #78: list_objects_v2 must be called exactly \
+                 once when the guard fires; got call #{} which means \
+                 the pagination loop did not break on a missing \
+                 next_continuation_token",
+                n + 1
+            );
+            Ok(S3Response::new(dto2::ListObjectsV2Output {
+                name: Some(req.input.bucket.clone()),
+                contents: Some(Vec::new()),
+                key_count: Some(0),
+                is_truncated: Some(true),
+                next_continuation_token: None,
+                ..Default::default()
+            }))
+        }
+
+        async fn list_multipart_uploads(
+            &self,
+            req: S3Request<dto2::ListMultipartUploadsInput>,
+        ) -> S3Result<S3Response<dto2::ListMultipartUploadsOutput>> {
+            // Benign: empty + not-truncated. The multipart path is not
+            // under test here; we just need it to no-op cleanly so
+            // `run_scan_once` walks both and the assertion isolates
+            // the object-list guard.
+            Ok(S3Response::new(dto2::ListMultipartUploadsOutput {
+                bucket: Some(req.input.bucket),
+                uploads: Some(Vec::new()),
+                is_truncated: Some(false),
+                ..Default::default()
+            }))
+        }
+    }
+
+    /// Backend whose `list_multipart_uploads` is malformed
+    /// (`is_truncated=true` with both `next_key_marker=None` and
+    /// `next_upload_id_marker=None`); `list_objects_v2` is benign.
+    /// Second `list_multipart_uploads` call panics.
+    #[derive(Default)]
+    struct MalformedListMultipartBackend {
+        mp_calls: AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl S3 for MalformedListMultipartBackend {
+        async fn list_objects_v2(
+            &self,
+            req: S3Request<dto2::ListObjectsV2Input>,
+        ) -> S3Result<S3Response<dto2::ListObjectsV2Output>> {
+            // Benign: empty + not-truncated.
+            Ok(S3Response::new(dto2::ListObjectsV2Output {
+                name: Some(req.input.bucket),
+                contents: Some(Vec::new()),
+                key_count: Some(0),
+                is_truncated: Some(false),
+                ..Default::default()
+            }))
+        }
+
+        async fn list_multipart_uploads(
+            &self,
+            req: S3Request<dto2::ListMultipartUploadsInput>,
+        ) -> S3Result<S3Response<dto2::ListMultipartUploadsOutput>> {
+            let n = self.mp_calls.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                n == 0,
+                "v0.8.4 #78: list_multipart_uploads must be called \
+                 exactly once when the guard fires; got call #{} \
+                 which means the pagination loop did not break on \
+                 missing (next_key_marker, next_upload_id_marker)",
+                n + 1
+            );
+            Ok(S3Response::new(dto2::ListMultipartUploadsOutput {
+                bucket: Some(req.input.bucket),
+                uploads: Some(Vec::new()),
+                is_truncated: Some(true),
+                next_key_marker: None,
+                next_upload_id_marker: None,
+                ..Default::default()
+            }))
+        }
+    }
+
+    /// v0.8.4 #78 (audit M3): a backend that lies about
+    /// `list_objects_v2` truncation (sets `is_truncated=true` but omits
+    /// `next_continuation_token`) must NOT cause the lifecycle scanner
+    /// to spin. The guard in `scan_bucket` warn-logs and breaks the
+    /// loop after the first malformed page; the backend's call counter
+    /// + assertion turns any regression into an immediate panic
+    /// instead of a test hang. The scan completes cleanly with
+    /// `buckets_scanned = 1` and no actions taken (the malformed page
+    /// has zero contents).
+    #[tokio::test]
+    async fn scan_handles_truncated_with_missing_marker_without_infinite_loop()
+    {
+        let backend = MalformedListObjectsBackend::default();
+        let bucket = "lc-malformed-list-78";
+        let registry = Arc::new(
+            CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)),
+        );
+        let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
+        let mgr = Arc::new(LifecycleManager::new());
+        // Any rule will do — the malformed listing returns zero
+        // contents so the evaluator never sees a key. We just need
+        // the bucket to be in `mgr.buckets()` so `scan_bucket` runs.
+        mgr.put(
+            bucket,
+            LifecycleConfig {
+                rules: vec![LifecycleRule::expire_after_days("r", 0)],
+            },
+        );
+        let s4 = Arc::new(
+            S4Service::new(backend, registry, dispatcher).with_lifecycle(Arc::clone(&mgr)),
+        );
+
+        // The decisive assertion is "this future completes" — if the
+        // guard regressed, the second `list_objects_v2` call panics
+        // (per the backend's `assert!`) and the test fails. We also
+        // sanity-check the report shape: scanner saw the bucket but
+        // took no actions (zero contents in the malformed page).
+        let report = run_scan_once(&s4).await.expect("scan");
+        assert_eq!(report.buckets_scanned, 1);
+        assert_eq!(report.objects_evaluated, 0);
+        assert_eq!(report.expired, 0);
+        assert_eq!(report.transitioned, 0);
+        assert_eq!(report.action_errors, 0);
+    }
+
+    /// v0.8.4 #78 (audit M3): same guarantee for the multipart sweep
+    /// — a backend that returns `is_truncated=true` with both
+    /// `next_key_marker=None` and `next_upload_id_marker=None` must
+    /// NOT cause `scan_in_flight_multipart_uploads` to spin. Second
+    /// `list_multipart_uploads` call panics if the guard regresses.
+    #[tokio::test]
+    async fn scan_multipart_handles_truncated_with_missing_marker_without_infinite_loop()
+    {
+        let backend = MalformedListMultipartBackend::default();
+        let bucket = "lc-malformed-mp-78";
+        let registry = Arc::new(
+            CodecRegistry::new(CodecKind::Passthrough).with(Arc::new(Passthrough)),
+        );
+        let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::Passthrough));
+        let mgr = Arc::new(LifecycleManager::new());
+        // Rule with `abort_incomplete_multipart_upload_days = Some(7)`
+        // so the multipart-evaluator path is reachable (the rule body
+        // is otherwise irrelevant — the malformed listing has zero
+        // uploads).
+        let mut rule = LifecycleRule {
+            id: "abort-7d".into(),
+            status: LifecycleStatus::Enabled,
+            filter: LifecycleFilter::default(),
+            expiration_days: None,
+            expiration_date: None,
+            transitions: Vec::new(),
+            noncurrent_version_expiration_days: None,
+            abort_incomplete_multipart_upload_days: Some(7),
+        };
+        rule.filter.prefix = Some("uploads/".into());
+        mgr.put(bucket, LifecycleConfig { rules: vec![rule] });
+        let s4 = Arc::new(
+            S4Service::new(backend, registry, dispatcher).with_lifecycle(Arc::clone(&mgr)),
+        );
+
+        let report = run_scan_once(&s4).await.expect("scan");
+        assert_eq!(report.buckets_scanned, 1);
+        assert_eq!(report.aborted_multipart, 0);
+        assert_eq!(report.action_errors, 0);
     }
 }
