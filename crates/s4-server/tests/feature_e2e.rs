@@ -1929,3 +1929,1129 @@ async fn mfa_delete_through_aws_sdk() {
     let _ = spawned.shutdown.send(());
 }
 
+// =============================================================================
+// v0.8 #54 — Multipart × SSE / Versioning / Object-Lock / Tagging interaction E2E.
+// =============================================================================
+//
+// v0.7 #48 surfaced 4 wire bugs (BUG-1 .. BUG-4) on the **single-shot**
+// `put_object` SSE path. Those are fixed. v0.8 #54 walks the complementary
+// **multipart** wire path (CreateMultipartUpload → UploadPart × N →
+// CompleteMultipartUpload) crossed with the same feature axes — SSE-S4 /
+// SSE-C / SSE-KMS / Versioning / Object Lock / Tagging / Replication —
+// because the multipart code path in `service.rs` has its own branches
+// (`create_multipart_upload` ~L3172, `upload_part` ~L3192,
+// `complete_multipart_upload` ~L3260) and the v0.7 fixes did not reach
+// any of them. Each test is wire-level (aws-sdk-s3 → S4 listener → MinIO
+// container) and exercises a 3-part 5 MiB multipart so the realistic
+// CreateMultipart / UploadPart / Complete sequence is on the wire.
+//
+// Tests fall into two categories:
+//
+//   - Bug-discovery: when the multipart × feature interaction is broken
+//     in `service.rs` (no SSE encryption hook on UploadPart, no version-id
+//     mint on CompleteMultipartUpload, etc), the test FAILS with a
+//     `BUG-N` eprintln so CI loudly surfaces the regression. Source fixes
+//     are explicitly out of scope for v0.8 #54 (per spec).
+//
+//   - Sanity: features that are not gated on the multipart path (the
+//     no-SSE happy path, abort-multipart, mismatched-etag rejection)
+//     are kept as plain pass/fail gates so the file documents the full
+//     wire contract for the multipart code path.
+//
+// `HashMap` is already in scope from the v0.7 #47 SigV4a section
+// (`use std::collections::HashMap;` at L242) — no re-import needed.
+
+/// Encryption recipe passed to [`do_3part_multipart_upload`]. Mirrors the
+/// shape of the SSE branches inside `service::put_object` so each test
+/// can pick exactly one without ceremony.
+#[derive(Clone)]
+enum SseConfig {
+    None,
+    SseS4,
+    SseC { key: [u8; 32] },
+    SseKms { key_id: String },
+}
+
+/// Drive a canonical 3-part 5 MiB multipart upload through `s4_client`,
+/// applying the supplied `SseConfig` to CreateMultipart **and** every
+/// UploadPart **and** CompleteMultipart (the AWS spec requires SSE-C
+/// headers on every step of a multipart upload — same key consistently;
+/// SSE-S4 / SSE-KMS only need them on Create, but we mirror them
+/// throughout for parity with how aws-sdk-s3 actually serialises them on
+/// the wire).
+///
+/// Returns `(etag, full_payload)` so the caller can re-fetch via GET
+/// and assert the round-trip.
+///
+/// Each part is exactly 5 MiB so it satisfies S3's non-final-part
+/// minimum without padding gymnastics (the v0.2 `pad_to_minimum` heuristic
+/// in `service::upload_part` is a no-op once the framed bytes already
+/// exceed `S3_MULTIPART_MIN_PART_BYTES`).
+async fn do_3part_multipart_upload(
+    s4_client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    sse_config: SseConfig,
+    extra_meta: HashMap<String, String>,
+) -> (String, Vec<u8>) {
+    use base64::Engine as _;
+
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+    fn make_part(seed: u8, size: usize) -> bytes::Bytes {
+        let mut buf = Vec::with_capacity(size);
+        let pattern = format!("MP-PART-{seed:02x}-payload-block ");
+        while buf.len() < size {
+            buf.extend_from_slice(pattern.as_bytes());
+        }
+        buf.truncate(size);
+        bytes::Bytes::from(buf)
+    }
+    let parts = [
+        make_part(0xa1, PART_SIZE),
+        make_part(0xb2, PART_SIZE),
+        make_part(0xc3, PART_SIZE),
+    ];
+    let mut full = Vec::with_capacity(PART_SIZE * 3);
+    for p in &parts {
+        full.extend_from_slice(p);
+    }
+
+    // CreateMultipartUpload — apply SSE config + extra metadata. The
+    // aws-sdk-s3 builder serialises these onto the
+    // `?uploads&` POST exactly like a real workload.
+    let mut create = s4_client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key);
+    if !extra_meta.is_empty() {
+        for (k, v) in &extra_meta {
+            create = create.metadata(k, v);
+        }
+    }
+    let (sse_c_key_b64, sse_c_md5_b64) = match &sse_config {
+        SseConfig::SseS4 => {
+            // SSE-S4 has no AWS-compatible header on Create — the
+            // gateway picks up the keyring on its own. Nothing to set
+            // on the SDK builder here.
+            (None, None)
+        }
+        SseConfig::SseC { key } => {
+            let key_b64 = base64::engine::general_purpose::STANDARD.encode(key);
+            let md5_b64 = base64::engine::general_purpose::STANDARD
+                .encode(s4_server::sse::compute_key_md5(key));
+            create = create
+                .sse_customer_algorithm("AES256")
+                .sse_customer_key(key_b64.clone())
+                .sse_customer_key_md5(md5_b64.clone());
+            (Some(key_b64), Some(md5_b64))
+        }
+        SseConfig::SseKms { key_id } => {
+            create = create
+                .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+                .ssekms_key_id(key_id);
+            (None, None)
+        }
+        SseConfig::None => (None, None),
+    };
+    // v0.8 #54 BUG-10 detection: when the gateway forwards SSE-C /
+    // SSE-KMS request headers to the backend instead of consuming them
+    // (no SSE branch in `create_multipart_upload`), MinIO rejects with
+    // `InvalidRequest` (SSE-C requires HTTPS) or `NotImplemented`
+    // (SSE-KMS requires MinIO to have KMS configured). The single-PUT
+    // path was fixed as v0.7 #48 BUG-2/3 by `take()`-ing these fields
+    // off `req.input` before forwarding; the multipart Create handler
+    // needs the same treatment. We surface this with a focused
+    // panic-with-BUG-10 so CI surfaces it loudly.
+    let create_resp = match create.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let dbg = format!("{e:?}");
+            let is_sse = matches!(
+                sse_config,
+                SseConfig::SseC { .. } | SseConfig::SseKms { .. }
+            );
+            if is_sse
+                && (dbg.contains("InvalidRequest")
+                    || dbg.contains("NotImplemented")
+                    || dbg.contains("must be made over a secure connection")
+                    || dbg.contains("KMS is not configured"))
+            {
+                eprintln!(
+                    "v0.8 #54 BUG-10: CreateMultipartUpload forwarded SSE-C/SSE-KMS \
+                     headers to the backend (MinIO) instead of consuming them at the \
+                     gateway. Same root cause as v0.7 #48 BUG-2/3 (fixed for put_object \
+                     at service.rs L1826) but the multipart Create handler L3172 has \
+                     no equivalent take()/strip step. Backend reply: {dbg}"
+                );
+                panic!(
+                    "BUG-10: SSE headers forwarded to backend on CreateMultipartUpload \
+                     ({bucket}/{key})"
+                );
+            }
+            panic!("create_multipart_upload({bucket}/{key}) failed: {dbg}");
+        }
+    };
+    let upload_id = create_resp
+        .upload_id()
+        .expect("upload_id")
+        .to_string();
+
+    // UploadPart × 3 — for SSE-C, the same key headers MUST be on every
+    // UploadPart (AWS spec: "if you specify a customer-provided
+    // encryption key when initiating the multipart upload, you must
+    // include the same headers in subsequent upload part requests").
+    let mut completed_parts = Vec::with_capacity(3);
+    for (i, part_body) in parts.iter().enumerate() {
+        let pn = (i + 1) as i32;
+        let mut up = s4_client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(pn)
+            .body(part_body.clone().into());
+        if let (Some(k), Some(m)) = (sse_c_key_b64.as_ref(), sse_c_md5_b64.as_ref()) {
+            up = up
+                .sse_customer_algorithm("AES256")
+                .sse_customer_key(k.clone())
+                .sse_customer_key_md5(m.clone());
+        }
+        let resp = up
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("upload_part {pn} failed: {e:?}"));
+        completed_parts.push(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .e_tag(resp.e_tag().unwrap_or_default())
+                .part_number(pn)
+                .build(),
+        );
+    }
+
+    // CompleteMultipartUpload. SSE-C headers are NOT required on
+    // Complete per the spec, but the AWS Rust SDK accepts them; we
+    // intentionally omit them to mirror the canonical client shape and
+    // keep the test pass/fail focused on the gateway logic.
+    let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+        .set_parts(Some(completed_parts))
+        .build();
+    let complete_resp = s4_client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(completed)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("complete_multipart_upload failed: {e:?}"));
+    let etag = complete_resp.e_tag().unwrap_or_default().to_string();
+    (etag, full)
+}
+
+// ---------------------------------------------------------------------------
+// 1) Multipart × SSE-S4 — round-trip through the gateway keyring.
+// ---------------------------------------------------------------------------
+//
+// SSE-S4 (gateway-internal AES-256-GCM under a server-side keyring) on
+// the multipart path SHOULD apply per-frame encryption inside
+// `upload_part`, mirroring how the single-PUT path at `put_object`
+// ~L1949 does. A direct backend GET should see S4E2 magic; the
+// per-object metadata flag `s4-encrypted: aes-256-gcm` should be
+// stamped on the parent object.
+//
+// ## v0.8 #54 EXPECTED BUG-5
+//
+// `service::upload_part` (~L3192) has NO SSE branch. The plaintext part
+// bytes are framed (S4F2) and PUT to MinIO unencrypted. This is a
+// **silent data-leak** — operators believe SSE-S4 is on, but the
+// multipart object on disk is plaintext. The test FAILS with a `BUG-5`
+// eprintln so CI surfaces the regression. Fix scope: add the same SSE
+// encrypt branch from `put_object` (1834-1949) into `upload_part`, plus
+// stamp `s4-encrypted` / `s4-sse-type` metadata on the parent object via
+// `complete_multipart_upload`.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn multipart_sse_s4_round_trip() {
+    let minio = start_minio().await;
+    let key = [0xa3u8; 32];
+    let spawned = spawn_s4_with_options(
+        &minio.endpoint_url,
+        S4TestOpts::default().with_sse_s4_key(key),
+    )
+    .await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    ensure_bucket(&backend_client, "mp-sse-s4").await;
+    let s4_client = build_aws_client_v2(&spawned.endpoint_url);
+
+    let (_etag, full) = do_3part_multipart_upload(
+        &s4_client,
+        "mp-sse-s4",
+        "obj",
+        SseConfig::SseS4,
+        HashMap::new(),
+    )
+    .await;
+
+    // GET via S4 must round-trip the original plaintext bytes.
+    let resp = s4_client
+        .get_object()
+        .bucket("mp-sse-s4")
+        .key("obj")
+        .send()
+        .await
+        .expect("get");
+    let got = resp.body.collect().await.expect("body").into_bytes();
+    assert_eq!(got.len(), full.len(), "round-trip length must match");
+    assert_eq!(got.as_ref(), full.as_slice(), "round-trip bytes must match");
+
+    // Direct backend read — multipart bytes on MinIO must be encrypted
+    // (no plaintext leak). The current production behaviour leaks the
+    // first part's plaintext (`MP-PART-a1-payload-block`) inside the
+    // S4F2 frame payload — we look for that signature and FAIL the test
+    // with a BUG-5 eprintln when found.
+    let raw = backend_client
+        .get_object()
+        .bucket("mp-sse-s4")
+        .key("obj")
+        .send()
+        .await
+        .expect("raw get");
+    let raw_meta = raw.metadata().cloned().unwrap_or_default();
+    let raw_bytes = raw.body.collect().await.expect("raw body").into_bytes();
+    let leaks_plaintext = raw_bytes.windows(20).any(|w| w == b"MP-PART-a1-payload-b");
+    let has_sse_marker = raw_meta.get("s4-encrypted").map(String::as_str)
+        == Some("aes-256-gcm");
+    if leaks_plaintext || !has_sse_marker {
+        eprintln!(
+            "v0.8 #54 BUG-5: multipart × SSE-S4 plaintext on disk (leak={leaks_plaintext}, \
+             s4-encrypted-marker={has_sse_marker:?}). service::upload_part has no SSE \
+             branch — the per-part body is framed unencrypted and the parent object lacks \
+             the gateway-internal encryption marker. Fix in crates/s4-server/src/service.rs \
+             (mirror put_object's SSE encrypt branch into upload_part + stamp s4-encrypted \
+             on complete_multipart_upload)."
+        );
+        panic!("BUG-5: multipart × SSE-S4 leaks plaintext to backend (raw bytes were not encrypted)");
+    }
+
+    let _ = spawned.shutdown.send(());
+}
+
+// ---------------------------------------------------------------------------
+// 2) Multipart × SSE-C — wrong key on GET must 403.
+// ---------------------------------------------------------------------------
+//
+// SSE-C wire shape on multipart: same `x-amz-server-side-encryption-
+// customer-{algorithm,key,key-MD5}` triple on Create + every UploadPart.
+//
+// Two compounding bugs surface here:
+//
+//   - BUG-10 (header leak): `create_multipart_upload` forwards the
+//     SSE-C headers to MinIO instead of consuming them at the gateway.
+//     MinIO rejects with `InvalidRequest` (SSE-C requires HTTPS). This
+//     is the first failure the test hits. Once BUG-10 is fixed and
+//     CreateMultipart succeeds at the gateway, BUG-5 (no SSE branch
+//     in `upload_part`) becomes the next failure: the part body is
+//     stored plaintext, so the wrong-key GET also succeeds.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn multipart_sse_c_round_trip() {
+    use base64::Engine as _;
+
+    let minio = start_minio().await;
+    let spawned = spawn_s4_with_options(&minio.endpoint_url, S4TestOpts::default()).await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    ensure_bucket(&backend_client, "mp-sse-c").await;
+    let s4_client = build_aws_client_v2(&spawned.endpoint_url);
+
+    let cust_key = [0xa5u8; 32];
+    let key_b64 = base64::engine::general_purpose::STANDARD.encode(cust_key);
+    let md5_b64 = base64::engine::general_purpose::STANDARD
+        .encode(s4_server::sse::compute_key_md5(&cust_key));
+
+    let (_etag, full) = do_3part_multipart_upload(
+        &s4_client,
+        "mp-sse-c",
+        "obj",
+        SseConfig::SseC { key: cust_key },
+        HashMap::new(),
+    )
+    .await;
+
+    // Same key → bytes round-trip exactly.
+    let get = s4_client
+        .get_object()
+        .bucket("mp-sse-c")
+        .key("obj")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(key_b64.clone())
+        .sse_customer_key_md5(md5_b64.clone())
+        .send()
+        .await
+        .expect("get with correct SSE-C key");
+    let got = get.body.collect().await.expect("body").into_bytes();
+    assert_eq!(got.len(), full.len(), "SSE-C multipart round-trip length");
+    assert_eq!(got.as_ref(), full.as_slice(), "SSE-C multipart bytes match");
+
+    // Wrong key → MUST be 403. If this succeeds, the multipart object
+    // is plaintext on disk (BUG-5).
+    let wrong_key = [0xb6u8; 32];
+    let wrong_key_b64 = base64::engine::general_purpose::STANDARD.encode(wrong_key);
+    let wrong_md5_b64 = base64::engine::general_purpose::STANDARD
+        .encode(s4_server::sse::compute_key_md5(&wrong_key));
+    let res = s4_client
+        .get_object()
+        .bucket("mp-sse-c")
+        .key("obj")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(wrong_key_b64)
+        .sse_customer_key_md5(wrong_md5_b64)
+        .send()
+        .await;
+    match res {
+        Ok(_) => {
+            eprintln!(
+                "v0.8 #54 BUG-5 (multipart × SSE-C variant): wrong-key GET succeeded — \
+                 indicates multipart object body was stored plaintext on the backend \
+                 (upload_part skipped SSE-C encryption). Same root cause as BUG-5 in \
+                 multipart_sse_s4_round_trip. Fix: mirror put_object's SSE-C branch \
+                 (service.rs L1834-L1949) into upload_part."
+            );
+            panic!("BUG-5 (SSE-C variant): wrong key on multipart object did NOT fail");
+        }
+        Err(err) => {
+            let dbg = format!("{err:?}");
+            assert!(
+                dbg.contains("AccessDenied") || dbg.contains("403"),
+                "wrong SSE-C key on multipart must surface AccessDenied / 403; got: {dbg}"
+            );
+        }
+    }
+
+    let _ = spawned.shutdown.send(());
+}
+
+// ---------------------------------------------------------------------------
+// 3) Multipart × SSE-KMS — HEAD must echo aws:kms.
+// ---------------------------------------------------------------------------
+//
+// SSE-KMS multipart wire shape: `x-amz-server-side-encryption: aws:kms`
+// + `x-amz-server-side-encryption-aws-kms-key-id: <id>` on Create. The
+// gateway should generate a per-object DEK, wrap under the named KEK
+// (or the default), encrypt every UploadPart body, and stamp the
+// canonical `s4-sse-type: aws:kms` + `s4-sse-kms-key-id` metadata so a
+// later HEAD echoes the AWS-compatible headers.
+//
+// ## v0.8 #54 EXPECTED BUGS — BUG-10 surfaces first, BUG-5 second.
+//
+// BUG-10: `create_multipart_upload` forwards `x-amz-server-side-
+// encryption: aws:kms` to MinIO, which replies `NotImplemented` (MinIO
+// has no KMS configured). The gateway should `take()` the SSE-KMS
+// fields off `req.input` like the single-PUT path does (v0.7 #48
+// BUG-2/3 fix at service.rs L1826) and handle envelope encryption
+// internally. Once BUG-10 is fixed, BUG-5 becomes the next failure:
+// `upload_part` has no SSE branch, so the part body is stored
+// plaintext and HEAD never echoes `aws:kms` (the `s4-sse-type`
+// metadata is never stamped on Complete).
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn multipart_sse_kms_round_trip() {
+    let minio = start_minio().await;
+    let kek_alpha = [0x33u8; 32];
+    let spawned = spawn_s4_with_options(
+        &minio.endpoint_url,
+        S4TestOpts::default()
+            .with_kms_local(vec![("alpha".into(), kek_alpha)], Some("alpha".into())),
+    )
+    .await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    ensure_bucket(&backend_client, "mp-sse-kms").await;
+    let s4_client = build_aws_client_v2(&spawned.endpoint_url);
+
+    let (_etag, full) = do_3part_multipart_upload(
+        &s4_client,
+        "mp-sse-kms",
+        "obj",
+        SseConfig::SseKms { key_id: "alpha".into() },
+        HashMap::new(),
+    )
+    .await;
+
+    // GET must round-trip transparently (gateway decrypts using the
+    // wrapped DEK). On the broken path this still succeeds because the
+    // body is plaintext on disk — the actual failure surfaces on HEAD
+    // below.
+    let resp = s4_client
+        .get_object()
+        .bucket("mp-sse-kms")
+        .key("obj")
+        .send()
+        .await
+        .expect("get SSE-KMS multipart");
+    let got = resp.body.collect().await.expect("body").into_bytes();
+    assert_eq!(got.len(), full.len(), "SSE-KMS multipart length");
+    assert_eq!(got.as_ref(), full.as_slice(), "SSE-KMS multipart bytes");
+
+    // HEAD must echo `aws:kms` + the key id. This relies on the
+    // multipart Complete handler stamping `s4-sse-type` + `s4-sse-kms-
+    // key-id` — neither is wired today.
+    let head = s4_client
+        .head_object()
+        .bucket("mp-sse-kms")
+        .key("obj")
+        .send()
+        .await
+        .expect("head SSE-KMS multipart");
+    let echoed = head.server_side_encryption();
+    let echoed_key_id = head.ssekms_key_id();
+    if echoed != Some(&aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+        || echoed_key_id != Some("alpha")
+    {
+        eprintln!(
+            "v0.8 #54 BUG-5 (SSE-KMS variant): HEAD did not echo aws:kms / key-id (got \
+             sse={echoed:?}, key_id={echoed_key_id:?}). Multipart Complete handler \
+             never stamps s4-sse-type / s4-sse-kms-key-id metadata. Fix: in \
+             complete_multipart_upload, mirror put_object's metadata-stamp branch \
+             (service.rs ~L1901) and route the per-part body through the SSE-KMS \
+             encrypt path inside upload_part."
+        );
+        panic!(
+            "BUG-5 (SSE-KMS variant): HEAD missing aws:kms echo for multipart object"
+        );
+    }
+
+    let _ = spawned.shutdown.send(());
+}
+
+// ---------------------------------------------------------------------------
+// 4) Multipart × Versioning — Complete must mint a version-id.
+// ---------------------------------------------------------------------------
+//
+// Versioned bucket: PutBucketVersioning(Enabled), then a 3-part
+// multipart upload. CompleteMultipartUpload should mint a version-id
+// (via the VersioningManager), the response should carry it, and
+// ListObjectVersions should see exactly one entry. GET ?versionId=<vid>
+// must return the original payload.
+//
+// ## v0.8 #54 EXPECTED BUG-6
+//
+// `complete_multipart_upload` has no versioning hook — versions are
+// minted exclusively in `put_object` (~L1968). Multipart objects on a
+// versioned bucket get NO version-id, ListObjectVersions sees the
+// object only as a "null"-version entry, and GET ?versionId= cannot
+// resolve. Fix: replicate the `pending_version` mint + shadow-key
+// rewrite from put_object inside complete_multipart_upload (or
+// upstream of it).
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn multipart_versioning_round_trip() {
+    let minio = start_minio().await;
+    let spawned = spawn_s4_with_options(
+        &minio.endpoint_url,
+        S4TestOpts::default().with_versioning(),
+    )
+    .await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    ensure_bucket(&backend_client, "mp-ver").await;
+    let s4_client = build_aws_client_v2(&spawned.endpoint_url);
+
+    s4_client
+        .put_bucket_versioning()
+        .bucket("mp-ver")
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("PutBucketVersioning(Enabled)");
+
+    // Capture the version_id returned by Complete (this is where the
+    // bug surfaces today — Complete returns None / empty on the
+    // versioning-aware bucket).
+    let parts_payload = {
+        // Inline this so we can capture Complete's version_id directly
+        // (the helper drops it). We still reuse the helper's per-part
+        // construction to keep the fixture identical to the SSE tests.
+        const PART_SIZE: usize = 5 * 1024 * 1024;
+        fn make_part(seed: u8) -> bytes::Bytes {
+            let mut buf = Vec::with_capacity(PART_SIZE);
+            let pattern = format!("VER-{seed:02x}-block ");
+            while buf.len() < PART_SIZE {
+                buf.extend_from_slice(pattern.as_bytes());
+            }
+            buf.truncate(PART_SIZE);
+            bytes::Bytes::from(buf)
+        }
+        let parts = [make_part(0xa1), make_part(0xb2), make_part(0xc3)];
+        let mut full = Vec::with_capacity(PART_SIZE * 3);
+        for p in &parts {
+            full.extend_from_slice(p);
+        }
+        let create = s4_client
+            .create_multipart_upload()
+            .bucket("mp-ver")
+            .key("obj")
+            .send()
+            .await
+            .expect("create");
+        let upload_id = create.upload_id().expect("upload_id").to_string();
+        let mut completed_parts = Vec::with_capacity(3);
+        for (i, p) in parts.iter().enumerate() {
+            let pn = (i + 1) as i32;
+            let resp = s4_client
+                .upload_part()
+                .bucket("mp-ver")
+                .key("obj")
+                .upload_id(&upload_id)
+                .part_number(pn)
+                .body(p.clone().into())
+                .send()
+                .await
+                .expect("upload_part");
+            completed_parts.push(
+                aws_sdk_s3::types::CompletedPart::builder()
+                    .e_tag(resp.e_tag().unwrap_or_default())
+                    .part_number(pn)
+                    .build(),
+            );
+        }
+        let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+            .set_parts(Some(completed_parts))
+            .build();
+        let cresp = s4_client
+            .complete_multipart_upload()
+            .bucket("mp-ver")
+            .key("obj")
+            .upload_id(&upload_id)
+            .multipart_upload(completed)
+            .send()
+            .await
+            .expect("complete");
+        (cresp.version_id().map(str::to_owned), bytes::Bytes::from(full))
+    };
+    let (vid_opt, full) = parts_payload;
+
+    let Some(vid) = vid_opt else {
+        eprintln!(
+            "v0.8 #54 BUG-6: CompleteMultipartUpload on a versioned bucket returned no \
+             version_id. service::complete_multipart_upload (L3260) has no versioning \
+             hook — versions are only minted inside put_object (~L1968). Fix: replicate \
+             the put_object pending_version branch inside the multipart Complete handler \
+             (or upstream of upload_part / Complete) so the multipart parent object \
+             enters the per-key chain like a single-PUT does."
+        );
+        panic!("BUG-6: multipart Complete on versioned bucket missing version_id");
+    };
+
+    // GET ?versionId= must return the multipart payload.
+    let g = s4_client
+        .get_object()
+        .bucket("mp-ver")
+        .key("obj")
+        .version_id(&vid)
+        .send()
+        .await
+        .expect("get by version_id");
+    let body = g.body.collect().await.expect("body").into_bytes();
+    assert_eq!(body, full, "GET ?versionId= must return multipart bytes");
+
+    // ListObjectVersions sees exactly one entry for `obj`.
+    let listed = s4_client
+        .list_object_versions()
+        .bucket("mp-ver")
+        .send()
+        .await
+        .expect("list_object_versions");
+    let entries_for_obj: Vec<_> = listed
+        .versions()
+        .iter()
+        .filter(|v| v.key() == Some("obj"))
+        .collect();
+    assert_eq!(
+        entries_for_obj.len(),
+        1,
+        "exactly one multipart version of `obj` must list; got {:?}",
+        listed.versions()
+    );
+    assert_eq!(
+        entries_for_obj[0].version_id(),
+        Some(vid.as_str()),
+        "list entry must carry the Complete-minted version_id"
+    );
+
+    let _ = spawned.shutdown.send(());
+}
+
+// ---------------------------------------------------------------------------
+// 5) Multipart × Object Lock (Compliance) — DELETE must 403 even with bypass.
+// ---------------------------------------------------------------------------
+//
+// Compliance-mode default retention on a bucket. Multipart upload of a
+// 3-part object should be subject to the same per-object lock as a
+// single-PUT. DELETE without bypass → 403 (AccessDenied). DELETE with
+// `bypass_governance_retention(true)` is also 403 because Compliance
+// is one-way (cannot be overridden by bypass).
+//
+// ## v0.8 #54 EXPECTED BUG-7
+//
+// `complete_multipart_upload` doesn't call
+// `mgr.apply_default_on_put(...)` — that hook only fires from
+// `put_object` (~L2074). The multipart-uploaded object is therefore
+// NOT recorded in the lock manager, and DELETE proceeds. Fix: add the
+// `apply_default_on_put` call inside the multipart Complete handler.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn multipart_object_lock_compliance_blocks_delete() {
+    let minio = start_minio().await;
+    let spawned = spawn_s4_with_options(
+        &minio.endpoint_url,
+        S4TestOpts::default().with_object_lock().with_versioning(),
+    )
+    .await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    ensure_bucket(&backend_client, "mp-lock-comp").await;
+    let s4_client = build_aws_client_v2(&spawned.endpoint_url);
+
+    s4_client
+        .put_object_lock_configuration()
+        .bucket("mp-lock-comp")
+        .object_lock_configuration(
+            aws_sdk_s3::types::ObjectLockConfiguration::builder()
+                .object_lock_enabled(aws_sdk_s3::types::ObjectLockEnabled::Enabled)
+                .rule(
+                    aws_sdk_s3::types::ObjectLockRule::builder()
+                        .default_retention(
+                            aws_sdk_s3::types::DefaultRetention::builder()
+                                .mode(aws_sdk_s3::types::ObjectLockRetentionMode::Compliance)
+                                .days(30)
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect("PutObjectLockConfiguration(COMPLIANCE/30d)");
+
+    let (_etag, _full) = do_3part_multipart_upload(
+        &s4_client,
+        "mp-lock-comp",
+        "worm.bin",
+        SseConfig::None,
+        HashMap::new(),
+    )
+    .await;
+
+    // DELETE must fail. If the multipart Complete didn't apply the
+    // bucket default, this DELETE will succeed silently (BUG-7).
+    let res = s4_client
+        .delete_object()
+        .bucket("mp-lock-comp")
+        .key("worm.bin")
+        .send()
+        .await;
+    match res {
+        Ok(_) => {
+            eprintln!(
+                "v0.8 #54 BUG-7: DELETE of a multipart-uploaded object under Compliance \
+                 default retention SUCCEEDED. complete_multipart_upload doesn't call \
+                 ObjectLockManager::apply_default_on_put — only put_object (~L2074) \
+                 does. Multipart objects bypass WORM. Fix: add the same \
+                 apply_default_on_put call inside the multipart Complete handler."
+            );
+            panic!("BUG-7: multipart object NOT protected by Compliance default retention");
+        }
+        Err(err) => {
+            let dbg = format!("{err:?}");
+            assert!(
+                dbg.contains("AccessDenied") || dbg.contains("403"),
+                "Compliance DELETE on multipart must be 403; got: {dbg}"
+            );
+        }
+    }
+
+    // Bypass header must also be rejected (Compliance is one-way).
+    let res = s4_client
+        .delete_object()
+        .bucket("mp-lock-comp")
+        .key("worm.bin")
+        .bypass_governance_retention(true)
+        .send()
+        .await;
+    match res {
+        Ok(_) => panic!(
+            "BUG-7 follow-up: bypass header succeeded against Compliance multipart object"
+        ),
+        Err(err) => {
+            let dbg = format!("{err:?}");
+            assert!(
+                dbg.contains("AccessDenied") || dbg.contains("403"),
+                "Compliance bypass on multipart must still be 403; got: {dbg}"
+            );
+        }
+    }
+
+    let _ = spawned.shutdown.send(());
+}
+
+// ---------------------------------------------------------------------------
+// 6) Multipart × Replication — Complete must dispatch to destination.
+// ---------------------------------------------------------------------------
+//
+// PutBucketReplication(src=A, dst=B) + multipart upload to A/key →
+// poll B/key for replica appearance (≤5s). v0.6 #40 wired replication
+// for `put_object` only (~L2165); the multipart Complete handler does
+// not call `spawn_replication_if_matched`. Test FAILS with BUG-8 if the
+// replica never appears.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn multipart_replication_replicates() {
+    let minio = start_minio().await;
+    let spawned = spawn_s4_with_options(
+        &minio.endpoint_url,
+        S4TestOpts::default().with_replication(),
+    )
+    .await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    ensure_bucket(&backend_client, "mp-repl-src").await;
+    ensure_bucket(&backend_client, "mp-repl-dst").await;
+    let s4_client = build_aws_client_v2(&spawned.endpoint_url);
+
+    s4_client
+        .put_bucket_replication()
+        .bucket("mp-repl-src")
+        .replication_configuration(
+            aws_sdk_s3::types::ReplicationConfiguration::builder()
+                .role("arn:aws:iam::000000000000:role/s4-test")
+                .rules(
+                    aws_sdk_s3::types::ReplicationRule::builder()
+                        .id("rule-mp")
+                        .priority(1)
+                        .status(aws_sdk_s3::types::ReplicationRuleStatus::Enabled)
+                        .filter(
+                            aws_sdk_s3::types::ReplicationRuleFilter::builder()
+                                .prefix(String::new())
+                                .build(),
+                        )
+                        .destination(
+                            aws_sdk_s3::types::Destination::builder()
+                                .bucket("mp-repl-dst")
+                                .build()
+                                .expect("destination"),
+                        )
+                        .build()
+                        .expect("rule"),
+                )
+                .build()
+                .expect("replication configuration"),
+        )
+        .send()
+        .await
+        .expect("PutBucketReplication");
+
+    let (_etag, _full) = do_3part_multipart_upload(
+        &s4_client,
+        "mp-repl-src",
+        "k",
+        SseConfig::None,
+        HashMap::new(),
+    )
+    .await;
+
+    let mut found = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match backend_client
+            .head_object()
+            .bucket("mp-repl-dst")
+            .key("k")
+            .send()
+            .await
+        {
+            Ok(_) => {
+                found = true;
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+    if !found {
+        eprintln!(
+            "v0.8 #54 BUG-8: multipart upload to a replication-source bucket did NOT \
+             produce a replica in the destination within 5s. \
+             complete_multipart_upload doesn't call spawn_replication_if_matched — only \
+             put_object (~L2165) does. Fix: invoke spawn_replication_if_matched inside \
+             the multipart Complete handler (read the completed object via a synthetic \
+             GET so the source bytes / metadata are available, like \
+             complete_multipart_upload already does for the sidecar build at L3297)."
+        );
+        panic!("BUG-8: multipart replication did NOT fire");
+    }
+
+    let _ = spawned.shutdown.send(());
+}
+
+// ---------------------------------------------------------------------------
+// 7) Multipart × Tagging — CreateMultipart Tagging persists to GetObjectTagging.
+// ---------------------------------------------------------------------------
+//
+// CreateMultipartUpload accepts an `x-amz-tagging` header whose
+// URL-encoded value becomes the object's initial tag set. After
+// Complete, GetObjectTagging should return those tags.
+//
+// ## v0.8 #54 EXPECTED BUG-9
+//
+// The TagManager is populated on `put_object` (~L2153) but
+// `create_multipart_upload` doesn't parse or persist the tagging
+// header. GetObjectTagging will return empty. Fix: replicate the
+// tag-parse + `mgr.put_object_tags(...)` call from put_object into
+// the multipart Complete handler (Create captures the desired tags;
+// Complete commits them).
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn multipart_tagging_round_trip() {
+    let minio = start_minio().await;
+    let spawned =
+        spawn_s4_with_options(&minio.endpoint_url, S4TestOpts::default().with_tagging()).await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    ensure_bucket(&backend_client, "mp-tag").await;
+    let s4_client = build_aws_client_v2(&spawned.endpoint_url);
+
+    // Custom multipart inline so we can pass `tagging("...")` to
+    // create_multipart_upload (the helper does not expose it — every
+    // SSE / object-lock test uses extra_meta only).
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+    fn make_part(seed: u8) -> bytes::Bytes {
+        let mut buf = Vec::with_capacity(PART_SIZE);
+        let pattern = format!("TAG-{seed:02x}-block ");
+        while buf.len() < PART_SIZE {
+            buf.extend_from_slice(pattern.as_bytes());
+        }
+        buf.truncate(PART_SIZE);
+        bytes::Bytes::from(buf)
+    }
+    let parts = [make_part(0xa1), make_part(0xb2), make_part(0xc3)];
+    let create = s4_client
+        .create_multipart_upload()
+        .bucket("mp-tag")
+        .key("obj")
+        .tagging("team=infra&phase=alpha")
+        .send()
+        .await
+        .expect("create with tagging");
+    let upload_id = create.upload_id().expect("upload_id").to_string();
+    let mut completed_parts = Vec::with_capacity(3);
+    for (i, p) in parts.iter().enumerate() {
+        let pn = (i + 1) as i32;
+        let resp = s4_client
+            .upload_part()
+            .bucket("mp-tag")
+            .key("obj")
+            .upload_id(&upload_id)
+            .part_number(pn)
+            .body(p.clone().into())
+            .send()
+            .await
+            .expect("upload_part");
+        completed_parts.push(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .e_tag(resp.e_tag().unwrap_or_default())
+                .part_number(pn)
+                .build(),
+        );
+    }
+    let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+        .set_parts(Some(completed_parts))
+        .build();
+    s4_client
+        .complete_multipart_upload()
+        .bucket("mp-tag")
+        .key("obj")
+        .upload_id(&upload_id)
+        .multipart_upload(completed)
+        .send()
+        .await
+        .expect("complete");
+
+    let got = s4_client
+        .get_object_tagging()
+        .bucket("mp-tag")
+        .key("obj")
+        .send()
+        .await
+        .expect("GetObjectTagging");
+    let pairs_set: std::collections::HashSet<(String, String)> = got
+        .tag_set()
+        .iter()
+        .map(|t| (t.key().to_owned(), t.value().to_owned()))
+        .collect();
+    let want_set: std::collections::HashSet<(String, String)> = [
+        ("team".to_string(), "infra".to_string()),
+        ("phase".to_string(), "alpha".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    if pairs_set != want_set {
+        eprintln!(
+            "v0.8 #54 BUG-9: CreateMultipartUpload's x-amz-tagging header was NOT \
+             persisted into the TagManager. GetObjectTagging returned {pairs_set:?}, \
+             expected {want_set:?}. service::create_multipart_upload (L3172) doesn't \
+             parse the tagging input field; service::complete_multipart_upload (L3260) \
+             doesn't commit it. Fix: capture the tagging header on Create (e.g. into \
+             a per-(bucket, upload_id) side-table) and commit via mgr.put_object_tags \
+             on Complete, or stash the parsed tag-set in the upload's metadata (s3s \
+             passes through the create-time metadata onto the completed object)."
+        );
+        panic!("BUG-9: multipart × tagging not persisted");
+    }
+
+    let _ = spawned.shutdown.send(());
+}
+
+// ---------------------------------------------------------------------------
+// 8) Multipart × CompleteMultipartUpload with mismatched ETags — must 400.
+// ---------------------------------------------------------------------------
+//
+// Regression check: forge bogus ETags into the CompletedMultipartUpload
+// payload. AWS S3 (and MinIO, via s3s_aws::Proxy) responds with 400
+// `InvalidPart` because the ETag chain doesn't match the on-disk parts.
+// This test is NOT a known wire-bug surface — we assert the error
+// surface stays 400 / InvalidPart so a future refactor that swallows
+// the backend error gets caught.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn multipart_complete_with_mismatched_etags_fails() {
+    let minio = start_minio().await;
+    let spawned = spawn_s4_with_options(&minio.endpoint_url, S4TestOpts::default()).await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    ensure_bucket(&backend_client, "mp-bad-etag").await;
+    let s4_client = build_aws_client_v2(&spawned.endpoint_url);
+
+    let create = s4_client
+        .create_multipart_upload()
+        .bucket("mp-bad-etag")
+        .key("k")
+        .send()
+        .await
+        .expect("create");
+    let upload_id = create.upload_id().expect("upload_id").to_string();
+
+    // Upload 2 parts (5 MiB each) but DON'T capture the real ETags —
+    // instead build the Complete payload with bogus md5-shaped ETags.
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+    let part = bytes::Bytes::from(vec![0x44u8; PART_SIZE]);
+    for pn in 1..=2 {
+        s4_client
+            .upload_part()
+            .bucket("mp-bad-etag")
+            .key("k")
+            .upload_id(&upload_id)
+            .part_number(pn)
+            .body(part.clone().into())
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("upload_part {pn} failed: {e:?}"));
+    }
+    let bogus = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+        .parts(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .e_tag("\"00000000000000000000000000000000\"")
+                .part_number(1)
+                .build(),
+        )
+        .parts(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .e_tag("\"11111111111111111111111111111111\"")
+                .part_number(2)
+                .build(),
+        )
+        .build();
+    let res = s4_client
+        .complete_multipart_upload()
+        .bucket("mp-bad-etag")
+        .key("k")
+        .upload_id(&upload_id)
+        .multipart_upload(bogus)
+        .send()
+        .await;
+    let err = res.expect_err("Complete with bogus ETags must fail");
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("InvalidPart") || dbg.contains("400") || dbg.contains("InvalidArgument"),
+        "Complete with mismatched ETags must surface 400 / InvalidPart; got: {dbg}"
+    );
+
+    let _ = spawned.shutdown.send(());
+}
+
+// ---------------------------------------------------------------------------
+// 9) Multipart × AbortMultipartUpload — drops in-flight parts.
+// ---------------------------------------------------------------------------
+//
+// CreateMultipart + 2 UploadParts + AbortMultipartUpload, then
+// ListMultipartUploads must show no uploads for the bucket. Sanity test
+// that the abort path is wired through the gateway (it is — `service::
+// abort_multipart_upload` is a pure passthrough at L3307).
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn multipart_abort_drops_in_flight_parts() {
+    let minio = start_minio().await;
+    let spawned = spawn_s4_with_options(&minio.endpoint_url, S4TestOpts::default()).await;
+    let backend_client = build_aws_client_v2(&minio.endpoint_url);
+    ensure_bucket(&backend_client, "mp-abort").await;
+    let s4_client = build_aws_client_v2(&spawned.endpoint_url);
+
+    let create = s4_client
+        .create_multipart_upload()
+        .bucket("mp-abort")
+        .key("k")
+        .send()
+        .await
+        .expect("create");
+    let upload_id = create.upload_id().expect("upload_id").to_string();
+
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+    let part = bytes::Bytes::from(vec![0x77u8; PART_SIZE]);
+    for pn in 1..=2 {
+        s4_client
+            .upload_part()
+            .bucket("mp-abort")
+            .key("k")
+            .upload_id(&upload_id)
+            .part_number(pn)
+            .body(part.clone().into())
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("upload_part {pn} failed: {e:?}"));
+    }
+
+    s4_client
+        .abort_multipart_upload()
+        .bucket("mp-abort")
+        .key("k")
+        .upload_id(&upload_id)
+        .send()
+        .await
+        .expect("abort_multipart_upload");
+
+    // ListMultipartUploads must be empty for this bucket. We list via
+    // the S4 client — list_multipart_uploads is a passthrough so the
+    // result reflects MinIO's view directly.
+    let listed = s4_client
+        .list_multipart_uploads()
+        .bucket("mp-abort")
+        .send()
+        .await
+        .expect("list_multipart_uploads");
+    let n = listed.uploads().len();
+    assert_eq!(
+        n, 0,
+        "AbortMultipartUpload must remove the in-flight upload; got {n} entries: {:?}",
+        listed.uploads()
+    );
+
+    let _ = spawned.shutdown.send(());
+}
+
