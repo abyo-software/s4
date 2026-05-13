@@ -13,6 +13,7 @@ pub mod sigv4a;
 pub mod sse;
 pub mod streaming;
 pub mod tls;
+pub mod versioning;
 
 pub use s4_codec as codec;
 pub use s4_config as config;

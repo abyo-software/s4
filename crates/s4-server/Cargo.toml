@@ -86,6 +86,11 @@ md-5 = "0.10"
 # `--sigv4a-credentials <DIR>`).
 p256 = { version = "0.13", features = ["ecdsa", "std", "pem", "pkcs8"] }
 ecdsa = "0.16"
+# v0.5 #34: versioning state machine — UUIDv4 version-id 採番 (`uuid`) と、
+# in-memory snapshot を `to_json` / `from_json` する serde 系 timestamp
+# (`chrono` の `clock` + `serde` features 限定) のため。
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+uuid = { version = "1", features = ["v4"] }
 
 s4-codec = { path = "../s4-codec", version = "0.4.0" }
 s4-config = { path = "../s4-config", version = "0.4.0" }

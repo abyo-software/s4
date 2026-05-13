@@ -86,6 +86,16 @@ pub struct S4Service<B: S3> {
     /// key in a 1-slot keyring so single-key (v0.4) operators get the
     /// same behaviour they had before, just on the v2 frame.
     sse_keyring: Option<crate::sse::SharedSseKeyring>,
+    /// v0.5 #34: optional first-class versioning state machine. When
+    /// `Some(...)`, S4-server itself owns the per-bucket versioning
+    /// state + per-(bucket, key) version chain; PUT / GET / DELETE /
+    /// list_object_versions / get_bucket_versioning /
+    /// put_bucket_versioning handlers consult the manager instead of
+    /// passing through. When `None` (default), the legacy
+    /// backend-passthrough behaviour applies so existing v0.4
+    /// deployments are unaffected until they explicitly call
+    /// `with_versioning(...)`.
+    versioning: Option<Arc<crate::versioning::VersioningManager>>,
 }
 
 impl<B: S3> S4Service<B> {
@@ -107,7 +117,25 @@ impl<B: S3> S4Service<B> {
             rate_limits: None,
             access_log: None,
             sse_keyring: None,
+            versioning: None,
         }
+    }
+
+    /// v0.5 #34: attach the first-class versioning state machine. Once
+    /// set, this `S4Service` owns the per-bucket versioning state +
+    /// per-(bucket, key) version chain; `put_object` / `get_object` /
+    /// `delete_object` / `list_object_versions` /
+    /// `get_bucket_versioning` / `put_bucket_versioning` consult the
+    /// manager instead of passing through to the backend. The backend
+    /// is still used as the byte store: Suspended / Unversioned buckets
+    /// keep using `<key>` directly (legacy), Enabled buckets redirect
+    /// each version's bytes to a shadow key
+    /// (`<key>.__s4ver__/<version-id>`) so older versions survive newer
+    /// PUTs to the same logical key.
+    #[must_use]
+    pub fn with_versioning(mut self, mgr: Arc<crate::versioning::VersioningManager>) -> Self {
+        self.versioning = Some(mgr);
+        self
     }
 
     /// v0.4 #21 (kept for back-compat): attach a single SSE-S4 key.
@@ -563,6 +591,29 @@ fn parse_copy_source_range(s: &str) -> Result<s3s::dto::Range, String> {
     })
 }
 
+/// v0.5 #34: synthesize the backend storage key for a given
+/// (logical key, version-id) pair on an Enabled-versioning bucket.
+///
+/// Uses the `__s4ver__/` infix because:
+/// - it's not a substring of `.s4index` / `.s4ver` natural keys (no false-positive
+///   listing filter collisions)
+/// - directory-style separator keeps S3 console "browse by prefix" UX intact
+///   (versions roll up under one virtual folder per object)
+/// - human-readable on debug logs / `aws s3 ls`
+///
+/// `list_objects` / `list_objects_v2` / `list_object_versions` MUST filter
+/// keys containing `.__s4ver__/` from results so customers don't see internal
+/// shadow objects.
+pub fn versioned_shadow_key(key: &str, version_id: &str) -> String {
+    format!("{key}.__s4ver__/{version_id}")
+}
+
+/// Test for the marker substring used by [`versioned_shadow_key`]. Cheap str
+/// scan; both list_objects filter and the GET passthrough check use this.
+fn is_versioning_shadow_key(key: &str) -> bool {
+    key.contains(".__s4ver__/")
+}
+
 fn is_multipart_object(metadata: &Option<Metadata>) -> bool {
     metadata
         .as_ref()
@@ -792,14 +843,79 @@ impl<B: S3> S3 for S4Service<B> {
                 compressed.clone()
             };
             req.input.body = Some(bytes_to_blob(body_to_send));
-            let backend_resp = self.backend.put_object(req).await;
+            // v0.5 #34: pre-allocate a version-id when the bucket is
+            // Enabled, then redirect the backend storage key to the
+            // shadow path so older versions survive newer PUTs.
+            // Suspended / Unversioned buckets keep using the plain
+            // `<key>` (S3 spec: Suspended overwrites the same backend
+            // object). Pre-allocation (instead of recording after PUT)
+            // ensures the shadow key + the response's
+            // `x-amz-version-id` use the same vid.
+            let pending_version: Option<crate::versioning::PutOutcome> = self
+                .versioning
+                .as_ref()
+                .map(|mgr| mgr.state(&put_bucket))
+                .map(|state| match state {
+                    crate::versioning::VersioningState::Enabled => {
+                        crate::versioning::PutOutcome {
+                            version_id: crate::versioning::VersioningManager::new_version_id(),
+                            versioned_response: true,
+                        }
+                    }
+                    crate::versioning::VersioningState::Suspended
+                    | crate::versioning::VersioningState::Unversioned => {
+                        crate::versioning::PutOutcome {
+                            version_id: crate::versioning::NULL_VERSION_ID.to_owned(),
+                            versioned_response: false,
+                        }
+                    }
+                });
+            if let Some(ref pv) = pending_version
+                && pv.versioned_response
+            {
+                req.input.key = versioned_shadow_key(&put_key, &pv.version_id);
+            }
+            let mut backend_resp = self.backend.put_object(req).await;
             if let Some(idx) = sidecar_index
                 && backend_resp.is_ok()
                 && idx.entries.len() > 1
             {
                 // 1 chunk しかない (small object) なら sidecar は意味がない (=
                 // partial fetch しても full body と同じ範囲) ので省略。
+                // Sidecar は user-visible key で書く (latest version の
+                // partial fetch path 用)。Old versions の Range GET は今 task
+                // の scope 外 (full read fallback でも意味的には正しい)。
                 self.write_sidecar(&put_bucket, &put_key, &idx).await;
+            }
+            // v0.5 #34: commit the new version into the manager only on
+            // backend success. Use the pre-allocated vid so the response
+            // header and the chain entry agree.
+            if let (Some(mgr), Some(pv), Ok(resp)) = (
+                self.versioning.as_ref(),
+                pending_version.as_ref(),
+                backend_resp.as_mut(),
+            ) {
+                let etag = resp
+                    .output
+                    .e_tag
+                    .clone()
+                    .map(ETag::into_value)
+                    .unwrap_or_else(|| format!("\"crc32c-{}\"", manifest.crc32c));
+                let now = chrono::Utc::now();
+                mgr.commit_put_with_version(
+                    &put_bucket,
+                    &put_key,
+                    crate::versioning::VersionEntry {
+                        version_id: pv.version_id.clone(),
+                        etag,
+                        size: original_size,
+                        is_delete_marker: false,
+                        created_at: now,
+                    },
+                );
+                if pv.versioned_response {
+                    resp.output.version_id = Some(pv.version_id.clone());
+                }
             }
             let _ = (original_size, compressed_size); // mute unused warnings
             let elapsed = put_start.elapsed();
@@ -840,7 +956,57 @@ impl<B: S3> S3 for S4Service<B> {
             );
             return backend_resp;
         }
-        self.backend.put_object(req).await
+        // Body-less PUT (rare: zero-length object). Mirror the body-full
+        // versioning hooks so list_object_versions / GET-by-version still see
+        // empty-body objects in the chain.
+        let pending_version: Option<crate::versioning::PutOutcome> = self
+            .versioning
+            .as_ref()
+            .map(|mgr| mgr.state(&put_bucket))
+            .map(|state| match state {
+                crate::versioning::VersioningState::Enabled => crate::versioning::PutOutcome {
+                    version_id: crate::versioning::VersioningManager::new_version_id(),
+                    versioned_response: true,
+                },
+                _ => crate::versioning::PutOutcome {
+                    version_id: crate::versioning::NULL_VERSION_ID.to_owned(),
+                    versioned_response: false,
+                },
+            });
+        if let Some(ref pv) = pending_version
+            && pv.versioned_response
+        {
+            req.input.key = versioned_shadow_key(&put_key, &pv.version_id);
+        }
+        let mut backend_resp = self.backend.put_object(req).await;
+        if let (Some(mgr), Some(pv), Ok(resp)) = (
+            self.versioning.as_ref(),
+            pending_version.as_ref(),
+            backend_resp.as_mut(),
+        ) {
+            let etag = resp
+                .output
+                .e_tag
+                .clone()
+                .map(ETag::into_value)
+                .unwrap_or_default();
+            let now = chrono::Utc::now();
+            mgr.commit_put_with_version(
+                &put_bucket,
+                &put_key,
+                crate::versioning::VersionEntry {
+                    version_id: pv.version_id.clone(),
+                    etag,
+                    size: 0,
+                    is_delete_marker: false,
+                    created_at: now,
+                },
+            );
+            if pv.versioned_response {
+                resp.output.version_id = Some(pv.version_id.clone());
+            }
+        }
+        backend_resp
     }
 
     // === 圧縮を解く path (GET) ===
@@ -860,6 +1026,58 @@ impl<B: S3> S3 for S4Service<B> {
         self.enforce_policy(&req, "s3:GetObject", &get_bucket, Some(&get_key))?;
         // Range request の事前検出 (decompress 後 slice する path に使う)。
         let range_request = req.input.range.take();
+
+        // v0.5 #34: route the GET through the VersioningManager when
+        // attached AND the bucket is in a versioning-aware state.
+        // Resolves which version to fetch (explicit `?versionId=` query
+        // param vs. chain latest), translates a delete-marker into 404
+        // NoSuchKey, and rewrites the backend storage key to the shadow
+        // path (`<key>.__s4ver__/<vid>`) for non-null Enabled-bucket
+        // versions. `resolved_version_id` is stamped onto the response
+        // so clients see a coherent `x-amz-version-id` header.
+        //
+        // When the bucket is Unversioned (or no manager attached), the
+        // chain-resolution step is skipped and the request flows
+        // through the existing single-key path unchanged.
+        let resolved_version_id: Option<String> = match self.versioning.as_ref() {
+            Some(mgr)
+                if mgr.state(&get_bucket) != crate::versioning::VersioningState::Unversioned =>
+            {
+                let req_vid = req.input.version_id.take();
+                let entry = match req_vid.as_deref() {
+                    Some(vid) => mgr.lookup_version(&get_bucket, &get_key, vid).ok_or_else(
+                        || S3Error::with_message(
+                            S3ErrorCode::NoSuchVersion,
+                            format!("no such version: {vid}"),
+                        ),
+                    )?,
+                    None => mgr.lookup_latest(&get_bucket, &get_key).ok_or_else(|| {
+                        S3Error::with_message(
+                            S3ErrorCode::NoSuchKey,
+                            format!("no such key: {get_key}"),
+                        )
+                    })?,
+                };
+                if entry.is_delete_marker {
+                    // S3 spec: GET without versionId on a
+                    // delete-marker latest → 404 NoSuchKey + the
+                    // response carries `x-amz-delete-marker: true`.
+                    // GET with explicit versionId pointing at a delete
+                    // marker → 405 MethodNotAllowed; we surface
+                    // NoSuchKey here for both since s3s collapses them
+                    // into the same not-found error path.
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::NoSuchKey,
+                        format!("delete marker is the current version of {get_key}"),
+                    ));
+                }
+                if entry.version_id != crate::versioning::NULL_VERSION_ID {
+                    req.input.key = versioned_shadow_key(&get_key, &entry.version_id);
+                }
+                Some(entry.version_id)
+            }
+            _ => None,
+        };
 
         // ====== Range GET の partial-fetch fast path (sidecar index 利用) ======
         // sidecar `<key>.s4index` が存在し、multipart-framed object であれば
@@ -881,6 +1099,13 @@ impl<B: S3> S3 for S4Service<B> {
             }
         }
         let mut resp = self.backend.get_object(req).await?;
+        // v0.5 #34: stamp the resolved version-id so the client sees a
+        // coherent `x-amz-version-id` header (only for chains owned by
+        // the manager — Unversioned buckets / no-manager paths never
+        // set this).
+        if let Some(ref vid) = resolved_version_id {
+            resp.output.version_id = Some(vid.clone());
+        }
         let is_multipart = is_multipart_object(&resp.output.metadata);
         let is_framed_v2 = is_framed_v2_object(&resp.output.metadata);
         // v0.2 #4: framed-v2 single-PUT は多 frame parse が必要なので
@@ -1098,13 +1323,111 @@ impl<B: S3> S3 for S4Service<B> {
     }
     async fn delete_object(
         &self,
-        req: S3Request<DeleteObjectInput>,
+        mut req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
         self.enforce_rate_limit(&req, &bucket)?;
         self.enforce_policy(&req, "s3:DeleteObject", &bucket, Some(&key))?;
-        // sidecar も best-effort で削除 (失敗は無視 — 存在しない場合や IAM 制限を許容)
+        // v0.5 #34: route DELETE through the VersioningManager when the
+        // bucket is in a versioning-aware state.
+        //
+        // - Enabled bucket, no version_id → push a delete marker into
+        //   the chain. NO backend object is touched (older versions
+        //   stay reachable via specific-version GET).
+        // - Enabled / Suspended bucket, with version_id → physical
+        //   delete. Backend bytes at the shadow key (or `<key>` for
+        //   `null`) are removed; chain entry is dropped. If the deleted
+        //   entry was a delete marker, no backend bytes exist for it
+        //   (record-only).
+        // - Suspended bucket, no version_id → push a "null" delete
+        //   marker (S3 spec); backend bytes at `<key>` are physically
+        //   removed (same as legacy).
+        // - Unversioned bucket → fall through to legacy passthrough.
+        if let Some(mgr) = self.versioning.as_ref() {
+            let state = mgr.state(&bucket);
+            if state != crate::versioning::VersioningState::Unversioned {
+                let req_vid = req.input.version_id.take();
+                if let Some(vid) = req_vid {
+                    // Specific-version DELETE: touch backend bytes only
+                    // when the entry was a real version (not a delete
+                    // marker, which has no backend bytes).
+                    let outcome = mgr.record_delete_specific(&bucket, &key, &vid);
+                    let backend_target = if vid == crate::versioning::NULL_VERSION_ID {
+                        key.clone()
+                    } else {
+                        versioned_shadow_key(&key, &vid)
+                    };
+                    let was_real_version = outcome
+                        .as_ref()
+                        .map(|o| !o.is_delete_marker)
+                        .unwrap_or(false);
+                    if was_real_version {
+                        // Best-effort backend cleanup; missing bytes
+                        // are not an error (e.g. shadow key already
+                        // GC'd).
+                        let backend_input = DeleteObjectInput {
+                            bucket: bucket.clone(),
+                            key: backend_target,
+                            ..Default::default()
+                        };
+                        let backend_req = S3Request {
+                            input: backend_input,
+                            method: http::Method::DELETE,
+                            uri: req.uri.clone(),
+                            headers: req.headers.clone(),
+                            extensions: http::Extensions::new(),
+                            credentials: req.credentials.clone(),
+                            region: req.region.clone(),
+                            service: req.service.clone(),
+                            trailing_headers: None,
+                        };
+                        let _ = self.backend.delete_object(backend_req).await;
+                    }
+                    let mut output = DeleteObjectOutput {
+                        version_id: Some(vid.clone()),
+                        ..Default::default()
+                    };
+                    if let Some(o) = outcome.as_ref()
+                        && o.is_delete_marker
+                    {
+                        output.delete_marker = Some(true);
+                    }
+                    return Ok(S3Response::new(output));
+                }
+                // No version_id: record a delete marker (state-aware).
+                let outcome = mgr.record_delete(&bucket, &key);
+                if state == crate::versioning::VersioningState::Suspended {
+                    // Suspended buckets also evict the prior `<key>`
+                    // bytes (the previous null version is gone too).
+                    let backend_input = DeleteObjectInput {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        ..Default::default()
+                    };
+                    let backend_req = S3Request {
+                        input: backend_input,
+                        method: http::Method::DELETE,
+                        uri: req.uri.clone(),
+                        headers: req.headers.clone(),
+                        extensions: http::Extensions::new(),
+                        credentials: req.credentials.clone(),
+                        region: req.region.clone(),
+                        service: req.service.clone(),
+                        trailing_headers: None,
+                    };
+                    let _ = self.backend.delete_object(backend_req).await;
+                }
+                let output = DeleteObjectOutput {
+                    delete_marker: Some(true),
+                    version_id: outcome.version_id,
+                    ..Default::default()
+                };
+                return Ok(S3Response::new(output));
+            }
+        }
+        // Legacy / Unversioned path: physical delete on the backend +
+        // best-effort sidecar cleanup (mirrors v0.4 behaviour).
         let resp = self.backend.delete_object(req).await?;
         let sidecar_input = DeleteObjectInput {
             bucket: bucket.clone(),
@@ -1210,12 +1533,13 @@ impl<B: S3> S3 for S4Service<B> {
         self.enforce_rate_limit(&req, &req.input.bucket)?;
         self.enforce_policy(&req, "s3:ListBucket", &req.input.bucket, None)?;
         let mut resp = self.backend.list_objects(req).await?;
-        // S4 内部 object (`*.s4index` sidecar 等) を顧客から隠す
+        // S4 内部 object (`*.s4index` sidecar、`.__s4ver__/` shadow versions
+        // — v0.5 #34) を顧客から隠す。
         if let Some(contents) = resp.output.contents.as_mut() {
             contents.retain(|o| {
                 o.key
                     .as_ref()
-                    .map(|k| !k.ends_with(".s4index"))
+                    .map(|k| !k.ends_with(".s4index") && !is_versioning_shadow_key(k))
                     .unwrap_or(true)
             });
         }
@@ -1233,7 +1557,7 @@ impl<B: S3> S3 for S4Service<B> {
             contents.retain(|o| {
                 o.key
                     .as_ref()
-                    .map(|k| !k.ends_with(".s4index"))
+                    .map(|k| !k.ends_with(".s4index") && !is_versioning_shadow_key(k))
                     .unwrap_or(true)
             });
             // key_count も補正 (S3 spec compliance)
@@ -1244,22 +1568,84 @@ impl<B: S3> S3 for S4Service<B> {
         Ok(resp)
     }
     /// v0.4 #17: filter S4-internal sidecars from versioned listings.
-    /// Same shape as `list_objects_v2` filter but applies to both the
-    /// `Versions` and `DeleteMarkers` arrays (each carries its own
-    /// `.s4index` versions on a versioned bucket where the sidecar has
-    /// been overwritten).
+    /// v0.5 #34: when a [`crate::versioning::VersioningManager`] is
+    /// attached AND the bucket is in a versioning-aware state, build
+    /// the `Versions` / `DeleteMarkers` arrays directly from the
+    /// in-memory chain (paginated + ordered the S3 way: key asc,
+    /// version newest-first inside each key). Otherwise fall back to
+    /// passthrough + sidecar-filter (legacy v0.4 behaviour).
     async fn list_object_versions(
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
         self.enforce_rate_limit(&req, &req.input.bucket)?;
         self.enforce_policy(&req, "s3:ListBucket", &req.input.bucket, None)?;
+        // v0.5 #34: VersioningManager-owned path.
+        if let Some(mgr) = self.versioning.as_ref()
+            && mgr.state(&req.input.bucket) != crate::versioning::VersioningState::Unversioned
+        {
+            let max_keys = req.input.max_keys.unwrap_or(1000) as usize;
+            let page = mgr.list_versions(
+                &req.input.bucket,
+                req.input.prefix.as_deref(),
+                req.input.key_marker.as_deref(),
+                req.input.version_id_marker.as_deref(),
+                max_keys,
+            );
+            let versions: Vec<ObjectVersion> = page
+                .versions
+                .into_iter()
+                .map(|e| ObjectVersion {
+                    key: Some(e.key),
+                    version_id: Some(e.version_id),
+                    is_latest: Some(e.is_latest),
+                    e_tag: Some(ETag::Strong(e.etag)),
+                    size: Some(e.size as i64),
+                    last_modified: Some(std::time::SystemTime::from(e.last_modified).into()),
+                    ..Default::default()
+                })
+                .collect();
+            let delete_markers: Vec<DeleteMarkerEntry> = page
+                .delete_markers
+                .into_iter()
+                .map(|e| DeleteMarkerEntry {
+                    key: Some(e.key),
+                    version_id: Some(e.version_id),
+                    is_latest: Some(e.is_latest),
+                    last_modified: Some(std::time::SystemTime::from(e.last_modified).into()),
+                    ..Default::default()
+                })
+                .collect();
+            let output = ListObjectVersionsOutput {
+                name: Some(req.input.bucket.clone()),
+                prefix: req.input.prefix.clone(),
+                key_marker: req.input.key_marker.clone(),
+                version_id_marker: req.input.version_id_marker.clone(),
+                max_keys: req.input.max_keys,
+                versions: if versions.is_empty() {
+                    None
+                } else {
+                    Some(versions)
+                },
+                delete_markers: if delete_markers.is_empty() {
+                    None
+                } else {
+                    Some(delete_markers)
+                },
+                is_truncated: Some(page.is_truncated),
+                next_key_marker: page.next_key_marker,
+                next_version_id_marker: page.next_version_id_marker,
+                ..Default::default()
+            };
+            return Ok(S3Response::new(output));
+        }
+        // Legacy passthrough path (v0.4 #17 sidecar filter retained).
         let mut resp = self.backend.list_object_versions(req).await?;
         if let Some(versions) = resp.output.versions.as_mut() {
             versions.retain(|v| {
                 v.key
                     .as_ref()
-                    .map(|k| !k.ends_with(".s4index"))
+                    .map(|k| !k.ends_with(".s4index") && !is_versioning_shadow_key(k))
                     .unwrap_or(true)
             });
         }
@@ -1267,7 +1653,7 @@ impl<B: S3> S3 for S4Service<B> {
             markers.retain(|m| {
                 m.key
                     .as_ref()
-                    .map(|k| !k.ends_with(".s4index"))
+                    .map(|k| !k.ends_with(".s4index") && !is_versioning_shadow_key(k))
                     .unwrap_or(true)
             });
         }
@@ -1666,18 +2052,57 @@ impl<B: S3> S3 for S4Service<B> {
 
     // ---- Versioning ----
     // list_object_versions is implemented above in the compression-hook
-    // section so it filters S4-internal sidecars (v0.4 #17). Per-version
-    // S4 metadata is preserved by the backend automatically.
+    // section so it filters S4-internal sidecars (v0.4 #17) AND, when a
+    // VersioningManager is attached (v0.5 #34), serves chains directly
+    // from the in-memory index.
     async fn get_bucket_versioning(
         &self,
         req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        // v0.5 #34: when a VersioningManager is attached, the bucket's
+        // versioning state lives in the manager (= S4-server's
+        // authoritative source). Pass-through hits the backend only
+        // when no manager is configured (legacy v0.4 behaviour).
+        if let Some(mgr) = self.versioning.as_ref() {
+            let output = match mgr.state(&req.input.bucket).as_aws_status() {
+                Some(s) => GetBucketVersioningOutput {
+                    status: Some(BucketVersioningStatus::from(s.to_owned())),
+                    ..Default::default()
+                },
+                None => GetBucketVersioningOutput::default(),
+            };
+            return Ok(S3Response::new(output));
+        }
         self.backend.get_bucket_versioning(req).await
     }
     async fn put_bucket_versioning(
         &self,
         req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        // v0.5 #34: stash the new state in the manager, then forward to
+        // the backend so any downstream that *also* tracks state
+        // (e.g. a real S3 backend) stays in sync. Manager-attached but
+        // backend rejection is treated as a soft-fail (state is still
+        // owned by the manager).
+        if let Some(mgr) = self.versioning.as_ref() {
+            let new_state = match req
+                .input
+                .versioning_configuration
+                .status
+                .as_ref()
+                .map(|s| s.as_str())
+            {
+                Some(s) if s.eq_ignore_ascii_case("Enabled") => {
+                    crate::versioning::VersioningState::Enabled
+                }
+                Some(s) if s.eq_ignore_ascii_case("Suspended") => {
+                    crate::versioning::VersioningState::Suspended
+                }
+                _ => crate::versioning::VersioningState::Unversioned,
+            };
+            mgr.set_state(&req.input.bucket, new_state);
+            return Ok(S3Response::new(PutBucketVersioningOutput::default()));
+        }
         self.backend.put_bucket_versioning(req).await
     }
 

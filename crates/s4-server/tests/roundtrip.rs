@@ -122,6 +122,18 @@ impl S3 for MemoryBackend {
         };
         Ok(S3Response::new(out))
     }
+
+    /// v0.5 #34: DELETE the backend bytes (idempotent — missing key is OK,
+    /// matching real S3 behaviour). The S4Service-level versioning logic
+    /// owns the chain semantics; this just clears the underlying byte.
+    async fn delete_object(
+        &self,
+        req: S3Request<DeleteObjectInput>,
+    ) -> S3Result<S3Response<DeleteObjectOutput>> {
+        let key = (req.input.bucket.clone(), req.input.key.clone());
+        self.inner.lock().unwrap().remove(&key);
+        Ok(S3Response::new(DeleteObjectOutput::default()))
+    }
 }
 
 fn put_request(bucket: &str, key: &str, body: Bytes) -> S3Request<PutObjectInput> {
@@ -1066,3 +1078,404 @@ async fn registry_dispatches_decompress_across_codecs() {
         .expect("get zstd");
     assert_eq!(read_back(resp_zstd).await, zpayload);
 }
+
+// =========================================================================
+// v0.5 #34: Versioning state machine integration tests.
+//
+// All five tests share the same shape:
+//   1. Build an S4Service with `with_versioning(...)` attached.
+//   2. Drive PUT/GET/DELETE/list_object_versions through it.
+//   3. Inspect S3-level outputs (response.version_id, list_object_versions
+//      Versions / DeleteMarkers arrays, etc) for the expected wire-shape.
+//
+// We use cpu-zstd as the codec so the buckets exercise the full
+// compress + framed PUT path, but the assertions are about versioning
+// semantics only (compression correctness is covered by the upstream
+// roundtrip tests).
+// =========================================================================
+
+fn make_versioned_s4(
+    codec: CodecKind,
+) -> (
+    S4Service<MemoryBackend>,
+    Arc<s4_server::versioning::VersioningManager>,
+) {
+    let backend = MemoryBackend::new();
+    let mgr = Arc::new(s4_server::versioning::VersioningManager::new());
+    let s4 = S4Service::new(backend, make_registry(codec), make_dispatcher(codec))
+        .with_versioning(Arc::clone(&mgr));
+    (s4, mgr)
+}
+
+async fn enable_versioning_on(s4: &S4Service<MemoryBackend>, bucket: &str) {
+    let inp = PutBucketVersioningInput::builder()
+        .bucket(bucket.to_owned())
+        .versioning_configuration(VersioningConfiguration {
+            status: Some(BucketVersioningStatus::from_static(
+                BucketVersioningStatus::ENABLED,
+            )),
+            ..Default::default()
+        })
+        .build()
+        .expect("build PutBucketVersioningInput");
+    let req = S3Request {
+        input: inp,
+        method: http::Method::PUT,
+        uri: format!("/{bucket}?versioning").parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    s4.put_bucket_versioning(req)
+        .await
+        .expect("enable versioning");
+}
+
+fn get_request_with_version(bucket: &str, key: &str, version_id: &str) -> S3Request<GetObjectInput> {
+    let mut r = get_request(bucket, key);
+    r.input.version_id = Some(version_id.to_owned());
+    r
+}
+
+fn delete_request(bucket: &str, key: &str) -> S3Request<DeleteObjectInput> {
+    let input = DeleteObjectInput {
+        bucket: bucket.into(),
+        key: key.into(),
+        ..Default::default()
+    };
+    S3Request {
+        input,
+        method: http::Method::DELETE,
+        uri: format!("/{bucket}/{key}").parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+fn delete_request_with_version(
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> S3Request<DeleteObjectInput> {
+    let mut r = delete_request(bucket, key);
+    r.input.version_id = Some(version_id.to_owned());
+    r
+}
+
+fn list_versions_request(bucket: &str) -> S3Request<ListObjectVersionsInput> {
+    let input = ListObjectVersionsInput {
+        bucket: bucket.into(),
+        ..Default::default()
+    };
+    S3Request {
+        input,
+        method: http::Method::GET,
+        uri: format!("/{bucket}?versions").parse().unwrap(),
+        headers: http::HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+#[tokio::test]
+async fn versioning_enable_then_put_creates_new_version() {
+    let (s4, mgr) = make_versioned_s4(CodecKind::CpuZstd);
+    enable_versioning_on(&s4, "bucket").await;
+    assert_eq!(
+        mgr.state("bucket"),
+        s4_server::versioning::VersioningState::Enabled
+    );
+
+    let payload1 = Bytes::from_static(b"hello version 1");
+    let resp1 = s4
+        .put_object(put_request("bucket", "key", payload1.clone()))
+        .await
+        .expect("put v1");
+    let vid1 = resp1
+        .output
+        .version_id
+        .as_ref()
+        .expect("Enabled bucket PUT must surface x-amz-version-id")
+        .clone();
+    assert_ne!(vid1, "null");
+    assert_eq!(vid1.len(), 32, "UUIDv4 simple form is 32 hex chars");
+
+    let payload2 = Bytes::from_static(b"hello version 2 - longer");
+    let resp2 = s4
+        .put_object(put_request("bucket", "key", payload2.clone()))
+        .await
+        .expect("put v2");
+    let vid2 = resp2.output.version_id.as_ref().expect("vid2").clone();
+    assert_ne!(vid1, vid2, "each PUT must mint a fresh version-id");
+
+    // Latest GET (no versionId) returns v2.
+    let got_latest = s4
+        .get_object(get_request("bucket", "key"))
+        .await
+        .expect("get latest");
+    assert_eq!(got_latest.output.version_id.as_deref(), Some(vid2.as_str()));
+    assert_eq!(read_back(got_latest).await, payload2);
+
+    // The chain has two entries.
+    let page = mgr.list_versions("bucket", None, None, None, 100);
+    assert_eq!(page.versions.len(), 2);
+}
+
+#[tokio::test]
+async fn versioning_get_with_version_id_returns_specific_version() {
+    let (s4, _mgr) = make_versioned_s4(CodecKind::CpuZstd);
+    enable_versioning_on(&s4, "bucket").await;
+
+    let v1_payload = Bytes::from_static(b"v1 body");
+    let resp1 = s4
+        .put_object(put_request("bucket", "obj", v1_payload.clone()))
+        .await
+        .expect("put v1");
+    let vid1 = resp1.output.version_id.expect("vid1");
+
+    let v2_payload = Bytes::from_static(b"v2 body - different");
+    let resp2 = s4
+        .put_object(put_request("bucket", "obj", v2_payload.clone()))
+        .await
+        .expect("put v2");
+    let vid2 = resp2.output.version_id.expect("vid2");
+
+    // GET with the older vid returns v1's bytes (the new shadow-key
+    // routing is what makes this work — without it, both PUTs would
+    // overwrite the same backend key and v1 bytes would be lost).
+    let got_v1 = s4
+        .get_object(get_request_with_version("bucket", "obj", &vid1))
+        .await
+        .expect("get v1");
+    assert_eq!(got_v1.output.version_id.as_deref(), Some(vid1.as_str()));
+    assert_eq!(read_back(got_v1).await, v1_payload);
+
+    // GET with the newer vid returns v2.
+    let got_v2 = s4
+        .get_object(get_request_with_version("bucket", "obj", &vid2))
+        .await
+        .expect("get v2");
+    assert_eq!(read_back(got_v2).await, v2_payload);
+
+    // GET with an unknown vid returns NoSuchVersion.
+    let err = s4
+        .get_object(get_request_with_version(
+            "bucket",
+            "obj",
+            "deadbeefdeadbeefdeadbeefdeadbeef",
+        ))
+        .await
+        .expect_err("unknown version must 404");
+    assert!(
+        format!("{err:?}").contains("NoSuchVersion"),
+        "expected NoSuchVersion, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn versioning_delete_without_version_id_creates_delete_marker_and_get_returns_404() {
+    let (s4, mgr) = make_versioned_s4(CodecKind::CpuZstd);
+    enable_versioning_on(&s4, "bucket").await;
+
+    let payload = Bytes::from_static(b"about to be tombstoned");
+    let put_resp = s4
+        .put_object(put_request("bucket", "doomed", payload.clone()))
+        .await
+        .expect("put");
+    let real_vid = put_resp.output.version_id.expect("real vid");
+
+    // DELETE without version-id → push a delete marker.
+    let del_resp = s4
+        .delete_object(delete_request("bucket", "doomed"))
+        .await
+        .expect("delete creates marker");
+    assert_eq!(del_resp.output.delete_marker, Some(true));
+    let marker_vid = del_resp.output.version_id.expect("marker vid");
+    assert_ne!(marker_vid, real_vid);
+
+    // GET without version-id now returns NoSuchKey (delete marker is
+    // the latest entry in the chain).
+    let err = s4
+        .get_object(get_request("bucket", "doomed"))
+        .await
+        .expect_err("delete-marker latest must 404");
+    assert!(
+        format!("{err:?}").contains("NoSuchKey"),
+        "expected NoSuchKey, got {err:?}"
+    );
+
+    // The real version is still reachable by explicit version-id —
+    // the delete marker is a tombstone, not a destructive delete.
+    let undeleted = s4
+        .get_object(get_request_with_version("bucket", "doomed", &real_vid))
+        .await
+        .expect("real version still reachable by vid");
+    assert_eq!(read_back(undeleted).await, payload);
+
+    // Index sanity: chain has 1 real + 1 marker.
+    let page = mgr.list_versions("bucket", None, None, None, 100);
+    assert_eq!(page.versions.len(), 1);
+    assert_eq!(page.delete_markers.len(), 1);
+    assert!(page.delete_markers[0].is_latest);
+}
+
+#[tokio::test]
+async fn versioning_delete_with_version_id_removes_specific_version_and_other_versions_remain() {
+    let (s4, mgr) = make_versioned_s4(CodecKind::CpuZstd);
+    enable_versioning_on(&s4, "bucket").await;
+
+    let p1 = Bytes::from_static(b"version one");
+    let r1 = s4
+        .put_object(put_request("bucket", "k", p1.clone()))
+        .await
+        .expect("put 1");
+    let v1 = r1.output.version_id.expect("v1");
+
+    let p2 = Bytes::from_static(b"version two - bigger payload");
+    let r2 = s4
+        .put_object(put_request("bucket", "k", p2.clone()))
+        .await
+        .expect("put 2");
+    let v2 = r2.output.version_id.expect("v2");
+
+    let p3 = Bytes::from_static(b"version three - biggest payload of them all");
+    let r3 = s4
+        .put_object(put_request("bucket", "k", p3.clone()))
+        .await
+        .expect("put 3");
+    let v3 = r3.output.version_id.expect("v3");
+
+    // Delete the *middle* version specifically — other versions stay.
+    let del = s4
+        .delete_object(delete_request_with_version("bucket", "k", &v2))
+        .await
+        .expect("specific-version delete");
+    assert_eq!(del.output.version_id.as_deref(), Some(v2.as_str()));
+    assert_ne!(del.output.delete_marker, Some(true));
+
+    // v1 + v3 are still reachable by explicit vid; v2 is gone.
+    let got_v1 = s4
+        .get_object(get_request_with_version("bucket", "k", &v1))
+        .await
+        .expect("v1 must remain");
+    assert_eq!(read_back(got_v1).await, p1);
+
+    let got_v3 = s4
+        .get_object(get_request_with_version("bucket", "k", &v3))
+        .await
+        .expect("v3 must remain");
+    assert_eq!(read_back(got_v3).await, p3);
+
+    let err = s4
+        .get_object(get_request_with_version("bucket", "k", &v2))
+        .await
+        .expect_err("v2 must be gone");
+    assert!(
+        format!("{err:?}").contains("NoSuchVersion"),
+        "expected NoSuchVersion, got {err:?}"
+    );
+
+    // Latest (= v3) is still v3, GET without vid returns p3.
+    let latest = s4
+        .get_object(get_request("bucket", "k"))
+        .await
+        .expect("latest");
+    assert_eq!(latest.output.version_id.as_deref(), Some(v3.as_str()));
+    assert_eq!(read_back(latest).await, p3);
+
+    // Chain has 2 entries left.
+    let page = mgr.list_versions("bucket", None, None, None, 100);
+    assert_eq!(page.versions.len(), 2);
+    let vids: Vec<&str> = page.versions.iter().map(|e| e.version_id.as_str()).collect();
+    assert!(vids.contains(&v1.as_str()));
+    assert!(vids.contains(&v3.as_str()));
+    assert!(!vids.contains(&v2.as_str()));
+}
+
+#[tokio::test]
+async fn versioning_list_versions_returns_chronological_history_with_is_latest_flag() {
+    let (s4, _mgr) = make_versioned_s4(CodecKind::CpuZstd);
+    enable_versioning_on(&s4, "bucket").await;
+
+    // Three versions of the same key + one of a different key + a
+    // delete marker on the second key.
+    let _ = s4
+        .put_object(put_request("bucket", "alpha", Bytes::from_static(b"a1")))
+        .await
+        .expect("a1");
+    let _ = s4
+        .put_object(put_request("bucket", "alpha", Bytes::from_static(b"a2")))
+        .await
+        .expect("a2");
+    let r3 = s4
+        .put_object(put_request("bucket", "alpha", Bytes::from_static(b"a3")))
+        .await
+        .expect("a3");
+    let v3_alpha = r3.output.version_id.expect("a3 vid");
+
+    let _ = s4
+        .put_object(put_request("bucket", "beta", Bytes::from_static(b"b1")))
+        .await
+        .expect("b1");
+    let _ = s4
+        .delete_object(delete_request("bucket", "beta"))
+        .await
+        .expect("delete beta");
+
+    // Drive list_object_versions through the S4Service handler (full
+    // wire-shape, as a real S3 client would see it).
+    let resp = s4
+        .list_object_versions(list_versions_request("bucket"))
+        .await
+        .expect("list versions");
+
+    // 3 alpha versions + 1 real beta version.
+    let versions = resp.output.versions.expect("Versions array");
+    assert_eq!(versions.len(), 4);
+    // Ordering: key asc → "alpha" first, then "beta". Inside "alpha"
+    // newest first.
+    let alpha_versions: Vec<&ObjectVersion> = versions
+        .iter()
+        .filter(|v| v.key.as_deref() == Some("alpha"))
+        .collect();
+    assert_eq!(alpha_versions.len(), 3);
+    assert_eq!(
+        alpha_versions[0].version_id.as_deref(),
+        Some(v3_alpha.as_str()),
+        "newest alpha must come first"
+    );
+    assert_eq!(alpha_versions[0].is_latest, Some(true));
+    assert_eq!(alpha_versions[1].is_latest, Some(false));
+    assert_eq!(alpha_versions[2].is_latest, Some(false));
+
+    // 1 delete marker for beta — and it must be is_latest=true (the
+    // delete marker is the current state of beta).
+    let markers = resp.output.delete_markers.expect("DeleteMarkers array");
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].key.as_deref(), Some("beta"));
+    assert_eq!(markers[0].is_latest, Some(true));
+
+    // beta's prior real version is still in the Versions array but
+    // is_latest=false (since the delete marker is now latest).
+    let beta_real: Vec<&ObjectVersion> = versions
+        .iter()
+        .filter(|v| v.key.as_deref() == Some("beta"))
+        .collect();
+    assert_eq!(beta_real.len(), 1);
+    assert_eq!(beta_real[0].is_latest, Some(false));
+
+    // Bucket name + paging metadata round-trip.
+    assert_eq!(resp.output.name.as_deref(), Some("bucket"));
+    assert_eq!(resp.output.is_truncated, Some(false));
+}
+

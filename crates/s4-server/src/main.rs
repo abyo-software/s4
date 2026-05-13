@@ -217,6 +217,19 @@ struct Opt {
     #[clap(long)]
     audit_log_hmac_key: Option<String>,
 
+    /// v0.5 #34: enable the in-memory first-class versioning state
+    /// machine (`VersioningManager`). When set, S4-server itself owns
+    /// per-bucket versioning state + per-(bucket, key) version chain
+    /// (replacing the previous backend-passthrough behaviour). The
+    /// optional path argument names a JSON snapshot file that's
+    /// loaded at startup if present; SIGUSR1-driven dump-back-to-file
+    /// is a future hook (see `VersioningManager::to_json` /
+    /// `from_json` — not yet wired into a signal handler in v0.5
+    /// #34's scope). Pass `--versioning-state-file ""` (empty path) to
+    /// enable the manager with no snapshot to load.
+    #[clap(long, value_name = "PATH")]
+    versioning_state_file: Option<std::path::PathBuf>,
+
     /// v0.5 #31: optional subcommand. When omitted, runs the gateway
     /// (existing v0.4 behaviour). Available subcommands:
     /// `verify-audit-log <FILE> --hmac-key <SPEC>` walks an audit-log
@@ -509,6 +522,34 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             .map_err(|e| format!("--policy {}: {e}", policy_path.display()))?;
         info!(path = %policy_path.display(), "S4 bucket policy loaded");
         s4 = s4.with_policy(std::sync::Arc::new(policy));
+    }
+    // v0.5 #34: wire the in-memory versioning state machine when
+    // --versioning-state-file is supplied. An empty / missing path
+    // starts the manager with a fresh state; a populated path is
+    // loaded as a JSON snapshot (produced previously by
+    // `VersioningManager::to_json`). SIGUSR1-triggered dump-back is
+    // intentionally deferred (signal-handler wiring is out of scope
+    // for v0.5 #34 — operators can still snapshot manually via the
+    // future API).
+    if let Some(ref path) = opt.versioning_state_file {
+        let mgr = if path.as_os_str().is_empty() || !path.exists() {
+            s4_server::versioning::VersioningManager::new()
+        } else {
+            let raw = std::fs::read_to_string(path).map_err(|e| {
+                format!("--versioning-state-file {}: read failed: {e}", path.display())
+            })?;
+            s4_server::versioning::VersioningManager::from_json(&raw).map_err(|e| {
+                format!(
+                    "--versioning-state-file {}: parse failed: {e}",
+                    path.display()
+                )
+            })?
+        };
+        info!(
+            path = %path.display(),
+            "S4 versioning state machine attached (in-memory; v0.5 #34 single-instance scope)"
+        );
+        s4 = s4.with_versioning(std::sync::Arc::new(mgr));
     }
     run_server(s4, &sdk_conf, &opt, ready_client).await
 }
