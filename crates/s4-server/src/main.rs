@@ -761,34 +761,13 @@ fn parse_rotated_key_spec(
     Ok((id, path))
 }
 
-/// v0.7 dogfood follow-up: read a `--*-state-file <PATH>` snapshot,
-/// returning `Ok(None)` for the three "start fresh" cases and
-/// `Ok(Some(json))` for the actual restore-from-snapshot case:
-///
-/// 1. empty path (`--flag=`)
-/// 2. file doesn't exist
-/// 3. file exists but is empty / whitespace-only
-///
-/// The third case used to surface as a `from_json("")` parse error
-/// ("EOF while parsing"), which forced operators to hand-write a
-/// non-trivial empty-snapshot JSON before the manager would attach.
-/// `touch /tmp/foo.json && --flag /tmp/foo.json` is now equivalent to
-/// "fresh manager, dump snapshots back here" once the SIGUSR1 hook
-/// lands.
-fn read_state_file_or_fresh(
-    path: &std::path::Path,
-) -> Result<Option<String>, Box<dyn Error + Send + Sync + 'static>> {
-    if path.as_os_str().is_empty() || !path.exists() {
-        return Ok(None);
-    }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("read failed for {}: {e}", path.display()))?;
-    if raw.trim().is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(raw))
-    }
-}
+// v0.8.4 #72: `read_state_file_or_fresh` (v0.7 dogfood follow-up) was
+// promoted into the library crate as
+// `s4_server::state_loader::read_state_file_or_fresh`, alongside the
+// new `state_loader::load_or_fresh` wrapper that turns a corrupted
+// snapshot into a `tracing::warn!` + counter bump + fresh manager
+// instead of killing the gateway boot. See `state_loader.rs` for the
+// full contract.
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
@@ -1008,16 +987,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // for v0.5 #34 — operators can still snapshot manually via the
     // future API).
     if let Some(ref path) = opt.versioning_state_file {
-        let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
-            s4_server::versioning::VersioningManager::from_json(&raw).map_err(|e| {
-                format!(
-                    "--versioning-state-file {}: parse failed: {e}",
-                    path.display()
-                )
-            })?
-        } else {
-            s4_server::versioning::VersioningManager::new()
-        };
+        // v0.8.4 #72: corrupted snapshots WARN + bump
+        // `s4_state_file_load_failures_total{manager="versioning"}` and
+        // boot fresh instead of killing the gateway. The on-disk file
+        // is left untouched so the operator can inspect / restore.
+        let mgr = s4_server::state_loader::load_or_fresh(
+            "versioning",
+            path,
+            s4_server::versioning::VersioningManager::from_json,
+        );
         info!(
             path = %path.display(),
             "S4 versioning state machine attached (in-memory; v0.5 #34 single-instance scope)"
@@ -1029,16 +1007,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // as a JSON snapshot (produced previously by
     // `ObjectLockManager::to_json`).
     if let Some(ref path) = opt.object_lock_state_file {
-        let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
-            s4_server::object_lock::ObjectLockManager::from_json(&raw).map_err(|e| {
-                format!(
-                    "--object-lock-state-file {}: parse failed: {e}",
-                    path.display()
-                )
-            })?
-        } else {
-            s4_server::object_lock::ObjectLockManager::new()
-        };
+        // v0.8.4 #72: per-manager fault isolation (see versioning above).
+        let mgr = s4_server::state_loader::load_or_fresh(
+            "object_lock",
+            path,
+            s4_server::object_lock::ObjectLockManager::from_json,
+        );
         info!(
             path = %path.display(),
             "S4 Object Lock manager attached (in-memory; v0.5 #30 single-instance scope)"
@@ -1054,16 +1028,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // wide default secret on top of (or in addition to) any per-bucket
     // overrides loaded from the JSON snapshot.
     if let Some(ref path) = opt.mfa_delete_state_file {
-        let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
-            s4_server::mfa::MfaDeleteManager::from_json(&raw).map_err(|e| {
-                format!(
-                    "--mfa-delete-state-file {}: parse failed: {e}",
-                    path.display()
-                )
-            })?
-        } else {
-            s4_server::mfa::MfaDeleteManager::new()
-        };
+        // v0.8.4 #72: per-manager fault isolation (see versioning above).
+        // The MFA-Delete *snapshot* is per-bucket-override config — a
+        // corrupt snapshot still falls back to "no overrides" (the
+        // gateway-wide default secret below remains the gate). The
+        // `--mfa-default-secret-file` read inside this block stays
+        // fail-closed (`?`): if the operator opted into MFA Delete and
+        // we cannot read the secret, the gate cannot verify TOTP codes
+        // and the only safe behaviour is to refuse to boot — silently
+        // booting with no secret would let DELETEs slip past MFA.
+        let mgr = s4_server::state_loader::load_or_fresh(
+            "mfa_delete",
+            path,
+            s4_server::mfa::MfaDeleteManager::from_json,
+        );
         if let Some(ref secret_path) = opt.mfa_default_secret_file {
             let raw = std::fs::read_to_string(secret_path).map_err(|e| {
                 format!(
@@ -1103,13 +1081,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // populated path is loaded as a JSON snapshot (produced by
     // `CorsManager::to_json`).
     if let Some(ref path) = opt.cors_state_file {
-        let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
-            s4_server::cors::CorsManager::from_json(&raw).map_err(|e| {
-                format!("--cors-state-file {}: parse failed: {e}", path.display())
-            })?
-        } else {
-            s4_server::cors::CorsManager::new()
-        };
+        // v0.8.4 #72: per-manager fault isolation (see versioning above).
+        let mgr = s4_server::state_loader::load_or_fresh(
+            "cors",
+            path,
+            s4_server::cors::CorsManager::from_json,
+        );
         info!(
             path = %path.display(),
             "S4 CORS manager attached (in-memory; v0.6 #38 single-instance scope; OPTIONS routing follow-up)"
@@ -1135,16 +1112,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // v0.7 #45 lifecycle pattern below).
     let inventory_to_scan: Option<std::sync::Arc<s4_server::inventory::InventoryManager>> =
         if let Some(ref path) = opt.inventory_state_file {
-            let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
-                s4_server::inventory::InventoryManager::from_json(&raw).map_err(|e| {
-                    format!(
-                        "--inventory-state-file {}: parse failed: {e}",
-                        path.display()
-                    )
-                })?
-            } else {
-                s4_server::inventory::InventoryManager::new()
-            };
+            // v0.8.4 #72: per-manager fault isolation (see versioning above).
+            let mgr = s4_server::state_loader::load_or_fresh(
+                "inventory",
+                path,
+                s4_server::inventory::InventoryManager::from_json,
+            );
             let mgr = std::sync::Arc::new(mgr);
             info!(
                 path = %path.display(),
@@ -1165,16 +1138,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // runs inside the request-path handlers (PUT / DELETE) on detached
     // tokio tasks, so no extra background scheduler is needed here.
     if let Some(ref path) = opt.notifications_state_file {
-        let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
-            s4_server::notifications::NotificationManager::from_json(&raw).map_err(|e| {
-                format!(
-                    "--notifications-state-file {}: parse failed: {e}",
-                    path.display()
-                )
-            })?
-        } else {
-            s4_server::notifications::NotificationManager::new()
-        };
+        // v0.8.4 #72: per-manager fault isolation (see versioning above).
+        let mgr = s4_server::state_loader::load_or_fresh(
+            "notifications",
+            path,
+            s4_server::notifications::NotificationManager::from_json,
+        );
         info!(
             path = %path.display(),
             "S4 notifications manager attached (in-memory; v0.6 #35 single-instance scope; webhook always available, SQS/SNS gated by `aws-events`)"
@@ -1187,16 +1156,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // starts a fresh manager, populated path is loaded as a JSON
     // snapshot produced previously by `TagManager::to_json`.
     if let Some(ref path) = opt.tagging_state_file {
-        let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
-            s4_server::tagging::TagManager::from_json(&raw).map_err(|e| {
-                format!(
-                    "--tagging-state-file {}: parse failed: {e}",
-                    path.display()
-                )
-            })?
-        } else {
-            s4_server::tagging::TagManager::new()
-        };
+        // v0.8.4 #72: per-manager fault isolation (see versioning above).
+        let mgr = s4_server::state_loader::load_or_fresh(
+            "tagging",
+            path,
+            s4_server::tagging::TagManager::from_json,
+        );
         info!(
             path = %path.display(),
             "S4 Tagging manager attached (in-memory; v0.6 #39 single-instance scope)"
@@ -1212,16 +1177,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // runs inside `put_object` on detached tokio tasks, so no extra
     // background scheduler is needed here.
     if let Some(ref path) = opt.replication_state_file {
-        let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
-            s4_server::replication::ReplicationManager::from_json(&raw).map_err(|e| {
-                format!(
-                    "--replication-state-file {}: parse failed: {e}",
-                    path.display()
-                )
-            })?
-        } else {
-            s4_server::replication::ReplicationManager::new()
-        };
+        // v0.8.4 #72: per-manager fault isolation (see versioning above).
+        let mgr = s4_server::state_loader::load_or_fresh(
+            "replication",
+            path,
+            s4_server::replication::ReplicationManager::from_json,
+        );
         info!(
             path = %path.display(),
             "S4 replication manager attached (in-memory; v0.6 #40 single-instance scope; same-S4Service source/destination only)"
@@ -1246,16 +1207,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // versions are fully covered.
     let lifecycle_to_scan: Option<std::sync::Arc<s4_server::lifecycle::LifecycleManager>> =
         if let Some(ref path) = opt.lifecycle_state_file {
-            let mgr = if let Some(raw) = read_state_file_or_fresh(path)? {
-                s4_server::lifecycle::LifecycleManager::from_json(&raw).map_err(|e| {
-                    format!(
-                        "--lifecycle-state-file {}: parse failed: {e}",
-                        path.display()
-                    )
-                })?
-            } else {
-                s4_server::lifecycle::LifecycleManager::new()
-            };
+            // v0.8.4 #72: per-manager fault isolation (see versioning above).
+            let mgr = s4_server::state_loader::load_or_fresh(
+                "lifecycle",
+                path,
+                s4_server::lifecycle::LifecycleManager::from_json,
+            );
             let mgr = std::sync::Arc::new(mgr);
             info!(
                 path = %path.display(),

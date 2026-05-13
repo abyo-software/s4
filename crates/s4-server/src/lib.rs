@@ -23,6 +23,7 @@ pub mod service;
 pub mod service_arc;
 pub mod sigv4a;
 pub mod sse;
+pub mod state_loader;
 pub mod streaming;
 pub mod tagging;
 pub mod tls;

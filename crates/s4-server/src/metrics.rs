@@ -154,6 +154,23 @@ pub mod names {
     /// per-pair signal (log) and aggregate volume (counter).
     pub const REPLICATION_LOCK_PROPAGATION_SKIPPED_TOTAL: &str =
         "s4_replication_lock_propagation_skipped_total";
+    /// v0.8.4 #72: counter bumped each time a `--*-state-file <PATH>`
+    /// snapshot fails to load at boot — the gateway fell back to a
+    /// fresh in-memory manager and the operator's file is left in
+    /// place for inspection. Labels:
+    /// - `manager` — short stable name (`"versioning"`, `"object_lock"`,
+    ///   `"mfa_delete"`, `"cors"`, `"inventory"`, `"notifications"`,
+    ///   `"tagging"`, `"replication"`, `"lifecycle"`).
+    /// - `reason` — `"read_error"` (filesystem read failed: permission,
+    ///   I/O error) or `"parse_error"` (corrupted JSON / schema drift).
+    ///
+    /// Cardinality bounded by (#managers × 2) = 18.
+    /// Operators alert on `rate(s4_state_file_load_failures_total > 0)`
+    /// so silent boot-time fall-backs surface in dashboards even when
+    /// the gateway itself comes up cleanly. Pair with the WARN log line
+    /// emitted by [`crate::state_loader::load_or_fresh`] for the per-
+    /// call detail (manager / path / underlying error).
+    pub const STATE_FILE_LOAD_FAILURES_TOTAL: &str = "s4_state_file_load_failures_total";
     /// v0.8.4 #77 (audit H-8): bumped each time a state-manager
     /// `RwLock` / `Mutex` recovery helper (see [`crate::lock_recovery`])
     /// observes a poisoned lock and forwards the inner data instead of
@@ -180,6 +197,22 @@ pub fn record_lock_poison_recovery(lock: &'static str, kind: &'static str) {
         names::LOCK_POISON_RECOVERY_TOTAL,
         "lock" => lock,
         "kind" => kind,
+    )
+    .increment(1);
+}
+
+/// v0.8.4 #72: bump the per-manager state-file load-failure counter.
+/// Called from [`crate::state_loader::load_or_fresh`] after a snapshot
+/// load fell back to the manager's `Default::default()` because the
+/// file could not be read (`reason = "read_error"`) or parsed
+/// (`reason = "parse_error"`). The accompanying WARN log line carries
+/// the file path + underlying error; this counter is the dashboard-
+/// friendly aggregate so an alert can fire even if log scraping is off.
+pub fn record_state_file_load_failure(manager: &'static str, reason: &'static str) {
+    metrics::counter!(
+        names::STATE_FILE_LOAD_FAILURES_TOTAL,
+        "manager" => manager,
+        "reason" => reason,
     )
     .increment(1);
 }

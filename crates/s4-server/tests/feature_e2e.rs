@@ -5658,3 +5658,467 @@ async fn upload_part_copy_propagates_source_version_id() {
 
     let _ = spawned.shutdown.send(());
 }
+
+// ---------------------------------------------------------------------------
+// v0.8.4 #72 — Snapshot boot fault isolation tests (no Docker required)
+// ---------------------------------------------------------------------------
+//
+// These tests exercise the v0.8.4 #72 boot path directly (no listener
+// spawn, no MinIO container) — they call `s4_server::state_loader::
+// load_or_fresh` exactly the way `main.rs` does for each `--*-state-file`
+// flag. The point is to prove that one corrupted snapshot file no longer
+// kills the gateway boot for every other manager.
+
+/// Process-global Prometheus recorder shared between the v0.8.4 #72
+/// integration test and the back-compat regression tests below. The
+/// recorder slot can only be installed once per binary, so every test
+/// in this file that wants to grep `/metrics` MUST go through this
+/// helper (mirrors the `test_metrics_handle()` pattern inside the
+/// crate's own `metrics.rs` unit tests).
+fn install_test_metrics_recorder()
+-> &'static metrics_exporter_prometheus::PrometheusHandle {
+    use std::sync::OnceLock;
+    static HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
+    HANDLE.get_or_init(|| {
+        // Tolerate the recorder already being installed by an
+        // earlier-running test in the same binary — fall back to
+        // a fresh `PrometheusBuilder` handle that points at the
+        // same global recorder slot.
+        match metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder() {
+            Ok(h) => h,
+            Err(_) => metrics_exporter_prometheus::PrometheusBuilder::new()
+                .build_recorder()
+                .handle(),
+        }
+    })
+}
+
+#[test]
+fn corrupted_versioning_snapshot_falls_back_to_fresh_with_warn_metric() {
+    // v0.8.4 #72 (audit C-2 + back-compat MEDIUM): write a
+    // syntactically broken JSON file, then drive
+    // `state_loader::load_or_fresh` exactly the way main.rs does for
+    // `--versioning-state-file <PATH>`. The boot path must NOT bubble
+    // an Err — it must:
+    //
+    //   1. emit a `tracing::warn!` log line carrying the manager name,
+    //      path, and the parser's `serde_json::Error`;
+    //   2. bump
+    //      `s4_state_file_load_failures_total{manager="versioning",
+    //      reason="parse_error"}` by 1;
+    //   3. return a fresh `VersioningManager::default()` so the
+    //      gateway can still bind its listener;
+    //   4. leave the operator's bytes on disk for inspection.
+    //
+    // Pre-#72 step 1+2+3 collapsed into "exit boot with a stringified
+    // error" and the gateway never reached the listener bind, taking
+    // the entire data plane down for one bad file.
+
+    let handle = install_test_metrics_recorder();
+    let before = handle.render();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("versioning.json");
+    let corrupted = br#"{ "broken json"#;
+    std::fs::write(&path, corrupted).expect("write corrupted snapshot");
+
+    // Boot routine — same shape as `main.rs`'s `--versioning-state-file`
+    // loader after the v0.8.4 #72 migration. No listener, no Arc wrap,
+    // just the manager construction so the assertion is on the boot
+    // contract.
+    let mgr = s4_server::state_loader::load_or_fresh(
+        "versioning",
+        &path,
+        s4_server::versioning::VersioningManager::from_json,
+    );
+
+    // Step 3 — boot succeeds with a fresh empty state. We can't peek
+    // at `VersioningManager`'s internal HashMap directly (private
+    // fields), but the `to_json` snapshot of an empty manager is the
+    // empty-state JSON; round-tripping that and re-checking is the
+    // observable proxy for "no buckets, no versions".
+    let snap = mgr
+        .to_json()
+        .expect("fresh VersioningManager must serialise");
+    let mgr2 = s4_server::versioning::VersioningManager::from_json(&snap)
+        .expect("the round-trip JSON must parse cleanly (no corruption)");
+    let _ = mgr2; // confirms the type round-trips; emptiness asserted via JSON below.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&snap).expect("fresh snapshot must be valid JSON");
+    // Walk the snapshot Value tree looking for any non-empty leaf
+    // object/array — a fresh manager carries empty maps everywhere
+    // (e.g. `{"index":{"buckets":{}},"state":{}}`) so any non-empty
+    // map proves the corrupted file's bytes leaked through. Tolerate
+    // arbitrary nesting depth.
+    fn all_empty(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Object(m) => m.values().all(all_empty),
+            serde_json::Value::Array(a) => a.iter().all(all_empty),
+            serde_json::Value::Null => true,
+            // A scalar (string/number/bool) at a leaf would mean an
+            // entry survived the fresh-default round-trip — fail.
+            _ => false,
+        }
+    }
+    assert!(
+        all_empty(&parsed),
+        "fresh VersioningManager snapshot must carry no buckets / no \
+         versions (got {snap:?}) — the corrupted file's bytes appear \
+         to have leaked through",
+    );
+
+    // Step 4 — the operator's bytes survive untouched.
+    let post = std::fs::read(&path).expect("post-load read");
+    assert_eq!(
+        post, corrupted,
+        "v0.8.4 #72: corrupted snapshot file MUST be left in place for operator inspection (no boot-time mutation / deletion)",
+    );
+
+    // Step 2 — the per-manager / per-reason failure counter incremented.
+    // We compare `before` vs `after` so concurrent tests in the same
+    // binary cannot make this assertion flaky.
+    let after = handle.render();
+    let label_frag =
+        r#"s4_state_file_load_failures_total{manager="versioning",reason="parse_error"}"#;
+    let count_after = parse_counter_value(&after, label_frag);
+    let count_before = parse_counter_value(&before, label_frag);
+    assert!(
+        count_after > count_before,
+        "v0.8.4 #72: corrupted versioning snapshot MUST bump \
+         {label_frag} (before={count_before}, after={count_after}); \
+         render slice:\n{}",
+        slice_metric(&after, "s4_state_file_load_failures_total"),
+    );
+}
+
+/// Pull the integer value out of a Prometheus text-format counter line.
+/// Returns 0 when the label combo has not been emitted yet (counters
+/// are sparse — a label combo only appears after its first increment).
+fn parse_counter_value(rendered: &str, label_fragment: &str) -> u64 {
+    for line in rendered.lines() {
+        if let Some(rest) = line.strip_prefix(label_fragment) {
+            // `rest` is now ` <value>` (e.g. ` 1`).
+            if let Some(num) = rest.split_whitespace().next() {
+                // Prometheus exporter emits counters as floats
+                // ("1" / "1.0" / "1e0"); parse via f64 then cast to u64.
+                if let Ok(v) = num.parse::<f64>() {
+                    return v as u64;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Slice the rendered Prometheus output to the lines that contain
+/// `name_fragment` (used for `assert!` panic messages so the operator
+/// can see exactly which counter label combos were emitted).
+fn slice_metric(rendered: &str, name_fragment: &str) -> String {
+    rendered
+        .lines()
+        .filter(|l| l.contains(name_fragment))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// v0.8.4 #72 back-compat regression guards (no Docker required)
+// ---------------------------------------------------------------------------
+
+/// Per-chunk AAD for an S4E5 frame. Kept in this test crate as a
+/// hand-crafted mirror of `s4_server::sse`'s private `aad_v5` so we
+/// can synthesise a "v0.8.0 vintage" S4E5 blob without exposing the
+/// pre-v0.8.1 emit path through the library API.
+fn aad_v5_for_test(
+    chunk_index: u32,
+    total_chunks: u32,
+    key_id: u16,
+    salt: &[u8; 4],
+) -> [u8; 19] {
+    let mut aad = [0u8; 19];
+    aad[..4].copy_from_slice(s4_server::sse::SSE_MAGIC_V5);
+    aad[4] = s4_server::sse::ALGO_AES_256_GCM;
+    aad[5..9].copy_from_slice(&chunk_index.to_be_bytes());
+    aad[9..13].copy_from_slice(&total_chunks.to_be_bytes());
+    aad[13..15].copy_from_slice(&key_id.to_be_bytes());
+    aad[15..19].copy_from_slice(salt);
+    aad
+}
+
+/// 12-byte AES-GCM nonce for an S4E5 chunk: `b"E5\0\0" || salt(4) ||
+/// chunk_index_BE_u32(4)`. Matches the private `nonce_v5` derivation
+/// inside the library.
+fn nonce_v5_for_test(salt: &[u8; 4], chunk_index: u32) -> [u8; 12] {
+    let mut n = [0u8; 12];
+    n[..4].copy_from_slice(&[b'E', b'5', 0, 0]);
+    n[4..8].copy_from_slice(salt);
+    n[8..12].copy_from_slice(&chunk_index.to_be_bytes());
+    n
+}
+
+#[test]
+fn legacy_s4e5_chunks_decrypt_on_v0_8_4_gateway() {
+    // v0.8.4 #72 back-compat MEDIUM: every S4E5-framed object written
+    // by a pre-v0.8.1 gateway MUST still decrypt cleanly under the
+    // current `s4_server::sse::decrypt` dispatcher. Without this
+    // guarantee the per-manager fault isolation work in this commit
+    // would mask a much worse regression — operators upgrading would
+    // see "boot succeeded" but every S4E5 GET would 500.
+    //
+    // We hand-craft an S4E5 frame here (the library's
+    // `encrypt_v2_chunked_s4e5_for_test` is `#[cfg(test)]`-private)
+    // using the public `SSE_MAGIC_V5` / `ALGO_AES_256_GCM` constants
+    // and the documented S4E5 wire format:
+    //   header = magic(4) || algo(1) || key_id_BE(2) || reserved(1)
+    //          || chunk_size_BE(4) || chunk_count_BE(4) || salt(4)  // = 20 bytes
+    //   chunk  = tag(16) || ciphertext
+
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead, aead::Payload};
+    use rand::RngCore as _;
+
+    let key_bytes = [0x57u8; 32];
+    let key_id: u16 = 1;
+    let key = s4_server::sse::SseKey::from_bytes(&key_bytes).expect("32-byte key");
+    let kr = s4_server::sse::SseKeyring::new(key_id, std::sync::Arc::new(key));
+
+    // Pick a plaintext that spans multiple chunks so the test exercises
+    // the chunk-walk loop, not just the one-chunk happy path.
+    let plaintext: Vec<u8> = b"v0.8.0 vintage chunked SSE-S4 object".repeat(64);
+    let chunk_size: usize = 91; // odd-sized chunks → forces a partial last chunk.
+
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes).expect("aes-256 key");
+    let mut salt = [0u8; 4];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+
+    let chunk_count: u32 = if plaintext.is_empty() {
+        1
+    } else {
+        plaintext
+            .len()
+            .div_ceil(chunk_size)
+            .try_into()
+            .expect("chunk_count fits u32")
+    };
+
+    let mut frame: Vec<u8> = Vec::with_capacity(s4_server::sse::S4E5_HEADER_BYTES + plaintext.len());
+    // Header.
+    frame.extend_from_slice(s4_server::sse::SSE_MAGIC_V5);
+    frame.push(s4_server::sse::ALGO_AES_256_GCM);
+    frame.extend_from_slice(&key_id.to_be_bytes());
+    frame.push(0u8); // reserved
+    frame.extend_from_slice(&(chunk_size as u32).to_be_bytes());
+    frame.extend_from_slice(&chunk_count.to_be_bytes());
+    frame.extend_from_slice(&salt);
+
+    // Chunks: [tag(16) || ct(...)] each.
+    for i in 0..chunk_count {
+        let off = (i as usize) * chunk_size;
+        let end = (off + chunk_size).min(plaintext.len());
+        let chunk_pt: &[u8] = if off >= plaintext.len() {
+            &[]
+        } else {
+            &plaintext[off..end]
+        };
+        let nonce_bytes = nonce_v5_for_test(&salt, i);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let aad = aad_v5_for_test(i, chunk_count, key_id, &salt);
+        let ct_with_tag = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: chunk_pt,
+                    aad: &aad,
+                },
+            )
+            .expect("aes-gcm encrypt cannot fail with a 32-byte key");
+        // The library wire format is `tag(16) || ciphertext`, NOT the
+        // `aes-gcm` crate's default `ciphertext || tag` layout, so split
+        // and re-order.
+        let split = ct_with_tag.len() - 16;
+        let (ct, tag) = ct_with_tag.split_at(split);
+        frame.extend_from_slice(tag);
+        frame.extend_from_slice(ct);
+    }
+
+    // Sanity: this really IS S4E5, not S4E6 / S4E1 / etc.
+    assert_eq!(
+        &frame[..4],
+        s4_server::sse::SSE_MAGIC_V5,
+        "fixture must be S4E5 (= v0.8.0 vintage), not the v0.8.1+ S4E6"
+    );
+    assert_eq!(
+        s4_server::sse::peek_magic(&frame),
+        Some("S4E5"),
+        "library's peek_magic helper must agree this is an S4E5 blob"
+    );
+
+    // Decrypt via the top-level dispatcher (= the same path the GET
+    // handler exercises in production).
+    let plain = s4_server::sse::decrypt(&frame, &kr)
+        .expect("v0.8.4 gateway MUST still decrypt v0.8.0-vintage S4E5 frames");
+    assert_eq!(
+        plain.as_ref(),
+        plaintext.as_slice(),
+        "byte-equal plaintext round-trip across the v0.8.0 -> v0.8.4 SSE-S4 schema"
+    );
+}
+
+#[test]
+fn pre_v0_8_2_replication_snapshot_loads_with_zero_generation_via_untagged() {
+    // v0.8.4 #72 back-compat MEDIUM: prove that `ReplicationManager::
+    // from_json` accepts the **pre-v0.8.2 snapshot shape** (bare
+    // `(bucket, key) -> ReplicationStatus`, no `generation` token, no
+    // `recorded_at`) via the `serde(untagged)` `StatusOrEntry` enum.
+    //
+    // The new gateway must:
+    //   - load the entry with `generation = 0` (= guaranteed
+    //     overridable by the very next real PUT, which mints
+    //     `generation = 1`);
+    //   - stamp `recorded_at = Utc::now()` so the v0.8.3 #66 sweep
+    //     gives the entry one full TTL grace window before pruning.
+    //
+    // Without this back-compat path, every v0.8.1 → v0.8.4 upgrade
+    // would either deserialise-fail at boot (which #72's per-manager
+    // fault isolation would now silently degrade!) or lose every
+    // already-replicated COMPLETED stamp on the upgrade window.
+
+    // Pre-v0.8.2 wire shape: serialise a bare ReplicationStatus per
+    // entry, NO `generation`, NO `recorded_at`, NO `next_generation`
+    // top-level field. The `serde(untagged)` enum + `serde(default)`
+    // attributes on the new fields are what make this round-trip
+    // possible.
+    let pre_v0_8_2_json = r#"{
+        "by_bucket": {},
+        "statuses": [
+            [["src", "k"], "Completed"],
+            [["src", "k2"], "Failed"]
+        ]
+    }"#;
+
+    let mgr = s4_server::replication::ReplicationManager::from_json(pre_v0_8_2_json)
+        .expect("v0.8.4 gateway MUST still load v0.8.1-vintage replication snapshots");
+
+    // (a) status round-trip lossless.
+    assert_eq!(
+        mgr.lookup_status("src", "k"),
+        Some(s4_server::replication::ReplicationStatus::Completed),
+        "Completed status must survive v0.8.1 -> v0.8.4 deserialise",
+    );
+    assert_eq!(
+        mgr.lookup_status("src", "k2"),
+        Some(s4_server::replication::ReplicationStatus::Failed),
+        "Failed status must survive v0.8.1 -> v0.8.4 deserialise",
+    );
+    // (b) a never-stored entry is still None.
+    assert!(mgr.lookup_status("src", "missing").is_none());
+
+    // (c) generation = 0 → guaranteed overridable by next PUT (which
+    // mints generation >= 1). We verify this through the public
+    // `record_status_if_newer` CAS contract — passing generation = 1
+    // MUST succeed against a generation = 0 stored entry.
+    assert!(
+        mgr.record_status_if_newer(
+            "src",
+            "k",
+            1,
+            s4_server::replication::ReplicationStatus::Pending,
+        ),
+        "pre-v0.8.2 entry's generation MUST be 0 (= overridable by gen=1)",
+    );
+    assert!(
+        mgr.record_status_if_newer(
+            "src",
+            "k2",
+            1,
+            s4_server::replication::ReplicationStatus::Pending,
+        ),
+        "pre-v0.8.2 entry's generation MUST be 0 (= overridable by gen=1)",
+    );
+
+    // (d) `next_generation` defaults to 1 on a pre-v0.8.2 snapshot
+    // (= the first mint after restore is strictly greater than every
+    // legacy `generation = 0` entry). We verify by minting and
+    // confirming the returned token is >= 1 (it will already be 2 or 3
+    // because the `record_status_if_newer` calls above also bumped it
+    // — what matters is "strictly > 0").
+    let g = mgr.next_generation();
+    assert!(
+        g >= 1,
+        "next_generation after restoring a pre-v0.8.2 snapshot must be >= 1 (got {g})",
+    );
+
+    // (e) `recorded_at` was stamped near `Utc::now()` at deserialise
+    // time. We can't peek at the entry directly through the public
+    // API (statuses is private), but `to_json` round-trips the entry
+    // including the `recorded_at` field — re-parse and confirm the
+    // timestamp falls inside the [before, after] window we captured
+    // around the from_json call.
+    let snap = mgr
+        .to_json()
+        .expect("ReplicationManager::to_json on a pre-v0.8.2-loaded mgr");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&snap).expect("re-emitted snapshot must be valid JSON");
+    let statuses = parsed
+        .get("statuses")
+        .and_then(|v| v.as_array())
+        .expect("statuses array must exist in the re-emitted snapshot");
+    // After the two `record_status_if_newer(...,1,Pending)` calls the
+    // statuses table holds the freshly-stamped entries (recorded_at
+    // bumped to that call's `Utc::now()`). To verify the back-compat
+    // default-now stamp specifically, re-load a fresh manager from
+    // the same input and `to_json` immediately, so the snapshot's
+    // `recorded_at` is the deserialise-time default and nothing else.
+    // We capture the `[before, after]` clock window TIGHTLY around the
+    // pristine deserialise so the assertion below is a strict bound.
+    let before = chrono::Utc::now();
+    let mgr_pristine = s4_server::replication::ReplicationManager::from_json(pre_v0_8_2_json)
+        .expect("re-load pristine");
+    let after = chrono::Utc::now();
+    let snap_pristine = mgr_pristine.to_json().expect("to_json pristine");
+    let pristine: serde_json::Value =
+        serde_json::from_str(&snap_pristine).expect("pristine valid JSON");
+    let pristine_statuses = pristine
+        .get("statuses")
+        .and_then(|v| v.as_array())
+        .expect("pristine statuses array");
+    assert!(
+        !pristine_statuses.is_empty(),
+        "pristine snapshot must carry the two pre-v0.8.2 entries"
+    );
+    for entry_pair in pristine_statuses {
+        // Each element is `[[bucket, key], { status, generation, recorded_at }]`.
+        let entry_obj = entry_pair
+            .as_array()
+            .and_then(|a| a.get(1))
+            .and_then(|v| v.as_object())
+            .expect("entry payload must be an object");
+        let generation = entry_obj
+            .get("generation")
+            .and_then(|v| v.as_u64())
+            .expect("generation field present");
+        assert_eq!(
+            generation, 0,
+            "pre-v0.8.2 entry MUST deserialise with generation = 0 (got {generation})",
+        );
+        let recorded_at = entry_obj
+            .get("recorded_at")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .expect("recorded_at must be RFC3339-parseable");
+        assert!(
+            recorded_at >= before && recorded_at <= after,
+            "recorded_at MUST be ~Utc::now() at deserialise time \
+             (got {recorded_at}, window [{before}, {after}])",
+        );
+    }
+    // Also assert against `statuses` (the live mgr) just to ensure
+    // the snapshot path stays connected to the public observable —
+    // we don't care about the timestamp here, only the count.
+    assert_eq!(
+        statuses.len(),
+        2,
+        "live mgr must carry both pre-v0.8.2 entries"
+    );
+    let _ = g; // silence unused warning when assertions skip.
+}
