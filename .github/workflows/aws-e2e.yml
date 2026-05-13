@@ -31,7 +31,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Pre-flight — verify GitHub Actions variables are configured
+      - name: Pre-flight — check if AWS E2E variables are configured
+        id: check
         run: |
           set -eu
           missing=""
@@ -39,28 +40,33 @@ jobs:
           [ -n "${{ vars.AWS_E2E_ROLE_ARN }}" ] || missing="$missing AWS_E2E_ROLE_ARN"
           [ -n "${{ vars.AWS_E2E_REGION }}" ]   || missing="$missing AWS_E2E_REGION"
           if [ -n "$missing" ]; then
-            echo "::error::Required repository variables not set:$missing"
-            echo "Set them in Settings → Secrets and variables → Actions → Variables tab."
-            echo "See infra/aws-e2e/README.md for setup instructions."
-            exit 1
+            echo "::notice::AWS E2E is opt-in; skipping (set$missing in Settings → Secrets and variables → Actions → Variables tab to enable). See infra/aws-e2e/README.md."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: dtolnay/rust-toolchain@stable
+      - if: steps.check.outputs.configured == 'true'
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
+      - if: steps.check.outputs.configured == 'true'
+        name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Configure AWS credentials via OIDC
+      - if: steps.check.outputs.configured == 'true'
+        name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_E2E_ROLE_ARN }}
           aws-region: ${{ vars.AWS_E2E_REGION }}
           role-session-name: s4-aws-e2e-${{ github.run_id }}
 
-      - name: Build s4 (CPU)
+      - if: steps.check.outputs.configured == 'true'
+        name: Build s4 (CPU)
         run: cargo build --release -p s4-server --bin s4
 
-      - name: Run AWS E2E tests
+      - if: steps.check.outputs.configured == 'true'
+        name: Run AWS E2E tests
         env:
           AWS_E2E_BUCKET: ${{ vars.AWS_E2E_BUCKET }}
           AWS_E2E_REGION: ${{ vars.AWS_E2E_REGION }}
@@ -72,7 +78,7 @@ jobs:
             -- --ignored --test-threads=1 --nocapture
 
       - name: Open issue on failure
-        if: failure() && github.event_name == 'schedule'
+        if: failure() && github.event_name == 'schedule' && steps.check.outputs.configured == 'true'
         uses: actions/github-script@v7
         with:
           script: |
