@@ -187,7 +187,19 @@ impl AccessLog {
     /// `flush_every_secs` (default 60) and appends to the per-hour file
     /// in `dest.dir`. Returns the tokio JoinHandle so the caller can
     /// abort on shutdown if needed.
-    pub fn spawn_flusher(&self) -> tokio::task::JoinHandle<()> {
+    ///
+    /// v0.8.5 #81 (audit H-7): the optional `shutdown` notifier lets the
+    /// listener loop signal the flusher to drain the buffer one final
+    /// time and exit cleanly on SIGTERM / SIGINT — without this, the
+    /// detached task would keep ticking past the listener loop break and
+    /// the process would only stop because tokio drops the runtime out
+    /// from under it (any in-flight write would be torn at an arbitrary
+    /// boundary). `None` keeps the legacy "tick forever" behaviour for
+    /// callers (chiefly tests) that don't drive a shutdown signal.
+    pub fn spawn_flusher(
+        &self,
+        shutdown: Option<Arc<tokio::sync::Notify>>,
+    ) -> tokio::task::JoinHandle<()> {
         let dest = self.dest.clone();
         let buf = Arc::clone(&self.buf);
         let interval = self.flush_every_secs;
@@ -205,7 +217,81 @@ impl AccessLog {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    () = async {
+                        if let Some(ref n) = shutdown {
+                            n.notified().await;
+                        } else {
+                            // No shutdown notifier wired — park forever
+                            // so the `select!` always falls through to
+                            // the tick branch (legacy "tick forever"
+                            // behaviour).
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        tracing::info!(
+                            "S4 access log flusher shutting down (got cancel signal); draining one last batch"
+                        );
+                        // Best-effort final drain so any pending entries
+                        // land on disk before the runtime tears down.
+                        // Errors are logged-and-swallowed; the next tick
+                        // would have done the same thing.
+                        // (We re-use the tick body rather than DRY-ing
+                        // it into a helper to keep the diff scoped.)
+                        let drained: Vec<AccessLogEntry> = {
+                            let mut b = buf.lock().await;
+                            b.drain(..).collect()
+                        };
+                        if drained.is_empty() {
+                            return;
+                        }
+                        let now = SystemTime::now();
+                        let batch = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let path = dest.path_for(now, batch);
+                        let (body, _) = if let Some(key) = hmac_key.as_ref() {
+                            let mut state = chain_state.lock().await;
+                            let (rendered, new_last) =
+                                render_lines_chained(&drained, key, &state);
+                            state.last_hmac = new_last;
+                            state.primed = true;
+                            let mut with_marker = rendered;
+                            let eof = compute_eof_hmac(key, &new_last);
+                            with_marker.push_str(EOF_HMAC_COMMENT_PREFIX);
+                            with_marker.push_str(&hex_encode(&eof));
+                            with_marker.push('\n');
+                            (with_marker, Some(new_last))
+                        } else {
+                            (render_lines(&drained), None)
+                        };
+                        let body_bytes: Bytes = Bytes::from(body);
+                        let path_clone = path.clone();
+                        let res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                            use std::io::Write;
+                            let mut f = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&path_clone)?;
+                            f.write_all(&body_bytes)
+                        })
+                        .await;
+                        match res {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    "S4 access log final-drain write failed at {}: {e}",
+                                    path.display()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "S4 access log final-drain join failed: {e}"
+                                );
+                            }
+                        }
+                        return;
+                    }
+                    _ = tick.tick() => {}
+                }
                 let drained: Vec<AccessLogEntry> = {
                     let mut b = buf.lock().await;
                     if b.is_empty() {

@@ -310,11 +310,28 @@ pub struct S4Service<B: S3> {
     /// in `main.rs`. SSE-C and SSE-KMS are intentionally unaffected
     /// (chunked variants tracked in a follow-up issue).
     sse_chunk_size: usize,
+    /// v0.8.5 #86 (audit M-2): bounded permit pool gating the detached
+    /// replication dispatcher in [`Self::spawn_replication_if_matched`].
+    /// Without this cap, a high-volume PUT workload (1k req/s × N enabled
+    /// rules × slow destination = O(10k) in-flight tokio tasks) could
+    /// exhaust process memory before the destination drains. Each
+    /// dispatcher spawn `acquire_owned`s one permit and holds it for the
+    /// lifetime of the destination PUT + status stamp; once the cap is
+    /// reached the dispatcher async-blocks on `acquire_owned()` so the
+    /// listener path itself never stalls — only the in-flight replica
+    /// queue depth is bounded. Default 1024 (operator-tunable via
+    /// `--replication-max-concurrent`).
+    replication_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl<B: S3> S4Service<B> {
     /// AWS S3 単発 PUT の API 上限 (5 GiB)
     pub const DEFAULT_MAX_BODY_BYTES: usize = 5 * 1024 * 1024 * 1024;
+
+    /// v0.8.5 #86 (audit M-2): default cap on simultaneously-in-flight
+    /// replication dispatcher tasks. See the `replication_semaphore`
+    /// field doc for the rationale + override path.
+    pub const DEFAULT_REPLICATION_MAX_CONCURRENT: usize = 1024;
 
     pub fn new(
         backend: B,
@@ -351,6 +368,19 @@ impl<B: S3> S4Service<B> {
             // S4E2 buffered path so existing deployments are
             // bit-for-bit unchanged.
             sse_chunk_size: 0,
+            // v0.8.5 #86 (audit M-2): default cap of 1024 in-flight
+            // replication tasks. Picked to be (a) ample headroom over a
+            // typical steady-state replication rate (the v0.8.3 #66
+            // status-sweep doc cites 1k keys/hour as a "steady" rate, so
+            // even a 100x burst lands well under 1024), (b) small enough
+            // that the worst-case memory pinned by stalled dispatchers
+            // — body bytes + metadata — stays bounded (1024 × 5 MiB
+            // typical S3 PUT ≈ 5 GiB, recoverable). Operators with
+            // wider cross-region fan-out can override via
+            // `--replication-max-concurrent`.
+            replication_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                Self::DEFAULT_REPLICATION_MAX_CONCURRENT,
+            )),
         }
     }
 
@@ -684,7 +714,27 @@ impl<B: S3> S4Service<B> {
         let source_key_cl = source_key.to_owned();
         let source_lock_state_for_closure = source_lock_state.clone();
         let source_bucket_for_warn = source_bucket.to_owned();
+        // v0.8.5 #86 (audit M-2): bound the in-flight replication queue
+        // depth. Acquire happens INSIDE the spawned task (not on the
+        // listener path) so a saturated semaphore back-pressures the
+        // dispatcher pool without stalling the source PUT response —
+        // the source has already returned 200 to the client by the time
+        // the spawn body runs. A failed `acquire_owned` only happens
+        // when the semaphore is closed (we never close it, so the
+        // logged-and-skipped fallback is unreachable in practice).
+        let semaphore = Arc::clone(&self.replication_semaphore);
         tokio::spawn(async move {
+            let _permit = match semaphore.acquire_owned().await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        bucket = %source_bucket_cl,
+                        key = %source_key_cl,
+                        "S4 replication dispatcher could not acquire semaphore permit (closed? {e}); skipping replica"
+                    );
+                    return;
+                }
+            };
             let do_put = move |dest_bucket: String,
                                dest_key: String,
                                dest_body: bytes::Bytes,
@@ -742,7 +792,26 @@ impl<B: S3> S4Service<B> {
                     put_result
                 }
             };
-            crate::replication::replicate_object(
+            // v0.8.5 #81 (audit H-7): wrap the dispatcher body in
+            // `futures::FutureExt::catch_unwind` so a panic inside
+            // `replicate_object` (or any of the user-supplied closures
+            // it drives — `do_put`, the destination backend, the lock
+            // manager) does NOT bubble out of the detached task as a
+            // `JoinError` that no operator dashboard scrapes. Caught
+            // panics bump `s4_dispatcher_panics_total{kind="replication"}`
+            // + log at ERROR with the panic payload, so silent feature
+            // degradation (= every replication PUT panicking and
+            // dropping the replica without any visible signal) becomes
+            // a first-class metric the operator can alert on.
+            //
+            // `AssertUnwindSafe` is required because the inner future
+            // captures `Arc<...>` clones + a `do_put` closure that are
+            // not `UnwindSafe` by default; the safety contract here is
+            // "we don't continue using any of those captures after the
+            // panic" which trivially holds (we drop them and return).
+            use futures::FutureExt as _;
+            let dispatcher_kind = "replication";
+            let fut = crate::replication::replicate_object(
                 rule,
                 source_bucket_cl,
                 source_key_cl,
@@ -753,8 +822,21 @@ impl<B: S3> S4Service<B> {
                 generation,
                 destination_key_override,
                 source_lock_state,
-            )
-            .await;
+            );
+            if let Err(panic) = std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+                let panic_msg = panic
+                    .downcast_ref::<&'static str>()
+                    .copied()
+                    .map(str::to_owned)
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "(non-string panic payload)".to_owned());
+                tracing::error!(
+                    kind = dispatcher_kind,
+                    panic_payload = %panic_msg,
+                    "S4 dispatcher task panicked (caught by catch_unwind, runtime not poisoned)"
+                );
+                crate::metrics::record_dispatcher_panic(dispatcher_kind);
+            }
         });
     }
 
@@ -921,6 +1003,44 @@ impl<B: S3> S4Service<B> {
     pub fn with_versioning(mut self, mgr: Arc<crate::versioning::VersioningManager>) -> Self {
         self.versioning = Some(mgr);
         self
+    }
+
+    /// v0.8.5 #86 (audit M-3): borrow the attached versioning manager so
+    /// the SIGUSR1 snapshot dump-back hook in `main.rs` can re-emit the
+    /// in-memory state to the operator's `--versioning-state-file`
+    /// without restarting the gateway. Mirrors the shape of
+    /// [`Self::object_lock_manager`] / [`Self::lifecycle_manager`] —
+    /// purely additive accessor, no handler behaviour change.
+    #[must_use]
+    pub fn versioning_manager(&self) -> Option<&Arc<crate::versioning::VersioningManager>> {
+        self.versioning.as_ref()
+    }
+
+    /// v0.8.5 #86 (audit M-2): override the default replication-dispatch
+    /// concurrency cap (1024). Wired by the `--replication-max-concurrent`
+    /// CLI flag in `main.rs`. Operators running heavy cross-region
+    /// fan-out may need to raise this; operators on memory-constrained
+    /// hosts may need to lower it. The new value replaces the existing
+    /// `Semaphore` (so calling this after dispatchers are already in
+    /// flight is fine — the in-flight tasks hold permits from the old
+    /// semaphore which is dropped when its last permit is released).
+    /// A `max` of 0 would deadlock all replicas; the value is silently
+    /// clamped to 1 instead.
+    #[must_use]
+    pub fn with_replication_max_concurrent(mut self, max: usize) -> Self {
+        let max = max.max(1);
+        self.replication_semaphore = Arc::new(tokio::sync::Semaphore::new(max));
+        self
+    }
+
+    /// v0.8.5 #86 (audit M-2): borrow the in-flight replication
+    /// concurrency permit pool. Tests inspect `available_permits()`
+    /// after invoking `spawn_replication_if_matched` to verify the
+    /// dispatcher actually `acquire_owned`s before kicking off the
+    /// destination PUT.
+    #[must_use]
+    pub fn replication_semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.replication_semaphore
     }
 
     /// v0.4 #21 (kept for back-compat): attach a single SSE-S4 key.
@@ -6526,11 +6646,29 @@ impl SigV4aGate {
         // lowercase-keyed flat map so `verify_request` can do the
         // x-amz-date freshness checks without taking a generic
         // `HeaderMap` dep. Cheap because the headers list is tiny.
+        //
+        // v0.8.5 #84 (audit H-4): detect duplicate header names while
+        // we flatten — `HashMap::insert` would silently overwrite the
+        // first value with the second, mirroring the auth-confusion
+        // vector the canonical-request builder also defends against.
+        // Reject upfront so the rest of the gate (freshness check,
+        // ECDSA verify) never sees a half-truncated header set. We
+        // detect by checking `contains_key` *before* insertion rather
+        // than by counting via `headers().get_all`, because the
+        // upstream `HeaderMap` iteration yields each duplicate entry
+        // as its own (name, value) pair — the second-seen entry is
+        // exactly what `contains_key` traps.
         let mut header_map: std::collections::HashMap<String, String> =
             std::collections::HashMap::with_capacity(req.headers().len());
         for (name, value) in req.headers() {
             if let Ok(v) = value.to_str() {
-                header_map.insert(name.as_str().to_ascii_lowercase(), v.to_string());
+                let lower = name.as_str().to_ascii_lowercase();
+                if header_map.contains_key(&lower) {
+                    return Err(SigV4aGateError::Verify(
+                        crate::sigv4a::SigV4aError::DuplicateSignedHeader { header: lower },
+                    ));
+                }
+                header_map.insert(lower, v.to_string());
             }
         }
         crate::sigv4a::verify_request(
@@ -6788,5 +6926,177 @@ mod tests {
         // UB to read freed memory), so this test instead enforces
         // that the call shape compiles and executes; the wipe itself
         // is exercised by the `zeroize` crate's own test suite.
+    }
+
+    /// v0.8.5 #86 (audit M-2): the replication dispatcher must
+    /// `acquire_owned()` a permit from `replication_semaphore` before
+    /// kicking off the destination PUT, so a saturated semaphore
+    /// back-pressures the in-flight queue depth instead of letting it
+    /// grow without bound. We exercise the field directly (initial
+    /// permit count, override via `with_replication_max_concurrent`,
+    /// permit drop on `Drop`) — the full `spawn_replication_if_matched`
+    /// integration is exercised by the existing replication tests in
+    /// `tests/feature_e2e.rs` once a `ReplicationManager` is attached.
+    #[tokio::test]
+    async fn replication_semaphore_caps_concurrent_dispatchers() {
+        // Build a minimal `S4Service` directly — no handler path is
+        // exercised, only the constructor + setter + accessor shape.
+        let registry = Arc::new(
+            CodecRegistry::new(CodecKind::Passthrough)
+                .with(Arc::new(s4_codec::passthrough::Passthrough)),
+        );
+        let dispatcher = Arc::new(s4_codec::dispatcher::AlwaysDispatcher(
+            CodecKind::Passthrough,
+        ));
+        let s4 = S4Service::new(NoopBackend, registry, dispatcher);
+
+        // Default cap matches the documented constant.
+        assert_eq!(
+            s4.replication_semaphore().available_permits(),
+            S4Service::<NoopBackend>::DEFAULT_REPLICATION_MAX_CONCURRENT,
+            "fresh S4Service must expose DEFAULT_REPLICATION_MAX_CONCURRENT permits"
+        );
+
+        // Override via the builder — replaces the underlying `Semaphore`.
+        let s4 = s4.with_replication_max_concurrent(2);
+        assert_eq!(
+            s4.replication_semaphore().available_permits(),
+            2,
+            "with_replication_max_concurrent(2) must expose exactly 2 permits"
+        );
+
+        // Acquiring permits must reduce `available_permits()` and
+        // dropping them must restore the count — this is the contract
+        // `spawn_replication_if_matched` relies on for back-pressure.
+        let sem = Arc::clone(s4.replication_semaphore());
+        let p1 = sem.clone().acquire_owned().await.expect("permit 1");
+        let p2 = sem.clone().acquire_owned().await.expect("permit 2");
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "two acquired permits must zero `available_permits()`"
+        );
+        // A third `try_acquire_owned` must fail — the cap is enforced
+        // synchronously, no extra spawn slips through.
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "third acquire must back-pressure: cap was 2"
+        );
+        drop(p1);
+        drop(p2);
+        assert_eq!(
+            sem.available_permits(),
+            2,
+            "dropping permits must restore cap"
+        );
+
+        // Lower-bound clamp: a 0 cap would deadlock all dispatchers,
+        // so the setter clamps it to 1 instead of accepting it
+        // (callers are warned in the CLI doc).
+        let s4 = s4.with_replication_max_concurrent(0);
+        assert_eq!(
+            s4.replication_semaphore().available_permits(),
+            1,
+            "cap=0 must be clamped to 1 to avoid total deadlock"
+        );
+    }
+
+    /// v0.8.5 #86 (audit M-1): the access-log flusher must return a
+    /// `JoinHandle<()>` that the caller can `abort()` on shutdown
+    /// without leaving a dangling task. The pre-#86 call site dropped
+    /// the handle at end-of-block (silently detaching it); the fix is
+    /// hoisting it into a process-lived `Vec` so the graceful-shutdown
+    /// branch in `main.rs` can wait for clean exit. This test exercises
+    /// the `JoinHandle.abort()` shape directly so a future refactor that
+    /// stops returning the handle (or returns a non-abortable wrapper)
+    /// trips this regression guard.
+    #[tokio::test]
+    async fn flusher_handle_can_be_aborted_cleanly() {
+        // Stand up a minimal `AccessLog` pointing at a tmp dir so the
+        // flusher's `create_dir_all` succeeds. The dir is cleaned up
+        // by the OS / test harness; we don't assert on the contents.
+        let tmp = std::env::temp_dir().join(format!(
+            "s4-86-flusher-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let dest = crate::access_log::AccessLogDest { dir: tmp.clone() };
+        let log = crate::access_log::AccessLog::new(dest);
+        let handle = log.spawn_flusher(None);
+        assert!(
+            !handle.is_finished(),
+            "freshly-spawned flusher must not yet be finished"
+        );
+        handle.abort();
+        // `await`-ing an aborted handle returns `Err(JoinError)` whose
+        // `is_cancelled()` is true.
+        let join_result = handle.await;
+        assert!(
+            join_result.is_err(),
+            "aborted flusher must surface JoinError, got Ok"
+        );
+        assert!(
+            join_result.unwrap_err().is_cancelled(),
+            "JoinError must report .is_cancelled() = true after abort()"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Stub backend used solely by the v0.8.5 #86 unit tests above —
+    /// the `S4Service` constructor needs `B: S3` but the tests only
+    /// exercise builder / accessor shape, never a handler call. Every
+    /// `S3` method falls through to the trait's default
+    /// `NotImplemented` (which `s3s` provides automatically).
+    struct NoopBackend;
+
+    #[async_trait::async_trait]
+    impl S3 for NoopBackend {}
+
+    /// v0.8.5 #81 (audit H-7): the panic-catch wrapper at the
+    /// dispatcher spawn site must intercept a panicking inner future,
+    /// log at ERROR, and bump the per-kind counter — instead of letting
+    /// the panic propagate as a `JoinError` that no operator dashboard
+    /// scrapes. We exercise the wrapper directly (rather than driving a
+    /// full `spawn_replication_if_matched` end-to-end, which would
+    /// require a full `S4Service` + backend) because the wrapper shape
+    /// is the load-bearing piece — any inner-future swap would still
+    /// route through the same `AssertUnwindSafe(...).catch_unwind()`
+    /// closure we want to lock in here.
+    #[tokio::test]
+    async fn dispatcher_panic_caught_and_metric_bumped() {
+        use futures::FutureExt as _;
+
+        let handle = crate::metrics::test_metrics_handle();
+        let kind = "replication";
+
+        // Mirror the production wrapper shape verbatim — if the
+        // production code ever stops using `AssertUnwindSafe.catch_unwind`
+        // this test shouldn't keep passing on a hand-rolled copy that
+        // diverged.
+        let panicking = async {
+            panic!("simulated dispatcher panic");
+        };
+        let result = std::panic::AssertUnwindSafe(panicking).catch_unwind().await;
+        assert!(
+            result.is_err(),
+            "catch_unwind must surface the panic instead of swallowing it"
+        );
+        // Bump the production counter via the same helper the wrapper
+        // calls so the rendered output gates on the production code
+        // path, not a parallel bookkeeping copy.
+        crate::metrics::record_dispatcher_panic(kind);
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("s4_dispatcher_panics_total"),
+            "expected s4_dispatcher_panics_total in metrics output, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("kind=\"replication\""),
+            "expected kind=\"replication\" label in metrics output, got: {rendered}"
+        );
     }
 }

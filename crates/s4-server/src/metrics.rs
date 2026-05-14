@@ -184,6 +184,59 @@ pub mod names {
     /// the WARN log lines emitted by the recovery helpers for the
     /// per-call detail.
     pub const LOCK_POISON_RECOVERY_TOTAL: &str = "s4_lock_poison_recovery_total";
+    /// v0.8.5 #81 (audit H-7): bumped each time a detached
+    /// dispatcher task (replication / notification) panics inside the
+    /// `tokio::spawn` body. The panic is caught by a
+    /// `futures::FutureExt::catch_unwind` wrapper at the spawn site so
+    /// the runtime is never poisoned and the outer service keeps
+    /// serving; the counter surfaces the silent feature degradation
+    /// (e.g. all replication PUTs failing because a destination
+    /// backend started returning unexpected payloads) that would
+    /// otherwise only be visible in a stderr scrape. Labels: `kind`
+    /// (= `"replication"` / `"notification"`). Cardinality bounded
+    /// by the dispatcher kind set (= 2). Operators alert on a
+    /// non-zero rate.
+    pub const DISPATCHER_PANICS_TOTAL: &str = "s4_dispatcher_panics_total";
+    /// v0.8.5 #86 (audit M-3): counter bumped each time the operator
+    /// sends `SIGUSR1` to the gateway and the snapshot dump-back routine
+    /// re-emits one in-memory manager's state to its
+    /// `--<manager>-state-file <PATH>`. Labels:
+    /// - `manager` — short stable name (`"versioning"`, `"object_lock"`,
+    ///   `"mfa_delete"`, `"cors"`, `"inventory"`, `"notifications"`,
+    ///   `"tagging"`, `"replication"`, `"lifecycle"`).
+    /// - `result` — `"ok"` (atomic write completed) / `"err"`
+    ///   (`to_json` / fs::write / fs::rename returned an error — the
+    ///   underlying state file is left untouched in that case).
+    ///
+    /// Cardinality bounded by (#managers × 2) = 18. Operators alert on
+    /// `rate(s4_sigusr1_dump_total{result="err"} > 0)` so silent
+    /// snapshot-write failures surface in dashboards.
+    pub const SIGUSR1_DUMP_TOTAL: &str = "s4_sigusr1_dump_total";
+}
+
+/// v0.8.5 #86 (audit M-3): bump the SIGUSR1 snapshot dump-back counter.
+/// `manager` is the stable short label (`"versioning"`, `"object_lock"`,
+/// `"replication"`, …); `success` is `true` when the atomic write
+/// (`to_json` → tmp file → rename) completed and `false` when any step
+/// returned an error. Called once per managed snapshot per SIGUSR1
+/// reception so the per-signal dump batch shows up as N counter bumps,
+/// one per attached manager.
+pub fn record_sigusr1_dump(manager: &'static str, success: bool) {
+    let result = if success { "ok" } else { "err" };
+    metrics::counter!(names::SIGUSR1_DUMP_TOTAL, "manager" => manager, "result" => result)
+        .increment(1);
+}
+
+/// v0.8.5 #81 (audit H-7): bump the per-kind dispatcher-panic counter.
+/// Called from the panic-catch wrapper at the
+/// `spawn_replication_if_matched` (kind=`"replication"`) and
+/// `dispatch_event` (kind=`"notification"`) spawn sites whenever the
+/// detached dispatcher closure panicked. The counter is the
+/// dashboard-friendly aggregate so an alert can fire even if log
+/// scraping is off; pair with the ERROR log line carrying the
+/// `panic_payload` for the per-incident detail.
+pub fn record_dispatcher_panic(kind: &'static str) {
+    metrics::counter!(names::DISPATCHER_PANICS_TOTAL, "kind" => kind).increment(1);
 }
 
 /// v0.8.4 #77 (audit H-8): bump the lock-poison-recovery counter by 1.

@@ -412,8 +412,41 @@ pub async fn dispatch_event(
     for dest in dests {
         let mgr = Arc::clone(&manager);
         let body = body.clone();
+        // v0.8.5 #81 (audit H-7): wrap the per-destination `send_one`
+        // body in `futures::FutureExt::catch_unwind` so a panic inside
+        // the reqwest stack / aws-sdk-sns / aws-sdk-sqs (or a bug in
+        // our retry loop) does NOT bubble out of the detached task as
+        // a `JoinError` that no operator dashboard scrapes. Caught
+        // panics bump `s4_dispatcher_panics_total{kind="notification"}`
+        // + log at ERROR with the panic payload, so silent feature
+        // degradation (= every webhook dispatch panicking and never
+        // reaching the receiver, but the gateway itself looking
+        // healthy) becomes a first-class metric the operator can
+        // alert on.
+        //
+        // `AssertUnwindSafe` is required because the `Arc<...>` +
+        // `String` captures are not `UnwindSafe` by default; the
+        // safety contract here is "we don't continue using any of
+        // those captures after the panic" which trivially holds (we
+        // drop them and return).
         tokio::spawn(async move {
-            send_one(mgr, dest, body).await;
+            use futures::FutureExt as _;
+            let kind = "notification";
+            let fut = send_one(mgr, dest, body);
+            if let Err(panic) = std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+                let panic_msg = panic
+                    .downcast_ref::<&'static str>()
+                    .copied()
+                    .map(str::to_owned)
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "(non-string panic payload)".to_owned());
+                tracing::error!(
+                    kind,
+                    panic_payload = %panic_msg,
+                    "S4 dispatcher task panicked (caught by catch_unwind, runtime not poisoned)"
+                );
+                crate::metrics::record_dispatcher_panic(kind);
+            }
         });
     }
 }
