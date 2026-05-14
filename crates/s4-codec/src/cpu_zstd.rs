@@ -6,7 +6,10 @@
 
 use bytes::Bytes;
 
-use crate::{ChunkManifest, Codec, CodecError, CodecKind};
+use crate::{
+    ChunkManifest, Codec, CodecError, CodecKind, DECOMPRESS_BOOTSTRAP_CAPACITY,
+    validate_decompress_manifest,
+};
 
 /// CPU zstd codec。`level` は 1..=22 (zstd-22 は最大圧縮率、時間は長い)。
 ///
@@ -46,16 +49,19 @@ pub fn decompress_blocking(input: &[u8], manifest: &ChunkManifest) -> Result<Vec
             got: manifest.codec,
         });
     }
-    if input.len() as u64 != manifest.compressed_size {
-        return Err(CodecError::SizeMismatch {
-            expected: manifest.compressed_size,
-            got: input.len() as u64,
-        });
-    }
+    // v0.8.6 #89: pre-allocation guard. Reject `original_size > 5 GiB` and
+    // confirm `compressed_size` matches the actual payload length BEFORE
+    // the `Vec::with_capacity` below.
+    let allocated_orig_size = validate_decompress_manifest(manifest, input.len())?;
     use std::io::Read;
     let limit = manifest.original_size.saturating_add(1024);
     let mut decoder = zstd::stream::Decoder::new(input).map_err(CodecError::Io)?;
-    let mut buf = Vec::with_capacity(manifest.original_size as usize);
+    // v0.8.6 #89: cap the *initial* alloc at 1 MiB even if the manifest
+    // claims a much larger output. A forged `original_size = 4 GiB` no
+    // longer drives 4 GiB of address space at `with_capacity` time;
+    // `read_to_end` (already bounded by `take(limit)` above) grows the
+    // buffer naturally as actual decoded bytes arrive.
+    let mut buf = Vec::with_capacity(allocated_orig_size.min(DECOMPRESS_BOOTSTRAP_CAPACITY));
     (&mut decoder)
         .take(limit)
         .read_to_end(&mut buf)
@@ -139,12 +145,13 @@ impl Codec for CpuZstd {
                 got: manifest.codec,
             });
         }
-        if input.len() as u64 != manifest.compressed_size {
-            return Err(CodecError::SizeMismatch {
-                expected: manifest.compressed_size,
-                got: input.len() as u64,
-            });
-        }
+        // v0.8.6 #89: pre-allocation guard — reject `original_size > 5 GiB`
+        // and confirm `compressed_size` matches the actual payload length
+        // BEFORE the `Vec::with_capacity` inside spawn_blocking. The fuzz
+        // farm (cpu_zstd_decompress_bolero, issue #89) hit OOM within
+        // seconds because a manifest could claim `original_size = u32::MAX`
+        // and drive `Vec::with_capacity(4 GiB)` before any size check.
+        let allocated_orig_size = validate_decompress_manifest(manifest, input.len())?;
 
         let expected_crc = manifest.crc32c;
         let expected_orig_size = manifest.original_size;
@@ -160,7 +167,10 @@ impl Codec for CpuZstd {
             // bomb 認定して error にする
             let limit = expected_orig_size.saturating_add(1024);
             let mut decoder = zstd::stream::Decoder::new(input.as_ref())?;
-            let mut buf = Vec::with_capacity(expected_orig_size as usize);
+            // v0.8.6 #89: bootstrap-capped initial alloc — see lib.rs
+            // `DECOMPRESS_BOOTSTRAP_CAPACITY` doc.
+            let mut buf =
+                Vec::with_capacity(allocated_orig_size.min(DECOMPRESS_BOOTSTRAP_CAPACITY));
             (&mut decoder).take(limit).read_to_end(&mut buf)?;
             // limit 以上を消費したかチェック (= bomb)
             if (buf.len() as u64) > expected_orig_size {
@@ -255,6 +265,62 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, CodecError::CodecMismatch { .. }));
+    }
+
+    /// v0.8.6 #89 regression #1 — manifest claims `original_size > 5 GiB`
+    /// (above `MAX_DECOMPRESSED_BYTES`); `validate_decompress_manifest`
+    /// must reject it pre-allocation.
+    #[tokio::test]
+    async fn issue_89_rejects_manifest_over_5gib() {
+        let codec = CpuZstd::default();
+        let body = Bytes::from_static(&[0x00, 0xd1, 0xd1, 0xd1, 0xd1, 0xd1]);
+        let manifest = ChunkManifest {
+            codec: CodecKind::CpuZstd,
+            original_size: crate::MAX_DECOMPRESSED_BYTES + 1,
+            compressed_size: body.len() as u64,
+            crc32c: 0,
+        };
+        let err = codec.decompress(body, &manifest).await.unwrap_err();
+        match err {
+            CodecError::ManifestSizeExceedsLimit { requested, limit } => {
+                assert_eq!(requested, crate::MAX_DECOMPRESSED_BYTES + 1);
+                assert_eq!(limit, crate::MAX_DECOMPRESSED_BYTES);
+            }
+            other => panic!("expected ManifestSizeExceedsLimit, got {other:?}"),
+        }
+    }
+
+    /// v0.8.6 #89 regression #2 — replays the exact OOM-triggering shape
+    /// the continuous fuzz farm landed in `cpu_zstd_decompress_bolero`'s
+    /// crashes/ dir within seconds. The libfuzzer artifact had body
+    /// `0x00 0xd1×5` with a `(Vec<u8>, u32)` bolero generator producing a
+    /// `claimed_orig` close to `u32::MAX` — under the 5 GiB validate
+    /// ceiling, so `validate_decompress_manifest` accepts it. The
+    /// `DECOMPRESS_BOOTSTRAP_CAPACITY` cap on the initial `with_capacity`
+    /// is what now keeps the actual alloc at 1 MiB instead of 4 GiB; the
+    /// decode then fails fast with `Io(UnexpectedEof)` because the body
+    /// is not a valid zstd frame, well before any RSS pressure.
+    #[tokio::test]
+    async fn issue_89_bootstrap_cap_keeps_4gib_claim_alloc_safe() {
+        let codec = CpuZstd::default();
+        let body = Bytes::from_static(&[0x00, 0xd1, 0xd1, 0xd1, 0xd1, 0xd1]);
+        let manifest = ChunkManifest {
+            codec: CodecKind::CpuZstd,
+            // u32::MAX = 4 GiB, below the 5 GiB validate ceiling, so the
+            // pre-alloc guard passes and we exercise the bootstrap-cap
+            // alloc path directly.
+            original_size: u32::MAX as u64,
+            compressed_size: body.len() as u64,
+            crc32c: 0,
+        };
+        let err = codec.decompress(body, &manifest).await.unwrap_err();
+        // Either Io (zstd refuses to decode the garbage body) or
+        // SizeMismatch (decoded a zero-byte plaintext, manifest claims
+        // 4 GiB) — both prove the call returned cleanly without OOM.
+        assert!(
+            matches!(err, CodecError::Io(_) | CodecError::SizeMismatch { .. }),
+            "expected Io or SizeMismatch, got {err:?}"
+        );
     }
 
     /// `decompress_blocking` (used by `s4-codec-wasm`) round-trips through

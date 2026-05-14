@@ -23,57 +23,13 @@
 //! cargo test --features nvcomp-gpu -- --ignored  # GPU 必須テスト
 //! ```
 
+// v0.8.6 #89: `MAX_DECOMPRESSED_BYTES` and `validate_decompress_manifest`
+// were promoted from this module to crate root (`s4_codec::*`) so CPU
+// codecs (CpuZstd / CpuGzip) share the exact same pre-allocation guard.
+// Re-exported here under the historical names so any downstream that
+// imported `s4_codec::nvcomp::MAX_DECOMPRESSED_BYTES` keeps compiling.
 #[cfg(any(feature = "nvcomp-gpu", test))]
-use crate::{ChunkManifest, CodecError};
-
-/// v0.8.5 #83 H-3: maximum decompressed payload size honoured at
-/// decompress entry. Manifests claiming a larger `original_size` are
-/// rejected pre-allocation as forged / corrupted, so a malicious
-/// manifest cannot drive `Vec::with_capacity(huge)` into an OOM
-/// (memory-DoS) before the CRC check ever runs.
-///
-/// Rationale for 5 GiB: matches AWS S3's documented single-PUT object
-/// ceiling (`PUT Object` is capped at 5 GiB; bigger payloads must use
-/// multipart upload, which is split into ≤5 GiB parts). Real S4
-/// chunks are bounded by the same ceiling end-to-end, so a manifest
-/// whose `original_size` exceeds it cannot have come from a
-/// well-formed S4 PUT.
-#[cfg(any(feature = "nvcomp-gpu", test))]
-pub const MAX_DECOMPRESSED_BYTES: u64 = 5 * 1024 * 1024 * 1024;
-
-/// v0.8.5 #83 H-3 helper: shared pre-allocation manifest validator
-/// invoked by every nvCOMP decompress path (Zstd / Bitcomp /
-/// GDeflate). Centralising the check keeps the three decompress sites
-/// (and any future nvCOMP codec) using identical limits and error
-/// shapes, so one missed update can't reintroduce the alloc-before-
-/// validate bug. Returns the `usize`-narrowed `original_size` ready
-/// for `Vec::with_capacity`, or a typed `CodecError` the caller
-/// propagates verbatim.
-#[cfg(any(feature = "nvcomp-gpu", test))]
-pub(crate) fn validate_decompress_manifest(
-    manifest: &ChunkManifest,
-    actual_compressed_len: usize,
-) -> Result<usize, CodecError> {
-    if manifest.original_size > MAX_DECOMPRESSED_BYTES {
-        return Err(CodecError::ManifestSizeExceedsLimit {
-            requested: manifest.original_size,
-            limit: MAX_DECOMPRESSED_BYTES,
-        });
-    }
-    if manifest.compressed_size != actual_compressed_len as u64 {
-        return Err(CodecError::ManifestSizeMismatch {
-            manifest: manifest.compressed_size,
-            actual: actual_compressed_len as u64,
-        });
-    }
-    // `u64 → usize` is lossy on 32-bit targets; reject explicitly so
-    // a 3 GiB manifest doesn't truncate to ~0 bytes on wasm32 / armv7
-    // and silently under-allocate the destination buffer.
-    usize::try_from(manifest.original_size).map_err(|_| CodecError::ManifestSizeExceedsLimit {
-        requested: manifest.original_size,
-        limit: usize::MAX as u64,
-    })
-}
+pub use crate::{MAX_DECOMPRESSED_BYTES, validate_decompress_manifest};
 
 #[cfg(feature = "nvcomp-gpu")]
 mod imp {

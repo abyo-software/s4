@@ -267,6 +267,74 @@ pub enum CodecError {
     ManifestSizeMismatch { manifest: u64, actual: u64 },
 }
 
+/// v0.8.6 #89: maximum decompressed payload size honoured at decompress
+/// entry by every codec. Manifests claiming a larger `original_size` are
+/// rejected pre-allocation as forged / corrupted, so a malicious manifest
+/// cannot drive `Vec::with_capacity(huge)` into an OOM (memory-DoS)
+/// before the CRC check ever runs.
+///
+/// Was `nvcomp::MAX_DECOMPRESSED_BYTES` (v0.8.5 #83), promoted to
+/// `s4_codec::MAX_DECOMPRESSED_BYTES` so CPU codecs (CpuZstd / CpuGzip)
+/// share the exact same ceiling — the continuous fuzz farm hit OOM in
+/// `cpu_zstd_decompress_bolero` (issue #89) within minutes because the
+/// CPU codecs were doing `Vec::with_capacity(manifest.original_size)`
+/// before this guard had been promoted out of the GPU-only module.
+///
+/// Rationale for 5 GiB: matches AWS S3's documented single-PUT object
+/// ceiling (`PUT Object` is capped at 5 GiB; bigger payloads must use
+/// multipart upload, which is split into ≤5 GiB parts). Real S4 chunks
+/// are bounded by the same ceiling end-to-end, so a manifest whose
+/// `original_size` exceeds it cannot have come from a well-formed S4 PUT.
+pub const MAX_DECOMPRESSED_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// v0.8.6 #89: bootstrap capacity for the decompressed-output `Vec` so
+/// the `Vec::with_capacity(original_size)` pre-allocation can no longer
+/// be driven into RSS-OOM by a forged manifest. Small enough (1 MiB)
+/// that even an attacker claiming `original_size = u32::MAX` only
+/// reserves 1 MiB up front; `read_to_end` grows the buffer as actual
+/// decompressed bytes arrive (capped at `manifest.original_size + 1024`
+/// by the existing decompression-bomb guard).
+///
+/// Why not `Vec::new()` (= 0 capacity)? `read_to_end` would grow the
+/// buffer via doubling, producing ~20 reallocations + memcpys for a
+/// typical 1 MiB chunk. 1 MiB pre-alloc skips those for the common
+/// small-chunk case while keeping the worst-case adversarial alloc
+/// flat at 1 MiB.
+pub const DECOMPRESS_BOOTSTRAP_CAPACITY: usize = 1 << 20; // 1 MiB
+
+/// v0.8.6 #89: shared pre-allocation manifest validator invoked by every
+/// decompress path (CpuZstd / CpuGzip / nvCOMP Zstd / Bitcomp /
+/// GDeflate). Centralising the check keeps every decompress site using
+/// identical limits and error shapes, so one missed update can't
+/// reintroduce the alloc-before-validate bug. Returns the
+/// `usize`-narrowed `original_size` ready for `Vec::with_capacity`, or a
+/// typed `CodecError` the caller propagates verbatim.
+///
+/// Was `nvcomp::validate_decompress_manifest` (v0.8.5 #83). Promoted
+/// out of the `#[cfg(any(feature = "nvcomp-gpu", test))]` gate so CPU
+/// codecs can call it unconditionally.
+pub fn validate_decompress_manifest(
+    manifest: &ChunkManifest,
+    actual_compressed_len: usize,
+) -> Result<usize, CodecError> {
+    if manifest.original_size > MAX_DECOMPRESSED_BYTES {
+        return Err(CodecError::ManifestSizeExceedsLimit {
+            requested: manifest.original_size,
+            limit: MAX_DECOMPRESSED_BYTES,
+        });
+    }
+    if manifest.compressed_size != actual_compressed_len as u64 {
+        return Err(CodecError::ManifestSizeMismatch {
+            manifest: manifest.compressed_size,
+            actual: actual_compressed_len as u64,
+        });
+    }
+    usize::try_from(manifest.original_size).map_err(|_| CodecError::ManifestSizeExceedsLimit {
+        requested: manifest.original_size,
+        limit: usize::MAX as u64,
+    })
+}
+
 /// pluggable な圧縮 backend trait。
 ///
 /// すべて async — GPU codec は CUDA stream に await でき、CPU codec は

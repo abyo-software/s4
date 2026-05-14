@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6] — 2026-05-14
+
+Continuous fuzz farm caught **#89** — `CpuZstd::decompress` would
+`Vec::with_capacity(manifest.original_size as usize)` _before_ checking
+the manifest, so a forged manifest with `original_size = u32::MAX`
+drove a 4 GiB pre-allocation and OOM'd the process inside the
+libfuzzer 2 GiB RSS cap (within seconds of the farm starting).
+Identical shape exists in `CpuGzip::decompress` and both
+`*_blocking` siblings (used by the WASM crate).
+
+This is the same class of bug as v0.8.5 #83 (`nvcomp.rs` H-3): the
+GPU codecs were already guarded, the CPU codecs were not. The audit
+rounds missed it because `nvcomp.rs` had its own private
+`MAX_DECOMPRESSED_BYTES` + `validate_decompress_manifest` helper
+under `#[cfg(any(feature = "nvcomp-gpu", test))]`, so a global grep
+for the helper name only ever surfaced the GPU sites.
+
+### Fixed
+
+- **#89 alloc-before-validate in CpuZstd / CpuGzip** —
+  - **Promoted `MAX_DECOMPRESSED_BYTES` (5 GiB, AWS S3 single-PUT max)
+    + `validate_decompress_manifest` from `s4_codec::nvcomp::*` to
+    crate root `s4_codec::*`** so CPU codecs share the exact same
+    pre-allocation guard. Re-exported under the historical names
+    inside `nvcomp.rs` so any downstream that imported
+    `s4_codec::nvcomp::MAX_DECOMPRESSED_BYTES` keeps compiling.
+  - **New `DECOMPRESS_BOOTSTRAP_CAPACITY = 1 MiB` constant** caps the
+    *initial* `Vec::with_capacity` even when the manifest claims a
+    legitimate-but-large output (≤5 GiB, e.g. 4 GiB). Without this
+    the validate guard alone wasn't sufficient — `with_capacity(4 GiB)`
+    still drove address-space pressure / RSS-OOM under the libfuzzer
+    cap. `read_to_end` (already bounded by the existing decompression-
+    bomb `take(limit)`) grows the buffer as actual bytes arrive.
+  - Both async and `_blocking` paths in `cpu_zstd.rs` + `cpu_gzip.rs`
+    now route through `validate_decompress_manifest` and the
+    bootstrap-capped `with_capacity`.
+  - 4 new regression tests pin both shapes:
+    `issue_89_rejects_manifest_over_5gib` (ceiling reject) +
+    `issue_89_bootstrap_cap_keeps_4gib_claim_alloc_safe` (sub-ceiling
+    forged claim handled cleanly), per codec.
+  - `Passthrough::decompress` already does no `original_size`-based
+    allocation (it just verifies CRC against the input bytes), so
+    nothing to change there.
+
+### Continuous fuzz farm (out-of-tree, /home/y1/fuzz-runner/)
+
+- Re-enabled `s4-fuzz@s4-codec-cpu_zstd_decompress_bolero.service`
+  after #89 fix landed; the same OOM input no longer trips the 2 GiB
+  libfuzzer cap.
+
+### Test posture
+
+618 workspace tests pass (was 614) / 52 ignored. CI green.
+
 ## [0.8.5] — 2026-05-14
 
 Deep-audit 第三弾 sweep: **3 CRITICAL + 9 HIGH + 5 MEDIUM + 1 LOW**

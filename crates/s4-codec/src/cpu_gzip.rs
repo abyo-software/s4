@@ -22,7 +22,10 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 
-use crate::{ChunkManifest, Codec, CodecError, CodecKind};
+use crate::{
+    ChunkManifest, Codec, CodecError, CodecKind, DECOMPRESS_BOOTSTRAP_CAPACITY,
+    validate_decompress_manifest,
+};
 
 /// CPU gzip codec (RFC 1952). `level` clamped to 0..=9.
 #[derive(Debug, Clone)]
@@ -57,14 +60,14 @@ pub fn decompress_blocking(input: &[u8], manifest: &ChunkManifest) -> Result<Vec
             got: manifest.codec,
         });
     }
-    if input.len() as u64 != manifest.compressed_size {
-        return Err(CodecError::SizeMismatch {
-            expected: manifest.compressed_size,
-            got: input.len() as u64,
-        });
-    }
+    // v0.8.6 #89: pre-allocation guard. Reject `original_size > 5 GiB` and
+    // confirm `compressed_size` matches the actual payload length BEFORE
+    // the `Vec::with_capacity` below — same shape applied to cpu_zstd.
+    let allocated_orig_size = validate_decompress_manifest(manifest, input.len())?;
     let limit = manifest.original_size.saturating_add(1024);
-    let mut buf = Vec::with_capacity(manifest.original_size as usize);
+    // v0.8.6 #89: bootstrap-capped initial alloc — see lib.rs
+    // `DECOMPRESS_BOOTSTRAP_CAPACITY` doc.
+    let mut buf = Vec::with_capacity(allocated_orig_size.min(DECOMPRESS_BOOTSTRAP_CAPACITY));
     let mut decoder = GzDecoder::new(input);
     (&mut decoder)
         .take(limit)
@@ -150,12 +153,12 @@ impl Codec for CpuGzip {
                 got: manifest.codec,
             });
         }
-        if input.len() as u64 != manifest.compressed_size {
-            return Err(CodecError::SizeMismatch {
-                expected: manifest.compressed_size,
-                got: input.len() as u64,
-            });
-        }
+        // v0.8.6 #89: pre-allocation guard — same shape as cpu_zstd. The
+        // CpuZstd OOM (issue #89) was caught by the fuzz farm in seconds;
+        // CpuGzip has the identical `Vec::with_capacity(original_size)`
+        // shape and is just as vulnerable to a forged manifest.
+        let allocated_orig_size = validate_decompress_manifest(manifest, input.len())?;
+
         let expected_crc = manifest.crc32c;
         let expected_orig_size = manifest.original_size;
 
@@ -165,7 +168,10 @@ impl Codec for CpuGzip {
             // claim a tiny original_size while the gzip footer says otherwise;
             // we trust the manifest and detect inflation past it as bomb.
             let limit = expected_orig_size.saturating_add(1024);
-            let mut buf = Vec::with_capacity(expected_orig_size as usize);
+            // v0.8.6 #89: bootstrap-capped initial alloc — see lib.rs
+            // `DECOMPRESS_BOOTSTRAP_CAPACITY` doc.
+            let mut buf =
+                Vec::with_capacity(allocated_orig_size.min(DECOMPRESS_BOOTSTRAP_CAPACITY));
             let mut decoder = GzDecoder::new(input.as_ref());
             (&mut decoder).take(limit).read_to_end(&mut buf)?;
             if (buf.len() as u64) > expected_orig_size {
@@ -267,6 +273,48 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, CodecError::CodecMismatch { .. }));
+    }
+
+    /// v0.8.6 #89 — CpuGzip has the identical
+    /// `Vec::with_capacity(manifest.original_size)` shape as CpuZstd
+    /// did. (1) reject manifests over the 5 GiB ceiling, (2) bootstrap-
+    /// cap the initial alloc so a sub-5-GiB-but-still-huge claim
+    /// (e.g. 4 GiB) doesn't drive the address space.
+    #[tokio::test]
+    async fn issue_89_rejects_manifest_over_5gib() {
+        let codec = CpuGzip::default();
+        let body = Bytes::from_static(&[0x1f, 0x8b]);
+        let manifest = ChunkManifest {
+            codec: CodecKind::CpuGzip,
+            original_size: crate::MAX_DECOMPRESSED_BYTES + 1,
+            compressed_size: body.len() as u64,
+            crc32c: 0,
+        };
+        let err = codec.decompress(body, &manifest).await.unwrap_err();
+        match err {
+            CodecError::ManifestSizeExceedsLimit { requested, limit } => {
+                assert_eq!(requested, crate::MAX_DECOMPRESSED_BYTES + 1);
+                assert_eq!(limit, crate::MAX_DECOMPRESSED_BYTES);
+            }
+            other => panic!("expected ManifestSizeExceedsLimit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_89_bootstrap_cap_keeps_4gib_claim_alloc_safe() {
+        let codec = CpuGzip::default();
+        let body = Bytes::from_static(&[0x1f, 0x8b]);
+        let manifest = ChunkManifest {
+            codec: CodecKind::CpuGzip,
+            original_size: u32::MAX as u64,
+            compressed_size: body.len() as u64,
+            crc32c: 0,
+        };
+        let err = codec.decompress(body, &manifest).await.unwrap_err();
+        assert!(
+            matches!(err, CodecError::Io(_) | CodecError::SizeMismatch { .. }),
+            "expected Io or SizeMismatch, got {err:?}"
+        );
     }
 
     /// `decompress_blocking` (used by `s4-codec-wasm`) round-trips through
