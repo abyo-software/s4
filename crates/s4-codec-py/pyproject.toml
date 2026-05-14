@@ -38,6 +38,13 @@ Repository = "https://github.com/abyo-software/s4"
 Documentation = "https://github.com/abyo-software/s4#readme"
 Issues = "https://github.com/abyo-software/s4/issues"
 
+# v0.8.5 #85 H-8: declare the pytest dev-dep so `pip install -e ".[dev]"`
+# pulls in the harness needed to run `tests/test_binding.py` after a
+# `maturin develop`. Kept on the `dev` extra so end users `pip install
+# s4-codec` still get the slim runtime dep set.
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
 [tool.maturin]
 # The cdylib's library name is `s4_codec` (= the importable Python module).
 # Maturin maps that to the `s4-codec` PyPI distribution name automatically.

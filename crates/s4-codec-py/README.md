@@ -67,6 +67,47 @@ maturin build --release --features nvcomp-gpu
 `maturin develop` installs the wheel into the current virtualenv for
 iterative development.
 
+## Running tests
+
+```sh
+maturin develop
+pip install -e ".[dev]"
+pytest tests/
+```
+
+GPU codecs require a `--features nvcomp-gpu` build:
+
+```sh
+maturin develop --release --features nvcomp-gpu
+```
+
+The pytest suite covers CPU codec round-trips, RFC 1952 gzip compatibility,
+GIL-release threading, version inheritance, and the per-`CodecError`
+exception class hierarchy (v0.8.5 #85). A separate Rust-side test
+(`tests/version_matches_workspace.rs`) guards the workspace semver inherit.
+
+## Error handling
+
+The binding raises a subclass tree per `CodecError` variant so callers can
+branch programmatically instead of string-matching:
+
+| Exception class | `CodecError` variant | Base class |
+| --- | --- | --- |
+| `S4Error` | (base + `TruncatedStream`) | `ValueError` |
+| `S4CrcMismatchError` | `CrcMismatch` | `S4Error` |
+| `S4SizeMismatchError` | `SizeMismatch` | `S4Error` |
+| `S4CodecMismatchError` | `CodecMismatch` | `S4Error` |
+| `S4UnregisteredCodecError` | `UnregisteredCodec` | `S4Error` |
+| `S4ManifestSizeExceedsLimitError` | `ManifestSizeExceedsLimit` | `S4Error` |
+| `S4ManifestSizeMismatchError` | `ManifestSizeMismatch` | `S4Error` |
+| `S4BackendError` | `Backend` / `Join` | `RuntimeError` |
+| `S4IoError` | `Io` | `OSError` |
+
+`S4Error` inherits from `ValueError` for backward compat with code that
+caught the previous flat `ValueError` mapping. `S4BackendError` and
+`S4IoError` deliberately escape that hierarchy so existing retry-on-IOError
+middleware continues to fire on the right class.
+
 ## Workspace integration
 
 The crate ships a `cdylib` only and uses PyO3's `extension-module`

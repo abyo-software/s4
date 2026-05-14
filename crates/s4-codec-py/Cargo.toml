@@ -25,6 +25,12 @@ description = "Python (pyo3) bindings for s4-codec — in-process GPU/CPU compre
 # pyo3-generated glue; our own code stays safe Rust.
 [lints.rust]
 unsafe_code = "allow"
+# v0.8.5 #85: pyo3 0.22's `create_exception!` macro expands to
+# `#[cfg(feature = "gil-refs")]` inside *our* crate (not pyo3's), so rustc's
+# check-cfg lint complains it's not in OUR features list. The feature lives
+# in pyo3's manifest; we just have to tell our own check-cfg about it.
+# Removable once pyo3 0.23+ drops the gil-refs gate.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("gil-refs"))'] }
 
 [lints.clippy]
 # pyo3 0.22's `#[pymethods]` macro expands `PyResult` return types to
