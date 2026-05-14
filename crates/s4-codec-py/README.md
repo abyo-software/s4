@@ -79,16 +79,57 @@ If you ever see a link error like
 `undefined reference to PyExc_…`, drop `pyo3/extension-module` from the
 features and you'll get the diagnostic build that does link libpython.
 
-## Publishing (maintainers only)
+## Threading / GIL
 
-Wheels are not built automatically on every push (no CI matrix yet —
-that's [issue #X tbd]). Locally:
+Both `CpuZstd.compress()` and `CpuGzip.compress()` (and their `decompress()`
+counterparts) **release the Python GIL** while running, so other Python threads
+make progress concurrently. This is safe for:
 
-```bash
-maturin build --release --strip                            # CPU-only
-maturin build --release --strip --features nvcomp-gpu      # GPU
-twine upload target/wheels/*.whl                           # requires PyPI token
+- Django / Flask workers
+- ASGI / asyncio event loops (use `asyncio.to_thread()` to wrap the blocking call)
+- multi-threaded data pipelines
+
+Example (asyncio):
+
+```python
+import asyncio
+from s4_codec import CpuZstd
+
+async def compress_async(data: bytes) -> bytes:
+    codec = CpuZstd()
+    compressed, orig_size, crc = await asyncio.to_thread(codec.compress, data)
+    return compressed
 ```
+
+Note: the methods themselves are **synchronous** — they don't return awaitables.
+The GIL release means another Python thread can run during the compress; it
+doesn't make the call async-aware.
+
+## Supported codecs
+
+| Codec | Default | Requires `--features nvcomp-gpu` |
+|---|---|---|
+| `CpuZstd` | ✓ | — |
+| `CpuGzip` | ✓ | — |
+| `NvcompZstd` | — | ✓ + CUDA 12.x at runtime |
+| `NvcompBitcomp` | — | ✓ + CUDA 12.x at runtime |
+| `NvcompGDeflate` | — | ✓ + CUDA 12.x at runtime |
+
+Use `gpu_available() -> bool` at runtime to confirm a CUDA-capable GPU is present
+before constructing a GPU codec — building the wheel with `--features nvcomp-gpu`
+on a host with no GPU still produces a wheel that loads but raises at codec
+construction time.
+
+## Publishing status
+
+- PyPI publish is **manual** (no CI automation as of v0.8.5):
+  ```sh
+  cd crates/s4-codec-py
+  maturin build --release
+  twine upload target/wheels/*
+  ```
+- Workspace version inheritance was fixed in v0.8.5 #82 — the published wheel
+  version now matches the gateway version.
 
 `target/wheels/` is gitignored — never commit `.whl` files.
 

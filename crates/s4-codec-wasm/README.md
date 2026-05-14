@@ -107,6 +107,32 @@ metadata (`x-amz-meta-s4-codec`, `x-amz-meta-s4-original-size`,
 and decodes it in-browser. Open it after `wasm-pack build` and the
 sample text shows up in the `<pre>`.
 
+## Limitations
+
+- **WASM heap size**: Browser default is 256 MB. For objects larger than ~128 MB, the
+  binding allocates the full input in WASM linear memory (wasm-bindgen safety
+  boundary), which can fail with `RuntimeError: out of memory` on the JS side.
+
+  Workaround: pre-chunk via `Uint8Array.subarray()` in JS and decompress per-chunk
+  (each S4F2 frame is independently decodable when you know the frame boundaries).
+  A streaming decoder API is tracked as a v0.9+ follow-up.
+
+- **Browser-safe codec subset**: only `Passthrough`, `CpuZstd`, `CpuGzip` are
+  exported. Encountering a GPU-codec frame (NvcompZstd / NvcompBitcomp / etc) in
+  an S4F2 body returns a hard error — fetch the object via the S4 server gateway
+  for transparent decompression instead.
+
+## Publishing status
+
+- npm publish is **manual** (no CI automation as of v0.8.5):
+  ```sh
+  cd crates/s4-codec-wasm
+  wasm-pack build --release --target web
+  cd pkg && npm publish
+  ```
+- Workspace version inheritance was fixed in v0.8.5 #82 — the published package
+  version now matches the gateway version.
+
 ## License
 
 Apache-2.0 — same as the rest of S4.
