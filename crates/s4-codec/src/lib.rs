@@ -243,6 +243,30 @@ pub enum CodecError {
     /// silent success of a half-uploaded body.
     #[error("streaming compress truncated: expected {expected} input bytes, got {got}")]
     TruncatedStream { expected: u64, got: u64 },
+
+    /// v0.8.5 #83 H-3: nvCOMP decompress refused to honour a manifest whose
+    /// `original_size` exceeds the safety ceiling (default 5 GiB — AWS S3
+    /// single-PUT max). Without this gate, a forged or corrupted manifest
+    /// can drive a `Vec::with_capacity(huge)` and trip an OOM before the
+    /// CRC check ever runs. Distinct from `SizeMismatch` because here the
+    /// manifest itself is rejected pre-allocation rather than a
+    /// post-decompress length comparison.
+    #[error(
+        "manifest original_size {requested} exceeds safety limit {limit} \
+         (forged / corrupted manifest?)"
+    )]
+    ManifestSizeExceedsLimit { requested: u64, limit: u64 },
+
+    /// v0.8.5 #83 H-3: nvCOMP decompress saw a manifest whose
+    /// `compressed_size` field disagrees with the actual input payload
+    /// length. Surfaced before allocation so a forged header can't drive
+    /// a sized read against truncated or padded input. Distinct from
+    /// `SizeMismatch` (which is the post-decompress original-size check):
+    /// this is a pre-flight check on the *compressed* side.
+    #[error(
+        "manifest compressed_size {manifest} does not match payload length {actual}"
+    )]
+    ManifestSizeMismatch { manifest: u64, actual: u64 },
 }
 
 /// pluggable な圧縮 backend trait。

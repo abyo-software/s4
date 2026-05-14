@@ -23,6 +23,58 @@
 //! cargo test --features nvcomp-gpu -- --ignored  # GPU 必須テスト
 //! ```
 
+#[cfg(any(feature = "nvcomp-gpu", test))]
+use crate::{ChunkManifest, CodecError};
+
+/// v0.8.5 #83 H-3: maximum decompressed payload size honoured at
+/// decompress entry. Manifests claiming a larger `original_size` are
+/// rejected pre-allocation as forged / corrupted, so a malicious
+/// manifest cannot drive `Vec::with_capacity(huge)` into an OOM
+/// (memory-DoS) before the CRC check ever runs.
+///
+/// Rationale for 5 GiB: matches AWS S3's documented single-PUT object
+/// ceiling (`PUT Object` is capped at 5 GiB; bigger payloads must use
+/// multipart upload, which is split into ≤5 GiB parts). Real S4
+/// chunks are bounded by the same ceiling end-to-end, so a manifest
+/// whose `original_size` exceeds it cannot have come from a
+/// well-formed S4 PUT.
+#[cfg(any(feature = "nvcomp-gpu", test))]
+pub const MAX_DECOMPRESSED_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// v0.8.5 #83 H-3 helper: shared pre-allocation manifest validator
+/// invoked by every nvCOMP decompress path (Zstd / Bitcomp /
+/// GDeflate). Centralising the check keeps the three decompress sites
+/// (and any future nvCOMP codec) using identical limits and error
+/// shapes, so one missed update can't reintroduce the alloc-before-
+/// validate bug. Returns the `usize`-narrowed `original_size` ready
+/// for `Vec::with_capacity`, or a typed `CodecError` the caller
+/// propagates verbatim.
+#[cfg(any(feature = "nvcomp-gpu", test))]
+pub(crate) fn validate_decompress_manifest(
+    manifest: &ChunkManifest,
+    actual_compressed_len: usize,
+) -> Result<usize, CodecError> {
+    if manifest.original_size > MAX_DECOMPRESSED_BYTES {
+        return Err(CodecError::ManifestSizeExceedsLimit {
+            requested: manifest.original_size,
+            limit: MAX_DECOMPRESSED_BYTES,
+        });
+    }
+    if manifest.compressed_size != actual_compressed_len as u64 {
+        return Err(CodecError::ManifestSizeMismatch {
+            manifest: manifest.compressed_size,
+            actual: actual_compressed_len as u64,
+        });
+    }
+    // `u64 → usize` is lossy on 32-bit targets; reject explicitly so
+    // a 3 GiB manifest doesn't truncate to ~0 bytes on wasm32 / armv7
+    // and silently under-allocate the destination buffer.
+    usize::try_from(manifest.original_size).map_err(|_| CodecError::ManifestSizeExceedsLimit {
+        requested: manifest.original_size,
+        limit: usize::MAX as u64,
+    })
+}
+
 #[cfg(feature = "nvcomp-gpu")]
 mod imp {
     use std::sync::Arc;
@@ -31,6 +83,7 @@ mod imp {
     use bytes::Bytes;
 
     use crate::{ChunkManifest, Codec, CodecError, CodecKind};
+    use super::validate_decompress_manifest;
 
     /// nvCOMP zstd-GPU を S4 の `Codec` trait に bridge。
     pub struct NvcompZstdCodec {
@@ -85,8 +138,14 @@ mod imp {
                     got: manifest.codec,
                 });
             }
+            // v0.8.5 #83 H-3: validate manifest BEFORE allocating the
+            // destination buffer. A forged manifest with a huge
+            // `original_size` would otherwise drive `Vec::with_capacity`
+            // straight into an OOM (memory-DoS) before the CRC check
+            // ever runs, and a `u64 as usize` truncation on a 32-bit
+            // target would silently under-allocate.
             let expected_crc = manifest.crc32c;
-            let expected_orig_size = manifest.original_size as usize;
+            let expected_orig_size = validate_decompress_manifest(manifest, input.len())?;
             let codec = Arc::clone(&self.inner);
             let decompressed =
                 tokio::task::spawn_blocking(move || -> Result<Vec<u8>, CodecError> {
@@ -174,8 +233,9 @@ mod imp {
                     got: manifest.codec,
                 });
             }
+            // v0.8.5 #83 H-3: see NvcompZstdCodec::decompress.
             let expected_crc = manifest.crc32c;
-            let expected_orig_size = manifest.original_size as usize;
+            let expected_orig_size = validate_decompress_manifest(manifest, input.len())?;
             let codec = Arc::clone(&self.inner);
             let decompressed =
                 tokio::task::spawn_blocking(move || -> Result<Vec<u8>, CodecError> {
@@ -259,8 +319,9 @@ mod imp {
                     got: manifest.codec,
                 });
             }
+            // v0.8.5 #83 H-3: see NvcompZstdCodec::decompress.
             let expected_crc = manifest.crc32c;
-            let expected_orig_size = manifest.original_size as usize;
+            let expected_orig_size = validate_decompress_manifest(manifest, input.len())?;
             let codec = Arc::clone(&self.inner);
             let decompressed =
                 tokio::task::spawn_blocking(move || -> Result<Vec<u8>, CodecError> {
@@ -361,5 +422,104 @@ mod tests {
             .await
             .expect("decompress");
         assert_eq!(decompressed, input);
+    }
+}
+
+/// v0.8.5 #83 H-3 unit tests for the manifest pre-allocation validator.
+/// These run without `nvcomp-gpu` because they exercise the
+/// pure-host validation path — no CUDA runtime, no large allocations.
+/// Keeps the safety guard exercised on every `cargo test -p s4-codec`
+/// invocation, even on machines that can't build the full nvCOMP backend.
+#[cfg(test)]
+mod manifest_validate_tests {
+    use super::{MAX_DECOMPRESSED_BYTES, validate_decompress_manifest};
+    use crate::{ChunkManifest, CodecError, CodecKind};
+
+    fn manifest(original: u64, compressed: u64) -> ChunkManifest {
+        ChunkManifest {
+            codec: CodecKind::NvcompZstd,
+            original_size: original,
+            compressed_size: compressed,
+            crc32c: 0,
+        }
+    }
+
+    #[test]
+    fn decompress_rejects_manifest_original_size_over_limit() {
+        // Forged manifest claiming 6 GiB of decompressed output —
+        // would otherwise have allocated `Vec::with_capacity(6 GiB)`
+        // and tripped an OOM before any CRC check.
+        let m = manifest(MAX_DECOMPRESSED_BYTES + 1, 1024);
+        let err = validate_decompress_manifest(&m, 1024).unwrap_err();
+        match err {
+            CodecError::ManifestSizeExceedsLimit { requested, limit } => {
+                assert_eq!(requested, MAX_DECOMPRESSED_BYTES + 1);
+                assert_eq!(limit, MAX_DECOMPRESSED_BYTES);
+            }
+            other => panic!("expected ManifestSizeExceedsLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decompress_rejects_manifest_compressed_size_mismatch() {
+        // Forged manifest whose compressed_size disagrees with the
+        // actual payload length — fails fast pre-allocation so a
+        // truncated / padded payload cannot drive a sized read.
+        let m = manifest(1024, 2048);
+        let err = validate_decompress_manifest(&m, 1024).unwrap_err();
+        match err {
+            CodecError::ManifestSizeMismatch {
+                manifest: m_size,
+                actual,
+            } => {
+                assert_eq!(m_size, 2048);
+                assert_eq!(actual, 1024);
+            }
+            other => panic!("expected ManifestSizeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decompress_validates_well_formed_manifest() {
+        // Sanity: a manifest whose original_size is at the ceiling
+        // and whose compressed_size matches is accepted.
+        let m = manifest(MAX_DECOMPRESSED_BYTES, 1024);
+        let n = validate_decompress_manifest(&m, 1024)
+            .expect("well-formed manifest at the ceiling must pass");
+        assert_eq!(n as u64, MAX_DECOMPRESSED_BYTES);
+    }
+
+    /// v0.8.5 #83 H-3: on a 32-bit target a `u64 → usize` cast can
+    /// truncate a multi-GiB manifest down to a few hundred MiB,
+    /// silently under-allocating the destination buffer. The explicit
+    /// `usize::try_from` arm in `validate_decompress_manifest` closes
+    /// that bug. We can't flip the host pointer width, but we can
+    /// assert the limit-check arm catches anything the try_from would
+    /// have rejected on either pointer width — on 32-bit
+    /// `MAX_DECOMPRESSED_BYTES` already exceeds `usize::MAX`, so the
+    /// limit arm catches it first; on 64-bit the limit guards the
+    /// same value-space below `usize::MAX`. Either way the
+    /// alloc-before-validate / silent-truncation bug class stays
+    /// closed.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn decompress_rejects_u64_to_usize_overflow_on_32bit_targets() {
+        // 5 GiB > u32::MAX (~4 GiB), so the limit check fires first.
+        let m = manifest(MAX_DECOMPRESSED_BYTES, 1024);
+        let err = validate_decompress_manifest(&m, 1024).unwrap_err();
+        assert!(matches!(err, CodecError::ManifestSizeExceedsLimit { .. }));
+    }
+
+    /// 64-bit dual: validate that the entire safe range narrows
+    /// cleanly under `usize::try_from`. The 32-bit gating arm above
+    /// carries the forge-the-truncation contract on platforms where
+    /// it matters; on 64-bit the conversion can't fail for any value
+    /// within the accepted range.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn decompress_rejects_u64_to_usize_overflow_on_32bit_targets() {
+        let m = manifest(MAX_DECOMPRESSED_BYTES, 16);
+        let n = validate_decompress_manifest(&m, 16).expect("limit value narrows on 64-bit");
+        assert_eq!(n as u64, MAX_DECOMPRESSED_BYTES);
     }
 }
