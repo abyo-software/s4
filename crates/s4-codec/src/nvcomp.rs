@@ -82,8 +82,8 @@ mod imp {
     use crate::ferro_compress::{Algo, BitcompDataType, Codec as FerroCodec, NvcompCodec};
     use bytes::Bytes;
 
-    use crate::{ChunkManifest, Codec, CodecError, CodecKind};
     use super::validate_decompress_manifest;
+    use crate::{ChunkManifest, Codec, CodecError, CodecKind};
 
     /// nvCOMP zstd-GPU を S4 の `Codec` trait に bridge。
     pub struct NvcompZstdCodec {

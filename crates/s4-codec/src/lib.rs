@@ -263,9 +263,7 @@ pub enum CodecError {
     /// a sized read against truncated or padded input. Distinct from
     /// `SizeMismatch` (which is the post-decompress original-size check):
     /// this is a pre-flight check on the *compressed* side.
-    #[error(
-        "manifest compressed_size {manifest} does not match payload length {actual}"
-    )]
+    #[error("manifest compressed_size {manifest} does not match payload length {actual}")]
     ManifestSizeMismatch { manifest: u64, actual: u64 },
 }
 
