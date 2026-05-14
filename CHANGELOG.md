@@ -7,6 +7,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.5] — 2026-05-14
+
+Deep-audit 第三弾 sweep: **3 CRITICAL + 9 HIGH + 5 MEDIUM + 1 LOW**
+findings closed across **7 issues** (#81–#87). Fresh audit angles
+(HTTP wire / GPU codec safety / WASM+Python bindings / background
+task lifecycle) found 18 new issues missing from the first two
+audit rounds. Same posture: deploy if you run S4 in production.
+
+### Fixed (operational resilience)
+
+- **SIGTERM handler + background task cancellation + dispatcher
+  panic supervision** (#81 / C-1 + H-7) — Kubernetes pod stop
+  (SIGTERM) used to bypass graceful shutdown completely; only SIGINT
+  was wired. Pods waited the full grace period and then SIGKILL,
+  losing every in-flight upload mid-write. Now `SignalKind::terminate`
+  feeds the same shutdown notify as Ctrl-C; six background tasks
+  (lifecycle / inventory / multipart-sweep / replication-status-sweep
+  / access-log flusher / TLS reload) listen for the notify and exit
+  cleanly. Per-PUT replication + per-event notification dispatcher
+  spawns now wrap their futures in `futures::FutureExt::catch_unwind`
+  so a single panic doesn't silently kill the whole feature; new
+  metric `s4_dispatcher_panics_total{kind}`.
+
+### Fixed (binding correctness)
+
+- **Binding version inheritance + WASM panic hook** (#82 / C-2 + C-3)
+  — both `s4-codec-py` and `s4-codec-wasm` were `version = "0.1.0"`
+  hardcoded while the workspace was already at v0.8.x; PyPI / npm
+  publishes were going to ship a misleadingly-pre-release bundle.
+  Both now inherit `version.workspace = true`. `s4-codec-wasm` also
+  installs `console_error_panic_hook` automatically via
+  `#[wasm_bindgen(start)]` so a codec panic surfaces as a
+  `console.error` instead of poisoning the WASM linear memory and
+  silently killing the JS context.
+
+### Fixed (data integrity)
+
+- **GPU codec safety: u32 offsets / memory budget / nvCOMP manifest
+  validate** (#83 / H-1 + H-2 + H-3) — GPU `select_csv` accepted CSV
+  bodies up to 12 GiB but stored absolute byte offsets in `u32`,
+  silently truncating any column past the 4 GiB boundary; the kernel
+  then dereferenced `csv[start + i]` against unrelated bytes,
+  producing wrong WHERE-filter results. Now capped at `u32::MAX`
+  (4 GiB) with `GpuSelectError::BodyTooLarge`. The memory budget
+  check also now accounts for row-index allocations + host clones,
+  so small-row × billions-of-rows inputs fall back to CPU instead of
+  OOM-ing. nvCOMP decompress validates `manifest.original_size` /
+  `compressed_size` against a 5 GiB ceiling (AWS S3 single-PUT max)
+  before allocating, and uses `usize::try_from` instead of `as` to
+  catch `u64`-truncation on 32-bit targets.
+
+### Fixed (security)
+
+- **HTTP wire hardening** (#84 / H-4 + H-5 + H-6) — three issues:
+  - **Duplicate signed-header reject (SigV4a)**: a client sending
+    two `x-amz-date` headers used to make the signature canonical
+    bytes and the downstream input parser see different values
+    (auth confusion). Now `routing.rs` rejects with
+    `SigV4aError::DuplicateSignedHeader`.
+  - **Slowloris guard**: per-connection `tokio::time::timeout`
+    (default 30s, `--read-timeout-seconds`) and connection cap via
+    `Arc<Semaphore>` (default 1024, `--max-concurrent-connections`).
+  - **Hyper limits explicit**: `--max-header-bytes` (default 64 KiB),
+    `--http2` (default off — S3 API is HTTP/1.1 in practice and h2
+    has its own DoS surface).
+
+### Fixed (correctness + ergonomics)
+
+- **Python pytest suite + per-CodecError exception classes** (#85 /
+  H-8 + M-5) — `s4-codec-py` had zero test files; the wheel was
+  unverified at runtime. New `tests/test_binding.py` with 10 pytest
+  functions (zstd / gzip round-trip, gzip stdlib decode compat,
+  GIL release threading, tampered-payload error, version regression
+  guard). `codec_err_to_py` rewritten as exhaustive match — each
+  `CodecError` variant maps to a typed Python exception
+  (`S4CrcMismatchError`, `S4SizeMismatchError`, `S4BackendError`,
+  `S4IoError`, etc.) so callers can `except S4CrcMismatchError`
+  programmatically.
+- **Lifecycle MEDIUM** (#86 / M-1 + M-2 + M-3) —
+  - **Flusher Notify**: access-log flusher honors the cancellation
+    Notify so it drains pending entries on shutdown instead of being
+    SIGKILL-aborted mid-write.
+  - **Replication semaphore**: bounded `tokio::sync::Semaphore`
+    (default 1024, `--replication-max-concurrent`) caps in-flight
+    dispatcher tasks. Fixes OOM under high-volume + slow-destination
+    workloads.
+  - **SIGUSR1 snapshot dump-back**: long-promised hook finally
+    landed. `kill -USR1 <pid>` walks all 9 manager `to_json`
+    snapshots and atomic-writes them (tmp + rename) to the
+    configured `--*-state-file` paths; new metric
+    `s4_sigusr1_dump_total{manager,result}`.
+
+### Documentation (#87)
+
+- `s4-codec-wasm/README.md`: documented the 256 MB browser heap
+  limit + `Uint8Array.subarray` per-frame workaround; clarified the
+  browser-safe codec subset (Passthrough / CpuZstd / CpuGzip only).
+- `s4-codec-py/README.md`: added Threading / GIL section (compress
+  releases the GIL; safe for asyncio via `asyncio.to_thread`),
+  Supported codecs table (CPU default vs `--features nvcomp-gpu`
+  opt-in), Publishing status (manual maturin + twine until CI
+  automates).
+
+### Test posture
+
+614 workspace tests pass / 52 ignored (Docker-gated). Was 593/52 in
+v0.8.4. CI green.
+
 ## [0.8.4] — 2026-05-14
 
 Deep-audit 第二弾 sweep: **2 CRITICAL + 8 HIGH + 6 MEDIUM + 1 LOW**
