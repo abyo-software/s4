@@ -11,7 +11,10 @@
 
 [package]
 name = "s4-codec-wasm"
-version = "0.1.0"
+# v0.8.5 #82 C-2: inherit version from `[workspace.package]` so npm publishes
+# under the workspace's actual semver (was hard-coded "0.1.0", which would
+# have shipped a misleadingly-pre-release bundle for a v0.8.x workspace).
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -40,3 +43,17 @@ crc32c = { workspace = true }
 wasm-bindgen = "0.2"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["console"] }
+# v0.8.5 #82 C-3: install a panic hook on module load (see `lib.rs`'s
+# `s4_codec_wasm_init`) so a codec panic surfaces as `console.error` in the
+# browser instead of silently poisoning the WASM linear memory and killing
+# the JS context with no diagnostic.
+console_error_panic_hook = "0.1"
+
+[dev-dependencies]
+# v0.8.5 #82: parse `CARGO_PKG_VERSION` in `tests/version_matches_workspace.rs`
+# to assert the binding's version is a real workspace-inherited semver
+# (>= 0.8.0), not the legacy hard-coded "0.1.0".
+semver = "1"
+# Host-target smoke test for the panic-hook install path. (Real wasm-target
+# behaviour requires `wasm-pack test --node`; see `tests/panic_hook.rs`.)
+wasm-bindgen-test = "0.3"

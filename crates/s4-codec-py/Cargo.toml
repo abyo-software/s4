@@ -1,6 +1,9 @@
 [package]
 name = "s4-codec-py"
-version = "0.1.0"
+# v0.8.5 #82 C-2: inherit version from `[workspace.package]` so PyPI publishes
+# under the workspace's actual semver (was hard-coded "0.1.0", which would
+# have shipped a misleadingly-pre-release wheel for a v0.8.x workspace).
+version.workspace = true
 # Edition 2021 (not 2024) — PyO3 0.22's proc-macros generate code that
 # trips edition-2024's `unsafe-op-in-unsafe-fn` hard-error. Upgrading to
 # pyo3 0.23+ would let us go to 2024, but 0.22 is the latest stable line
@@ -60,3 +63,10 @@ pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
 s4-codec-rs = { package = "s4-codec", path = "../s4-codec", version = "0.8.4" }
 bytes = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+# v0.8.5 #82: parse `CARGO_PKG_VERSION` in `tests/version_matches_workspace.rs`
+# to assert the binding's version is a real workspace-inherited semver
+# (>= 0.8.0), not the legacy hard-coded "0.1.0" (which CARGO_PKG_VERSION
+# alone can't disambiguate from a deliberate pre-release).
+semver = "1"

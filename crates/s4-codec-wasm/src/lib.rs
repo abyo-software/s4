@@ -50,6 +50,28 @@ use s4_codec::{
 };
 use wasm_bindgen::prelude::*;
 
+/// v0.8.5 #82 C-3: install a panic hook the moment the WASM module loads,
+/// so any subsequent codec panic (decompression bomb tripped, malformed
+/// frame, OOM in `Vec::extend_from_slice`, etc.) surfaces as a readable
+/// `console.error` stack trace in the browser instead of silently
+/// poisoning the WASM linear memory and killing the JS context with no
+/// diagnostic at all.
+///
+/// `#[wasm_bindgen(start)]` makes wasm-bindgen emit module-init glue that
+/// calls this exactly once when the .wasm is first instantiated — there's
+/// no API surface for the JS caller to forget. `set_once()` is also
+/// idempotent, so a host-target unit test or repeated module instantiation
+/// can't double-install.
+///
+/// On the host (`cargo test` / `cargo build` for a non-wasm target) the
+/// `#[wasm_bindgen(start)]` annotation is a no-op for invocation (no JS
+/// loader runs), but the symbol still compiles and `set_once()` still
+/// works if called manually — `tests/panic_hook.rs` exercises that path.
+#[wasm_bindgen(start)]
+pub fn s4_codec_wasm_init() {
+    console_error_panic_hook::set_once();
+}
+
 /// Decompress an S4F2-framed object (the wire format S4 writes for both
 /// single-PUT and multipart uploads since v0.2 #4). Walks the byte
 /// stream as a sequence of `S4F2` frames + `S4P1` padding skips, calls

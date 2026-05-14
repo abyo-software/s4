@@ -4,7 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "s4-codec"
-version = "0.1.0"
+# v0.8.5 #82 C-2: declare `version` as `dynamic` so maturin reads it from
+# `Cargo.toml` (which now inherits from `[workspace.package]`). Hard-coding
+# "0.1.0" here would have desynced the wheel from the workspace semver and
+# shipped a misleading pre-release tag on PyPI.
+dynamic = ["version"]
 description = "Python bindings for s4-codec — in-process GPU/CPU compression (zstd / gzip / nvCOMP) for ML and ETL pipelines."
 readme = "README.md"
 requires-python = ">=3.9"
