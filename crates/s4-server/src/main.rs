@@ -1559,8 +1559,50 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         }
     }
 
+    // v0.8.5 #86 (audit M-3): install the SIGUSR1 snapshot dump-back
+    // handler. Operators send `kill -USR1 <pid>` to durably re-emit
+    // every attached manager's in-memory state to its
+    // `--<manager>-state-file <PATH>` without bouncing the gateway.
+    // Pre-#86 this was documented as a "future hook" in seven different
+    // CLI docstrings; the snapshot-load side already shipped in v0.5
+    // #34 / #30 etc. but the dump-back side never landed, so any
+    // restart lost everything written through the manager since boot.
+    //
+    // Unix-only — `tokio::signal::unix` is not available on Windows.
+    // The handler is best-effort: per-manager errors are
+    // logged-and-counted (`s4_sigusr1_dump_total{result="err"}`) so the
+    // operator notices, but a single bad write does not abort the
+    // dump-back of the remaining managers. The atomic-write pattern
+    // (write `<PATH>.tmp` → `rename` → `<PATH>`) guarantees an
+    // interrupted dump never leaves the operator with a half-written
+    // snapshot file (the rename is atomic on every POSIX-compliant fs;
+    // on a power loss the worst case is a `<PATH>.tmp` orphan, never a
+    // truncated `<PATH>`).
+    #[cfg(unix)]
+    {
+        let s4_for_dump = std::sync::Arc::clone(&s4_arc);
+        let snapshot_paths = OptSnapshotPaths::from_opt(&opt);
+        match install_sigusr1_snapshot_handler(s4_for_dump, snapshot_paths) {
+            Ok(()) => {
+                info!(
+                    "S4 SIGUSR1 snapshot dump-back handler installed \
+                     (v0.8.5 #86 audit M-3): operator can `kill -USR1 <pid>` to \
+                     re-emit every attached manager's state to its --*-state-file"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "S4 SIGUSR1 snapshot dump-back handler installation failed; \
+                     SIGUSR1 will be ignored. Operators must restart with the \
+                     existing `--*-state-file` paths to durably persist new state."
+                );
+            }
+        }
+    }
+
     let shared = s4_server::service_arc::SharedService::new(s4_arc);
-    run_server(
+    let server_result = run_server(
         shared,
         &sdk_conf,
         &opt,
@@ -1569,7 +1611,176 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         sigv4a_gate,
         shutdown_notify,
     )
-    .await
+    .await;
+
+    // v0.8.5 #86 (audit M-1): drain background-task handles on the way
+    // out. The flusher already exits cleanly when `shutdown_notify`
+    // fires (above in `run_server`'s listener loop break), so the joins
+    // here are a best-effort wait-for-clean-exit. We swallow any
+    // `JoinError` (panic / abort) — those are already surfaced via the
+    // dispatcher-panic counter / per-task error logs; bubbling them
+    // out of `start_server` would mask the actual graceful-shutdown
+    // completion in the operator's exit-code observability.
+    for handle in background_handles {
+        // Bound the wait so a wedged background task can't keep the
+        // process alive forever: 5 s is enough for the access-log
+        // flusher's final-drain (1 file write) and is well under the
+        // existing 10 s `graceful.shutdown()` budget in `run_server`.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+    server_result
+}
+
+/// v0.8.5 #86 (audit M-3): snapshot of every `--*-state-file` CLI flag
+/// captured at boot, so the SIGUSR1 dump-back handler can write each
+/// attached manager's `to_json()` back to its operator-supplied path
+/// without holding a borrow of the (consumed) `Opt`. `None` for a path
+/// means the operator did not pass that flag — the matching manager is
+/// not attached, and the dump-back skips it without bumping the metric.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+struct OptSnapshotPaths {
+    versioning: Option<std::path::PathBuf>,
+    object_lock: Option<std::path::PathBuf>,
+    mfa_delete: Option<std::path::PathBuf>,
+    cors: Option<std::path::PathBuf>,
+    inventory: Option<std::path::PathBuf>,
+    notifications: Option<std::path::PathBuf>,
+    tagging: Option<std::path::PathBuf>,
+    replication: Option<std::path::PathBuf>,
+    lifecycle: Option<std::path::PathBuf>,
+}
+
+#[cfg(unix)]
+impl OptSnapshotPaths {
+    fn from_opt(opt: &Opt) -> Self {
+        Self {
+            versioning: opt.versioning_state_file.clone(),
+            object_lock: opt.object_lock_state_file.clone(),
+            mfa_delete: opt.mfa_delete_state_file.clone(),
+            cors: opt.cors_state_file.clone(),
+            inventory: opt.inventory_state_file.clone(),
+            notifications: opt.notifications_state_file.clone(),
+            tagging: opt.tagging_state_file.clone(),
+            replication: opt.replication_state_file.clone(),
+            lifecycle: opt.lifecycle_state_file.clone(),
+        }
+    }
+}
+
+/// v0.8.5 #86 (audit M-3): install a `SignalKind::user_defined1`
+/// listener that, on every SIGUSR1 reception, walks every attached
+/// manager on the supplied `S4Service` and dumps its `to_json()` to
+/// the matching `--*-state-file` path via [`atomic_write`]. Returns
+/// the handler installation error (e.g. "too many signal handlers
+/// installed for SIGUSR1") so the caller can log a WARN and fall back
+/// to the documented "restart to persist" path.
+#[cfg(unix)]
+fn install_sigusr1_snapshot_handler<B>(
+    s4: std::sync::Arc<s4_server::S4Service<B>>,
+    paths: OptSnapshotPaths,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>>
+where
+    B: s3s::S3 + Send + Sync + 'static,
+{
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut usr1 =
+        signal(SignalKind::user_defined1()).map_err(|e| format!("install SIGUSR1 handler: {e}"))?;
+    tokio::spawn(async move {
+        while usr1.recv().await.is_some() {
+            let (ok, err) = dump_all_snapshots(&s4, &paths);
+            tracing::info!(
+                ok_count = ok,
+                err_count = err,
+                "S4 SIGUSR1: dumped attached-manager snapshots to --*-state-file paths (v0.8.5 #86)"
+            );
+        }
+    });
+    Ok(())
+}
+
+/// v0.8.5 #86 (audit M-3): walk every attached manager + matching
+/// snapshot path pair, render `to_json()`, and atomically write to disk.
+/// Returns `(ok_count, err_count)` so the SIGUSR1 callback can log a
+/// summary; per-manager `s4_sigusr1_dump_total{manager,result}` is
+/// bumped inside this fn so dashboards can split clean writes from
+/// failures.
+#[cfg(unix)]
+fn dump_all_snapshots<B>(
+    s4: &std::sync::Arc<s4_server::S4Service<B>>,
+    paths: &OptSnapshotPaths,
+) -> (usize, usize)
+where
+    B: s3s::S3 + Send + Sync + 'static,
+{
+    let mut ok = 0usize;
+    let mut err = 0usize;
+    macro_rules! dump_one {
+        ($manager_name:expr, $accessor:expr, $path_field:ident) => {{
+            if let (Some(mgr), Some(path)) = ($accessor, paths.$path_field.as_ref()) {
+                let success = match mgr.to_json() {
+                    Ok(json) => match atomic_write(path, &json) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(
+                                manager = $manager_name,
+                                path = %path.display(),
+                                error = %e,
+                                "S4 SIGUSR1: snapshot atomic_write failed"
+                            );
+                            false
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            manager = $manager_name,
+                            path = %path.display(),
+                            error = %e,
+                            "S4 SIGUSR1: manager.to_json() failed"
+                        );
+                        false
+                    }
+                };
+                s4_server::metrics::record_sigusr1_dump($manager_name, success);
+                if success {
+                    ok += 1;
+                } else {
+                    err += 1;
+                }
+            }
+        }};
+    }
+    dump_one!("versioning", s4.versioning_manager(), versioning);
+    dump_one!("object_lock", s4.object_lock_manager(), object_lock);
+    dump_one!("mfa_delete", s4.mfa_delete_manager(), mfa_delete);
+    dump_one!("cors", s4.cors_manager(), cors);
+    dump_one!("inventory", s4.inventory_manager(), inventory);
+    dump_one!("notifications", s4.notifications_manager(), notifications);
+    dump_one!("tagging", s4.tag_manager(), tagging);
+    dump_one!("replication", s4.replication_manager(), replication);
+    dump_one!("lifecycle", s4.lifecycle_manager(), lifecycle);
+    (ok, err)
+}
+
+/// v0.8.5 #86 (audit M-3): write `contents` to `path` atomically. We
+/// write to `<path>.tmp` first, then `rename` it onto `<path>`. The
+/// rename is atomic on every POSIX-compliant filesystem; on a power
+/// loss the worst case is a `<path>.tmp` orphan, never a half-written
+/// `<path>`. (`std::fs::rename` is documented to overwrite the
+/// destination on Unix; on Windows it would fail if the target exists,
+/// but this fn is `#[cfg(unix)]`-gated through its only caller.)
+#[cfg(unix)]
+fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    // Place the tmp file alongside the target so the rename stays on
+    // the same filesystem (cross-fs rename is not atomic and will fall
+    // back to copy + delete). `with_extension("tmp")` preserves the
+    // parent directory — a relative `versioning.json` becomes
+    // `versioning.tmp` next to it; an absolute `/srv/state/versioning.json`
+    // becomes `/srv/state/versioning.tmp`.
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// v0.5 #32: enforce compliance-mode prerequisites at boot. Each
@@ -2319,5 +2530,124 @@ mod hardening_tests {
         // reachable.
         assert!(b.is_http1_available());
         assert!(b.is_http2_available());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod sigusr1_dump_tests {
+    //! v0.8.5 #86 (audit M-3): unit tests for the SIGUSR1 snapshot
+    //! dump-back helpers. We don't drive an actual SIGUSR1 into the
+    //! test process — that's a process-self-signal that races every
+    //! other test parked on tokio handles — so the assertions cap at
+    //! the [`atomic_write`] file-system contract; the per-manager
+    //! `dump_all_snapshots` walk is exercised end-to-end whenever the
+    //! parent integration test sends SIGUSR1 (out of unit-test scope).
+
+    use std::io::Read as _;
+
+    /// The atomic-write helper must (a) leave the target file with
+    /// exactly the new contents, (b) NOT leave a `<path>.tmp` orphan
+    /// behind on a successful run, and (c) overwrite an existing
+    /// target file (the `--*-state-file` snapshot may already exist
+    /// from the previous boot's snapshot or from a prior SIGUSR1).
+    #[test]
+    fn atomic_write_replaces_target_atomically() {
+        let dir = std::env::temp_dir().join(format!(
+            "s4-86-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir create");
+        let target = dir.join("snapshot.json");
+
+        // Pre-populate the target with stale contents so we can
+        // assert the rename actually replaced (not appended) them.
+        std::fs::write(&target, b"STALE").expect("seed stale target");
+
+        let payload = "{\"versioning\":{}}";
+        super::atomic_write(&target, payload).expect("atomic_write must succeed");
+
+        let mut buf = String::new();
+        std::fs::File::open(&target)
+            .expect("target re-open after atomic_write")
+            .read_to_string(&mut buf)
+            .expect("target read after atomic_write");
+        assert_eq!(
+            buf, payload,
+            "atomic_write must overwrite the target with the new payload, not append"
+        );
+
+        // The tmp sibling MUST be gone after a successful rename.
+        let tmp = target.with_extension("tmp");
+        assert!(
+            !tmp.exists(),
+            "successful atomic_write must remove the .tmp sibling (rename, not copy); \
+             found leftover at {}",
+            tmp.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `OptSnapshotPaths::from_opt` is a pure projection — every
+    /// `--*-state-file` flag round-trips into the matching `Option`
+    /// field. The dump-back walk gates on `Some(path)` per manager,
+    /// so a regression that swapped two field assignments would
+    /// silently dump the wrong manager's JSON to the operator's path.
+    /// We can't easily build a full `Opt` here (clap's `Parser`
+    /// derive needs a process-wide arg vector), so the test asserts
+    /// the empty / `None` defaults instead — the populated case is
+    /// covered by the integration-test path that drives the binary
+    /// with explicit `--*-state-file` args.
+    #[test]
+    fn opt_snapshot_paths_default_is_all_none() {
+        // Synthesise an `Opt` via clap's `try_parse_from` with only
+        // the required `--endpoint-url` arg so every `--*-state-file`
+        // flag falls back to its default (= `None`).
+        use clap::Parser as _;
+        let opt = match super::Opt::try_parse_from([
+            "s4-server",
+            "--endpoint-url",
+            "http://127.0.0.1:9000",
+        ]) {
+            Ok(o) => o,
+            Err(e) => {
+                // clap surfaces missing required args as Err; the
+                // test only proceeds if every other flag is optional
+                // (= the `--endpoint-url` shown above is the only
+                // required positional). If a future change adds
+                // another required flag this test will need updating
+                // — fail loudly so we notice.
+                panic!("unable to parse minimal Opt for test: {e}");
+            }
+        };
+        let paths = super::OptSnapshotPaths::from_opt(&opt);
+        assert!(
+            paths.versioning.is_none(),
+            "versioning default must be None"
+        );
+        assert!(
+            paths.object_lock.is_none(),
+            "object_lock default must be None"
+        );
+        assert!(
+            paths.mfa_delete.is_none(),
+            "mfa_delete default must be None"
+        );
+        assert!(paths.cors.is_none(), "cors default must be None");
+        assert!(paths.inventory.is_none(), "inventory default must be None");
+        assert!(
+            paths.notifications.is_none(),
+            "notifications default must be None"
+        );
+        assert!(paths.tagging.is_none(), "tagging default must be None");
+        assert!(
+            paths.replication.is_none(),
+            "replication default must be None"
+        );
+        assert!(paths.lifecycle.is_none(), "lifecycle default must be None");
     }
 }

@@ -328,7 +328,22 @@ pub fn try_sigv4a_verify_at<B>(
                 )));
             }
         };
-    let canonical = build_canonical_request_bytes(req, &signed_headers);
+    let canonical = match build_canonical_request_bytes(req, &signed_headers) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            // v0.8.5 #84 H-4: duplicate signed header (only failure
+            // mode the canonical builder has today). Surface as
+            // `SignatureDoesNotMatch` 403 — the AWS SDKs treat that
+            // as the catch-all auth-failure code, and the diagnostic
+            // is in the response body / server log.
+            tracing::warn!(error = %err, "SigV4a canonical-request build rejected request");
+            return Some(Err(build_sigv4a_error_response(
+                StatusCode::FORBIDDEN,
+                "SignatureDoesNotMatch",
+                &err.to_string(),
+            )));
+        }
+    };
     match gate.pre_route_at(req, requested_region, &canonical, now) {
         Ok(()) => Some(Ok(())),
         Err(err) => {
@@ -357,7 +372,22 @@ pub fn try_sigv4a_verify_at<B>(
 /// 5. signed headers list (lowercase names joined by `;`)
 /// 6. payload hash (value of `x-amz-content-sha256`, or `UNSIGNED-PAYLOAD`
 ///    if absent)
-fn build_canonical_request_bytes<B>(req: &Request<B>, signed_headers: &[String]) -> Vec<u8> {
+///
+/// v0.8.5 #84 (audit H-4): every signed header is checked for being
+/// sent **exactly once** on the request. If a header in
+/// `SignedHeaders=` appears more than once we'd have to choose between
+/// the first value (`HeaderMap::get` semantics) and the comma-joined
+/// AWS-canonical form — and any S3 SDK / WAF / sidecar in front of us
+/// would make a different choice, opening "auth confusion" attacks
+/// (sign over the benign first `x-amz-date`, smuggle a second one for
+/// the inner parser). HTTP/1.1 spec already forbids duplicates of
+/// `host` / `x-amz-date` and the AWS SDKs never emit them, so any
+/// duplicate is a malicious or broken request — reject upfront with
+/// [`SigV4aError::DuplicateSignedHeader`].
+fn build_canonical_request_bytes<B>(
+    req: &Request<B>,
+    signed_headers: &[String],
+) -> Result<Vec<u8>, crate::sigv4a::SigV4aError> {
     let mut buf = String::with_capacity(512);
     buf.push_str(req.method().as_str());
     buf.push('\n');
@@ -366,6 +396,22 @@ fn build_canonical_request_bytes<B>(req: &Request<B>, signed_headers: &[String])
     buf.push_str(&canonical_query_string(req.uri().query().unwrap_or("")));
     buf.push('\n');
     for name in signed_headers {
+        // v0.8.5 #84 H-4: count occurrences via `get_all` rather than
+        // `get`, which only ever returns the first value. Two
+        // `x-amz-date` headers with `get` would canonicalise to the
+        // first value while a downstream HTTP/1.1 parser might pick
+        // the second — auth confusion. Single-value reject is the
+        // safe choice; comma-join would be the AWS-canonical form
+        // for legitimately multi-valued signed headers, but the AWS
+        // SDKs never sign over comma-joined values for any header
+        // S3 cares about, so refusing duplicates outright matches
+        // every real-world client.
+        let occurrences = req.headers().get_all(name.as_str()).iter().count();
+        if occurrences > 1 {
+            return Err(crate::sigv4a::SigV4aError::DuplicateSignedHeader {
+                header: name.clone(),
+            });
+        }
         let value = req
             .headers()
             .get(name.as_str())
@@ -388,7 +434,7 @@ fn build_canonical_request_bytes<B>(req: &Request<B>, signed_headers: &[String])
         .and_then(|v| v.to_str().ok())
         .unwrap_or("UNSIGNED-PAYLOAD");
     buf.push_str(payload_hash);
-    buf.into_bytes()
+    Ok(buf.into_bytes())
 }
 
 /// SigV4 canonical query string: split on `&`, parse each `k=v` (or
@@ -941,7 +987,8 @@ mod sigv4a_gate_tests {
             .iter()
             .map(|s| (*s).to_string())
             .collect();
-        let canonical = build_canonical_request_bytes(&pre, &signed_headers);
+        let canonical =
+            build_canonical_request_bytes(&pre, &signed_headers).expect("test fixture canonical");
         let sig: p256::ecdsa::Signature = signing.sign(&canonical);
         let sig_hex = lower_hex(sig.to_der().as_bytes());
         let auth = build_auth_header(access_key, &signed_headers_list, &sig_hex);
@@ -1211,7 +1258,8 @@ mod sigv4a_gate_tests {
             .iter()
             .map(|s| (*s).into())
             .collect();
-        let bytes = build_canonical_request_bytes(&r, &signed);
+        let bytes =
+            build_canonical_request_bytes(&r, &signed).expect("canonical request bytes must build");
         let s = std::str::from_utf8(&bytes).expect("utf-8");
         let expected = "PUT\n\
                         /bucket/key\n\
@@ -1223,5 +1271,122 @@ mod sigv4a_gate_tests {
                         host;x-amz-content-sha256;x-amz-date\n\
                         UNSIGNED-PAYLOAD";
         assert_eq!(s, expected, "canonical request bytes mismatch:\n{s}");
+    }
+
+    /// v0.8.5 #84 H-4: duplicate `x-amz-date` headers must be rejected
+    /// at canonical-request build time (not silently coalesced to the
+    /// first value). HTTP/1.1 spec already forbids duplicates of
+    /// `host` / `x-amz-date`; AWS SDKs never emit them; so any
+    /// duplicate must be malicious or broken — single-value reject is
+    /// the safe choice (see [`build_canonical_request_bytes`] doc).
+    #[test]
+    fn sigv4a_duplicate_x_amz_date_rejected() {
+        // Two x-amz-date headers — first one matches the signature the
+        // gate expects, second one is what a downstream parser might
+        // pick up. This is the textbook auth-confusion vector.
+        let r = Request::builder()
+            .method(Method::GET)
+            .uri("/b/k")
+            .header("host", "s3.example.com")
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .header("x-amz-date", "20260513T120000Z")
+            .header("x-amz-date", "20260513T130000Z")
+            .body(())
+            .expect("dup-header request");
+        let signed: Vec<String> = ["host", "x-amz-content-sha256", "x-amz-date"]
+            .iter()
+            .map(|s| (*s).into())
+            .collect();
+        let err = build_canonical_request_bytes(&r, &signed)
+            .expect_err("duplicate x-amz-date must reject");
+        match err {
+            crate::sigv4a::SigV4aError::DuplicateSignedHeader { header } => {
+                assert_eq!(header, "x-amz-date");
+            }
+            other => panic!("expected DuplicateSignedHeader, got {other:?}"),
+        }
+    }
+
+    /// v0.8.5 #84 H-4: counterpart to the duplicate-reject test —
+    /// single-occurrence headers on the same path stay accepted.
+    /// Guards against a regression where the duplicate-detect logic
+    /// is over-eager and trips on a normally-formed request.
+    #[test]
+    fn sigv4a_canonicalization_single_header_passes() {
+        let r = req(
+            Method::GET,
+            "/b/k",
+            &[
+                ("host", "s3.example.com"),
+                ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+                ("x-amz-date", "20260513T120000Z"),
+            ],
+        );
+        let signed: Vec<String> = ["host", "x-amz-content-sha256", "x-amz-date"]
+            .iter()
+            .map(|s| (*s).into())
+            .collect();
+        let bytes =
+            build_canonical_request_bytes(&r, &signed).expect("single-occurrence must accept");
+        // Body content not asserted in detail (covered by
+        // canonical_request_bytes_format); just confirm the bytes
+        // parse as utf-8 and contain the date verbatim.
+        let s = std::str::from_utf8(&bytes).expect("utf-8");
+        assert!(
+            s.contains("x-amz-date:20260513T120000Z"),
+            "canonical bytes must echo the single x-amz-date verbatim:\n{s}"
+        );
+    }
+
+    /// v0.8.5 #84 H-4: end-to-end through the
+    /// [`try_sigv4a_verify_at`] gate — duplicate `x-amz-date` on a
+    /// SigV4a-shaped request must surface 403 SignatureDoesNotMatch
+    /// (not silently authenticate against the first value).
+    #[tokio::test]
+    async fn sigv4a_pre_route_rejects_duplicate_signed_header() {
+        let signing = SigningKey::random(&mut OsRng);
+        let vk = p256::ecdsa::VerifyingKey::from(&signing);
+        let gate = make_gate_with("AKIAOK", vk);
+        // Authorization header lists x-amz-date in SignedHeaders —
+        // signature value itself can be garbage; the duplicate-detect
+        // path runs strictly before any ECDSA math.
+        let auth = build_auth_header(
+            "AKIAOK",
+            &[
+                "host",
+                "x-amz-content-sha256",
+                "x-amz-date",
+                REGION_SET_HEADER,
+            ],
+            "deadbeef",
+        );
+        let r = Request::builder()
+            .method(Method::GET)
+            .uri("/bucket/key")
+            .header("host", "s3.example.com")
+            .header(
+                "x-amz-content-sha256",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            )
+            .header("x-amz-date", "20260513T120000Z")
+            .header("x-amz-date", "20260513T130000Z")
+            .header(REGION_SET_HEADER, "us-east-1")
+            .header("authorization", auth)
+            .body(())
+            .expect("dup-header sigv4a request");
+        let result = try_sigv4a_verify_at(&r, Some(&gate), "us-east-1", fixture_now())
+            .expect("must intercept SigV4a request");
+        let resp = result.expect_err("duplicate signed header must reject at the gate");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_to_bytes(resp).await;
+        let body_str = String::from_utf8(body).expect("xml utf-8");
+        assert!(
+            body_str.contains("<Code>SignatureDoesNotMatch</Code>"),
+            "duplicate signed header must surface SignatureDoesNotMatch: {body_str}"
+        );
+        assert!(
+            body_str.contains("duplicate signed header"),
+            "diagnostic must mention duplicate header: {body_str}"
+        );
     }
 }

@@ -117,6 +117,17 @@ pub enum SigV4aError {
     /// 4 components total).
     #[error("credential scope must have 4 components separated by '/'")]
     InvalidCredentialScope,
+    /// v0.8.5 #84 (audit H-4): a header named in `SignedHeaders=` (or
+    /// the host / x-amz-date pair RFC 7230 forbids duplicates of) was
+    /// sent more than once on the same request. Single-value lookups
+    /// (`HeaderMap::get`) silently return only the first value, so the
+    /// canonical bytes the server signs differ from what a downstream
+    /// parser sees — an "auth confusion" vector. Reject upfront before
+    /// either side gets the chance to disagree.
+    #[error(
+        "duplicate signed header '{header}' (HTTP/1.1 forbids duplicates of host / x-amz-date)"
+    )]
+    DuplicateSignedHeader { header: String },
 }
 
 /// Newtype wrapper around the bytes that the SigV4a signature was
