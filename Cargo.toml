@@ -62,3 +62,13 @@ bolero = "0.13"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+
+# `cargo bolero test --engine libfuzzer` defaults to `--profile fuzz`. Inherit
+# from `release` (optimized, no debug-asserts) but force codegen-units=1 (bolero
+# README warns of compilation bugs otherwise) and keep debug info so libfuzzer
+# crash artifacts symbolicate.
+[profile.fuzz]
+inherits = "release"
+codegen-units = 1
+debug = true
+overflow-checks = true
