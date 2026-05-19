@@ -39,7 +39,7 @@ mod imp {
     use bytes::Bytes;
 
     use super::validate_decompress_manifest;
-    use crate::{ChunkManifest, Codec, CodecError, CodecKind};
+    use crate::{ChunkManifest, Codec, CodecError, CodecKind, DECOMPRESS_BOOTSTRAP_CAPACITY};
 
     /// nvCOMP zstd-GPU を S4 の `Codec` trait に bridge。
     pub struct NvcompZstdCodec {
@@ -105,7 +105,17 @@ mod imp {
             let codec = Arc::clone(&self.inner);
             let decompressed =
                 tokio::task::spawn_blocking(move || -> Result<Vec<u8>, CodecError> {
-                    let mut out = Vec::with_capacity(expected_orig_size);
+                    // v0.8.7 (Codex review HIGH): bootstrap-cap the initial
+                    // alloc to 1 MiB — `ferro_compress::Codec::decompress`'s
+                    // nvcomp_hlif impl `output.resize(decomp_bytes, 0)`s the
+                    // Vec itself based on the parsed compressed-frame header,
+                    // so the call-site `with_capacity` is purely a sizing
+                    // hint. Capping it removes the unconditional N-GiB host
+                    // alloc when an attacker-controlled manifest claims a
+                    // sub-5-GiB-but-still-huge `original_size` (e.g. u32::MAX
+                    // = 4 GiB), which `validate_decompress_manifest` accepts.
+                    let mut out =
+                        Vec::with_capacity(expected_orig_size.min(DECOMPRESS_BOOTSTRAP_CAPACITY));
                     codec.decompress(input.as_ref(), &mut out).map_err(|e| {
                         CodecError::Backend(anyhow::anyhow!("nvcomp zstd decompress: {e}"))
                     })?;
@@ -195,7 +205,17 @@ mod imp {
             let codec = Arc::clone(&self.inner);
             let decompressed =
                 tokio::task::spawn_blocking(move || -> Result<Vec<u8>, CodecError> {
-                    let mut out = Vec::with_capacity(expected_orig_size);
+                    // v0.8.7 (Codex review HIGH): bootstrap-cap the initial
+                    // alloc to 1 MiB — `ferro_compress::Codec::decompress`'s
+                    // nvcomp_hlif impl `output.resize(decomp_bytes, 0)`s the
+                    // Vec itself based on the parsed compressed-frame header,
+                    // so the call-site `with_capacity` is purely a sizing
+                    // hint. Capping it removes the unconditional N-GiB host
+                    // alloc when an attacker-controlled manifest claims a
+                    // sub-5-GiB-but-still-huge `original_size` (e.g. u32::MAX
+                    // = 4 GiB), which `validate_decompress_manifest` accepts.
+                    let mut out =
+                        Vec::with_capacity(expected_orig_size.min(DECOMPRESS_BOOTSTRAP_CAPACITY));
                     codec.decompress(input.as_ref(), &mut out).map_err(|e| {
                         CodecError::Backend(anyhow::anyhow!("nvcomp bitcomp decompress: {e}"))
                     })?;
@@ -281,7 +301,17 @@ mod imp {
             let codec = Arc::clone(&self.inner);
             let decompressed =
                 tokio::task::spawn_blocking(move || -> Result<Vec<u8>, CodecError> {
-                    let mut out = Vec::with_capacity(expected_orig_size);
+                    // v0.8.7 (Codex review HIGH): bootstrap-cap the initial
+                    // alloc to 1 MiB — `ferro_compress::Codec::decompress`'s
+                    // nvcomp_hlif impl `output.resize(decomp_bytes, 0)`s the
+                    // Vec itself based on the parsed compressed-frame header,
+                    // so the call-site `with_capacity` is purely a sizing
+                    // hint. Capping it removes the unconditional N-GiB host
+                    // alloc when an attacker-controlled manifest claims a
+                    // sub-5-GiB-but-still-huge `original_size` (e.g. u32::MAX
+                    // = 4 GiB), which `validate_decompress_manifest` accepts.
+                    let mut out =
+                        Vec::with_capacity(expected_orig_size.min(DECOMPRESS_BOOTSTRAP_CAPACITY));
                     codec.decompress(input.as_ref(), &mut out).map_err(|e| {
                         CodecError::Backend(anyhow::anyhow!("nvcomp gdeflate decompress: {e}"))
                     })?;

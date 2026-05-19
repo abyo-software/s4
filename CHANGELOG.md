@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.7] — 2026-05-14
+
+Codex (gpt-5.5) third-party review of v0.8.6 caught **3 findings** —
+1 HIGH (nvCOMP still had the same alloc-before-validate shape #89
+fixed in the CPU codecs) + 2 LOW (regression test gap on the WASM
+`*_blocking` path). Same-day fix-and-ship pattern.
+
+### Fixed
+
+- **HIGH (Codex review): nvcomp.rs alloc-before-validate residual** —
+  all three `Vec::with_capacity(expected_orig_size)` sites in
+  `NvcompZstdCodec::decompress` / `NvcompBitcompCodec::decompress` /
+  `NvcompGDeflateCodec::decompress` now route through
+  `expected_orig_size.min(DECOMPRESS_BOOTSTRAP_CAPACITY)` (the same
+  1 MiB cap v0.8.6 #89 applied to CPU codecs). Verified safe via the
+  `ferro_compress::Codec::decompress` impl: nvCOMP HLIF
+  (`nvcomp_hlif.rs:703`) calls `output.resize(decomp_bytes, 0)` to
+  size the buffer itself based on the parsed compressed-frame header,
+  so the call-site `with_capacity` is a sizing hint that doesn't
+  constrain the final length.
+- **LOW × 2 (Codex review): `decompress_blocking` regression coverage**
+  — v0.8.6 added `issue_89_*` regression tests only on the async
+  `Codec::decompress` path. WASM clients (`s4-codec-wasm`) hit the
+  sync `decompress_blocking` path because the browser has no tokio
+  runtime, so the async-path coverage left the WASM surface untested
+  for the same alloc-before-validate shape. Added blocking variants
+  per codec: `issue_89_blocking_rejects_manifest_over_5gib` +
+  `issue_89_blocking_bootstrap_cap_keeps_4gib_claim_alloc_safe`.
+
+### Process note
+
+`codex review --commit <SHA>` doesn't accept a custom prompt
+(`error: '--commit' cannot be used with '[PROMPT]'`). Workaround:
+`git show <SHA> -- <code-files> | codex exec "<prompt>"`. This both
+focuses the review on real code (excluding the 326 binary corpus
+files from the fuzz farm commit) and lets the prompt steer
+severity-tagged output. ~26k input tokens for a 3-finding response.
+
+### Test posture
+
+622 workspace tests pass (was 618, +4 blocking regressions) / 52
+ignored. CI green.
+
 ## [0.8.6] — 2026-05-14
 
 Continuous fuzz farm caught **#89** — `CpuZstd::decompress` would

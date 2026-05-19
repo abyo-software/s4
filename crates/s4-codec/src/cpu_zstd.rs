@@ -333,4 +333,46 @@ mod tests {
         let decompressed = decompress_blocking(&compressed, &manifest).unwrap();
         assert_eq!(decompressed, input);
     }
+
+    /// v0.8.7 (Codex review LOW) — blocking variants of the issue #89
+    /// regression tests. WASM clients hit the sync `decompress_blocking`
+    /// path (no tokio runtime in the browser), so the async-path coverage
+    /// alone left the WASM surface untested for the same alloc-before-
+    /// validate shape. Mirrors `issue_89_rejects_manifest_over_5gib` and
+    /// `issue_89_bootstrap_cap_keeps_4gib_claim_alloc_safe` from the async
+    /// path verbatim.
+    #[test]
+    fn issue_89_blocking_rejects_manifest_over_5gib() {
+        let body = &[0x00, 0xd1, 0xd1, 0xd1, 0xd1, 0xd1];
+        let manifest = ChunkManifest {
+            codec: CodecKind::CpuZstd,
+            original_size: crate::MAX_DECOMPRESSED_BYTES + 1,
+            compressed_size: body.len() as u64,
+            crc32c: 0,
+        };
+        let err = decompress_blocking(body, &manifest).unwrap_err();
+        match err {
+            CodecError::ManifestSizeExceedsLimit { requested, limit } => {
+                assert_eq!(requested, crate::MAX_DECOMPRESSED_BYTES + 1);
+                assert_eq!(limit, crate::MAX_DECOMPRESSED_BYTES);
+            }
+            other => panic!("expected ManifestSizeExceedsLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_89_blocking_bootstrap_cap_keeps_4gib_claim_alloc_safe() {
+        let body = &[0x00, 0xd1, 0xd1, 0xd1, 0xd1, 0xd1];
+        let manifest = ChunkManifest {
+            codec: CodecKind::CpuZstd,
+            original_size: u32::MAX as u64,
+            compressed_size: body.len() as u64,
+            crc32c: 0,
+        };
+        let err = decompress_blocking(body, &manifest).unwrap_err();
+        assert!(
+            matches!(err, CodecError::Io(_) | CodecError::SizeMismatch { .. }),
+            "expected Io or SizeMismatch, got {err:?}"
+        );
+    }
 }
