@@ -633,20 +633,40 @@ needed bytes from S3.
 
 ## Project Status
 
-- **v0.2.0 released** (2026-05-12) — 8 milestone issues delivered: GPU
-  streaming, HTTPS / TLS, single-PUT framed unification, multipart padding
-  trim, byte-range `upload_part_copy`, bucket policy enforcement, AWS-E2E CI
-  scaffold, GDeflate codec
-- **Phase 1 + 2.0 + 2.1 + 2.2 (= v0.2) complete** (~40 commits, 140 tests,
-  fuzz / soak / OTel / Prometheus / TLS / policy / GPU streaming all wired)
-- **Production-ready** for log archival, data lake, parquet/ORC analytics
-- **Real-GPU validation** done on RTX 4070 Ti SUPER + nvCOMP 5.x: streaming
-  zstd 1 GiB roundtrip + GDeflate roundtrip both green
-- **Open roadmap for v0.3 and beyond**: ACME / Let's Encrypt opt-in, TLS cert
-  hot-reload on SIGHUP, in-flight pipelining (chunk K-1 compress overlapped
-  with chunk K PCIe transfer), full IAM Conditions, additional codec backends
-  (DietGPU re-evaluated if user demand surfaces). File issues at
-  https://github.com/abyo-software/s4/issues to influence the roadmap.
+- **v0.8.6 released** (2026-05-14) — see [CHANGELOG.md](CHANGELOG.md) for
+  the full per-version history. Cumulative scope across v0.1 → v0.8.6 is
+  600+ workspace tests + 11 production milestones covering S3-compatible
+  PUT / GET / multipart / Select / SSE-S3 / SSE-KMS / SSE-C / IAM
+  Conditions / bucket policy / versioning / object-lock / lifecycle /
+  inventory / notifications (Webhook / SQS / SNS) / replication / CORS /
+  tagging / MFA delete / SigV4 + SigV4a, plus Python
+  (`s4-codec-py`) and browser (`s4-codec-wasm`) bindings, all on
+  crates.io as the
+  [`s4-server`](https://crates.io/crates/s4-server) /
+  [`s4-codec`](https://crates.io/crates/s4-codec) /
+  [`s4-config`](https://crates.io/crates/s4-config) trio.
+- **Three rounds of deep audit** (`第一弾` / `第二弾` / `第三弾`)
+  closed in v0.8.2 → v0.8.5 — 50+ findings spanning CRITICAL pre-auth
+  state-machine bugs, HTTP wire hardening, GPU codec safety, binding
+  correctness, and background-task lifecycle. Same posture for every
+  audit: deploy if you run S4 in production.
+- **Continuous fuzz farm** (v0.8.6) — 5 bolero targets running 24/7
+  under a `systemd-user` slice budgeted at 8 cores / 30 GiB (1/4 of the
+  build host). Coverage compounds across `Restart=always` wakeups; any
+  crash auto-files a GitHub issue (label `fuzz-crash`, deduped by SHA1
+  of the input). First catch: **#89** (CpuZstd / CpuGzip
+  alloc-before-validate) found within seconds, fixed and shipped
+  same-day in v0.8.6.
+- **Real-GPU validation** done on RTX 4070 Ti SUPER + nvCOMP 5.x:
+  streaming zstd 1 GiB roundtrip + GDeflate roundtrip both green; OMB
+  bench runs on EC2 c7gd.8xlarge (latest v0.8 perf chart at
+  `docs/perf-v0.8.png`).
+- **Production-ready** for log archival, data lake, parquet/ORC
+  analytics, and as a drop-in transparent-compression proxy in front of
+  any S3-compatible backend.
+- **Roadmap is driven by audit findings + continuous fuzz** rather than
+  feature checklists; file issues at
+  https://github.com/abyo-software/s4/issues to influence it.
 
 ## Contributing
 
