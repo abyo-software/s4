@@ -147,8 +147,20 @@ See [docker-compose.gpu.yml](docker-compose.gpu.yml) for details.
 
 ### Kubernetes (Helm)
 
+⚠️ **Build the image yourself first** (#108) — no `abyosoftware/s4` image is
+published to Docker Hub or ghcr.io yet (roadmap; expected after the first
+public production user is onboarded so we have something concrete to tag).
+For now, the chart expects you to build + push to your own registry:
+
 ```bash
+# 1. Build and push to your registry (substitute MY_REGISTRY)
+docker build -t MY_REGISTRY/s4:0.8.9 .
+docker push MY_REGISTRY/s4:0.8.9
+
+# 2. Install pointing at your image
 helm install s4 ./charts/s4 \
+  --set image.repository=MY_REGISTRY/s4 \
+  --set image.tag=0.8.9 \
   --set backend.endpointUrl=https://s3.us-east-1.amazonaws.com \
   --set backend.region=us-east-1
 kubectl port-forward svc/s4 8014:8014
@@ -157,9 +169,7 @@ kubectl port-forward svc/s4 8014:8014
 The chart in [`charts/s4/`](charts/s4/) ships a stateless Deployment + Service
 (ClusterIP, port 8014), optional GPU node selector (`gpu.enabled=true` for
 nvCOMP), inline or cert-manager TLS, and bucket-policy ConfigMap. See
-[charts/s4/README.md](charts/s4/README.md) for the values table and notes
-on building the image locally (the `abyosoftware/s4` image is not yet on
-Docker Hub).
+[charts/s4/README.md](charts/s4/README.md) for the full values table.
 
 ### Python (pip)
 
@@ -210,7 +220,7 @@ target/release/s4 --endpoint-url https://s3.us-east-1.amazonaws.com \
 | **CPU compression** | ✅ zstd 1–22 / gzip | ⚠️ S2 only (legacy) | ✅ zstd 1–22 | ❌ | ❌ |
 | **Auto codec selection** | ✅ entropy + magic-byte sampling | ❌ | ❌ | — | — |
 | **Range GET on compressed** | ✅ via S4IX sidecar (see [matrix](#s3-api-compatibility-matrix) for the range modes supported) | n/a | n/a | ✅ | ✅ |
-| **Streaming I/O** | ✅ chunked PUT / GET; GPU per-chunk pipelined | ✅ | ✅ | ✅ | ✅ |
+| **Streaming I/O** | ✅ chunked PUT / GET; GPU per-chunk pipelined ([conditions](#streaming-io)) | ✅ | ✅ | ✅ | ✅ |
 | **Native HTTPS / TLS** | ✅ rustls + ring, ALPN h2 | ⚠️ via reverse proxy | ⚠️ via reverse proxy | ✅ | ✅ |
 | **Bucket-policy enforcement at gateway** | ✅ AWS-style JSON, Allow / Deny | n/a | n/a | ✅ | ✅ |
 | **Acts as gateway to existing S3** | ✅ (the whole point) | ❌ (gateway mode removed upstream) | ❌ | ❌ | n/a |
@@ -263,6 +273,81 @@ GET against the footer work out of the box. Parallel range reads against
 overlapping frame extents do extra decode work and are not yet optimized;
 see #99 for the parquet/ORC reader cross-validation harness on the
 roadmap.
+
+### SDK compatibility matrix
+
+Test status per major S3 client. "Tested" means a green E2E run in CI or
+documented manual verification; "Should work" means the wire shape is
+satisfied but no explicit test covers it yet; "Known issue" links to the
+relevant issue.
+
+| Client | Status | Notes |
+|---|---|---|
+| `aws-cli` (v2.x) | ✅ Tested | path-style + virtual-hosted URLs, presigned URLs, multipart, range GET |
+| `boto3` (Python) | ✅ Tested | via `s4-codec-py` integration tests + `tests/test_binding.py` |
+| `aws-sdk-rust` (v1.x) | ✅ Tested | the gateway is built on it; trait-level coverage in `tests/feature_e2e.rs` |
+| `aws-sdk-go-v2` | ✅ Should work | wire-level shapes shared with aws-sdk-rust; no explicit smoke test yet |
+| `aws-sdk-java-v2` | ✅ Should work | same as Go v2 caveat |
+| `MinIO mc` | ✅ Should work | path-style + virtual-hosted both fine; one-off `mc cp` validated manually |
+| `rclone` (s3 backend) | ✅ Should work | multipart chunk size driven by client; large objects respect S4 frame budget |
+| `s3cmd` | ⚠️ Should work | older client; SigV2 fallback NOT supported (S4 is SigV4 + SigV4a only) |
+| Presigned URLs (SigV4) | ✅ Tested | both PUT and GET; query-string signing path covered |
+| Conditional GET / PUT | ✅ Tested | `If-Match` / `If-None-Match` / `If-Modified-Since` / `If-Unmodified-Since` |
+| `Content-MD5` / `x-amz-content-sha256` | ✅ Tested | both unsigned (`UNSIGNED-PAYLOAD`) and SHA256-hashed payloads |
+| `Content-Encoding: gzip` interplay | ⚠️ See note | S4 may double-encode if the client sends `Content-Encoding: gzip` AND S4 also picks `cpu-gzip` — use `--codec cpu-zstd` or set client `Content-Encoding: identity` |
+
+**Endpoint URL style** (#101): S4 accepts both **virtual-hosted-style**
+(`https://my-bucket.s4.example.com/key`) and **path-style**
+(`https://s4.example.com/my-bucket/key`); the backend ` aws-sdk-s3 `
+client uses whatever the operator's `--endpoint-url` configuration
+specifies. If your client is fussy about this, set `--path-style` on
+the s4 server side or `--force-path-style` on the AWS SDK side.
+
+## Security & threat model
+
+S4 is a TLS-terminating S3-compatible proxy. The boundaries you should
+think about:
+
+- **Authentication scope**: S4 verifies SigV4 / SigV4a on incoming
+  requests using credentials operators configure (`--credentials FILE`
+  or `--sigv4a-credentials DIR`). The S4 server then turns around and
+  speaks to the backend bucket using **its own** AWS credentials
+  (`AWS_ACCESS_KEY_ID` etc. from the standard SDK chain). Client
+  identity is **not** delegated to the backend; the backend sees S4 as
+  one principal regardless of which incoming client made the request.
+  If you need per-client backend identity, run one S4 instance per
+  client and use distinct backend credentials.
+- **TLS termination**: S4 terminates TLS at its own listener
+  (`--tls-cert` / `--tls-key`, or ACME via `--acme`). The connection
+  to the backend uses the SDK's own TLS (rustls with the system root
+  CA store). If your security model requires end-to-end TLS without
+  intermediate decryption, S4 is the wrong shape — use a different
+  proxy or run S4 colocated with the backend so the second TLS hop
+  doesn't leave the same host.
+- **Bucket policy enforcement at the S4 layer**: when `--bucket-policy
+  FILE` is set, S4 evaluates AWS-style JSON Allow / Deny rules
+  **before** forwarding to the backend. The backend's own bucket
+  policy still applies on top. Two policies in series; both must
+  permit. We do **not** parse every IAM Condition operator — see
+  [`crates/s4-server/src/policy.rs`](crates/s4-server/src/policy.rs)
+  for the supported subset.
+- **Body-size limits / request smuggling**: hyper limits enforced
+  (`--max-header-bytes`, default 64 KiB; `--max-concurrent-connections`,
+  default 1024; `--read-timeout-seconds`, default 30s — see v0.8.5
+  #84). HTTP/2 is **off by default** (`--http2` to opt in); the S3 API
+  is HTTP/1.1 in practice and h2 adds DoS surface (stream-multiplexing
+  abuse) that doesn't pay off for our workload.
+- **Tenant isolation**: S4 is **single-tenant by design** — one S4
+  instance per security boundary. We do not enforce cross-bucket
+  isolation at the S4 layer beyond what the backend's IAM enforces.
+  Multi-tenant deployments should run one S4 instance per tenant with
+  separate backend credentials.
+- **Non-goals**: S4 is not an IDS / WAF, does not log request bodies
+  (only headers + length), does not implement S3's `ObjectACL`
+  Grant-by-CanonicalUser semantics beyond canned ACLs, does not
+  proxy IAM API calls.
+
+For incident reporting see [SECURITY.md](SECURITY.md).
 
 ## Architecture
 
@@ -467,11 +552,105 @@ EC2 GPU instance running S4. Here's an honest table to self-diagnose:
   CPU instance, or front your bucket with nginx + gzip — both will give
   most of the savings without GPU hardware.
 
+## When NOT to use S4
+
+Honest list of workloads where S4 doesn't pay off:
+
+- **Already-compressed payloads** (mp4, jpeg, gzip-of-anything, parquet
+  with column-level codec already on, lz4 / zstd-prepacked archives) —
+  S4's dispatcher detects + routes to `passthrough` so there's no harm
+  done, but you're paying for the round-trip without getting savings.
+- **Small objects** (< 16 KiB) — the S4F2 frame header (28 bytes) +
+  S4IX sidecar (32–96 bytes per object) eats the compression ratio
+  before you start. Break-even is workload-dependent; rule of thumb
+  is **objects > 1 MiB** make the math comfortable, < 16 KiB make it
+  negative. The dispatcher does not yet skip-compress small objects
+  automatically (#105 follow-up).
+- **Metadata-ops dominant workloads** — heavy `ListObjects` / `HeadObject`
+  / `CopyObject` against millions of small keys add S4 hop latency
+  without touching the codec. S4 is on-path for those, so you pay
+  the second TLS hop + s3s framework overhead.
+- **Ultra-low-latency tail SLOs** (sub-10ms p99 GET) — S4's streaming
+  GET adds decoder warm-up + S4IX sidecar fetch (one extra round-trip
+  for the index when not cached). Fine for analytics / archival /
+  bulk; not fine for an OLTP-style hot read path.
+- **Single-region cold-storage-only** (everything goes straight to
+  Glacier) — Glacier already prices low enough that the storage
+  savings rarely pay for the compute / operational cost of running S4.
+- **Strict regulatory environments** until the **alpha disclaimer** in
+  Project Status lifts — S4 has no SOC2 / ISO27001 / FedRAMP audit
+  trail yet. If your compliance team's bar is "must have third-party
+  audit on file", S4 isn't there.
+- **As the only copy of irreplaceable data** — pre-1.0; pair with
+  backend-native versioning + replication. (Restated from Project
+  Status for emphasis.)
+
+## Durability, corruption recovery, and the repair tool
+
+### Write protocol
+A PUT goes through three S3 calls behind one client-visible request:
+
+1. **PUT `<key>`** — the compressed S4F2-framed body (atomic single-PUT
+   for objects under the multipart threshold; otherwise an S3 multipart
+   upload with per-part frames).
+2. **PUT `<key>.s4index`** — the S4IX sidecar with per-frame offset +
+   original-size + crc32c entries.
+3. (multipart only) **CompleteMultipartUpload** — finalises the main
+   object atomically; the sidecar is written after this completes.
+
+The main object PUT is the **commit point**; the sidecar exists to
+optimise Range GET and is treated as recoverable / rebuildable from the
+main object (next section).
+
+### Failure modes and what each one looks like
+
+| Failure | Visible symptom | Recovery |
+|---|---|---|
+| Client disconnects mid-PUT | Backend returns `IncompleteBody` or 5xx, S4 maps to `TruncatedStream` (v0.8.4 #73). Main object NOT created; sidecar NOT created. No partial state. | None needed — retry the PUT |
+| Main object PUT succeeds, sidecar PUT fails | GETs work (full object decode, no range optimisation); Range GETs fall back to "read whole object, decode, slice". | `s4-tool repair-sidecar <key>` rebuilds the sidecar by re-scanning frames in the main object |
+| Multipart UploadPart succeeds, CompleteMultipartUpload fails | Backend cleans up uncommitted parts on lifecycle-driven `AbortIncompleteMultipartUpload` (S3 default 7 days, or operator policy). | Retry the upload; orphan parts charged but auto-deleted |
+| S3 returns a corrupted object body (rare, but happens on hardware faults) | Per-frame `crc32c` mismatch on decode → `CodecError::CrcMismatch` → S4 returns 500 to client with diagnostic. | None within S4 — fix at the backend storage layer; S4 won't return corrupted bytes |
+| Sidecar diverges from main object (manual `aws-cli` edit, etc.) | First Range GET that hits the diverged region returns 500 with `IndexFrameMismatch`. | `s4-tool verify <key>` flags it; `s4-tool repair-sidecar <key>` rebuilds |
+| Backend object exists, sidecar missing entirely | GETs work; Range GETs degrade to fallback path. | `s4-tool repair-sidecar <key>` |
+
+### CRC scope
+
+`crc32c` is computed over the **decompressed original payload** of each
+frame and stored in both the frame header and the sidecar entry. This
+catches:
+- Mid-flight corruption at the backend storage layer
+- Codec backend bugs that decode to subtly wrong bytes
+- Forged manifest attacks where the attacker replaces the compressed body
+
+It does **not** catch:
+- A correctly-encoded malicious payload from a tampered backend (the
+  CRC verifies the bytes match what was encoded, not that what was
+  encoded was the originally-PUT bytes) — that's what S4's SigV4 auth
+  on the PUT side covers
+- Lost frames from a truncated multipart that nonetheless committed
+  (the per-part Complete API itself is the integrity check there)
+
+### Repair tool status
+
+`s4-tool repair-sidecar <bucket>/<key>` and `s4-tool verify <bucket>/<key>`
+are listed in the v0.9 roadmap (#106). Until they ship, the manual
+recovery for divergence cases is to `DELETE` the sidecar and the next
+non-range GET will work fine; Range GETs degrade silently to the fallback
+"read full, decode, slice" path that already exists.
+
 ## Production Features
 
 ### Streaming I/O
+
+**Measurement conditions for the numbers below** (#107): RTX 4070 Ti
+SUPER + Ryzen 9 9950X, single-pass 256 MiB compressible input, codec
+`cpu-zstd-3` (or as noted), single concurrent request, S4 colocated
+with backend (no network RTT to amortise). TTFB excludes TLS handshake
++ SigV4 verification (those add 5–15 ms once per connection).
+
 - **Streaming GET** for non-multipart `cpu-zstd` / `passthrough` objects:
-  TTFB ms-class, memory ≈ zstd window + 64 KiB buffer
+  TTFB **8–20 ms** under the conditions above, memory ≈ zstd window
+  (8 MiB at level 3) + 64 KiB buffer
 - **Streaming PUT** for the same codecs: input never fully buffered, peak memory
   ≈ compressed size (5 GB → ~50 MB at 100× ratio)
 - **GPU streaming compress** (v0.2): nvCOMP `zstd` / `gdeflate` PUTs run a
@@ -801,6 +980,24 @@ Licensed under the **Apache License, Version 2.0** ([LICENSE](LICENSE)).
 See [NOTICE](NOTICE) for third-party attributions including the vendored
 `ferro-compress` (Apache-2.0 OR MIT) and the optional NVIDIA nvCOMP SDK
 (proprietary, BYO).
+
+Full third-party license disclosure (auto-generated from `cargo about`
+across the three target triples we ship to —
+`x86_64-unknown-linux-gnu` / `aarch64-unknown-linux-gnu` /
+`wasm32-unknown-unknown`) lives at
+[`docs/THIRD_PARTY_LICENSES.html`](docs/THIRD_PARTY_LICENSES.html).
+~350 transitive crates, all permissive
+(Apache-2.0 / MIT / BSD-{2,3}-Clause / ISC / Zlib / Unicode / 0BSD /
+MPL-2.0 / OpenSSL / CDLA-Permissive-2.0). Regenerate with
+`cargo about generate about.hbs --output-file docs/THIRD_PARTY_LICENSES.html`
+(requires `cargo install cargo-about --features cli`).
+
+**The optional `nvcomp-gpu` feature** pulls the proprietary NVIDIA
+nvCOMP SDK at build time. nvCOMP is **not bundled** with S4 distributions;
+operators set `NVCOMP_HOME` to a locally extracted SDK from the
+[NVIDIA Developer Zone](https://developer.nvidia.com/nvcomp-download).
+nvCOMP redistribution is subject to NVIDIA's SLA — confirm with NVIDIA
+in writing before bundling into a downstream AMI / container image.
 
 `"S4"` and `"Squished S3"` are unregistered trademarks of abyo software 合同会社.
 `"Amazon S3"` and `"AWS"` are trademarks of Amazon.com, Inc. S4 is not

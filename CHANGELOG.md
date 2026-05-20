@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.10] — 2026-05-20
+
+Pre-launch hardening **Phase 3** (#111 tracker) — docs補強 sweep
+closing the remaining 8 audit findings (#100 #101 #102 #103 #104 #105
+#106 #107 #108). No code changes; only README + new
+`docs/THIRD_PARTY_LICENSES.html` + new `about.toml`.
+
+This completes the full pre-launch audit cycle: **20 / 20 findings
+resolved**. Tracker #111 closed.
+
+### Added
+
+- **#100 Security & threat model section** — explicit boundaries for
+  authentication scope (S4 verifies SigV4 / SigV4a on incoming; uses
+  its own credentials to backend, no client identity delegation), TLS
+  termination (S4 owns its listener; second hop to backend uses SDK's
+  rustls + system root CA), bucket policy enforcement (both layers
+  must permit), hyper body-size / connection / read-timeout limits
+  (from v0.8.5 #84), single-tenant-by-design isolation model, and
+  explicit non-goals (not an IDS/WAF, no body logging, no IAM proxy).
+- **#101 SDK compatibility matrix** — 11-row table: aws-cli /
+  boto3 / aws-sdk-rust (✅ Tested), aws-sdk-go-v2 / aws-sdk-java-v2 /
+  MinIO mc / rclone (✅ Should work; wire-level shapes covered),
+  s3cmd (⚠️ no SigV2 fallback), presigned URLs / conditional
+  GET-PUT / Content-MD5 / x-amz-content-sha256 (✅ Tested),
+  Content-Encoding: gzip double-encode caveat (⚠️ documented).
+  Endpoint URL style explainer (both virtual-hosted and path-style
+  accepted).
+- **#104 Third-party license disclosure** — new `about.toml` config
+  for cargo-about + auto-generated `docs/THIRD_PARTY_LICENSES.html`
+  (617 KB, ~350 transitive crates, all permissive: Apache-2.0 / MIT /
+  BSD-{2,3}-Clause / ISC / Zlib / Unicode / 0BSD / MPL-2.0 /
+  OpenSSL / CDLA-Permissive-2.0). Linked from the License section of
+  README. License section also got nvCOMP redistribution clarification
+  (BYO; NVIDIA SLA terms apply).
+- **#105 "When NOT to use S4" section** — already-compressed payloads
+  (passthrough cost), small objects (< 16 KiB break-even), metadata-
+  ops dominant workloads, ultra-low-latency tail SLOs, single-region
+  cold-storage-only (Glacier prices already low enough), strict
+  regulatory environments without third-party audit on file, and
+  the restated "do not use as the only copy of irreplaceable data"
+  pre-1.0 guidance.
+- **#106 Durability / corruption recovery section** — explicit write
+  protocol (PUT main → PUT sidecar → CompleteMultipart on multipart;
+  main object PUT is the commit point), 6-row failure-mode table
+  (client disconnect mid-PUT / sidecar PUT fail / multipart Complete
+  fail / corrupted body / sidecar divergence / sidecar missing) with
+  recovery actions per row, CRC scope documentation (what it catches
+  + what it doesn't), and repair tool status (v0.9 roadmap; manual
+  recovery path for divergence cases until then).
+
+### Changed
+
+- **#107 TTFB number sourcing** — "TTFB ms-class" qualified with
+  measurement conditions (RTX 4070 Ti SUPER + Ryzen 9 9950X,
+  single-pass 256 MiB compressible input, codec `cpu-zstd-3`, single
+  concurrent request, S4 colocated with backend, excluding TLS
+  handshake + SigV4 verify). Headline cell in How it Compares table
+  also links to the conditions block.
+- **#108 Helm chart "image not yet on Docker Hub" restructuring** —
+  Helm section now leads with "Build the image yourself first" and
+  spells out the `docker build → docker push → helm install --set
+  image.repository` flow, replacing the prior trailing
+  "the image is not yet on Docker Hub" caveat that read as
+  unfinished work.
+- **#102 #103 competitor diff** (fully closed; Phase 2 was partial) —
+  the SDK compat matrix + threat model section together complete
+  the "narrow the framing" guidance (we are a transparent-compression
+  proxy in front of an existing S3 backend, not a storage system
+  competing with MinIO / Garage / SeaweedFS). License framing pinned
+  to per-project upstream LICENSE links + footnote on terms changing
+  between releases.
+
+### Test posture
+
+622 workspace tests pass (unchanged) / 52 ignored. `cargo audit` clean
+(same 4 documented ignores as v0.8.8 / v0.8.9).
+
+### Tracker #111
+
+**CLOSED.** All 20 pre-launch audit findings (5 Phase 1 + 7 Phase 2 +
+8 Phase 3) resolved across v0.8.8 → v0.8.10.
+
 ## [0.8.9] — 2026-05-20
 
 Pre-launch hardening **Phase 2** — README claim accuracy sweep (#111 tracker).
