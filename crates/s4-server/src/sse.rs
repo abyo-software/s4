@@ -118,6 +118,14 @@
 //!   keys with KMS) is a separate issue. SSE-KMS for per-object DEKs
 //!   is implemented (see [`SseSource::Kms`] + S4E4 above).
 
+// v0.8.8: aes-gcm 0.10 + hmac 0.12 (pinned by RustCrypto) re-export the
+// `Nonce::from_slice` / `Key::<Aes256Gcm>::from_slice` helpers from
+// generic-array 0.14, whose helpers were deprecated in favour of the 1.x
+// API. Migrating requires bumping aes-gcm to a release that pins
+// generic-array 1.x (not yet stable as of this writing), so silence the
+// deprecation at module scope until the upstream RustCrypto stack lands.
+#![allow(deprecated)]
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;

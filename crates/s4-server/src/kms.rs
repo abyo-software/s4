@@ -32,6 +32,12 @@
 //! network I/O and we want the trait shape to stay compatible. The
 //! `LocalKms` futures resolve immediately.
 
+// v0.8.8: see same comment in `sse.rs` — aes-gcm 0.10 + hmac 0.12 pin
+// generic-array 0.14, whose `from_slice` helpers were deprecated in
+// favour of the 1.x API. Silence the module-scope deprecation warning
+// until aes-gcm publishes a generic-array-1.x release.
+#![allow(deprecated)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 

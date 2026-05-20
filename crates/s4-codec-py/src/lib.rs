@@ -158,7 +158,7 @@ impl PyCpuZstd {
         let (out, manifest) =
             block_on(py, async move { codec.compress(input).await }).map_err(codec_err_to_py)?;
         Ok((
-            PyBytes::new_bound(py, &out),
+            PyBytes::new(py, &out),
             manifest.original_size,
             manifest.crc32c,
         ))
@@ -183,7 +183,7 @@ impl PyCpuZstd {
         let codec = self.inner.clone();
         let out = block_on(py, async move { codec.decompress(input, &manifest).await })
             .map_err(codec_err_to_py)?;
-        Ok(PyBytes::new_bound(py, &out))
+        Ok(PyBytes::new(py, &out))
     }
 
     fn __repr__(&self) -> String {
@@ -219,7 +219,7 @@ impl PyCpuGzip {
         let (out, manifest) =
             block_on(py, async move { codec.compress(input).await }).map_err(codec_err_to_py)?;
         Ok((
-            PyBytes::new_bound(py, &out),
+            PyBytes::new(py, &out),
             manifest.original_size,
             manifest.crc32c,
         ))
@@ -242,7 +242,7 @@ impl PyCpuGzip {
         let codec = self.inner.clone();
         let out = block_on(py, async move { codec.decompress(input, &manifest).await })
             .map_err(codec_err_to_py)?;
-        Ok(PyBytes::new_bound(py, &out))
+        Ok(PyBytes::new(py, &out))
     }
 
     fn __repr__(&self) -> String {
@@ -266,32 +266,26 @@ fn s4_codec(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // v0.8.5 #85 M-5: export per-CodecError exception classes so Python
     // callers can branch on error kind. See module-level doc comments above
     // `create_exception!` for the inheritance hierarchy.
-    m.add("S4Error", py.get_type_bound::<S4Error>())?;
-    m.add(
-        "S4CrcMismatchError",
-        py.get_type_bound::<S4CrcMismatchError>(),
-    )?;
-    m.add(
-        "S4SizeMismatchError",
-        py.get_type_bound::<S4SizeMismatchError>(),
-    )?;
+    m.add("S4Error", py.get_type::<S4Error>())?;
+    m.add("S4CrcMismatchError", py.get_type::<S4CrcMismatchError>())?;
+    m.add("S4SizeMismatchError", py.get_type::<S4SizeMismatchError>())?;
     m.add(
         "S4CodecMismatchError",
-        py.get_type_bound::<S4CodecMismatchError>(),
+        py.get_type::<S4CodecMismatchError>(),
     )?;
     m.add(
         "S4UnregisteredCodecError",
-        py.get_type_bound::<S4UnregisteredCodecError>(),
+        py.get_type::<S4UnregisteredCodecError>(),
     )?;
     m.add(
         "S4ManifestSizeExceedsLimitError",
-        py.get_type_bound::<S4ManifestSizeExceedsLimitError>(),
+        py.get_type::<S4ManifestSizeExceedsLimitError>(),
     )?;
     m.add(
         "S4ManifestSizeMismatchError",
-        py.get_type_bound::<S4ManifestSizeMismatchError>(),
+        py.get_type::<S4ManifestSizeMismatchError>(),
     )?;
-    m.add("S4BackendError", py.get_type_bound::<S4BackendError>())?;
-    m.add("S4IoError", py.get_type_bound::<S4IoError>())?;
+    m.add("S4BackendError", py.get_type::<S4BackendError>())?;
+    m.add("S4IoError", py.get_type::<S4IoError>())?;
     Ok(())
 }

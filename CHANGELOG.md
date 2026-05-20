@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.8] — 2026-05-20
+
+Pre-launch hardening **Phase 1** (issue tracker #111). claude + codex
+cross-review of v0.8.7 surfaced 20 findings ahead of HN / Reddit-scale
+distribution; this release ships the security / CI / quickstart subset
+(5 issues closed). README claim tone-down + docs補強 (Phase 2 / 3) are
+queued in #93–#109 and ship in a follow-up.
+
+### Fixed
+
+- **#90 pyo3 0.22.6 buffer-overflow CVE (RUSTSEC-2025-0020)** — bumped
+  `s4-codec-py` from pyo3 0.22 to 0.24. API migration was a 13-call
+  rename (`get_type_bound` → `get_type`, `PyBytes::new_bound` →
+  `PyBytes::new`); pyo3 0.21 had already introduced the `Bound<'py>`
+  API the binding was using, so the upgrade was a deprecation-warning
+  cleanup rather than a structural rewrite. Existing pytest suite
+  (v0.8.5 #85) green post-upgrade.
+- **#92 metrics 0.24.5 yanked** — bumped to 0.24.6 via `cargo update`.
+  `rustls-acme 0.15.1 → 0.15.2` swept up the same way.
+- **#92 astral-tokio-tar 4 dev-only CVEs (RUSTSEC-2026-0066/0112/0113/
+  0145)** — bumped `testcontainers-modules` 0.14 → 0.15 (pulls
+  `astral-tokio-tar 0.6.x` transitively). dev-dependency only, not in
+  shipped binary, but cleans up `cargo audit` output. Existing E2E
+  test suite green post-upgrade.
+- **#98 README cargo install caveats** — added explicit Rust 1.92+
+  requirement, GPU codec opt-in (`--features nvcomp-gpu` + CUDA
+  toolchain + `NVCOMP_HOME`), and binary name (`s4`, not `s4-server`)
+  callouts under the Install via cargo block.
+- **#110 README Docker quickstart** — fixed the broken `aws cp s3://
+  demo/big.log -.compressed` line (unnatural destination name + no
+  `big.log` source generation step). Now generates a 135 MiB sample
+  via `head -c 100M /dev/urandom | base64 > big.log`, copies to
+  `./big.log.roundtrip` and `./big.log.compressed`, and shows
+  expected lossless roundtrip + size delta.
+
+### Added (CI)
+
+- **`security-audit` job** — `cargo audit --locked --version 0.21`
+  runs on every push and PR, gates `notify-on-failure` (so a fresh
+  RUSTSEC advisory blocks merge). Three `--ignore` flags for the
+  rustls-webpki CVEs (#91, upstream-blocked) and one for the
+  unmaintained `rustls-pemfile` caretaker advisory; each ignore
+  carries an inline comment pointing at the tracker issue so the
+  reason is auditable from the workflow itself.
+
+### Known issue (deferred to upstream)
+
+- **#91 rustls-webpki 0.101.7 three CVEs via aws-sdk-* TLS stack** —
+  RUSTSEC-2026-0098/0099/0104. The dep chain `aws-sdk-* →
+  aws-smithy-http-client → hyper-rustls 0.24 → rustls 0.21 →
+  rustls-webpki 0.101` is pinned by the upstream AWS SDK; resolving
+  the CVE requires rustls 0.23+ (webpki 0.103+), which is API-
+  incompatible with rustls 0.21. Three options remain on the table:
+  (a) wait for `aws-sdk-rust` to migrate (tracking in the AWS SDK
+  GitHub repo), (b) fork `aws-smithy-http-client` (large maintenance
+  surface), (c) switch the AWS SDK to `native-tls` (changes deployment
+  cert-handling story). v0.8.8 ships with the audit ignore + the
+  trade-off documented in #91; not exploitable without an
+  attacker-controlled CA chain that abuses the specific URI / wildcard
+  / CRL parser paths the CVEs cover.
+
+### Test posture
+
+622 workspace tests pass (unchanged from v0.8.7) / 52 ignored. New
+`security-audit` CI job green with documented `--ignore` set.
+
 ## [0.8.7] — 2026-05-14
 
 Codex (gpt-5.5) third-party review of v0.8.6 caught **3 findings** —

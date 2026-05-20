@@ -117,8 +117,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 aws-sdk-sns = { version = "1", optional = true }
 aws-sdk-sqs = { version = "1", optional = true }
 
-s4-codec = { path = "../s4-codec", version = "0.8.7" }
-s4-config = { path = "../s4-config", version = "0.8.7" }
+s4-codec = { path = "../s4-codec", version = "0.8.8" }
+s4-config = { path = "../s4-config", version = "0.8.8" }
 # v0.6 #41: S3 Select — server-side SQL filter on object body.
 sqlparser = "0.51"
 csv = "1"
@@ -149,7 +149,7 @@ zeroize = { version = "1", features = ["zeroize_derive"] }
 [dev-dependencies]
 tempfile = "3"
 http = "1"
-testcontainers-modules = { version = "0.14", features = ["minio"] }
+testcontainers-modules = { version = "0.15", features = ["minio"] }
 zstd = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 metrics-exporter-prometheus.workspace = true

@@ -24,6 +24,10 @@
 //! Requires Docker (the test starts a MinIO container via
 //! `testcontainers-modules`).
 
+// v0.8.8: see `src/sse.rs` — silence generic-array 0.14 deprecation
+// for the AES-GCM helper imports used in the SSE-S4 test paths.
+#![allow(deprecated)]
+
 use std::sync::Arc;
 
 use s4_codec::dispatcher::AlwaysDispatcher;

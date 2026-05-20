@@ -59,6 +59,31 @@ jobs:
         # Allow failure since CI lacks NVCOMP SDK; gate is "compile cleanly"
         continue-on-error: true
 
+  # v0.8.8 #92: cargo audit regression guard. Failing this job blocks merge
+  # so new RUSTSEC advisories are surfaced fast. The three rustls-webpki
+  # ignores are tracked in #91 — they live in the aws-sdk-rust TLS stack
+  # (hyper-rustls 0.24 → rustls 0.21 → rustls-webpki 0.101) which is pinned
+  # transitively by the upstream AWS SDK; we cannot bump them in isolation
+  # without forking aws-smithy-http-client. The dev-only rustls-pemfile
+  # unmaintained warning (RUSTSEC-2025-0134) is tracked in #92 (just a
+  # caretaker advisory; no exploit path).
+  security-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.21
+      - name: cargo audit (CVE + yanked + unmaintained)
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2026-0098 \
+            --ignore RUSTSEC-2026-0099 \
+            --ignore RUSTSEC-2026-0104 \
+            --ignore RUSTSEC-2025-0134
+
   e2e:
     name: E2E (MinIO Docker)
     runs-on: ubuntu-latest
@@ -76,7 +101,7 @@ jobs:
   notify-on-failure:
     name: Open issue on CI failure
     runs-on: ubuntu-latest
-    needs: [test, e2e]
+    needs: [test, e2e, security-audit]
     if: failure() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/github-script@v7

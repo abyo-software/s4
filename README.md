@@ -66,8 +66,17 @@ zstd before storing it.
 
 ```bash
 cargo install s4-server                                  # CPU build
-s4 --endpoint-url https://s3.us-east-1.amazonaws.com     # binary is `s4`
+s4 --endpoint-url https://s3.us-east-1.amazonaws.com     # binary is `s4`, not `s4-server`
 ```
+
+**Caveats** (v0.8.8, #98):
+- Requires Rust 1.92+ (`rustup update stable` first).
+- The default `cargo install` builds **CPU codecs only**. GPU codecs
+  (`nvcomp-zstd` / `Bitcomp` / `GDeflate`) require `cargo install s4-server
+  --features nvcomp-gpu`, which needs the CUDA toolchain and `NVCOMP_HOME`
+  pointing at an extracted nvCOMP SDK at build time. Without these the build
+  fails at link time with an `nvcomp` lib not found error.
+- The installed binary is `s4` (not `s4-server`); check with `which s4`.
 
 ### 60-second local trial (Docker, CPU-only)
 
@@ -75,14 +84,18 @@ s4 --endpoint-url https://s3.us-east-1.amazonaws.com     # binary is `s4`
 git clone https://github.com/abyo-software/s4 && cd s4
 docker compose up -d                    # MinIO + S4 server on localhost:8014
 
+# Generate a sample object so the cp lines have something to upload.
+head -c 100M /dev/urandom | base64 > big.log    # ~135 MiB of text, compresses well
+
 # Use any S3 client. Below uses aws-cli; replace endpoint with anything.
 aws --endpoint-url http://localhost:8014 s3 mb s3://demo
 aws --endpoint-url http://localhost:8014 s3 cp big.log s3://demo/big.log
-aws --endpoint-url http://localhost:8014 s3 cp s3://demo/big.log -
+aws --endpoint-url http://localhost:8014 s3 cp s3://demo/big.log ./big.log.roundtrip
 
-# Inspect the compressed object directly on MinIO (different endpoint):
-aws --endpoint-url http://localhost:9000 s3 cp s3://demo/big.log -.compressed
-ls -la big.log -.compressed             # the .compressed file is much smaller
+# Inspect the compressed object directly on MinIO (different endpoint, bypasses S4).
+aws --endpoint-url http://localhost:9000 s3 cp s3://demo/big.log ./big.log.compressed
+ls -la big.log big.log.compressed big.log.roundtrip
+# Expected: big.log == big.log.roundtrip (lossless), big.log.compressed is much smaller.
 ```
 
 ### Try with GPU compression (NVIDIA nvCOMP)
