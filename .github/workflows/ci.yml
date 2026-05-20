@@ -75,7 +75,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-audit
-        run: cargo install cargo-audit --locked --version 0.21
+        # Pin to ~0.22 — cargo-audit can change its CLI between minors;
+        # blast radius of a CLI break here is "CI red on next push" which
+        # is loud enough that updating the pin is fine when it happens.
+        run: cargo install cargo-audit --locked --version "^0.22"
       - name: cargo audit (CVE + yanked + unmaintained)
         run: |
           cargo audit \
