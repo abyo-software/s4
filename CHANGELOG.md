@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.9] — 2026-05-20
+
+Pre-launch hardening **Phase 2** — README claim accuracy sweep (#111 tracker).
+Closes 7 audit findings from the claude + codex cross-review.
+No code changes. Crates republished only to refresh crates.io README.
+
+### Documentation
+
+- **#93 (CRITICAL)** "No lock-in: read your bucket directly with aws-cli"
+  rewritten — the compressed objects + S4IX sidecars ARE S3-native (any
+  S3 client can read them), but the original payload requires
+  `s4-codec` / `s4-codec-py` / `s4-codec-wasm` to decompress. The
+  Apache-2.0 decoder tools are the actual anti-lock-in story; the
+  earlier line implied stock `aws-cli` returned original bytes, which
+  contradicted the rest of the README.
+- **#94 (CRITICAL)** "S3 API compatibility: ✅ Full" replaced with an
+  explicit matrix listing 25+ surfaces (PUT / GET / multipart / HEAD /
+  Range / Conditional / ACL / versioning / object-lock / lifecycle /
+  notifications / replication / policy / tagging / CORS / inventory /
+  MFA delete / SSE-S3 / SSE-KMS / SSE-C / Select / presigned URLs /
+  SigV4 + SigV4a / storage class transitions). NotImplemented surfaces
+  (RequestPayment / Accelerate / Logging / cross-region S4-chain
+  replication) marked "—".
+- **#95 (HIGH)** "Cuts your AWS S3 bill 50–80%" rephrased as "Reduces
+  S3 **storage bytes** 50–80% for compressible payloads. Total bill
+  impact depends on workload mix — request cost / egress / GPU compute
+  unchanged." Headline 99%-saved example kept but qualified.
+- **#96 (HIGH)** Bench table got a "Codec verdict" column making the
+  GPU vs CPU narrative explicit (CPU wins on text/log, GPU wins on
+  integer/columnar) so readers don't misread "cpu-zstd-3 best
+  throughput on nginx logs" as undermining the GPU pitch.
+- **#97 (HIGH)** "transparently compresses every object with GPU
+  codecs" reworded to acknowledge per-payload dispatcher routing
+  (text → CPU, columnar → GPU, already-compressed → passthrough, no
+  GPU → CPU end-to-end) with the Prometheus counter +
+  `codec_chosen` access-log field cited for observability.
+- **#99 (HIGH)** Range GET claim qualified — works out-of-box for
+  arrow-rs / datafusion / duckdb suffix-range Parquet footer reads;
+  parallel range reads across overlapping frame extents do extra
+  decode work and are not yet optimised. Tracked by the matrix entry
+  + a note explicitly calling out the parquet/ORC cross-validation
+  harness as roadmap.
+- **#109 (LOW)** Added explicit **"Status: alpha / early-access"**
+  callout at the top of Project Status, with "looking for design-
+  partner users", a pre-1.0 wire-format-may-break disclaimer, and
+  "do not use S4 as the only copy of irreplaceable data; pair with
+  backend-native replication / versioning until v1.0 + first public
+  production deployment is documented" guidance. Replaces the
+  prior "Production-ready" assertion that wasn't backed by any
+  public production user yet.
+
+### Competitor diff polish (partial #102 #103)
+
+- Comparison table got per-project upstream links (MinIO / Garage)
+  + "stance" row that frames S4 as a transparent-compression proxy
+  rather than a storage-system replacement. License cells now link
+  to upstream LICENSE files; in-table license framing softened to
+  "upstream LICENSE: AGPLv3 (+ commercial)" with a footnote
+  clarifying these can change between releases.
+
+### Test posture
+
+622 workspace tests pass (unchanged from v0.8.8) / 52 ignored.
+`cargo audit` clean.
+
 ## [0.8.8] — 2026-05-20
 
 Pre-launch hardening **Phase 1** (issue tracker #111). claude + codex

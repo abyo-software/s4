@@ -7,7 +7,9 @@
 [![Rust](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](https://www.rust-lang.org)
 
 > **Drop-in S3-compatible storage gateway with GPU-accelerated transparent compression.**
-> Cuts your AWS S3 bill 50–80% without changing a single line of application code.
+> Reduces S3 **storage bytes** 50–80% for compressible payloads (logs, JSON,
+> Parquet/ORC) without changing application code. Total bill impact depends on
+> workload mix — request cost / egress / GPU compute are unchanged.
 
 [日本語版 README → `README.ja.md`](README.ja.md)
 
@@ -15,16 +17,42 @@
 through `s4-codec`, last benchmarked 2026-05-13 on nvCOMP 5.2.0.10 / CUDA
 13.2 driver 595.58.03; full table + reproduction recipe below):
 
-| Workload | Best ratio | Best compress throughput |
-|---|---:|---:|
-| nginx access log (256 MiB)   | **155×** (cpu-zstd-3) | 3.7 GB/s (cpu-zstd-3) |
-| Parquet-like mixed (256 MiB) | **2.09×** (nvcomp-bitcomp) | 1.5 GB/s (nvcomp-bitcomp) |
-| Postings (u32, 64 MiB)       | **11.9×** (nvcomp-bitcomp) | 1.6 GB/s (nvcomp-bitcomp) |
-| Already-compressed (64 MiB)  | 1.00× (no harm done) | 2.2 GB/s (cpu-zstd-3) |
+| Workload | Best ratio | Best compress throughput | Codec verdict |
+|---|---:|---:|---|
+| nginx access log (256 MiB)   | **155×** (cpu-zstd-3) | 3.7 GB/s (cpu-zstd-3) | CPU wins — text deduplicates well at low CPU cost |
+| Parquet-like mixed (256 MiB) | **2.09×** (nvcomp-bitcomp) | 1.5 GB/s (nvcomp-bitcomp) | GPU wins on Bitcomp for integer/columnar layouts |
+| Postings (u32, 64 MiB)       | **11.9×** (nvcomp-bitcomp) | 1.6 GB/s (nvcomp-bitcomp) | GPU wins decisively on monotonic integer columns |
+| Already-compressed (64 MiB)  | 1.00× (passthrough)  | 2.2 GB/s (passthrough)| Dispatcher detects + skips — no codec cost |
+
+**Codec selection is not always GPU** (#96 #97). The dispatcher samples
+entropy + magic bytes and routes per object:
+
+- text / log → `cpu-zstd-3` (often beats GPU codecs both on ratio AND
+  throughput at the input size where everything fits in L3)
+- columnar integers (Parquet / postings / time-series) → `nvcomp-bitcomp`
+  / `nvcomp-gdeflate` (GPU's strength; orders of magnitude faster at the
+  large-batch sizes columnar workloads produce)
+- already-compressed (mp4 / jpeg / parquet-with-zstd-block-codec / `.gz`
+  detected by magic byte) → `passthrough` (no harm done)
+- non-GPU build OR no GPU at runtime → CPU codecs end-to-end
+
+Observe which codec was chosen via the `s4_codec_chosen_total{codec="..."}`
+Prometheus counter, or per-PUT in the structured JSON access log
+(`{"codec_chosen":"..."}`). GPU is a multiplier on the *integer/columnar*
+side of mixed workloads, not a blanket "compress with GPU" claim.
 
 Translated to AWS S3 Standard at $0.023/GB/month: **1 TiB of nginx log
 data → ~6.6 GiB stored → $0.15/month vs $23.55/month uncompressed (99%
-saved)**. Mixed-content Parquet workloads see ~50% savings.
+storage savings, single-pass)**. Mixed-content Parquet workloads see ~50%
+storage savings.
+
+**What this number does and doesn't cover** (#95): storage-bytes only.
+PUT/GET request cost is unchanged (1 PUT in = 1 PUT out, plus a small
+`.s4index` sidecar PUT for indexed range-read). Egress is unchanged
+(GET serves the decompressed payload). GPU compute is a separate cost
+(c. EC2 g4dn / g5 hourly) — pays for itself on TB-scale, not GB-scale,
+ingest. See [Cost savings — does S4 make sense for your bill?](#cost-savings-does-s4-make-sense-for-your-bill) below for the
+break-even maths.
 
 ---
 
@@ -33,8 +61,10 @@ saved)**. Mixed-content Parquet workloads see ~50% savings.
 S4 (**Squished S3**) is an S3-compatible storage gateway written in Rust that
 sits between your applications (boto3 / aws-sdk / aws-cli / Spark / Trino /
 DuckDB / anything S3) and your real S3 bucket — and **transparently compresses
-every object with GPU codecs** (NVIDIA nvCOMP zstd / Bitcomp / gANS) or CPU
-zstd before storing it.
+each object** with a codec the dispatcher picks per-payload: GPU
+(NVIDIA nvCOMP zstd / Bitcomp / GDeflate) for integer/columnar data, CPU
+zstd / gzip for text/log, passthrough (no codec cost) for already-compressed
+inputs. See [the codec verdict table](#headline-numbers) above for the routing rules.
 
 ```
                         endpoint: s4.example.com
@@ -49,7 +79,14 @@ zstd before storing it.
 
 - **No app changes**: same S3 wire protocol, same SigV4 auth, same SDK calls
 - **Transparent**: PUT compresses, GET decompresses; clients see the original bytes
-- **No lock-in**: stop the gateway, read your bucket directly with aws-cli
+- **Open format, no lock-in**: stop the gateway and the **compressed
+  objects + S4IX sidecars remain S3-native** — readable by stock `aws-cli`
+  / boto3 / any S3 client. The **original payload** then requires
+  `s4-codec` (CLI tool), `s4-codec-py` (pip), or `s4-codec-wasm` (browser)
+  to decompress — all Apache-2.0, ~1k LOC of pure decode, no gateway runtime
+  needed. The wire format (S4F2 frame + S4IX sidecar) is documented in
+  the source: [`crates/s4-codec/src/multipart.rs`](crates/s4-codec/src/multipart.rs) (frame layout) and
+  [`crates/s4-codec/src/index.rs`](crates/s4-codec/src/index.rs) (sidecar layout)
 
 ## Why S4?
 
@@ -165,18 +202,67 @@ target/release/s4 --endpoint-url https://s3.us-east-1.amazonaws.com \
 
 ## How it Compares
 
-| Feature | S4 | MinIO (built-in S2) | Garage | Wasabi / B2 | AWS S3 |
+| Feature | S4 | [MinIO](https://github.com/minio/minio) | [Garage](https://git.deuxfleurs.fr/Deuxfleurs/garage) | Wasabi / B2 | AWS S3 |
 |---|---|---|---|---|---|
-| S3 API compatibility | ✅ Full | ✅ Full | ⚠️ Subset | ✅ Full | ✅ Native |
+| Stance | Transparent-compression proxy in front of an existing S3 backend | Standalone S3-compatible storage system | Standalone S3-compatible storage system | Hosted S3-compatible storage | The reference |
+| S3 API compatibility | See [matrix below](#s3-api-compatibility-matrix) | Comprehensive | Subset | Comprehensive | Native |
 | **GPU compression** | ✅ nvCOMP zstd / Bitcomp / GDeflate | ❌ | ❌ | ❌ | ❌ |
-| **CPU compression** | ✅ zstd 1–22 | ⚠️ S2 only | ✅ zstd 1–22 | ❌ | ❌ |
+| **CPU compression** | ✅ zstd 1–22 / gzip | ⚠️ S2 only (legacy) | ✅ zstd 1–22 | ❌ | ❌ |
 | **Auto codec selection** | ✅ entropy + magic-byte sampling | ❌ | ❌ | — | — |
-| **Range GET on compressed** | ✅ via sidecar frame index (single-PUT + multipart) | n/a | n/a | ✅ | ✅ |
-| **Streaming I/O** | ✅ TTFB ms-class, ~10 MiB peak; GPU per-chunk pipelined | ✅ | ✅ | ✅ | ✅ |
+| **Range GET on compressed** | ✅ via S4IX sidecar (see [matrix](#s3-api-compatibility-matrix) for the range modes supported) | n/a | n/a | ✅ | ✅ |
+| **Streaming I/O** | ✅ chunked PUT / GET; GPU per-chunk pipelined | ✅ | ✅ | ✅ | ✅ |
 | **Native HTTPS / TLS** | ✅ rustls + ring, ALPN h2 | ⚠️ via reverse proxy | ⚠️ via reverse proxy | ✅ | ✅ |
 | **Bucket-policy enforcement at gateway** | ✅ AWS-style JSON, Allow / Deny | n/a | n/a | ✅ | ✅ |
-| **Acts as gateway to existing S3** | ✅ | ❌ (gateway mode removed) | ❌ | ❌ | n/a |
-| **License** | Apache-2.0 | AGPLv3 / commercial | AGPLv3 | proprietary | proprietary |
+| **Acts as gateway to existing S3** | ✅ (the whole point) | ❌ (gateway mode removed upstream) | ❌ | ❌ | n/a |
+| **License** | Apache-2.0 | upstream LICENSE: AGPLv3 (+ commercial) | upstream LICENSE: AGPLv3 | proprietary | proprietary |
+
+*(MinIO / Garage license cells link to upstream LICENSE files; project licenses
+ can change between releases. Do not treat as legal advice. See #103.)*
+
+### S3 API compatibility matrix
+
+S4 implements the parts of the S3 API needed to act as a transparent
+compression proxy in front of an existing bucket. **It is not a complete
+S3 implementation** — operations marked "—" return `NotImplemented` and
+should not be called against an S4 endpoint. PRs welcome on the matrix
+rows you need.
+
+| Surface | Status | Notes |
+|---|---|---|
+| PUT / GET object | ✅ Full | single-PUT + range-GET (see below) |
+| Multipart upload (create / part / complete / abort) | ✅ Full | with per-part framing + final-part padding trim |
+| HEAD object | ✅ Full | returns post-compression `Content-Length` (matches what S3 returns; original size in `x-amz-meta-s4-original-size`) |
+| Range GET | ✅ S3 spec | `bytes=N-M`, `bytes=-N` (suffix), `bytes=N-` (open-ended); range maps through S4IX sidecar to compressed byte offsets |
+| Conditional GET / PUT (`If-Match` / `If-None-Match` / `If-Modified-Since`) | ✅ Full | |
+| PutObjectAcl / GetObjectAcl | ✅ canned ACLs only | `private` / `public-read` / `public-read-write` / `authenticated-read` / `aws-exec-read` / `bucket-owner-read` / `bucket-owner-full-control` |
+| Bucket versioning | ✅ Full | per-version UUIDv4 ID, delete-marker semantics |
+| Object lock (Governance / Compliance) | ✅ Full | per-object retention + legal-hold |
+| Bucket lifecycle (`LifecycleConfiguration`) | ✅ Full | Expiration / NoncurrentVersionExpiration / AbortIncompleteMultipartUpload |
+| Bucket notifications (Webhook / SQS / SNS) | ✅ Full | SQS/SNS gated behind `aws-events` feature |
+| Bucket replication | ✅ Full | rule-based, per-PUT dispatcher |
+| Bucket policy | ✅ AWS-style JSON | Allow / Deny, IAM Conditions subset (see #100) |
+| Tagging (object / bucket) | ✅ Full | |
+| CORS configuration | ✅ Full | |
+| Inventory | ✅ Full | CSV / Parquet output |
+| MFA Delete | ✅ Full | RFC 6238 TOTP |
+| SSE-S3 (server-side, S4-managed keys) | ✅ Full | AES-256-GCM (S4E1/S4E2 wire) |
+| SSE-KMS (envelope encryption) | ✅ Full | LocalKms (file-backed KEKs) default; AWS KMS gated behind `aws-kms` feature |
+| SSE-C (customer-provided key) | ✅ Full | (S4E3 wire) |
+| S3 Select | ✅ subset | CSV input, single-column equality / inequality / GT / LT / LIKE-prefix; falls back to CPU eval where unsupported |
+| Presigned URLs | ✅ Full | both PUT and GET |
+| SigV4 / SigV4a auth | ✅ Full | SigV4a requires `--sigv4a-credentials <DIR>` |
+| Storage class transitions (Standard ↔ IA ↔ Glacier) | ✅ tagging-driven | see [docs/storage-class-transitions.md](docs/storage-class-transitions.md) |
+| Cross-region replication via S4 chain | — | use AWS S3 native CRR on the backend |
+| RequestPayment / Accelerate / Logging configuration | — | not implemented; report a 501 |
+
+**Range GET caveat** (#99): the S4IX sidecar gives a per-frame index, so
+range maps to a contiguous read of the covering frames and a decode that's
+sliced at the boundaries the caller asked for. Parquet/ORC readers
+(arrow-rs, datafusion, duckdb's parquet reader) that issue suffix-range
+GET against the footer work out of the box. Parallel range reads against
+overlapping frame extents do extra decode work and are not yet optimized;
+see #99 for the parquet/ORC reader cross-validation harness on the
+roadmap.
 
 ## Architecture
 
@@ -646,9 +732,18 @@ needed bytes from S3.
 
 ## Project Status
 
-- **v0.8.6 released** (2026-05-14) — see [CHANGELOG.md](CHANGELOG.md) for
-  the full per-version history. Cumulative scope across v0.1 → v0.8.6 is
-  600+ workspace tests + 11 production milestones covering S3-compatible
+> **Status: alpha / early-access.** Codepaths are well-exercised (600+
+> workspace tests, three deep-audit rounds, continuous fuzz farm), but
+> **no public production deployment yet**. Looking for design-partner
+> users to validate at TB-scale. If that's you, file an issue tagged
+> `early-adopter` and we'll prioritize the rough edges you hit.
+> Pre-1.0 — we may break the wire format if an audit round identifies
+> a structural issue (CHANGELOG will call this out explicitly when it
+> happens).
+
+- **v0.8.8 released** (2026-05-20) — see [CHANGELOG.md](CHANGELOG.md) for
+  the full per-version history. Cumulative scope across v0.1 → v0.8.8 is
+  620+ workspace tests + 12 production milestones covering S3-compatible
   PUT / GET / multipart / Select / SSE-S3 / SSE-KMS / SSE-C / IAM
   Conditions / bucket policy / versioning / object-lock / lifecycle /
   inventory / notifications (Webhook / SQS / SNS) / replication / CORS /
@@ -659,10 +754,12 @@ needed bytes from S3.
   [`s4-codec`](https://crates.io/crates/s4-codec) /
   [`s4-config`](https://crates.io/crates/s4-config) trio.
 - **Three rounds of deep audit** (`第一弾` / `第二弾` / `第三弾`)
-  closed in v0.8.2 → v0.8.5 — 50+ findings spanning CRITICAL pre-auth
-  state-machine bugs, HTTP wire hardening, GPU codec safety, binding
-  correctness, and background-task lifecycle. Same posture for every
-  audit: deploy if you run S4 in production.
+  closed in v0.8.2 → v0.8.5, plus a **pre-launch audit** (claude + codex
+  cross-review, tracker #111) in v0.8.7 → v0.8.8 — 70+ findings spanning
+  CRITICAL pre-auth state-machine bugs, HTTP wire hardening, GPU codec
+  safety, binding correctness, background-task lifecycle, and README
+  claim accuracy. CVE clean (`cargo audit`, see CI `security-audit` job)
+  except 3 upstream-blocked rustls-webpki advisories tracked in #91.
 - **Continuous fuzz farm** (v0.8.6) — 5 bolero targets running 24/7
   under a `systemd-user` slice budgeted at 8 cores / 30 GiB (1/4 of the
   build host). Coverage compounds across `Restart=always` wakeups; any
@@ -674,9 +771,13 @@ needed bytes from S3.
   streaming zstd 1 GiB roundtrip + GDeflate roundtrip both green; OMB
   bench runs on EC2 c7gd.8xlarge (latest v0.8 perf chart at
   `docs/perf-v0.8.png`).
-- **Production-ready** for log archival, data lake, parquet/ORC
-  analytics, and as a drop-in transparent-compression proxy in front of
-  any S3-compatible backend.
+- **Suitable for** log archival, data lake / parquet/ORC analytics,
+  drop-in transparent-compression proxy in front of any S3-compatible
+  backend — at the scale where you can absorb early-adopter rough
+  edges and report back. We do **not** yet recommend S4 as the only
+  copy of irreplaceable data; pair with backend-native replication
+  / versioning until v1.0 + the first public production deployment is
+  documented.
 - **Roadmap is driven by audit findings + continuous fuzz** rather than
   feature checklists; file issues at
   https://github.com/abyo-software/s4/issues to influence it.
