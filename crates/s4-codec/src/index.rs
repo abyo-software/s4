@@ -76,12 +76,20 @@ pub const INDEX_MAGIC: &[u8; 4] = b"S4IX";
 pub const INDEX_VERSION: u32 = 2;
 /// Legacy v1 fixed header — kept for tests / back-compat readers.
 pub const INDEX_VERSION_V1: u32 = 1;
-pub const INDEX_HEADER_BYTES: usize = 4 + 4 + 8 + 8 + 4 + 4 + 8; // 40 (with padding)
 /// v1 fixed header layout (kept for back-compat readers).
-const HEADER_FIXED_V1: usize = 4 + 4 + 8 + 8 + 8;
+pub const HEADER_FIXED_V1: usize = 4 + 4 + 8 + 8 + 8; // 32
 /// v2 fixed header layout (`HEADER_FIXED_V1` + `source_compressed_size` u64 +
 /// `etag_len` u32). The variable-length `etag` payload follows.
-const HEADER_FIXED_V2: usize = HEADER_FIXED_V1 + 8 + 4;
+pub const HEADER_FIXED_V2: usize = HEADER_FIXED_V1 + 8 + 4; // 44
+/// v0.8.16 F-15: kept for back-compat with external consumers that
+/// imported the v0.8.10-era constant. **DEPRECATED** — the value
+/// `40` was a typo (it should have been `44` for the v2 fixed
+/// header). Use [`HEADER_FIXED_V1`] / [`HEADER_FIXED_V2`] directly.
+#[deprecated(
+    since = "0.8.16",
+    note = "INDEX_HEADER_BYTES was an off-by-4 typo; use HEADER_FIXED_V1 or HEADER_FIXED_V2 instead"
+)]
+pub const INDEX_HEADER_BYTES: usize = HEADER_FIXED_V2;
 pub const ENTRY_BYTES: usize = 8 + 8 + 8 + 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,6 +252,23 @@ pub enum IndexError {
     /// this target (32-bit) or the operator-configured cap.
     #[error("sidecar etag_len {got} exceeds MAX_ETAG_BYTES={max}")]
     EtagTooLong { got: u32, max: u32 },
+    /// v0.8.16 F-2: consecutive entries are not in non-decreasing
+    /// order. `binary_search_by` / `lookup_range` rely on the
+    /// invariant that `entries[i+1].original_offset >=
+    /// entries[i].original_end()` (and the same for `compressed_*`).
+    /// A forged sidecar violating that lets a Range GET drive
+    /// `RangePlan.byte_end_exclusive` to a u64-wrapped value.
+    #[error(
+        "frame index entries out of order: prev_original_end={prev_original_end}, \
+         curr_original_offset={curr_original_offset}, prev_compressed_end={prev_compressed_end}, \
+         curr_compressed_offset={curr_compressed_offset}"
+    )]
+    NonMonotonicEntries {
+        prev_original_end: u64,
+        curr_original_offset: u64,
+        prev_compressed_end: u64,
+        curr_compressed_offset: u64,
+    },
 }
 
 /// v0.8.15 H-c: hard upper bound on the number of entries
@@ -425,6 +450,30 @@ pub fn decode_index(mut input: Bytes) -> Result<FrameIndex, IndexError> {
             compressed_size,
         });
     }
+    // v0.8.16 F-2: inter-entry monotonicity. v0.8.15 H-a closed the
+    // per-entry `offset + size` overflow but did NOT verify that
+    // entries are in non-decreasing order. The downstream
+    // `binary_search_by` in `lookup_range` assumes sorted entries
+    // — feed it a sidecar with `[ooff=100,...],[ooff=0,...]` and the
+    // partition point logic returns garbage, then `start - entries[
+    // first_idx].original_offset` underflows `u64` (wraps in
+    // release, panics in dev) and the resulting `RangePlan` drives
+    // an arbitrary backend GET range. Reject out-of-order entries
+    // here with a dedicated typed error.
+    for win in entries.windows(2) {
+        let prev = &win[0];
+        let curr = &win[1];
+        if curr.original_offset < prev.original_end()
+            || curr.compressed_offset < prev.compressed_end()
+        {
+            return Err(IndexError::NonMonotonicEntries {
+                prev_original_end: prev.original_end(),
+                curr_original_offset: curr.original_offset,
+                prev_compressed_end: prev.compressed_end(),
+                curr_compressed_offset: curr.compressed_offset,
+            });
+        }
+    }
     Ok(FrameIndex {
         total_padded_size,
         entries,
@@ -450,7 +499,26 @@ pub fn build_index_from_body(body: &Bytes) -> Result<FrameIndex, crate::multipar
                 break;
             }
             let pad_len = u64::from_le_bytes(body[cursor + 4..cursor + 12].try_into().unwrap());
-            cursor += crate::multipart::PADDING_HEADER_BYTES + pad_len as usize;
+            // v0.8.16 F-3: was `pad_len as usize`, silently
+            // truncating on 32-bit. A forged `S4P1 || u64::MAX`
+            // padding header advanced the cursor by `0xFFFF_FFFF`
+            // on 64-bit (skipping past `body.len()` into the next
+            // iteration's break) and by `0xFFFF_FFFF` truncated
+            // on 32-bit (different behaviour by target). Use
+            // try_from + checked_add so a malformed body fails
+            // closed with a typed `FrameError` instead of either
+            // wandering off the end of the buffer or silently
+            // skipping the bad frame.
+            let pad_len_usize = usize::try_from(pad_len)
+                .map_err(|_| crate::multipart::FrameError::PayloadTooLarge(pad_len))?;
+            let next_cursor = cursor
+                .checked_add(crate::multipart::PADDING_HEADER_BYTES)
+                .and_then(|n| n.checked_add(pad_len_usize))
+                .ok_or(crate::multipart::FrameError::PayloadTooLarge(pad_len))?;
+            cursor = next_cursor;
+            if cursor > body.len() {
+                break;
+            }
             iter_buf = body.slice(cursor..);
             continue;
         }
@@ -459,15 +527,33 @@ pub fn build_index_from_body(body: &Bytes) -> Result<FrameIndex, crate::multipar
             break;
         }
         let (header, _payload, rest) = crate::multipart::read_frame(iter_buf.clone())?;
-        let frame_total = crate::multipart::FRAME_HEADER_BYTES + header.compressed_size as usize;
+        // v0.8.16 F-3: `header.compressed_size as usize` had the
+        // same 32-bit-truncation hazard as the padding cursor
+        // arithmetic above. Use try_from so a forged 4 GiB+ frame
+        // surfaces as `PayloadTooLarge` instead of wandering off.
+        let compressed_size_usize = usize::try_from(header.compressed_size)
+            .map_err(|_| crate::multipart::FrameError::PayloadTooLarge(header.compressed_size))?;
+        let frame_total = crate::multipart::FRAME_HEADER_BYTES
+            .checked_add(compressed_size_usize)
+            .ok_or(crate::multipart::FrameError::PayloadTooLarge(
+                header.compressed_size,
+            ))?;
         entries.push(FrameIndexEntry {
             original_offset: original_off,
             original_size: header.original_size,
             compressed_offset: cursor as u64,
             compressed_size: frame_total as u64,
         });
-        original_off += header.original_size;
-        cursor += frame_total;
+        // v0.8.16 F-3: `original_off +=` was a plain `+`, panicking
+        // in dev / wrapping in release on a forged body whose
+        // cumulative original sizes overflow u64. Use checked_add
+        // → typed error.
+        original_off = original_off.checked_add(header.original_size).ok_or(
+            crate::multipart::FrameError::PayloadTooLarge(header.original_size),
+        )?;
+        cursor = cursor.checked_add(frame_total).ok_or(
+            crate::multipart::FrameError::PayloadTooLarge(header.compressed_size),
+        )?;
         iter_buf = rest;
     }
     Ok(FrameIndex {

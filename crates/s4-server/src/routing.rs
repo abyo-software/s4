@@ -294,6 +294,21 @@ pub fn try_sigv4a_verify_at<B>(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<Result<(), Response<s3s::Body>>> {
     let gate = gate?;
+    // v0.8.16 F-5: presigned URL form (`?X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256`)
+    // is not yet implemented. Pre-F-5 it silently fell through to
+    // the SigV4 path (which doesn't understand SigV4a query auth
+    // either), so the gate effectively accepted the request as
+    // unsigned. Surface a clean 501 NotImplemented so SDKs that
+    // emit presigned SigV4a URLs see a deterministic failure
+    // instead of an opaque 403 / 200.
+    if crate::sigv4a::detect_presigned(req) {
+        return Some(Err(build_sigv4a_error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            "SigV4a presigned URLs (query auth) are not yet supported on this gateway; \
+             use Authorization-header SigV4a instead",
+        )));
+    }
     if !crate::sigv4a::detect(req) {
         // Not a SigV4a request — caller forwards to the SigV4 path.
         return None;
@@ -420,11 +435,26 @@ fn build_canonical_request_bytes<B>(
                 header: name.clone(),
             });
         }
-        let value = req
+        // v0.8.16 F-4: presence is required. A signed header that's
+        // missing from the request used to canonicalise as `name:\n`
+        // (empty value) — a client could sign over a placeholder
+        // value, then drop the actual header on the wire. The gate
+        // would happily verify because both sides agreed on the
+        // empty-string canonical form. AWS S3 returns
+        // SignatureDoesNotMatch; we surface a typed variant so the
+        // gate can map to 403 with a clear message.
+        let value = match req
             .headers()
             .get(name.as_str())
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+        {
+            Some(v) => v,
+            None => {
+                return Err(crate::sigv4a::SigV4aError::SignedHeaderMissing {
+                    header: name.clone(),
+                });
+            }
+        };
         buf.push_str(name);
         buf.push(':');
         // Trim whitespace and collapse repeated inner whitespace per
@@ -472,14 +502,27 @@ fn canonical_query_string(query: &str) -> String {
     // Real AWS SDKs always emit fully-encoded canonical form, so the
     // pre-H-d "verbatim sort" only matched signatures the gate itself
     // produced, not signatures real clients ship.
+    // v0.8.16 F-6: byte-level decode + re-encode. The pre-F-6
+    // helpers ran `decode_utf8_lossy()` which silently replaced
+    // any non-UTF8 percent-encoded byte (e.g. `%FF`) with the
+    // U+FFFD replacement character (`%EF%BF%BD` after re-encode),
+    // mismatching every signer that operates on raw bytes (most
+    // AWS SDKs do). Now we work with `Vec<u8>` end-to-end so the
+    // canonical form is bit-for-bit identical to what AWS SDKs
+    // emit, including for non-UTF8 path / query content.
     let mut pairs: Vec<(String, String)> = query
         .split('&')
         .filter(|s| !s.is_empty())
         .map(|kv| match kv.split_once('=') {
-            Some((k, v)) => (percent_decode_to_string(k), percent_decode_to_string(v)),
-            None => (percent_decode_to_string(kv), String::new()),
+            Some((k, v)) => (percent_decode_bytes(k), percent_decode_bytes(v)),
+            None => (percent_decode_bytes(kv), Vec::new()),
         })
-        .map(|(k, v)| (aws_canonical_encode(&k), aws_canonical_encode(&v)))
+        .map(|(k, v)| {
+            (
+                aws_canonical_encode_bytes(&k),
+                aws_canonical_encode_bytes(&v),
+            )
+        })
         .collect();
     pairs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     let mut out = String::with_capacity(query.len());
@@ -503,6 +546,9 @@ fn canonical_uri_path(path: &str) -> String {
     if path.is_empty() {
         return "/".to_owned();
     }
+    // v0.8.16 F-6: byte-level. See `canonical_query_string` for
+    // the rationale — `decode_utf8_lossy` mangled non-UTF8 paths
+    // into U+FFFD before re-encoding, mismatching the signer.
     let mut out = String::with_capacity(path.len());
     let mut first = true;
     for segment in path.split('/') {
@@ -510,26 +556,41 @@ fn canonical_uri_path(path: &str) -> String {
             out.push('/');
         }
         first = false;
-        let decoded = percent_decode_to_string(segment);
-        out.push_str(&aws_canonical_encode(&decoded));
+        let decoded = percent_decode_bytes(segment);
+        out.push_str(&aws_canonical_encode_bytes(&decoded));
     }
     out
 }
 
-/// v0.8.15 H-d: decode a percent-encoded UTF-8 string to its raw
-/// bytes, then interpret as `String` (lossy fallback on bad UTF-8 so
-/// we never panic on weird input). The `percent_encoding` crate
-/// gives us the decode iterator; we just collect.
-fn percent_decode_to_string(s: &str) -> String {
-    percent_encoding::percent_decode_str(s)
-        .decode_utf8_lossy()
-        .into_owned()
+/// v0.8.16 F-6: decode a percent-encoded string to its raw bytes
+/// (`Vec<u8>`). Preserves non-UTF8 sequences verbatim so the
+/// downstream re-encode produces the same bytes a byte-level signer
+/// (e.g. `aws-crt-cpp`, `aws-sigv4` Rust crate) would compute.
+fn percent_decode_bytes(s: &str) -> Vec<u8> {
+    percent_encoding::percent_decode_str(s).collect()
 }
 
-/// v0.8.15 H-d: encode a UTF-8 string per AWS SigV4 canonical form.
-/// Per RFC 3986 the unreserved set is `A-Z a-z 0-9 - _ . ~`; every
-/// other byte becomes `%XX` with uppercase hex. AWS treats this set
-/// identically (it's the AWS-canonical set).
+/// v0.8.16 F-6: encode a raw byte sequence per AWS SigV4 canonical
+/// form. AWS canonical set = RFC 3986 unreserved (`A-Z a-z 0-9 - _
+/// . ~`); every other byte becomes `%XX` with uppercase hex.
+/// Operates on `&[u8]` so it never panics on non-UTF8 input.
+fn aws_canonical_encode_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+#[allow(dead_code)]
+/// v0.8.15 H-d (kept for any UTF-8-only call site): encode a UTF-8
+/// string per AWS SigV4 canonical form. Prefer
+/// [`aws_canonical_encode_bytes`] which doesn't lossy-decode.
 fn aws_canonical_encode(s: &str) -> String {
     /// AWS canonical set per SigV4 spec — equivalent to RFC 3986
     /// unreserved. Everything else gets `%XX`.

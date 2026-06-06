@@ -117,6 +117,19 @@ pub enum SigV4aError {
     /// without breaking the signature.
     #[error("x-amz-content-sha256 header present but not in SignedHeaders list")]
     ContentSha256NotSigned,
+    /// v0.8.16 F-4: the request does not carry an `x-amz-content-sha256`
+    /// header at all. AWS S3 requires this header on every SigV4 /
+    /// SigV4a request; without it the canonical request silently
+    /// falls back to `UNSIGNED-PAYLOAD`, defeating body integrity.
+    #[error("x-amz-content-sha256 header required for SigV4a requests")]
+    MissingContentSha256,
+    /// v0.8.16 F-4 routing-side: a header listed in `SignedHeaders=`
+    /// has no value in the request. Pre-F-4 the canonical request
+    /// substituted an empty string, letting the client sign over
+    /// `host:\n` (or any other listed header) and pass verification
+    /// despite the value never reaching the gate.
+    #[error("SignedHeaders lists {header:?} but the request omits that header")]
+    SignedHeaderMissing { header: String },
     /// Credential-scope terminator (the trailing component) is not the
     /// literal string `aws4_request` AWS mandates.
     #[error("credential scope must end with /aws4_request")]
@@ -340,6 +353,28 @@ pub fn detect<B>(req: &http::Request<B>) -> bool {
     h.contains_key(REGION_SET_HEADER)
 }
 
+/// v0.8.16 F-5: detect a SigV4a *presigned URL*. Presigned URLs
+/// carry the auth params in the query string (`X-Amz-Algorithm`,
+/// `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-SignedHeaders`,
+/// `X-Amz-Signature`) instead of the `Authorization` header. The
+/// gate currently only handles the header form; this helper lets
+/// the listener-side middleware surface an explicit
+/// `NotImplemented` instead of letting the request slip through
+/// unsigned. Once a real query-parameter parser lands, this helper
+/// becomes the dispatch point.
+pub fn detect_presigned<B>(req: &http::Request<B>) -> bool {
+    let Some(q) = req.uri().query() else {
+        return false;
+    };
+    // Cheap substring check — query parameters are URL-encoded, so
+    // `X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256` is the only canonical
+    // form. We accept case-insensitive parameter name lookups.
+    q.split('&').any(|pair| {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        k.eq_ignore_ascii_case("X-Amz-Algorithm") && v == SIGV4A_ALGORITHM
+    })
+}
+
 /// Verify an ECDSA-P256-SHA256 signature over a SigV4a canonical
 /// request, additionally enforcing that `requested_region` is a member
 /// of the signed `region_set` (the comma-separated value of
@@ -465,18 +500,20 @@ pub fn verify_request(
     {
         return Err(SigV4aError::HostNotSigned);
     }
-    // v0.8.15 H-e: when the request carries an
-    // `x-amz-content-sha256` header, it MUST also be in the signed
-    // list. Otherwise an attacker could flip a sender-computed
-    // SHA-256 to `UNSIGNED-PAYLOAD` to disable downstream body
-    // integrity. (Requests without the header at all are fine —
-    // payload-integrity is the sender's choice; we just need the
-    // value, when present, to be covered by the signature.)
-    if lookup_header_ci(headers, "x-amz-content-sha256").is_some()
-        && !parsed
-            .signed_headers
-            .iter()
-            .any(|h| h.eq_ignore_ascii_case("x-amz-content-sha256"))
+    // v0.8.15 H-e / v0.8.16 F-4: `x-amz-content-sha256` MUST be
+    // present AND covered by the signed list. The v0.8.15 fix only
+    // checked "if header present, must be signed", which allowed
+    // an attacker to drop the header entirely and have the
+    // canonical request fall back to `UNSIGNED-PAYLOAD`
+    // (`build_canonical_request_bytes` L460). AWS S3 requires the
+    // header on every SigV4 / SigV4a request — mirror that.
+    if lookup_header_ci(headers, "x-amz-content-sha256").is_none() {
+        return Err(SigV4aError::MissingContentSha256);
+    }
+    if !parsed
+        .signed_headers
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case("x-amz-content-sha256"))
     {
         return Err(SigV4aError::ContentSha256NotSigned);
     }
@@ -1029,7 +1066,11 @@ mod tests {
     ) -> (SigV4aAuth, HashMap<String, String>, Vec<u8>, VerifyingKey) {
         let signing = SigningKey::random(&mut OsRng);
         let verifying = VerifyingKey::from(&signing);
-        let canonical = b"GET\n/bucket/key\n\nhost:s3.example.com\nx-amz-date:placeholder\n\nhost;x-amz-date\nUNSIGNED-PAYLOAD".to_vec();
+        // v0.8.16 F-4: include `x-amz-content-sha256` in the
+        // SignedHeaders list and the headers map so the new
+        // MissingContentSha256 / ContentSha256NotSigned gates pass
+        // on the happy path.
+        let canonical = b"GET\n/bucket/key\n\nhost:s3.example.com\nx-amz-content-sha256:UNSIGNED-PAYLOAD\nx-amz-date:placeholder\n\nhost;x-amz-content-sha256;x-amz-date\nUNSIGNED-PAYLOAD".to_vec();
         // v0.8.12 #126 (MED-A): sign the AWS-spec string-to-sign, not
         // the raw canonical request, so the freshness-window test
         // (`sigv4a_accepts_within_skew_window`) actually exercises a
@@ -1043,13 +1084,17 @@ mod tests {
         let header = format!(
             "AWS4-ECDSA-P256-SHA256 \
              Credential=AKIATEST/{scope_date}/s3/aws4_request, \
-             SignedHeaders=host;x-amz-date, \
+             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
              Signature={sig_hex}"
         );
         let parsed = parse_authorization_header(&header).expect("parse");
         let mut headers = HashMap::new();
         headers.insert("host".to_string(), "s3.example.com".to_string());
         headers.insert("x-amz-date".to_string(), x_amz_date.to_string());
+        headers.insert(
+            "x-amz-content-sha256".to_string(),
+            "UNSIGNED-PAYLOAD".to_string(),
+        );
         (parsed, headers, canonical, verifying)
     }
 

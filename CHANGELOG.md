@@ -7,6 +7,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.16] — 2026-06-06
+
+Second-round audit closeout. The v0.8.15 HIGH + MED sweep landed
+the **shape** of every fix, but a follow-up Codex CLI + Claude
+Code review pass found 15 spots where the fix was incomplete,
+introduced a regression, or missed an adjacent code path. This
+release closes those. Reddit launch target stays v0.8.16+.
+
+### Fixed
+
+- **#145 F-1** — `cpu_zstd` / `cpu_gzip` bomb-detection probe was
+  dead code. `Read::take(limit)` returns `Ok(0)` for every
+  subsequent `read()` once its budget is exhausted, regardless of
+  the inner reader's state — the v0.8.15 #144 probe through the
+  consumed `Take` wrapper could never report "more bytes
+  available". Drop the wrapper first, then probe via the inner
+  decoder. Same fix applied to both the free-fn helpers AND the
+  `impl Codec` async path (which is what server-side multipart
+  GET actually invokes — the v0.8.15 fix never reached it).
+- **#146 F-2** — `decode_index` now verifies inter-entry
+  monotonicity. v0.8.15 H-a closed the per-entry `offset+size`
+  overflow but a forged sidecar with `[ooff=100,...],[ooff=0,...]`
+  still defeated `binary_search_by`, and `start - entries[first_idx].
+  original_offset` underflowed `u64`. New `NonMonotonicEntries`
+  variant + a `windows(2)` walk.
+- **#147 F-3** — `build_index_from_body` had three more
+  `as usize` / plain-`+` hazards left over from v0.8.15 H-b
+  (`pad_len`, `compressed_size`, cumulative `original_off`).
+  `try_from` / `checked_add` everywhere; typed `PayloadTooLarge`
+  on overflow.
+- **#148 F-4** — SigV4a `x-amz-content-sha256` header is now
+  *required* (not just "if present must be signed"), and the
+  canonical-request builder rejects `SignedHeaders=` entries
+  whose header is absent from the request. The v0.8.15 H-e fix
+  let an attacker drop the header entirely → canonical falls
+  back to `UNSIGNED-PAYLOAD`. New `MissingContentSha256` /
+  `SignedHeaderMissing` typed variants.
+- **#149 F-5** — SigV4a presigned URL form
+  (`?X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256`) is now explicitly
+  rejected with 501 NotImplemented. The pre-F-5 gate only
+  recognised the `Authorization` header form; presigned URLs
+  silently fell through to the SigV4 path which also doesn't
+  understand SigV4a query auth — effectively unsigned.
+- **#150 F-6** — `canonical_query_string` / `canonical_uri_path`
+  switched to byte-level encoding. The v0.8.15 #132 helpers ran
+  `decode_utf8_lossy()`, which replaced any non-UTF8 percent-
+  encoded byte (e.g. `%FF`) with `U+FFFD` (`%EF%BF%BD` after
+  re-encode), mismatching every signer that operates on raw
+  bytes. New `percent_decode_bytes` / `aws_canonical_encode_bytes`
+  pair.
+- **#151 F-7** — multipart Complete skips sidecar build for
+  versioning-Enabled buckets. The v0.8.15 H-g HEAD/stamp ran
+  *before* the shadow-key re-PUT, so the sidecar was bound to a
+  key that was about to be deleted — Range GET fall-back was
+  silently always-on, and the `<key>.s4index` was leaked. Skip
+  for versioned multipart; a follow-up issue tracks writing the
+  sidecar under the shadow key with the shadow's ETag.
+- **#152 F-8** — `copy_object` strips client `s4-*` metadata
+  unconditionally (moved outside the `if let Ok(head)` block).
+  The v0.8.15 M-2 fix's strip only ran when the backend HEAD
+  succeeded; on HEAD failure or `metadata=None` the client's
+  `S4-CODEC=...` injection survived.
+- **#153 F-9** — CORS validation now also runs on
+  `CorsManager::from_json` (snapshot restore) and the runtime
+  `rule_matches_method` no longer honours `pat == "*"`. The
+  v0.8.15 #139 fix only gated `PutBucketCors`; a pre-#139
+  snapshot file with `AllowedMethods: ["*"]` survived restore
+  and the legacy matcher kept honouring it.
+- **#154 F-10** — streaming PUT over-length is now a per-chunk
+  mid-flight check (inside the read loop), not a post-flight
+  check at end-of-stream. v0.8.15 M-4 let a client ship 100 GiB
+  through the compress + frame pipeline before rejecting with
+  `RequestBodyLengthMismatch`; F-10 short-circuits the moment
+  the cumulative read exceeds the declared length.
+- **#155 F-11** — `parse_iso8601` now applies per-month day
+  caps (+ leap-year for February). The v0.8.15 H-f bounds
+  accepted any `day ∈ [1, 31]`, so `2026-02-31` silently
+  normalised to `2026-03-03` through the civil-from-date
+  arithmetic.
+- **#156 F-12** — `SamplingDispatcher`'s `post_magic_entropy_high`
+  defaults to `false` (=  "don't trust the magic alone") on
+  short samples (≤ 48 bytes). The v0.8.15 M-7 fix returned
+  `true` for short samples, defeating the original motivation —
+  a 40-byte `BZh:loglog:` user log file still passthrough'd
+  even after M-7.
+- **#157 F-13** — reserved-name guard now also fires on GET /
+  HEAD / DELETE. The v0.8.15 #137 fix only blocked PUT / Copy /
+  CreateMultipart, so a curious client could
+  `GetObject(<key>.s4index)` and read the raw sidecar (frame
+  layout, source ETag) — information disclosure. DELETE on a
+  sidecar key would have orphaned the sidecar.
+- **#158 F-14** — `apply_default_on_put` re-arms expired
+  retention. Pre-F-14, a key whose `retain_until` had elapsed
+  but whose state record still lived in the manager silently
+  blocked re-arming on the next PUT — AWS S3 spec is that each
+  PUT under bucket-default re-arms the clock. `retain_until <=
+  now` no longer counts as "active retention".
+- **#159 F-15** — `INDEX_HEADER_BYTES = 40` constant was a typo
+  (v2 fixed header is actually 44 bytes). Now `#[deprecated]`
+  with the value corrected to `HEADER_FIXED_V2`, with
+  `HEADER_FIXED_V1` / `HEADER_FIXED_V2` exposed as the
+  successor public constants.
+
+### Tests
+
+- 438 lib + 45 integration tests green under `RUSTFLAGS="-D warnings"`;
+  `cargo clippy --workspace --all-targets` clean; `cargo fmt
+  --all --check` clean.
+
+### Notes
+
+- v0.8.16 is **the** version for the Reddit launch. Two
+  full multi-agent audit cycles (v0.8.11-15 + v0.8.16) have
+  closed every CRIT / HIGH / MED finding from the pre-release
+  review. Remaining LOW items are tracked as roadmap rather
+  than launch-blocking.
+
 ## [0.8.15] — 2026-06-06
 
 Post-launch security audit closeout. Picks up the HIGH (8) + MED (10)

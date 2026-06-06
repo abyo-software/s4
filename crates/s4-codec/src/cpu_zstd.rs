@@ -65,31 +65,32 @@ pub fn decompress_blocking(input: &[u8], manifest: &ChunkManifest) -> Result<Vec
     {
         let mut limited = (&mut decoder).take(limit);
         limited.read_to_end(&mut buf).map_err(CodecError::Io)?;
-        // v0.8.15 M-9: distinguish "bomb truncated at the cap" from
-        // "decoder happened to land in (orig_size, orig_size+1024]".
-        // The earlier error message reported `produced N bytes,
-        // manifest claimed M` even when the upstream had many more
-        // bytes available — misleading the operator log. Probe one
-        // extra byte after `read_to_end` saturated `limit`; if it
-        // succeeds, we know the source had more decoded output than
-        // the cap, so the message reflects the real shape.
-        if buf.len() as u64 > manifest.original_size {
-            let mut peek = [0u8; 1];
-            let more_available = limited.read(&mut peek).map(|n| n > 0).unwrap_or(false);
-            return Err(CodecError::Io(std::io::Error::other(format!(
-                "zstd decompression bomb detected: produced at least {} bytes \
-                 (truncated at cap = manifest.original_size + 1024 = {}); \
-                 manifest claimed {}{}",
-                buf.len(),
-                limit,
-                manifest.original_size,
-                if more_available {
-                    "; decoder had more bytes available beyond the cap"
-                } else {
-                    ""
-                },
-            ))));
-        }
+    }
+    // v0.8.16 F-1 (v0.8.15 #144 follow-up): `Read::take` returns
+    // `Ok(0)` for every subsequent `read()` after its budget is
+    // exhausted, regardless of whether the inner reader has more
+    // bytes. The v0.8.15 fix probed via the *consumed* `Take`
+    // wrapper, so `more_available` was always `false` and the
+    // extended message could never fire — dead code. Dropping
+    // `limited` first restores the unbounded budget on the inner
+    // `decoder`, so the one-byte peek actually tells us whether
+    // the bomb was truncated at the cap.
+    if buf.len() as u64 > manifest.original_size {
+        let mut peek = [0u8; 1];
+        let more_available = decoder.read(&mut peek).map(|n| n > 0).unwrap_or(false);
+        return Err(CodecError::Io(std::io::Error::other(format!(
+            "zstd decompression bomb detected: produced at least {} bytes \
+             (truncated at cap = manifest.original_size + 1024 = {}); \
+             manifest claimed {}{}",
+            buf.len(),
+            limit,
+            manifest.original_size,
+            if more_available {
+                "; decoder had more bytes available beyond the cap"
+            } else {
+                ""
+            },
+        ))));
     }
     if buf.len() as u64 != manifest.original_size {
         return Err(CodecError::SizeMismatch {
@@ -189,13 +190,35 @@ impl Codec for CpuZstd {
             // `DECOMPRESS_BOOTSTRAP_CAPACITY` doc.
             let mut buf =
                 Vec::with_capacity(allocated_orig_size.min(DECOMPRESS_BOOTSTRAP_CAPACITY));
-            (&mut decoder).take(limit).read_to_end(&mut buf)?;
-            // limit 以上を消費したかチェック (= bomb)
+            {
+                let mut limited = (&mut decoder).take(limit);
+                limited.read_to_end(&mut buf)?;
+            }
+            // v0.8.16 F-1 (v0.8.15 #144 follow-up): probe via the
+            // underlying decoder, NOT the consumed `Take` wrapper.
+            // `Read::take` returns Ok(0) for every subsequent
+            // `read()` after its budget is exhausted regardless of
+            // whether the inner reader has more bytes — the
+            // pre-F-1 `limited.read(...)` could never detect the
+            // "more available beyond cap" state. Dropping the
+            // `Take` first restores the unbounded budget so the
+            // single-byte peek actually tells us whether the
+            // decoder was capped.
             if (buf.len() as u64) > expected_orig_size {
+                let mut peek = [0u8; 1];
+                let more_available = decoder.read(&mut peek).map(|n| n > 0).unwrap_or(false);
                 return Err(std::io::Error::other(format!(
-                    "zstd decompression bomb detected: produced {} bytes, manifest claimed {}",
+                    "zstd decompression bomb detected: produced at least {} bytes \
+                     (truncated at cap = manifest.original_size + 1024 = {}); \
+                     manifest claimed {}{}",
                     buf.len(),
-                    expected_orig_size
+                    limit,
+                    expected_orig_size,
+                    if more_available {
+                        "; decoder had more bytes available beyond the cap"
+                    } else {
+                        ""
+                    },
                 )));
             }
             Ok(buf)

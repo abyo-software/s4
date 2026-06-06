@@ -174,8 +174,25 @@ impl CorsManager {
 
     /// snapshot JSON から restore。起動時に `--cors-state-file` を読み込む
     /// 経路で使える。
+    ///
+    /// v0.8.16 F-9: validate each restored config against the same
+    /// rules `PutBucketCors` enforces. Pre-F-9 a snapshot file with
+    /// `AllowedMethods: ["*"]` (the wildcard #139 prohibits) would
+    /// be silently restored and the `rule_matches_method` legacy
+    /// wildcard branch would honor it at preflight time. We now
+    /// surface `serde_json::Error` (custom-converted) on any
+    /// validation failure so the operator fixes the snapshot
+    /// before the listener serves traffic. Non-validation parse
+    /// errors propagate unchanged.
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
         let snap: CorsSnapshot = serde_json::from_str(s)?;
+        for cfg in snap.by_bucket.values() {
+            if let Err(e) = Self::validate(cfg) {
+                return Err(serde::de::Error::custom(format!(
+                    "CORS snapshot fails AWS S3 validation: {e}"
+                )));
+            }
+        }
         Ok(Self {
             by_bucket: RwLock::new(snap.by_bucket),
         })
@@ -222,11 +239,13 @@ fn rule_matches_origin(rule: &CorsRule, origin: &str) -> bool {
 }
 
 fn rule_matches_method(rule: &CorsRule, method: &str) -> bool {
-    // HTTP verbs are case-sensitive uppercase; we still tolerate the
-    // wildcard pattern but otherwise require exact match.
-    rule.allowed_methods
-        .iter()
-        .any(|pat| pat == "*" || pat == method)
+    // v0.8.16 F-9: the `*` wildcard is no longer recognised at
+    // runtime, mirroring the v0.8.15 #139 `PutBucketCors`
+    // validation. A pre-#139 deployment that persisted
+    // `AllowedMethods=["*"]` via snapshot would still preflight-
+    // match every verb at the matcher; that's the gap. AWS S3
+    // never recognised `*` as a verb wildcard — exact match only.
+    rule.allowed_methods.iter().any(|pat| pat == method)
 }
 
 fn rule_matches_headers(rule: &CorsRule, request_headers: &[String]) -> bool {

@@ -3163,6 +3163,19 @@ impl<B: S3> S3 for S4Service<B> {
         let get_start = Instant::now();
         let get_bucket = req.input.bucket.clone();
         let get_key = req.input.key.clone();
+        // v0.8.16 F-13: reserved-name guard now also fires on GET.
+        // The v0.8.15 #137 fix only blocked PUT / Copy / Create —
+        // a curious or hostile client could still
+        // `GetObject(<key>.s4index)` and read the raw sidecar
+        // (frame layout, source ETag, source compressed size).
+        // The list filter already hides the entry from listings;
+        // explicit reject closes the directed-read leak.
+        if s4_codec::index::is_reserved_sidecar_key(&get_key) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::NoSuchKey,
+                format!("object key {get_key:?} is reserved for S4 internal sidecars"),
+            ));
+        }
         self.enforce_rate_limit(&req, &get_bucket)?;
         self.enforce_policy(&req, "s3:GetObject", &get_bucket, Some(&get_key))?;
         // Range request の事前検出 (decompress 後 slice する path に使う)。
@@ -3650,6 +3663,13 @@ impl<B: S3> S3 for S4Service<B> {
         // replication-status echo can look the entry up.
         let head_bucket = req.input.bucket.clone();
         let head_key = req.input.key.clone();
+        // v0.8.16 F-13: same reserved-name guard as `get_object`.
+        if s4_codec::index::is_reserved_sidecar_key(&head_key) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::NoSuchKey,
+                format!("object key {head_key:?} is reserved for S4 internal sidecars"),
+            ));
+        }
         let mut resp = self.backend.head_object(req).await?;
         if let Some(manifest) = extract_manifest(&resp.output.metadata) {
             // 客側には decompress 後の意味のある content_length / checksum を返す。
@@ -3710,6 +3730,25 @@ impl<B: S3> S3 for S4Service<B> {
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
+        // v0.8.16 F-13: reserved-name guard on DELETE. Without it a
+        // hostile client could `DeleteObject(<key>.s4index)` to
+        // orphan the sidecar, silently disabling Range-GET
+        // partial-fetch for the corresponding `<key>`. The S4
+        // internal cleanup path (`write_sidecar` and friends)
+        // talks to `self.backend.delete_object(...)` directly, NOT
+        // through this trait method, so the guard doesn't break
+        // legitimate sidecar cleanup.
+        if s4_codec::index::is_reserved_sidecar_key(&key) {
+            let code = S3ErrorCode::from_bytes(b"InvalidObjectName")
+                .unwrap_or(S3ErrorCode::InvalidArgument);
+            return Err(S3Error::with_message(
+                code,
+                format!(
+                    "object key {key:?} is reserved (suffix `{}` is used for S4 internal sidecars)",
+                    s4_codec::index::SIDECAR_SUFFIX,
+                ),
+            ));
+        }
         self.enforce_rate_limit(&req, &bucket)?;
         self.enforce_policy(&req, "s3:DeleteObject", &bucket, Some(&key))?;
         // v0.6 #42: MFA Delete enforcement. When the bucket has
@@ -4082,6 +4121,20 @@ impl<B: S3> S3 for S4Service<B> {
             .map(|d| d.as_str() == MetadataDirective::REPLACE)
             .unwrap_or(false);
         if needs_merge && let CopySource::Bucket { bucket, key, .. } = &req.input.copy_source {
+            // v0.8.16 F-8: strip the client-supplied `s4-*` keys
+            // *unconditionally* — the v0.8.15 M-2 fix only ran the
+            // strip inside the `if let Ok(head) = ...` block, so a
+            // backend HEAD failure (transient 5xx, NoSuchKey on a
+            // racing delete) left attacker-injected `s4-*` /
+            // `S4-*` metadata intact on the destination. Now we
+            // strip first, then re-populate from the source HEAD
+            // when available — HEAD failure simply means the
+            // destination loses the codec markers (correct: a
+            // CopyObject without the source's codec metadata
+            // produces an unreadable object, but doesn't allow
+            // injection).
+            let dest_meta = req.input.metadata.get_or_insert_with(Default::default);
+            dest_meta.retain(|k, _| !k.to_ascii_lowercase().starts_with("s4-"));
             let head_input = HeadObjectInput {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -4102,23 +4155,6 @@ impl<B: S3> S3 for S4Service<B> {
                 && let Some(src_meta) = head.output.metadata.as_ref()
             {
                 let dest_meta = req.input.metadata.get_or_insert_with(Default::default);
-                // v0.8.15 M-2: drop ANY client-supplied `s4-*` key
-                // first. The reserved `s4-*` namespace describes the
-                // wire format the codec layer relies on
-                // (`s4-original-size`, `s4-crc32c`, `s4-codec`,
-                // `s4-multipart`, `s4-framed`, plus the SSE flags
-                // `s4-encrypted` / `s4-sse-type` / `s4-sse-c-key-md5`
-                // / `s4-sse-kms-key-id`). The pre-M-2 code used
-                // `or_insert_with` which *preferred* the client's
-                // value — a malicious client could
-                // `aws s3 cp s3://src s3://dst
-                //  --metadata-directive REPLACE
-                //  --metadata 's4-original-size=5368709120'`
-                // and persuade S4 to misread the body on the next
-                // GET (silent data corruption or DoS through
-                // mis-sized buffer alloc). Strip the namespace and
-                // force the source values back in.
-                dest_meta.retain(|k, _| !k.to_ascii_lowercase().starts_with("s4-"));
                 for key in [
                     META_CODEC,
                     META_ORIGINAL_SIZE,
@@ -4819,8 +4855,26 @@ impl<B: S3> S3 for S4Service<B> {
             .as_ref()
             .map(|c| !matches!(c.sse, crate::multipart_state::MultipartSseMode::None))
             .unwrap_or(false);
+        // v0.8.16 F-7: versioned multipart writes the assembled body
+        // under `versioned_shadow_key(&key, vid)` *after* this
+        // sidecar block, then deletes the original `<key>`. Stamping
+        // the sidecar against the to-be-deleted `<key>` (which is
+        // what H-g did) leaves an orphan `<key>.s4index` whose
+        // source-ETag binding can never match the live shadow body
+        // — the Range GET fast-path's stale-sidecar check then
+        // falls through to a full read on every request, silently
+        // disabling partial fetch. Skip the sidecar build entirely
+        // for versioned buckets; a follow-up issue tracks writing
+        // the sidecar under the shadow key with the shadow's ETag.
+        let mp_skip_sidecar_for_versioning = self
+            .versioning
+            .as_ref()
+            .map(|mgr| mgr.state(&bucket))
+            .map(|state| state == crate::versioning::VersioningState::Enabled)
+            .unwrap_or(false);
         if let Some(ref body) = assembled_body
             && !mp_will_encrypt
+            && !mp_skip_sidecar_for_versioning
             && let Ok(mut index) = build_index_from_body(body)
         {
             // v0.8.15 H-g: stamp the source-ETag / source-compressed-size

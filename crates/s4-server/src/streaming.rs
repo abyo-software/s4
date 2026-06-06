@@ -437,6 +437,23 @@ pub async fn streaming_compress_to_frames_with(
             let chunk_crc = crc32c::crc32c(chunk_slice);
             rolling_crc = crc32c::crc32c_append(rolling_crc, chunk_slice);
             total_in += filled as u64;
+            // v0.8.16 F-10: mid-flight over-length guard. The v0.8.15
+            // M-4 check only fired at end-of-stream — a client sending
+            // `Content-Length: 1` followed by 100 GiB of body had the
+            // full 100 GiB compressed + framed + held in `BytesMut`
+            // before the gateway rejected with
+            // `RequestBodyLengthMismatch`. AWS S3 cuts the connection
+            // when the read overruns the declared length. Mirror that
+            // by checking per-chunk and short-circuiting; the loop
+            // exits with `OverlengthStream` before doing more work.
+            if let Some(expected) = expected_size
+                && total_in > expected
+            {
+                return Err(CodecError::OverlengthStream {
+                    expected,
+                    got: total_in,
+                });
+            }
 
             let header = FrameHeader {
                 codec: codec_kind,

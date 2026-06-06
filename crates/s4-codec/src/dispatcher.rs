@@ -242,19 +242,28 @@ fn looks_columnar_integer(sample: &[u8]) -> bool {
     false
 }
 
-/// v0.8.15 M-7: confirm that the bytes *after* the magic-byte prefix
-/// look like compressed data (high entropy), not benign text whose
-/// leading 2-3 bytes happen to spell the magic. Returns `true` when
-/// the post-magic window has entropy `>= threshold` (default 7.5).
-/// Operates on `sample[16..]` ── 16 bytes of skip is enough to clear
-/// every magic this dispatcher knows about while leaving plenty of
-/// runway for the entropy estimate to be statistically meaningful.
-/// Returns `true` (skip the check) when the sample is too short to
-/// inspect, so behaviour matches the pre-M-7 path for tiny samples.
+/// v0.8.15 M-7 / v0.8.16 F-12: confirm that the bytes *after* the
+/// magic-byte prefix look like compressed data (high entropy), not
+/// benign text whose leading 2-3 bytes happen to spell the magic.
+/// Returns `true` when the post-magic window has entropy `>= threshold`
+/// (default 7.5). Operates on `sample[16..]` ── 16 bytes of skip is
+/// enough to clear every magic this dispatcher knows about while
+/// leaving plenty of runway for the entropy estimate to be statistically
+/// meaningful.
+///
+/// v0.8.16 F-12 fix: small samples now default to `false` (= "don't
+/// trust the magic byte alone on short samples"). The v0.8.15 M-7
+/// motivation was a 40-byte `BZh:loglog:` user log file — but the
+/// pre-F-12 `<= SKIP+32` short-circuit returned `true`, so
+/// passthrough still fired on exactly the case M-7 was meant to
+/// catch. Real bzip2 / gzip / zstd objects are essentially never <
+/// 48 bytes; rejecting the magic on a short sample is the safer
+/// default. Operators who really want passthrough on tiny inputs
+/// can run `--codec passthrough` explicitly.
 fn post_magic_entropy_high(sample: &[u8], threshold: f64) -> bool {
     const SKIP: usize = 16;
     if sample.len() <= SKIP + 32 {
-        return true;
+        return false;
     }
     shannon_entropy(&sample[SKIP..]) >= threshold
 }

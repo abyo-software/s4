@@ -906,7 +906,24 @@ fn parse_iso8601(s: &str) -> Option<i64> {
     if !(1..=12).contains(&month) {
         return None;
     }
-    if !(1..=31).contains(&day) {
+    // v0.8.16 F-11: per-month day cap (+ leap year for Feb). The
+    // v0.8.15 H-f fix accepted any `day ∈ 1..=31`, so `2026-02-31`
+    // parsed and the civil-from-date arithmetic silently normalised
+    // it to `2026-03-03`. AWS S3 rejects invalid calendar dates;
+    // mirror that.
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            // Leap-year rule: divisible by 4, except centuries
+            // unless divisible by 400. Year is already bounded to
+            // `[1970, 9999]` above so the arithmetic stays clean.
+            let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            if leap { 29 } else { 28 }
+        }
+        _ => unreachable!("month bounds already checked"),
+    };
+    if !(1..=max_day).contains(&day) {
         return None;
     }
     if !(0..=23).contains(&h) || !(0..=59).contains(&m) || !(0..=60).contains(&s) {

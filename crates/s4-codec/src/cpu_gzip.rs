@@ -72,27 +72,27 @@ pub fn decompress_blocking(input: &[u8], manifest: &ChunkManifest) -> Result<Vec
     {
         let mut limited = (&mut decoder).take(limit);
         limited.read_to_end(&mut buf).map_err(CodecError::Io)?;
-        // v0.8.15 M-9: see cpu_zstd.rs for the rationale. Probe one
-        // byte past `limit` to distinguish a truncated bomb from a
-        // legitimate overshoot inside the 1024-byte zstd buffer
-        // flush window the cap was tuned for.
-        if buf.len() as u64 > manifest.original_size {
-            let mut peek = [0u8; 1];
-            let more_available = limited.read(&mut peek).map(|n| n > 0).unwrap_or(false);
-            return Err(CodecError::Io(std::io::Error::other(format!(
-                "gzip decompression bomb detected: produced at least {} bytes \
-                 (truncated at cap = manifest.original_size + 1024 = {}); \
-                 manifest claimed {}{}",
-                buf.len(),
-                limit,
-                manifest.original_size,
-                if more_available {
-                    "; decoder had more bytes available beyond the cap"
-                } else {
-                    ""
-                },
-            ))));
-        }
+    }
+    // v0.8.16 F-1: same dead-code fix as cpu_zstd.rs. Probe via the
+    // inner decoder after dropping the `Take` wrapper so the budget
+    // is unbounded and the peek actually surfaces "decoder had more
+    // bytes available".
+    if buf.len() as u64 > manifest.original_size {
+        let mut peek = [0u8; 1];
+        let more_available = decoder.read(&mut peek).map(|n| n > 0).unwrap_or(false);
+        return Err(CodecError::Io(std::io::Error::other(format!(
+            "gzip decompression bomb detected: produced at least {} bytes \
+             (truncated at cap = manifest.original_size + 1024 = {}); \
+             manifest claimed {}{}",
+            buf.len(),
+            limit,
+            manifest.original_size,
+            if more_available {
+                "; decoder had more bytes available beyond the cap"
+            } else {
+                ""
+            },
+        ))));
     }
     if buf.len() as u64 != manifest.original_size {
         return Err(CodecError::SizeMismatch {
@@ -177,6 +177,7 @@ impl Codec for CpuGzip {
         let expected_orig_size = manifest.original_size;
 
         let decompressed = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+            use std::io::Read;
             // Decompression-bomb hardening: cap at expected_orig_size + small
             // margin (same pattern cpu_zstd uses). A malicious sidecar could
             // claim a tiny original_size while the gzip footer says otherwise;
@@ -187,12 +188,32 @@ impl Codec for CpuGzip {
             let mut buf =
                 Vec::with_capacity(allocated_orig_size.min(DECOMPRESS_BOOTSTRAP_CAPACITY));
             let mut decoder = GzDecoder::new(input.as_ref());
-            (&mut decoder).take(limit).read_to_end(&mut buf)?;
+            {
+                let mut limited = (&mut decoder).take(limit);
+                limited.read_to_end(&mut buf)?;
+            }
+            // v0.8.16 F-1: mirror the dead-code fix from the free-fn
+            // `decompress_cpu_gzip` + the CpuZstd async path. The
+            // v0.8.15 #144 fix never reached the async `impl Codec`
+            // path, which is the one server-side multipart GET
+            // actually invokes — every operator triage log so far
+            // has been the old "produced N bytes" message because of
+            // that miss.
             if (buf.len() as u64) > expected_orig_size {
+                let mut peek = [0u8; 1];
+                let more_available = decoder.read(&mut peek).map(|n| n > 0).unwrap_or(false);
                 return Err(std::io::Error::other(format!(
-                    "gzip decompression bomb detected: produced {} bytes, manifest claimed {}",
+                    "gzip decompression bomb detected: produced at least {} bytes \
+                     (truncated at cap = manifest.original_size + 1024 = {}); \
+                     manifest claimed {}{}",
                     buf.len(),
-                    expected_orig_size
+                    limit,
+                    expected_orig_size,
+                    if more_available {
+                        "; decoder had more bytes available beyond the cap"
+                    } else {
+                        ""
+                    },
                 )));
             }
             Ok(buf)
