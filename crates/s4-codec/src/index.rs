@@ -309,7 +309,23 @@ pub fn decode_index(mut input: Bytes) -> Result<FrameIndex, IndexError> {
             remaining: input.len(),
         });
     }
-    let mut entries = Vec::with_capacity(n as usize);
+    // v0.8.12 HIGH-14 fix: clamp the initial allocation the way the
+    // CpuZstd / CpuGzip decompress path does (see
+    // `DECOMPRESS_BOOTSTRAP_CAPACITY` in `lib.rs`, landed in #89).
+    // A forged sidecar with `n = 100_000_000` paired with a 3.2 GiB
+    // body (the only way the `expected_remaining` check above passes
+    // for that `n`) would otherwise commit ~3.2 GiB of `FrameIndexEntry`
+    // slots up front, on top of the 3.2 GiB body bytes already in
+    // RAM. The honest cap is 4096 entries (128 KiB at
+    // `ENTRY_BYTES = 32`) — large enough that single-PUT framed and
+    // typical multipart objects don't pay any growth cost, small
+    // enough that an adversarial sidecar can't drive multi-GiB
+    // pre-allocations behind the bounded `expected_remaining`
+    // check. The `push` loop below grows the vector naturally and
+    // is itself bounded by `expected_remaining == input.len()`.
+    const BOOTSTRAP_ENTRIES: usize = 4096;
+    let initial_cap = (n as usize).min(BOOTSTRAP_ENTRIES);
+    let mut entries = Vec::with_capacity(initial_cap);
     for _ in 0..n {
         let original_offset = input.get_u64_le();
         let original_size = input.get_u64_le();

@@ -7,6 +7,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.12] — 2026-06-06
+
+Pre-release **HIGH sweep** — 9 HIGH findings from the same Codex CLI
++ Claude Code review pass that produced the v0.8.11 CRIT cut. Every
+HIGH widens the gap between what the README claims and what the
+gateway actually enforces (Object Lock, IAM, integrity); shipping
+them before the launch keeps the public posture honest.
+
+### Fixed
+
+- **#116 HIGH-6 — multipart Complete now re-verifies Object Lock on
+  the target key (`service.rs:4306`).** The single-PUT path consults
+  the lock manager at L2007; Complete used to skip the check, so an
+  attacker with `s3:PutObject` could `CreateMultipartUpload` against
+  a `legal_hold=on` / under-retention key and overwrite it at Complete.
+  CompleteMultipartUpload doesn't carry the bypass header on the
+  wire — operators who need to break Governance call
+  `PutObjectRetention` first.
+- **#117 HIGH-7 — `x-amz-bypass-governance-retention` now requires
+  the matching IAM permission (`service.rs:3411 / 5227`).** The
+  bypass flag used to flow straight into `state.can_delete(...)`
+  regardless of policy. Now the gateway runs
+  `enforce_policy("s3:BypassGovernanceRetention", ...)` before
+  honouring the header; an unprivileged caller's bypass flag is
+  silently downgraded to `false` and the lock keeps blocking.
+- **#118 HIGH-8 — Object Lock administrative APIs now run
+  `enforce_policy` with the matching action verbs (`service.rs:5128 /
+  5169 / 5210 / 5250 / 5293`).** `put_object_legal_hold`,
+  `put_object_retention`, `put_object_lock_configuration`,
+  `get_object_legal_hold`, `get_object_retention`,
+  `get_object_lock_configuration` were previously ungated — a bucket
+  policy denying `s3:PutObjectLegalHold` could be bypassed by
+  hitting the API directly.
+- **#119 HIGH-9 — multipart API lifecycle now runs the same
+  `s3:PutObject` gate as single-PUT (`service.rs:3941 / 4097 / 4298 /
+  4818 / 4969`).** `create_multipart_upload`, `upload_part`,
+  `complete_multipart_upload`, `abort_multipart_upload`,
+  `upload_part_copy` were all previously ungated; a policy that
+  denied `s3:PutObject` was bypassable by switching the client to
+  the multipart wire path. README L693 ("every PUT / GET / DELETE
+  ... is evaluated") was previously aspirational; it is now correct.
+- **#120 HIGH-10 — sidecars are suppressed when the on-disk body
+  will be SSE-encrypted (`service.rs:2308 / 4436`).** The sidecar
+  describes offsets into the pre-encrypt `compressed` body, but the
+  bytes the backend stores under SSE-S4 / SSE-C / SSE-KMS are
+  *post-encrypt* (different length + layout). A Range GET would
+  slice the ciphertext at the stale offsets and 500. Encrypted-object
+  Range GET now buffers the full body, decrypts, and parses frames
+  — partial-fetch perf is traded for correctness. An encryption-
+  aware sidecar format is tracked as a follow-up.
+- **#121 HIGH-11 — rate-limit pool is bounded (`rate_limit.rs:55 +
+  73`).** The per-`(rule, principal, bucket)` `DashMap` was unbounded;
+  a request stream cycling fake access-key-ids could grow the pool
+  by millions of entries until the gateway OOM'd. New
+  `DEFAULT_MAX_ACTIVE_LIMITERS = 16384` cap; overflowing keys fall
+  onto a per-rule shared limiter (still rate-limited, just share one
+  bucket). `active_limiter_count()` accessor surfaces the live size
+  for the Prometheus gauge.
+- **#122 HIGH-12 — client-supplied integrity checksums are now
+  verified against the received body (`service.rs:132 / 2390 /
+  4319`).** `Content-MD5`, `x-amz-checksum-crc32c`, and
+  `x-amz-checksum-sha256` are computed over the received body
+  before the gateway strips the header on the way to the backend.
+  Mismatches surface as `BadDigest` (HTTP 400), matching AWS. The
+  remaining S3 checksum algorithms (CRC32 non-Castagnoli, SHA-1,
+  CRC64-NVME) and the streaming-framed PUT path are tracked as
+  follow-ups — covered in this release: buffered-path PUT,
+  `UploadPart`.
+- **#123 HIGH-13 — SigV4a Authorization parser now rejects
+  duplicate `Credential=` / `SignedHeaders=` / `Signature=` fields
+  (`sigv4a.rs:226`).** The previous loop overwrote on each match;
+  an attacker could send `Credential=AKIAVICTIM,Credential=AKIAATTACKER,
+  Signature=<valid-for-attacker>` and the verifier would pick the
+  attacker while a sidecar parser scanning left-to-right would see
+  the victim. Auth-confusion vector closed; duplicates now surface
+  as `BadSignature` at parse time.
+- **#124 HIGH-14 — `decode_index` no longer pre-allocates the full
+  attacker-claimed entry table (`index.rs:312`).** Mirrors the #89
+  hardening pattern: the initial `Vec::with_capacity` clamps to
+  4096 entries (128 KiB at 32 B/entry) and the `push` loop grows
+  the vector under the existing `expected_remaining == input.len()`
+  bound. A 3.2 GiB forged sidecar can no longer drive a 3.2 GiB
+  `Vec` allocation. Closes the obvious "same class as #89, applied
+  to sidecar" finding a reviewer would otherwise paste next to the
+  README's fuzz claim.
+
+### Tests
+
+- 438 lib + 45 integration tests green; `cargo fmt --all --check`
+  clean.
+
+### Notes
+
+- v0.8.12 is a strict superset of v0.8.11; the same `--trust-x-forwarded-for`
+  CLI flag still controls the v0.8.11 CRIT-4 default behaviour.
+- This release closes the **complete CRIT + HIGH set** from the
+  pre-release review. Remaining MED / LOW items (12 magic-byte rule
+  count is correct as of v0.8.11, dispatcher `Bitcomp` auto-promote,
+  multi-window sampling, etc.) are tracked individually and don't
+  block the public launch.
+
 ## [0.8.11] — 2026-06-06
 
 Pre-release **security review sweep** — 5 CRIT findings from a

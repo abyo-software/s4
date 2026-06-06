@@ -4202,7 +4202,7 @@ dependencies = [
 
 [[package]]
 name = "s4-codec"
-version = "0.8.11"
+version = "0.8.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4222,7 +4222,7 @@ dependencies = [
 
 [[package]]
 name = "s4-codec-py"
-version = "0.8.11"
+version = "0.8.12"
 dependencies = [
  "bytes",
  "pyo3",
@@ -4233,7 +4233,7 @@ dependencies = [
 
 [[package]]
 name = "s4-codec-wasm"
-version = "0.8.11"
+version = "0.8.12"
 dependencies = [
  "bytes",
  "console_error_panic_hook",
@@ -4248,7 +4248,7 @@ dependencies = [
 
 [[package]]
 name = "s4-config"
-version = "0.8.11"
+version = "0.8.12"
 dependencies = [
  "anyhow",
  "serde",
@@ -4256,7 +4256,7 @@ dependencies = [
 
 [[package]]
 name = "s4-server"
-version = "0.8.11"
+version = "0.8.12"
 dependencies = [
  "aes-gcm",
  "anyhow",

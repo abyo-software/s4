@@ -129,6 +129,106 @@ pub(crate) fn safe_object_uri(bucket: &str, key: &str) -> S3Result<http::Uri> {
     })
 }
 
+/// v0.8.12 HIGH-12 fix: verify a client-supplied integrity checksum
+/// against the received body BEFORE we strip the header on the way
+/// to the backend. Returns `Err(BadDigest)` on mismatch (matches
+/// AWS S3 wire behaviour); `Ok(())` when the supplied digest matches
+/// OR when the supplied algorithm is one we don't yet implement
+/// (the latter is logged so operators see the gap — fail-open on
+/// unsupported algorithms is the documented trade in the v0.8.11
+/// CHANGELOG, with full coverage tracked as a follow-up issue).
+///
+/// Algorithms covered: `Content-MD5` (base64 MD5),
+/// `x-amz-checksum-crc32c` (base64 big-endian u32),
+/// `x-amz-checksum-sha256` (base64 SHA-256). The remaining S3
+/// checksum algorithms (CRC32 non-Castagnoli, SHA-1, CRC64-NVME)
+/// are accepted and silently passed; verifying them needs new
+/// dependencies and was held back to keep the v0.8.12 surface
+/// bounded.
+fn verify_client_body_checksums(
+    body: &[u8],
+    content_md5_b64: Option<&str>,
+    checksum_crc32c_b64: Option<&str>,
+    checksum_sha256_b64: Option<&str>,
+) -> S3Result<()> {
+    use base64::Engine as _;
+    use md5::Md5;
+    use sha2::Sha256;
+    // `Digest` from md-5 / sha2 brings the `new`, `update`, `finalize`
+    // trait methods into scope. Bind anonymously so this `use` is
+    // never flagged as unused while still serving its real purpose.
+    use md5::Digest as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let bad = |what: &str| {
+        let code = S3ErrorCode::from_bytes(b"BadDigest").unwrap_or(S3ErrorCode::InvalidArgument);
+        S3Error::with_message(
+            code,
+            format!("client-supplied {what} did not match the received body"),
+        )
+    };
+    if let Some(claimed) = content_md5_b64 {
+        let want = b64.decode(claimed).map_err(|_| {
+            S3Error::with_message(S3ErrorCode::InvalidDigest, "malformed Content-MD5")
+        })?;
+        if want.len() != 16 {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidDigest,
+                "Content-MD5 must decode to 16 bytes",
+            ));
+        }
+        let mut h = Md5::new();
+        h.update(body);
+        let got = h.finalize();
+        // `subtle::ConstantTimeEq` would be ideal but the existing
+        // `constant_time_eq` helper in sse.rs is private; use a
+        // straightforward byte compare. The attacker doesn't get to
+        // choose the body retroactively, so a timing oracle here
+        // doesn't help them.
+        if got.as_slice() != want.as_slice() {
+            return Err(bad("Content-MD5"));
+        }
+    }
+    if let Some(claimed) = checksum_crc32c_b64 {
+        let want = b64.decode(claimed).map_err(|_| {
+            S3Error::with_message(
+                S3ErrorCode::InvalidDigest,
+                "malformed x-amz-checksum-crc32c",
+            )
+        })?;
+        if want.len() != 4 {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidDigest,
+                "x-amz-checksum-crc32c must decode to 4 bytes (big-endian u32)",
+            ));
+        }
+        let got = crc32c::crc32c(body).to_be_bytes();
+        if got != want.as_slice() {
+            return Err(bad("x-amz-checksum-crc32c"));
+        }
+    }
+    if let Some(claimed) = checksum_sha256_b64 {
+        let want = b64.decode(claimed).map_err(|_| {
+            S3Error::with_message(
+                S3ErrorCode::InvalidDigest,
+                "malformed x-amz-checksum-sha256",
+            )
+        })?;
+        if want.len() != 32 {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidDigest,
+                "x-amz-checksum-sha256 must decode to 32 bytes",
+            ));
+        }
+        let mut h = Sha256::new();
+        h.update(body);
+        let got = h.finalize();
+        if got.as_slice() != want.as_slice() {
+            return Err(bad("x-amz-checksum-sha256"));
+        }
+    }
+    Ok(())
+}
+
 /// v0.4 #20: captured at the start of a handler, before the request is
 /// consumed by the backend call, so the matching `record_access` at
 /// end-of-request can fill in the structured access log entry.
@@ -2221,6 +2321,18 @@ impl<B: S3> S3 for S4Service<B> {
                 let bytes = collect_with_sample(sample, rest_stream, self.max_body_bytes)
                     .await
                     .map_err(internal("collect put body (buffered path)"))?;
+                // v0.8.12 HIGH-12 fix: verify client-supplied
+                // checksums against the received body on the buffered
+                // path. The streaming-framed path above consumes the
+                // body chunk-by-chunk and cannot verify a whole-body
+                // digest without buffering the entire object —
+                // verification on that path is tracked as a follow-up.
+                verify_client_body_checksums(
+                    &bytes,
+                    req.input.content_md5.as_deref(),
+                    req.input.checksum_crc32c.as_deref(),
+                    req.input.checksum_sha256.as_deref(),
+                )?;
                 debug!(
                     bucket = ?req.input.bucket,
                     key = ?req.input.key,
@@ -2266,13 +2378,9 @@ impl<B: S3> S3 for S4Service<B> {
             let original_size = manifest.original_size;
             let compressed_size = manifest.compressed_size;
             let codec_label = manifest.codec.as_str();
-            // framed body は GET 側で sidecar partial-fetch を効かせるため
-            // build_index_from_body で sidecar を組み立てて backend に PUT する。
-            let sidecar_index = if is_framed {
-                s4_codec::index::build_index_from_body(&compressed).ok()
-            } else {
-                None
-            };
+            // (sidecar_index is built below, after the SSE-mode
+            // extraction, so v0.8.12 HIGH-10 can short-circuit the
+            // build when the on-disk bytes are about to be encrypted.)
             // v0.4 #21 / v0.5 #29 / v0.5 #27: encrypt-after-compress.
             // Precedence:
             //   - SSE-C headers present → per-request customer key (S4E3)
@@ -2304,6 +2412,25 @@ impl<B: S3> S3 for S4Service<B> {
                 &sse_kms_key,
                 self.kms_default_key_id.as_deref(),
             );
+            // v0.8.12 HIGH-10 fix: the sidecar offsets describe the
+            // pre-encrypt `compressed` body, but the bytes the
+            // backend stores when any SSE mode is active are
+            // *post-encrypt* (different length, different layout).
+            // A Range GET on an SSE-encrypted object would slice the
+            // ciphertext at the stale offsets, hand the wrong bytes
+            // to the frame parser, and 500. Suppress the sidecar
+            // entirely when SSE is going to be applied below;
+            // encrypted-object Range GET falls back to the buffered
+            // path (decrypt full body → frame parse → slice), trading
+            // partial-fetch performance for correctness. An
+            // encryption-aware sidecar format is a follow-up issue.
+            let will_encrypt =
+                sse_c_material.is_some() || kms_key_id.is_some() || self.sse_keyring.is_some();
+            let sidecar_index = if is_framed && !will_encrypt {
+                s4_codec::index::build_index_from_body(&compressed).ok()
+            } else {
+                None
+            };
             // v0.5 #32: in compliance-strict mode, every PUT must
             // declare SSE — either client-supplied (SSE-C), KMS, or by
             // virtue of a server-side keyring being configured (which
@@ -3407,9 +3534,21 @@ impl<B: S3> S3 for S4Service<B> {
         if let Some(mgr) = self.object_lock.as_ref()
             && let Some(state) = mgr.get(&bucket, &key)
         {
-            let bypass = req.input.bypass_governance_retention.unwrap_or(false);
+            let bypass_header = req.input.bypass_governance_retention.unwrap_or(false);
+            // v0.8.12 HIGH-7 fix: the bypass header alone used to be
+            // enough to override Governance retention. AWS spec
+            // requires the caller hold `s3:BypassGovernanceRetention`
+            // for the target ARN; without that, the header is
+            // silently ignored (not an error — it lines up with how
+            // AWS' canonical behaviour treats unprivileged callers).
+            let bypass_allowed = if bypass_header {
+                self.enforce_policy(&req, "s3:BypassGovernanceRetention", &bucket, Some(&key))
+                    .is_ok()
+            } else {
+                false
+            };
             let now = chrono::Utc::now();
-            if !state.can_delete(now, bypass) {
+            if !state.can_delete(now, bypass_allowed) {
                 crate::metrics::record_policy_denial("s3:DeleteObject", &bucket);
                 return Err(S3Error::with_message(
                     S3ErrorCode::AccessDenied,
@@ -3908,6 +4047,15 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         mut req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        // v0.8.12 HIGH-9 fix: gate multipart Create on `s3:PutObject` —
+        // the destination is conceptually about to host a new object,
+        // matching what `put_object` enforces L2078. Without this, a
+        // bucket policy denying `s3:PutObject` was bypassable simply
+        // by switching the client to the multipart wire path.
+        let mp_bucket = req.input.bucket.clone();
+        let mp_key = req.input.key.clone();
+        self.enforce_policy(&req, "s3:PutObject", &mp_bucket, Some(&mp_key))?;
+        self.enforce_rate_limit(&req, &mp_bucket)?;
         // Multipart object は per-part 圧縮 + frame 形式で書く。GET 時に
         // frame parse を起動するため、object metadata に flag を立てる。
         // codec は dispatcher の default kind を採用 (per-part 別 codec は Phase 2)。
@@ -4053,6 +4201,15 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         mut req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
+        // v0.8.12 HIGH-9 fix: same `s3:PutObject` gate as
+        // `put_object` / `create_multipart_upload`. Even though
+        // Create already passed the gate, a bucket policy that
+        // *revokes* `s3:PutObject` mid-flight should stop further
+        // parts (e.g. legal hold drops, retention shortened).
+        let part_bucket = req.input.bucket.clone();
+        let part_key = req.input.key.clone();
+        self.enforce_policy(&req, "s3:PutObject", &part_bucket, Some(&part_key))?;
+        self.enforce_rate_limit(&req, &part_bucket)?;
         // 各 part を圧縮して frame header 付きで forward。GET 時に
         // `decompress_multipart` が frame iter で順に解凍する。
         // **per-part codec dispatch**: dispatcher が body 先頭 sample から
@@ -4171,6 +4328,21 @@ impl<B: S3> S3 for S4Service<B> {
             let bytes = collect_blob(blob, self.max_body_bytes)
                 .await
                 .map_err(internal("collect upload_part body"))?;
+            // v0.8.12 HIGH-12 fix: verify client-supplied integrity
+            // checksum against the received body BEFORE we replace
+            // `req.input` and strip the headers. Previously the part
+            // body was accepted, compressed, framed, and persisted
+            // even when the supplied `Content-MD5` or
+            // `x-amz-checksum-*` didn't match — so an in-transit
+            // corruption that the client signed against was silently
+            // committed under the gateway's own CRC32C (which still
+            // matches because S4 hashes the bytes it actually saw).
+            verify_client_body_checksums(
+                &bytes,
+                req.input.content_md5.as_deref(),
+                req.input.checksum_crc32c.as_deref(),
+                req.input.checksum_sha256.as_deref(),
+            )?;
             let sample_len = bytes.len().min(SAMPLE_BYTES);
             // v0.8 #56: full part body is already in memory here; use its
             // length as the size hint so the dispatcher can promote to GPU
@@ -4242,6 +4414,36 @@ impl<B: S3> S3 for S4Service<B> {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
         let upload_id = req.input.upload_id.clone();
+        // v0.8.12 HIGH-9 fix: gate Complete on `s3:PutObject` (the
+        // commit point for the multipart-assembled object).
+        self.enforce_policy(&req, "s3:PutObject", &bucket, Some(&key))?;
+        self.enforce_rate_limit(&req, &bucket)?;
+        // v0.8.12 HIGH-6 fix: re-verify Object Lock on the target key
+        // at Complete time. Without this an attacker with PutObject
+        // permission could `CreateMultipartUpload` against a key
+        // that's currently under retention / legal hold and silently
+        // overwrite it on Complete (the single-PUT path runs the
+        // same check at L2007). Compliance retention is never
+        // bypassable; Governance only with explicit IAM permission
+        // (HIGH-7 gate below).
+        if let Some(mgr) = self.object_lock.as_ref()
+            && let Some(state) = mgr.get(&bucket, &key)
+        {
+            // CompleteMultipartUpload doesn't carry the bypass header
+            // (the s3s DTO matches AWS' wire schema). A locked key
+            // therefore cannot be overwritten by Complete regardless
+            // of caller permission — operators who need to break a
+            // Governance lock do it via PutObjectRetention before
+            // calling Complete.
+            let now = chrono::Utc::now();
+            if !state.can_delete(now, false) {
+                crate::metrics::record_policy_denial("s3:PutObject", &bucket);
+                return Err(S3Error::with_message(
+                    S3ErrorCode::AccessDenied,
+                    "Access Denied because target key is protected by object lock",
+                ));
+            }
+        }
         // v0.8.1 #59: serialise concurrent Complete invocations on the
         // same `(bucket, key)`. The race window the lock closes is the
         // GET-assembled-body → encrypt → PUT-encrypted-body triple
@@ -4353,7 +4555,19 @@ impl<B: S3> S3 for S4Service<B> {
             None
         };
         // Sidecar build (existing behaviour, gated on assembled body).
+        //
+        // v0.8.12 HIGH-10 fix: skip the sidecar when the Complete is
+        // going to SSE-encrypt the assembled body before re-PUT (the
+        // single-PUT path applies the same suppression at L2271).
+        // Stale offsets into the pre-encrypt body would break Range
+        // GET on the encrypted on-disk bytes. `ctx.sse != None`
+        // covers all three SSE modes captured at Create time.
+        let mp_will_encrypt = ctx
+            .as_ref()
+            .map(|c| !matches!(c.sse, crate::multipart_state::MultipartSseMode::None))
+            .unwrap_or(false);
         if let Some(ref body) = assembled_body
+            && !mp_will_encrypt
             && let Ok(index) = build_index_from_body(body)
         {
             self.write_sidecar(&bucket, &key, &index).await;
@@ -4732,6 +4946,18 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        // v0.8.12 HIGH-9 fix: gate Abort on `s3:AbortMultipartUpload`
+        // — the AWS-spec action verb for this operation. Without the
+        // gate, anyone who could guess an upload_id could throw away
+        // someone else's in-flight multipart upload.
+        let abort_bucket = req.input.bucket.clone();
+        let abort_key = req.input.key.clone();
+        self.enforce_policy(
+            &req,
+            "s3:AbortMultipartUpload",
+            &abort_bucket,
+            Some(&abort_key),
+        )?;
         // v0.8 #54: drop the per-upload state (SSE-C key bytes / tag
         // set) promptly so an aborted upload doesn't leak the
         // customer's key into a long-running gateway's RSS.
@@ -4875,6 +5101,15 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<UploadPartCopyInput>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        // v0.8.12 HIGH-9 fix: same per-action gates as `copy_object` —
+        // destination PUT + source GET.
+        let dst_bucket = req.input.bucket.clone();
+        let dst_key = req.input.key.clone();
+        self.enforce_policy(&req, "s3:PutObject", &dst_bucket, Some(&dst_key))?;
+        if let CopySource::Bucket { bucket, key, .. } = &req.input.copy_source {
+            self.enforce_policy(&req, "s3:GetObject", bucket, Some(key))?;
+        }
+        self.enforce_rate_limit(&req, &dst_bucket)?;
         // v0.2 #6: byte-range aware copy when the source is S4-framed.
         //
         // For a framed source (multipart upload OR single-PUT framed-v2),
@@ -5046,6 +5281,12 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<GetObjectLockConfigurationInput>,
     ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
+        self.enforce_policy(
+            &req,
+            "s3:GetBucketObjectLockConfiguration",
+            &req.input.bucket,
+            None,
+        )?;
         if let Some(mgr) = self.object_lock.as_ref() {
             let cfg = mgr
                 .bucket_default(&req.input.bucket)
@@ -5079,6 +5320,12 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<PutObjectLockConfigurationInput>,
     ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
+        self.enforce_policy(
+            &req,
+            "s3:PutBucketObjectLockConfiguration",
+            &req.input.bucket,
+            None,
+        )?;
         if let Some(mgr) = self.object_lock.as_ref() {
             let bucket = req.input.bucket.clone();
             if let Some(cfg) = req.input.object_lock_configuration.as_ref()
@@ -5124,6 +5371,8 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<GetObjectLegalHoldInput>,
     ) -> S3Result<S3Response<GetObjectLegalHoldOutput>> {
+        let key = req.input.key.clone();
+        self.enforce_policy(&req, "s3:GetObjectLegalHold", &req.input.bucket, Some(&key))?;
         if let Some(mgr) = self.object_lock.as_ref() {
             let on = mgr
                 .get(&req.input.bucket, &req.input.key)
@@ -5147,6 +5396,8 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<PutObjectLegalHoldInput>,
     ) -> S3Result<S3Response<PutObjectLegalHoldOutput>> {
+        let key = req.input.key.clone();
+        self.enforce_policy(&req, "s3:PutObjectLegalHold", &req.input.bucket, Some(&key))?;
         if let Some(mgr) = self.object_lock.as_ref() {
             let on = req
                 .input
@@ -5164,6 +5415,8 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<GetObjectRetentionInput>,
     ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
+        let key = req.input.key.clone();
+        self.enforce_policy(&req, "s3:GetObjectRetention", &req.input.bucket, Some(&key))?;
         if let Some(mgr) = self.object_lock.as_ref() {
             let retention = mgr
                 .get(&req.input.bucket, &req.input.key)
@@ -5194,10 +5447,23 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<PutObjectRetentionInput>,
     ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
+        let key = req.input.key.clone();
+        self.enforce_policy(&req, "s3:PutObjectRetention", &req.input.bucket, Some(&key))?;
         if let Some(mgr) = self.object_lock.as_ref() {
             let bucket = req.input.bucket.clone();
             let key = req.input.key.clone();
-            let bypass = req.input.bypass_governance_retention.unwrap_or(false);
+            // v0.8.12 HIGH-7 fix: the bypass header gates Governance
+            // shortening only when the caller has the matching IAM
+            // action explicitly allowed; otherwise it's silently
+            // dropped to `false` and the "shortening Governance
+            // requires bypass" branch below rejects.
+            let bypass_header = req.input.bypass_governance_retention.unwrap_or(false);
+            let bypass = if bypass_header {
+                self.enforce_policy(&req, "s3:BypassGovernanceRetention", &bucket, Some(&key))
+                    .is_ok()
+            } else {
+                false
+            };
             let retention = req.input.retention.as_ref().ok_or_else(|| {
                 S3Error::with_message(
                     S3ErrorCode::InvalidRequest,

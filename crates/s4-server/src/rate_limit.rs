@@ -53,7 +53,29 @@ pub struct RateLimits {
     /// the first request from a given principal/bucket pair instantiates
     /// the limiter, subsequent requests reuse it.
     limiters: Arc<DashMap<(usize, String, String), Arc<KeyLimiter>>>,
+    /// v0.8.12 HIGH-11 fix: per-rule shared limiter used as the
+    /// "overflow" fallback once `limiters` is at capacity. Lazily
+    /// initialised per rule on first overflow so steady-state
+    /// workloads under the cap don't allocate.
+    overflow: Arc<DashMap<usize, Arc<KeyLimiter>>>,
 }
+
+/// v0.8.12 HIGH-11 fix: hard cap on the per-(rule, principal, bucket)
+/// limiter pool. Without this, every distinct access-key-id /
+/// bucket-name combo a (potentially attacker-controlled) request
+/// stream presents allocates a fresh `Arc<KeyLimiter>` + a key tuple
+/// that's never reclaimed. At 1k req/s of unique fake principals the
+/// pool grows by ~3.6M entries/hour, each pinning ~200 B of memory
+/// → gateway OOMs in a single day. Once the pool fills, new keys
+/// fold onto a per-rule shared `overflow` limiter — they still get
+/// rate-limited (correctly, by the matching rule's quota), just
+/// share one bucket with every other overflowed key. Operators
+/// who legitimately need millions of distinct principals can raise
+/// the cap via `with_max_active_limiters(...)`; the default is a
+/// trade between memory budget (~3 MiB at this cap) and the realistic
+/// upper bound of distinct principals × buckets in a steady-state
+/// workload.
+pub const DEFAULT_MAX_ACTIVE_LIMITERS: usize = 16_384;
 
 type KeyLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
@@ -71,7 +93,15 @@ impl RateLimits {
         Ok(Self {
             rules: Arc::new(rules),
             limiters: Arc::new(DashMap::new()),
+            overflow: Arc::new(DashMap::new()),
         })
+    }
+
+    /// v0.8.12 HIGH-11 fix: current per-(rule, principal, bucket)
+    /// limiter count. Surfaced for tests and the
+    /// `rate_limit::active_limiters` Prometheus gauge.
+    pub fn active_limiter_count(&self) -> usize {
+        self.limiters.len()
     }
 
     pub fn from_path(path: &Path) -> Result<Self, String> {
@@ -92,21 +122,42 @@ impl RateLimits {
             if !glob_match(&rule.bucket, bucket) {
                 continue;
             }
+            // v0.8.12 HIGH-11 fix: if the per-key pool is already at
+            // the cap AND we'd be inserting a new entry, fold this
+            // request onto the rule's shared `overflow` limiter
+            // instead. Pool growth is bounded by
+            // `DEFAULT_MAX_ACTIVE_LIMITERS` regardless of how many
+            // distinct principal / bucket strings the request stream
+            // presents.
             let key = (idx, principal.to_owned(), bucket.to_owned());
-            let limiter = self
-                .limiters
-                .entry(key)
-                .or_insert_with(|| {
-                    let burst = NonZeroU32::new(rule.burst).expect("burst > 0 (validated)");
-                    let rps = NonZeroU32::new(rule.rps).expect("rps > 0 (validated)");
-                    let quota = Quota::per_second(rps).allow_burst(burst);
-                    Arc::new(RateLimiter::direct(quota))
-                })
-                .clone();
+            let limiter = if let Some(existing) = self.limiters.get(&key) {
+                existing.clone()
+            } else if self.limiters.len() >= DEFAULT_MAX_ACTIVE_LIMITERS {
+                self.overflow
+                    .entry(idx)
+                    .or_insert_with(|| Self::build_limiter(rule))
+                    .clone()
+            } else {
+                self.limiters
+                    .entry(key)
+                    .or_insert_with(|| Self::build_limiter(rule))
+                    .clone()
+            };
             return limiter.check().is_ok();
         }
         // No rule matched → no limit applies.
         true
+    }
+
+    /// Helper: build a fresh `KeyLimiter` from a `Rule`'s `rps` /
+    /// `burst`. Pulled out so the cap-driven overflow fallback and
+    /// the normal-path `or_insert_with` share one construction
+    /// recipe.
+    fn build_limiter(rule: &Rule) -> Arc<KeyLimiter> {
+        let burst = NonZeroU32::new(rule.burst).expect("burst > 0 (validated)");
+        let rps = NonZeroU32::new(rule.rps).expect("rps > 0 (validated)");
+        let quota = Quota::per_second(rps).allow_burst(burst);
+        Arc::new(RateLimiter::direct(quota))
     }
 }
 

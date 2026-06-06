@@ -213,13 +213,39 @@ pub fn parse_authorization_header(header: &str) -> Result<SigV4aAuth, SigV4aErro
     let mut signed_headers: Option<&str> = None;
     let mut signature: Option<&str> = None;
 
+    // v0.8.12 HIGH-13 fix: AWS SigV4a mandates each of
+    // `Credential=` / `SignedHeaders=` / `Signature=` appears exactly
+    // once. The previous loop overwrote on every match, which gave a
+    // textbook auth-confusion vector: an attacker could send
+    //   `Credential=AKIAVICTIM/..., Credential=AKIAATTACKER/..., \
+    //    SignedHeaders=..., Signature=<valid-for-attacker>`
+    // and the verifier would pick `AKIAATTACKER` (last-write-wins)
+    // while a sidecar parser (access log / WAF / IDS) scanning the
+    // header from the left would see `AKIAVICTIM`. Reject duplicates
+    // with the same `BadSignature` shape so the request fails closed
+    // at parse time.
     for part in rest.split(',') {
         let part = part.trim();
         if let Some(v) = part.strip_prefix("Credential=") {
+            if credential.is_some() {
+                return Err(SigV4aError::BadSignature(
+                    "duplicate Credential= field in Authorization header".into(),
+                ));
+            }
             credential = Some(v);
         } else if let Some(v) = part.strip_prefix("SignedHeaders=") {
+            if signed_headers.is_some() {
+                return Err(SigV4aError::BadSignature(
+                    "duplicate SignedHeaders= field in Authorization header".into(),
+                ));
+            }
             signed_headers = Some(v);
         } else if let Some(v) = part.strip_prefix("Signature=") {
+            if signature.is_some() {
+                return Err(SigV4aError::BadSignature(
+                    "duplicate Signature= field in Authorization header".into(),
+                ));
+            }
             signature = Some(v);
         }
     }
