@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.22] — 2026-06-07
+
+Seventh-round review caught that R6-6 introduced a fresh
+fabrication (the SIGUSR1 grep target didn't match the real log
+line) plus 2 stale stamps the audit cycles had left behind.
+
+### Fixed
+
+- **#200 R7-1** — Runbook §1 SIGUSR1 grep target corrected to
+  `"S4 SIGUSR1: dumped attached-manager snapshots"` (the real
+  substring in `main.rs:1830`). R6-6 used
+  `"SIGUSR1: dumped all state snapshots"`, which never matches
+  — the recipe would hang on `grep -m1` until the operator
+  gave up and fell back to the `sleep 5` floor.
+- **#201 R7-2** — README §roadmap "v0.8.8 released
+  (2026-05-20)" bullet replaced with a moving-target
+  reference to CHANGELOG + GitHub Releases. The pinned bullet
+  was 13 patches stale (we are on v0.8.22) and would have
+  drifted again on the next cut.
+- **#202 R7-3** — Threat-model and runbook "Last reviewed"
+  stamps now both read `v0.8.22` and carry a one-line
+  **Stamp policy** note declaring that future cuts bump both
+  stamps in lockstep. v0.8.20 had bumped threat-model only
+  (R5-6); v0.8.21 had bumped runbook only (R6-3); the
+  divergence was itself a finding in R7.
+
+### Tests
+
+- 449 lib + 45 integration + 11 SigV4 vectors + 2 bolero + 1
+  chaos unchanged; clippy + fmt clean.
+
+### Notes
+
+- Round 7 surfaced **1 HIGH + 2 LOW** vs Round 6's **1 HIGH +
+  4 MED + 1 LOW**. The findings curve is genuinely converging.
+  Round 8 expected to hit 0 or 1; if it finds more, the cause
+  is almost certainly a class of bug we haven't been grepping
+  for yet.
+
 ## [0.8.21] — 2026-06-07
 
 Sixth-round review caught that v0.8.20 R5-8 walked the

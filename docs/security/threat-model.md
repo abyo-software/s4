@@ -1,6 +1,9 @@
 # S4 threat model
 
-**Last reviewed:** v0.8.20 (2026-06-07)
+**Last reviewed:** v0.8.22 (2026-06-07)
+**Stamp policy:** bumped on every cut so the threat model + runbook
+review stamps stay aligned; companion doc is
+[`docs/ops/runbook.md`](../ops/runbook.md).
 **Scope:** S4 — S3-compatible gateway with transparent GPU/CPU
 compression. Single-binary `s4-server` listening on HTTP/HTTPS,
 talking to an operator-provided S3-protocol backend (AWS S3,
@@ -189,4 +192,4 @@ See `docs/ops/runbook.md` for operator procedures on:
 
 Threat model is reviewed at every minor release that touches
 the listener edge or the codec wire format. Last full review:
-v0.8.20 (post five audit cycles).
+v0.8.22 (post seven audit cycles).

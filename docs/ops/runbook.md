@@ -1,6 +1,9 @@
 # S4 operations runbook
 
-**Last reviewed:** v0.8.21 (2026-06-07)
+**Last reviewed:** v0.8.22 (2026-06-07)
+**Stamp policy:** bumped on every cut so the runbook + threat model
+review stamps stay aligned; companion doc is
+[`docs/security/threat-model.md`](../security/threat-model.md).
 
 Procedures for operating an S4 gateway in production. Each
 section is structured as **Symptom → Diagnose → Mitigate →
@@ -92,7 +95,7 @@ sudo mv /var/lib/s4/access-log/$(date +%Y%m%d).log /backup/
 #
 #   sudo kill -USR1 $(pidof s4-server)
 #   sudo journalctl -u s4-server -f --since "10 seconds ago" \
-#       | grep -m1 "SIGUSR1: dumped all state snapshots"
+#       | grep -m1 "S4 SIGUSR1: dumped attached-manager snapshots"
 #   sudo systemctl restart s4-server
 #
 # If you cannot tail the journal interactively, `sleep 5` is a

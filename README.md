@@ -934,15 +934,17 @@ needed bytes from S3.
 > a structural issue (CHANGELOG will call this out explicitly when it
 > happens).
 
-- **v0.8.8 released** (2026-05-20) — see [CHANGELOG.md](CHANGELOG.md) for
-  the full per-version history. Cumulative scope across v0.1 → v0.8.8 is
-  620+ workspace tests + 12 production milestones covering S3-compatible
-  PUT / GET / multipart / Select / SSE-S3 / SSE-KMS / SSE-C / IAM
-  Conditions / bucket policy / versioning / object-lock / lifecycle /
-  inventory / notifications (Webhook / SQS / SNS) / replication / CORS /
+- **Latest tag:** see [CHANGELOG.md](CHANGELOG.md) for the full
+  per-version history and the GitHub Releases page for the
+  cut-points. Cumulative scope through the current `0.8.x`
+  series is 540+ workspace tests + 14+ production milestones
+  covering S3-compatible PUT / GET / multipart / Select /
+  SSE-S3 / SSE-KMS / SSE-C / IAM Conditions / bucket policy /
+  versioning / object-lock / lifecycle / inventory /
+  notifications (Webhook / SQS / SNS) / replication / CORS /
   tagging / MFA delete / SigV4 + SigV4a, plus Python
-  (`s4-codec-py`) and browser (`s4-codec-wasm`) bindings, all on
-  crates.io as the
+  (`s4-codec-py`) and browser (`s4-codec-wasm`) bindings, all
+  on crates.io as the
   [`s4-server`](https://crates.io/crates/s4-server) /
   [`s4-codec`](https://crates.io/crates/s4-codec) /
   [`s4-config`](https://crates.io/crates/s4-config) trio.
