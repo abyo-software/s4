@@ -138,7 +138,17 @@ impl PrincipalSet {
     }
 }
 
+/// v0.8.11 CRIT-5: `deny_unknown_fields` to fail-closed on
+/// `NotAction` / `NotResource` / `NotPrincipal` and other AWS
+/// policy keywords S4 does not implement. Without this, serde
+/// silently drops them and a policy author who writes
+/// `{"NotResource": "secret/*"}` thinks they're scoping the rule
+/// to everything *except* secret/* — actual behaviour is "no
+/// Resource restriction" → matches everything including secret/*.
+/// Fail-open is the worst kind of policy bug; this turns it into
+/// a parse error the operator sees at config-load time.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StatementJson {
     #[serde(rename = "Sid")]
     sid: Option<String>,
@@ -160,9 +170,14 @@ struct StatementJson {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PolicyJson {
     #[serde(rename = "Version")]
     _version: Option<String>,
+    /// AWS canonical bucket policies often carry a top-level `Id`.
+    /// Accept-and-ignore is fine; the field is informational.
+    #[serde(rename = "Id", default)]
+    _id: Option<String>,
     #[serde(rename = "Statement")]
     statements: Vec<StatementJson>,
 }

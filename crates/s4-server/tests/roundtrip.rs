@@ -602,7 +602,15 @@ async fn policy_iam_condition_ip_address_denies_outside_cidr() {
             make_registry(CodecKind::CpuZstd),
             make_dispatcher(CodecKind::CpuZstd),
         )
-        .with_policy(Arc::new(policy));
+        .with_policy(Arc::new(policy))
+        // v0.8.11 CRIT-4 fix: the test exercises the IP-allowlist
+        // policy as if behind a trusted reverse proxy, so opt in to
+        // honouring X-Forwarded-For. Without this the new default
+        // (header ignored) makes source_ip = None and the IpAddress
+        // condition correctly fails for every request — which is the
+        // fail-closed behaviour public-internet listeners now get
+        // by default.
+        .with_trust_x_forwarded_for(true);
 
         // Inside the trusted CIDR → allow.
         let resp = s4

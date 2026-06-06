@@ -322,6 +322,21 @@ pub struct S4Service<B: S3> {
     /// queue depth is bounded. Default 1024 (operator-tunable via
     /// `--replication-max-concurrent`).
     replication_semaphore: Arc<tokio::sync::Semaphore>,
+    /// v0.8.11 CRIT-4 fix: trust the `X-Forwarded-For` header for the
+    /// `aws:SourceIp` Condition key only when the operator has
+    /// explicitly opted in via `--trust-x-forwarded-for`. Default
+    /// (`false`) makes the policy evaluator see `source_ip = None`
+    /// for incoming requests, so a public-internet client can no
+    /// longer spoof an internal CIDR by setting `X-Forwarded-For`
+    /// themselves. Operators behind a trusted reverse proxy that
+    /// scrubs / sets `X-Forwarded-For` enable the flag; gateways
+    /// listening directly on the public internet leave it off and
+    /// gain a clear fail-closed default. A future release plumbs
+    /// the TCP peer address through the s3s service trait so we can
+    /// validate the forwarded header against a `--trusted-proxies`
+    /// CIDR list; until then the boolean opt-in closes the immediate
+    /// auth-bypass surface.
+    trust_x_forwarded_for: bool,
 }
 
 impl<B: S3> S4Service<B> {
@@ -381,7 +396,25 @@ impl<B: S3> S4Service<B> {
             replication_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 Self::DEFAULT_REPLICATION_MAX_CONCURRENT,
             )),
+            // v0.8.11 CRIT-4: default fail-closed — ignore client-
+            // supplied `X-Forwarded-For` until the operator opts in
+            // through `with_trust_x_forwarded_for(true)`.
+            trust_x_forwarded_for: false,
         }
+    }
+
+    /// v0.8.11 CRIT-4 fix: opt in to consuming the leftmost token of
+    /// the `X-Forwarded-For` header as `aws:SourceIp`. Only enable
+    /// when the gateway sits behind a trusted reverse proxy that
+    /// strips (or rewrites) any client-supplied value. When left
+    /// off (default), the policy evaluator sees `source_ip = None`
+    /// regardless of what the client sends — closing the
+    /// public-internet `X-Forwarded-For: 10.0.0.1` IAM-allowlist
+    /// bypass.
+    #[must_use]
+    pub fn with_trust_x_forwarded_for(mut self, on: bool) -> Self {
+        self.trust_x_forwarded_for = on;
+        self
     }
 
     /// v0.7 #47: attach the SigV4a verify gate. Once set, the
@@ -1106,12 +1139,20 @@ impl<B: S3> S4Service<B> {
     fn access_log_preamble<I>(&self, req: &S3Request<I>) -> Option<AccessLogPreamble> {
         self.access_log.as_ref()?;
         Some(AccessLogPreamble {
-            remote_ip: req
-                .headers
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|raw| raw.split(',').next())
-                .map(|s| s.trim().to_owned()),
+            // v0.8.11 CRIT-4 fix: same trust gate as `request_context`.
+            // Recording a client-controllable header in the access log
+            // would poison forensic queries; leave it `None` until the
+            // operator declares X-Forwarded-For is set by a trusted
+            // proxy.
+            remote_ip: if self.trust_x_forwarded_for {
+                req.headers
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|raw| raw.split(',').next())
+                    .map(|s| s.trim().to_owned())
+            } else {
+                None
+            },
             requester: Self::principal_of(req).map(str::to_owned),
             request_uri: format!("{} {}", req.method, req.uri.path()),
             user_agent: req
@@ -1231,14 +1272,31 @@ impl<B: S3> S4Service<B> {
             .get("user-agent")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        // X-Forwarded-For is `client, proxy1, proxy2`; the leftmost entry
-        // is the original client. Trim and parse leniently.
-        let source_ip = req
-            .headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|raw| raw.split(',').next())
-            .and_then(|s| s.trim().parse().ok());
+        // v0.8.11 CRIT-4 fix: `X-Forwarded-For` is a client-controllable
+        // header. Trusting it unconditionally lets any public-internet
+        // request claim it came from a trusted CIDR (e.g.
+        // `curl -H 'X-Forwarded-For: 10.0.0.1'` to satisfy a
+        // `Condition: NotIpAddress aws:SourceIp [10.0.0.0/8]` Deny).
+        // We now only consume the header when the operator has
+        // declared "this gateway sits behind a trusted reverse proxy
+        // that scrubs client-supplied values" via
+        // `with_trust_x_forwarded_for(true)` /
+        // `--trust-x-forwarded-for`. Default leaves `source_ip` as
+        // `None`, which fails closed for IP-allowlist Allow rules
+        // and fails open for IP-blocklist Deny rules — operators
+        // who need either case behind a public listener must opt in
+        // or move the gate to the reverse proxy. The leftmost
+        // comma-separated token is the originator per the
+        // `X-Forwarded-For: client, proxy1, proxy2` convention.
+        let source_ip = if self.trust_x_forwarded_for {
+            req.headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|raw| raw.split(',').next())
+                .and_then(|s| s.trim().parse().ok())
+        } else {
+            None
+        };
         crate::policy::RequestContext {
             source_ip,
             user_agent,
@@ -2933,8 +2991,25 @@ impl<B: S3> S3 for S4Service<B> {
                 // be absent — otherwise we surface a clear
                 // misconfiguration error instead of silently
                 // falling through to the buffered chunked path.
+                // v0.8.11 CRIT-1 fix: the chunked stream early-return is
+                // only correct when the decrypted body IS the user's
+                // plaintext as-stored. If the object went through the
+                // codec (compressed) or carries S4F2 frames, returning
+                // the decrypt stream directly hands the client
+                // compressed / framed bytes. Restrict the early-return
+                // to codec=Passthrough + non-framed objects; everything
+                // else falls through to the buffered path, which
+                // decrypt-buffers S4E5/S4E6 via
+                // `decrypt_chunked_buffered_default` and then runs the
+                // existing decompress pipeline.
+                let chunked_streaming_safe = !needs_frame_parse
+                    && manifest_opt
+                        .as_ref()
+                        .map(|m| m.codec == CodecKind::Passthrough)
+                        .unwrap_or(false);
                 if matches!(crate::sse::peek_magic(&body), Some("S4E5") | Some("S4E6"))
                     && get_sse_c_material.is_none()
+                    && chunked_streaming_safe
                 {
                     let keyring_arc = self.sse_keyring.clone().ok_or_else(|| {
                         S3Error::with_message(
@@ -3528,7 +3603,100 @@ impl<B: S3> S3 for S4Service<B> {
                 return Err(mfa_error_to_s3(e));
             }
         }
-        self.backend.delete_objects(req).await
+        // v0.8.11 CRIT-3 fix: route every entry through the gated
+        // per-object `delete_object` path so Object Lock, IAM policy,
+        // versioning, tagging, sidecar cleanup and notification fan-
+        // out all fire for batch DELETE. The previous
+        // `self.backend.delete_objects(req).await` straight-through
+        // bypassed every gate, so a `legal_hold=on` key listed inside
+        // a DeleteObjects XML was happily removed.
+        //
+        // S3 spec note: DeleteObjects is "best-effort per object" —
+        // a failure on one key surfaces as an `Errors` entry without
+        // aborting the rest of the batch. Quiet-mode suppresses the
+        // `Deleted` list (errors are still reported). We honour both.
+        let bucket = req.input.bucket.clone();
+        let bypass_governance = req.input.bypass_governance_retention.unwrap_or(false);
+        let mfa_header = req.input.mfa.clone();
+        let quiet = req.input.delete.quiet.unwrap_or(false);
+        let mut deleted: Vec<DeletedObject> = Vec::new();
+        let mut errors: Vec<s3s::dto::Error> = Vec::new();
+        for ident in req.input.delete.objects.iter() {
+            let key = ident.key.clone();
+            let version_id = ident.version_id.clone();
+            let per_input = DeleteObjectInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: version_id.clone(),
+                bypass_governance_retention: Some(bypass_governance),
+                mfa: mfa_header.clone(),
+                ..Default::default()
+            };
+            let per_uri = match safe_object_uri(&bucket, &key) {
+                Ok(u) => u,
+                Err(_) => {
+                    errors.push(s3s::dto::Error {
+                        code: Some("InvalidArgument".to_owned()),
+                        key: Some(key),
+                        message: Some("object key is not URI-encodable".to_owned()),
+                        version_id,
+                    });
+                    continue;
+                }
+            };
+            let per_req = S3Request {
+                input: per_input,
+                method: http::Method::DELETE,
+                uri: per_uri,
+                headers: req.headers.clone(),
+                extensions: http::Extensions::new(),
+                credentials: req.credentials.clone(),
+                region: req.region.clone(),
+                service: req.service.clone(),
+                trailing_headers: None,
+            };
+            match self.delete_object(per_req).await {
+                Ok(resp) => {
+                    let out = resp.output;
+                    // DeleteObjectOutput doesn't surface a separate
+                    // `delete_marker_version_id`; the marker's version
+                    // id is whatever `version_id` carries (when the
+                    // versioning manager pushed a delete-marker, that
+                    // field already holds the marker's vid).
+                    let vid = out.version_id.clone().or(version_id);
+                    deleted.push(DeletedObject {
+                        key: Some(key),
+                        version_id: vid.clone(),
+                        delete_marker: out.delete_marker,
+                        delete_marker_version_id: vid,
+                    });
+                }
+                Err(e) => {
+                    let code_str = e.code().as_str().to_owned();
+                    let msg = e.message().unwrap_or(code_str.as_str()).to_owned();
+                    errors.push(s3s::dto::Error {
+                        code: Some(code_str),
+                        key: Some(key),
+                        message: Some(msg),
+                        version_id,
+                    });
+                }
+            }
+        }
+        let output = DeleteObjectsOutput {
+            deleted: if quiet || deleted.is_empty() {
+                None
+            } else {
+                Some(deleted)
+            },
+            errors: if errors.is_empty() {
+                None
+            } else {
+                Some(errors)
+            },
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
     }
     async fn copy_object(
         &self,
@@ -4242,9 +4410,19 @@ impl<B: S3> S3 for S4Service<B> {
                 .as_ref()
                 .map(|pv| pv.versioned_response)
                 .unwrap_or(false);
-            // Snapshot replication body in advance so we can pass it
-            // to the spawn helper after the (possibly absent) re-PUT.
-            let replication_body = assembled_body.clone();
+            // v0.8.11 CRIT-2 fix: seed the replication body with the
+            // pre-encrypt assembled bytes, but overwrite it with the
+            // post-encrypt `new_body` once the re-PUT branch lands.
+            // The previous "snapshot in advance" pattern shipped the
+            // *plaintext* framed body to the destination bucket even
+            // when SSE-S4 / SSE-C / SSE-KMS was active — the GET on
+            // the destination would then fail to decrypt (or, worse,
+            // succeed in handing out plaintext that the source had
+            // promised was encrypted at rest). When `needs_re_put`
+            // is false (no SSE, no versioning), the backend still
+            // holds the original plaintext-framed bytes, and the
+            // seed value is what the destination should receive.
+            let mut replication_body = assembled_body.clone();
             let mut applied_metadata: Option<std::collections::HashMap<String, String>> = None;
             if needs_re_put && let Some(body) = assembled_body {
                 // v0.8.1 #58: same Zeroizing pattern as put_object's
@@ -4410,6 +4588,14 @@ impl<B: S3> S3 for S4Service<B> {
                     trailing_headers: None,
                 };
                 self.backend.put_object(put_req).await?;
+                // v0.8.11 CRIT-2 fix: refresh the replication snapshot
+                // with the bytes that were actually persisted to the
+                // backend (post-SSE-encrypt for SSE modes; identical to
+                // `body` for `MultipartSseMode::None` + versioning-only
+                // re-PUT). The destination then sees the same on-disk
+                // shape the source does, and a destination GET decrypts
+                // correctly when SSE is on.
+                replication_body = Some(new_body.clone());
                 // If we rewrote the storage key (versioning shadow),
                 // we must drop the original (unshadowed) Complete-
                 // assembled bytes so subsequent listings don't see a

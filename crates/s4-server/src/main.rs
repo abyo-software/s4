@@ -230,6 +230,23 @@ struct Opt {
     #[clap(long, value_name = "BYTES", default_value_t = 1_048_576)]
     sse_chunk_size: usize,
 
+    /// v0.8.11 CRIT-4 fix: opt in to honouring the leftmost token of
+    /// the `X-Forwarded-For` request header as the `aws:SourceIp`
+    /// Condition key (and as the access-log `remote_ip`). Default
+    /// (`false`) makes the gateway treat `X-Forwarded-For` as
+    /// untrusted noise, so a public-internet client can no longer
+    /// satisfy a `Condition: IpAddress aws:SourceIp [10.0.0.0/8]`
+    /// Allow rule by sending the header themselves. Enable ONLY when
+    /// this gateway sits behind a trusted reverse proxy / LB that
+    /// scrubs (or sets) `X-Forwarded-For` for every request. Gateways
+    /// listening directly on the public internet must leave this off
+    /// (or move the IP gate to the proxy). A future release will
+    /// validate the forwarded address against a `--trusted-proxies`
+    /// CIDR list using the real TCP peer; until then this flag is
+    /// the supported way to opt back into the legacy behaviour.
+    #[clap(long, default_value_t = false)]
+    trust_x_forwarded_for: bool,
+
     /// Optional S3-style access-log destination directory. When set,
     /// every completed PUT / GET / DELETE / List request is buffered
     /// and flushed to hourly-rotated `.log` files under the directory.
@@ -937,6 +954,23 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // (--acme) qualifies.
     let listener_secure = opt.tls_cert.is_some() || opt.acme.is_some();
     s4 = s4.with_secure_transport(listener_secure);
+    // v0.8.11 CRIT-4 fix: wire the X-Forwarded-For trust gate.
+    // Default (`false`) means a public-internet client cannot spoof
+    // `aws:SourceIp`; operators behind a trusted reverse proxy pass
+    // `--trust-x-forwarded-for` to restore the legacy behaviour.
+    s4 = s4.with_trust_x_forwarded_for(opt.trust_x_forwarded_for);
+    if opt.trust_x_forwarded_for {
+        info!(
+            "S4 X-Forwarded-For trust: ENABLED — header value is consumed as aws:SourceIp \
+             and access-log remote_ip. Ensure a trusted reverse proxy strips client-supplied \
+             values (v0.8.11 CRIT-4 fix)."
+        );
+    } else {
+        info!(
+            "S4 X-Forwarded-For trust: disabled (default) — aws:SourceIp / access-log \
+             remote_ip stay None until --trust-x-forwarded-for is set (v0.8.11 CRIT-4 fix)."
+        );
+    }
     // v0.8.5 #86 (audit M-2): cap the replication dispatcher pool. The
     // setter clamps to 1 if the operator passed 0 (would deadlock all
     // replicas); see the field-level doc on

@@ -370,7 +370,7 @@ For incident reporting see [SECURITY.md](SECURITY.md).
 │  ┌─────────────────────────────────────────────────────────┐     │
 │  │ s4-codec::CodecDispatcher                               │     │
 │  │   ├─ AlwaysDispatcher                                   │     │
-│  │   └─ SamplingDispatcher  (entropy + 14 magic bytes)     │     │
+│  │   └─ SamplingDispatcher  (entropy + 12 magic bytes)     │     │
 │  └─────────────────────────────────────────────────────────┘     │
 └──────────────────────────────────────────────────────────────────┘
         ▲              ▲              ▲                ▲
@@ -700,8 +700,13 @@ with backend (no network RTT to amortise). TTFB excludes TLS handshake
 - **CRC32C** stored per-object (single PUT) or per-frame (multipart), verified on GET
 - **`copy_object` S4-aware**: source's `s4-*` metadata is preserved across
   `MetadataDirective: REPLACE` (prevents silent corruption of the destination)
-- **Zstd decompression bomb hardening**: `Decoder + take(manifest.original_size + margin)`
-  caps memory regardless of an attacker-controlled manifest claim
+- **Zstd decompression bomb hardening**: `Decoder + take(manifest.original_size + 1024)`
+  caps the decode at the manifest's declared size (+ a small overshoot margin) so a
+  zero-size manifest paired with a high-ratio frame surfaces as a typed `Io("bomb
+  detected")` instead of unbounded RAM growth. The cap is still bound by the
+  manifest claim itself — a 5 GiB manifest is honored up to 5 GiB, so operators
+  must additionally enforce a per-request memory ceiling at the listener
+  (`--max-body-bytes` / a future per-frame cap) for adversarial uploads
 
 ### Storage class transitions
 - Each compressed object is stored as `<key>` + `<key>.s4index` sidecar.

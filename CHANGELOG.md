@@ -7,6 +7,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.11] — 2026-06-06
+
+Pre-release **security review sweep** — 5 CRIT findings from a
+combined Codex CLI + Claude Code review pass, fixed and shipped
+before the public launch. Every CRIT is a real auth / data-integrity
+hole an attacker (or a confused operator) could trigger via the S3
+wire protocol; the patch is one-commit because the findings landed
+together and share build / CHANGELOG churn.
+
+### Fixed
+
+- **#111 CRIT-1 — chunked SSE GET no longer returns un-decompressed
+  bytes (`service.rs:2936`).** When `--sse-s4-key` + `--sse-chunk-size > 0`
+  were both configured, the `S4E5` / `S4E6` GET path took an early
+  return that wired the decrypt stream straight into the HTTP body,
+  skipping the codec decompress / frame parser stages. Clients
+  received S4F2-framed / zstd-compressed bytes instead of plaintext.
+  Fix: the streaming early-return is now gated on
+  `codec == Passthrough && !needs_frame_parse`; everything else
+  falls through to the buffered decrypt path
+  (`decrypt_chunked_buffered_default`), which feeds the existing
+  decompress pipeline. Streaming TTFB benefit preserved for the
+  passthrough case it was designed for.
+- **#112 CRIT-2 — multipart SSE replication no longer leaks plaintext
+  to the destination bucket (`service.rs:4247`).** The replication
+  dispatcher snapshot was taken before the SSE re-encrypt branch, so
+  destinations received the assembled-but-unencrypted framed body
+  even when SSE-S4 / SSE-C / SSE-KMS was active. Destination GETs
+  then failed to decrypt — or, worse, succeeded in handing plaintext
+  to a downstream consumer that had been promised at-rest encryption.
+  Fix: refresh `replication_body` with the post-encrypt `new_body`
+  inside the re-PUT branch so destinations always see the same
+  on-disk shape the source does.
+- **#113 CRIT-3 — `DeleteObjects` no longer bypasses Object Lock /
+  bucket policy / versioning / sidecar cleanup (`service.rs:3588`).**
+  Batch delete used to MFA-check the request and then call
+  `self.backend.delete_objects(req)` straight through, which meant
+  a key under `legal_hold = on` (or `Retain: Governance`) could be
+  removed by listing it inside a DeleteObjects XML — directly
+  contradicting the README's compliance posture. Fix: dispatch every
+  `ObjectIdentifier` through the gated per-object `delete_object`
+  handler, accumulate `DeletedObject` / `Error` lists, and respect
+  `Delete.quiet`. Failures surface as per-key entries in `Errors`
+  (S3 spec — batch never aborts on a single failure).
+- **#114 CRIT-4 — `X-Forwarded-For` is no longer trusted from any
+  client by default (`service.rs:1241`).** The `aws:SourceIp` Condition
+  key and the access-log `remote_ip` field both used to consume the
+  leftmost token of a client-supplied header. A public-internet
+  request could spoof `curl -H 'X-Forwarded-For: 10.0.0.1'` and
+  satisfy any IP-allowlist Allow rule. Fix: the header is ignored by
+  default; operators behind a trusted reverse proxy opt in with
+  `--trust-x-forwarded-for` (new CLI flag) and accept responsibility
+  for the proxy stripping client-supplied values. Boot log explicitly
+  states which mode is active. A future release will validate the
+  forwarded address against a `--trusted-proxies` CIDR list using
+  the real TCP peer address; this opt-in flag closes the immediate
+  auth-bypass without that plumbing.
+- **#115 CRIT-5 — policy parser no longer silently ignores
+  `NotAction` / `NotResource` / `NotPrincipal` and other unsupported
+  AWS keywords (`policy.rs:142`).** Without `#[serde(deny_unknown_fields)]`
+  on `StatementJson` / `PolicyJson`, a policy author writing
+  `{"NotResource": "secret/*"}` was silently parsed as "no Resource
+  restriction" — the rule then matched every object, including
+  `secret/`. Fail-open is the worst kind of policy bug; this turns
+  it into a parse error at config-load time so the operator sees
+  the misconfiguration immediately. The top-level `Id` field (AWS
+  canonical) is now explicitly accepted-and-ignored.
+
+### Changed
+
+- **README "14 magic-byte rules" → 12** (`README.md:373`,
+  `SOCIAL_POSTS.md:90 / :296`). The `looks_already_compressed` matcher
+  has 12 rules (gzip / zstd / PNG / JPEG / PDF / ZIP / 7z / xz /
+  bzip2 / ftyp / EBML / WEBP), not 14. The honest count goes into
+  the launch material.
+- **README zstd decompression bomb hardening wording**
+  (`README.md:703`) clarified. The guard caps the decode at
+  `manifest.original_size + 1024`, not "regardless of an
+  attacker-controlled manifest claim" — a 5 GiB manifest claim is
+  honored up to 5 GiB, so operators need an additional per-request
+  / per-frame memory ceiling at the listener edge for adversarial
+  uploads.
+
+### Tests
+
+- New defaults exercised: `tests/roundtrip.rs::policy_iam_condition_ip_address_denies_outside_cidr`
+  now opts in to `with_trust_x_forwarded_for(true)` since the test
+  models a trusted-proxy deployment.
+- 438 lib + 45 integration tests green; `cargo fmt --all --check`
+  clean.
+
+### Notes
+
+- This is a **behavioural breaking change** for operators relying on
+  the implicit `X-Forwarded-For` trust. Set `--trust-x-forwarded-for`
+  to restore the prior behaviour when the gateway is behind a
+  trusted reverse proxy that scrubs client-supplied values.
+  Gateways listening directly on the public internet should leave
+  the flag off and move IP gating to the proxy.
+
 ## [0.8.10] — 2026-05-20
 
 Pre-launch hardening **Phase 3** (#111 tracker) — docs補強 sweep
