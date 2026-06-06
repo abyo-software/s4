@@ -187,8 +187,10 @@ fn verify_client_body_checksums(
         // `constant_time_eq` helper in sse.rs is private; use a
         // straightforward byte compare. The attacker doesn't get to
         // choose the body retroactively, so a timing oracle here
-        // doesn't help them.
-        if got.as_slice() != want.as_slice() {
+        // doesn't help them. `&got[..]` derefs the GenericArray
+        // into a `&[u8]` (the deprecated `.as_slice()` is gone in
+        // generic-array 1.x; CI runs `-D warnings`).
+        if got[..] != *want.as_slice() {
             return Err(bad("Content-MD5"));
         }
     }
@@ -226,7 +228,7 @@ fn verify_client_body_checksums(
         let mut h = Sha256::new();
         h.update(body);
         let got = h.finalize();
-        if got.as_slice() != want.as_slice() {
+        if got[..] != *want.as_slice() {
             return Err(bad("x-amz-checksum-sha256"));
         }
     }
@@ -265,7 +267,7 @@ fn verify_client_body_checksums(
         let mut h = Sha1::new();
         h.update(body);
         let got = h.finalize();
-        if got.as_slice() != want.as_slice() {
+        if got[..] != *want.as_slice() {
             return Err(bad("x-amz-checksum-sha1"));
         }
     }
