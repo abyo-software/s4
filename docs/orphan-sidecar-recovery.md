@@ -83,9 +83,11 @@ done < /tmp/s4_sidecars.txt > /tmp/s4_orphans.txt
   Garage) for the list step because the S4 gateway's
   `ListObjectsV2` filter hides `.s4index` entries from listings by
   design. Direct backend access is required to enumerate them.
-- A future release (post-v1.0) may add an
-  `s4 admin sweep-orphan-sidecars` subcommand that automates
-  this loop. Until then, the manual recipe is the supported
+- The v0.9 roadmap (#106 `s4-tool repair-sidecar` /
+  `s4-tool verify`) is the umbrella for sidecar-maintenance
+  tooling. The `s4 admin sweep-orphan-sidecars` subcommand —
+  or its equivalent under `s4-tool` — automates this loop in
+  that scope. Until then, the manual recipe is the supported
   path.
 - The sweep is **idempotent and safe** — deleting a stale
   `<key>.s4index` only forces the next Range GET on `<key>` to

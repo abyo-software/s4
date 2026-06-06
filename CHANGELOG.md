@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.21] — 2026-06-07
+
+Sixth-round review caught that v0.8.20 R5-8 walked the
+--max-body-bytes fix in the wrong direction (silent truncation
+on 32-bit instead of the original loud compile error), plus 5
+other doc / cosmetic items. v0.8.21 reverts R5-8 and sweeps the
+rest.
+
+### Fixed
+
+- **#194 R6-1** — `--max-body-bytes` default reverted to the
+  bare `5 * 1024 * 1024 * 1024` literal. The v0.8.20 R5-8
+  `(5_u64 * 1024 * 1024 * 1024) as usize` would have silently
+  truncated to 1 GiB on a 32-bit target instead of the
+  original loud compile-time const-overflow. Loud failure is
+  the correct mode: s4-server only ships 64-bit Linux per
+  README §Supported targets, and a future 32-bit port needs
+  to think about the cap explicitly rather than rely on a
+  cast. CHANGELOG #193's "stays honest on cross-compile"
+  claim was wrong.
+- **#195 R6-2** — Runbook "Metric-naming note" at the bottom
+  of the metric reference still referenced
+  `s4_requests_total{status=~"5..."}` (a label that doesn't
+  exist on the metric). Corrected to
+  `s4_requests_total{result="err"}` — `result` is the actual
+  label, values `"ok"` / `"err"`. R5-2 swept §1/§2/§3/§7/§8
+  but missed this trailing paragraph.
+- **#196 R6-3** — Runbook "Last reviewed" stamp advanced
+  v0.8.18 → v0.8.21 (R5-1 / R5-2 / etc. edited §1/§2/§3/§7/§8
+  in v0.8.20 but didn't bump the stamp; the threat-model
+  companion was bumped in R5-6).
+- **#197 R6-4** — AWS SigV4 vectors provenance reverted
+  R5-7's `get-utf8-path` rename back to `get-utf8`. The AWS
+  upstream suite vector is called `get-utf8`; the `_path`
+  suffix is our private fn-name convention. R5-7 broke the
+  module docstring's "vector names match the public AWS
+  reference suite" claim.
+- **#198 R6-5** — `docs/orphan-sidecar-recovery.md` future-
+  release note advanced from "post-v1.0" (R5-5) to "v0.9
+  roadmap, paired with #106 `s4-tool repair-sidecar` /
+  `s4-tool verify`". The two adjacent sidecar-maintenance
+  promises now have consistent target versions.
+- **#199 R6-6** — Runbook §1 SIGUSR1-before-restart recipe
+  no longer relies on a fixed `sleep 1` (which can race
+  against a multi-second JSON dump on a large state file).
+  Recommends tailing `journalctl ... | grep -m1 "SIGUSR1:
+  dumped all state snapshots"` instead; `sleep 5` is the
+  fallback floor for non-interactive cases.
+
+### Tests
+
+- 449 lib + 45 integration + 11 SigV4 vectors + 2 bolero + 1
+  chaos unchanged; clippy + fmt clean.
+
+### Notes
+
+- The v0.8.20 → v0.8.21 sequence (and the v0.8.19 D-6 →
+  v0.8.20 R5-2 sequence before it) keeps illustrating the
+  same pattern: every doc fix needs to grep the rest of the
+  tree for the same fabrication. v0.8.21 is also the
+  sixth-round closeout; if round 7 finds more it's almost
+  certainly a fabrication R6 missed.
+
 ## [0.8.20] — 2026-06-07
 
 Fifth-round review caught that v0.8.19 D-6 only fixed runbook §12;

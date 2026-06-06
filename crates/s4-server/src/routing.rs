@@ -1028,7 +1028,7 @@ mod preflight_tests {
 ///
 /// - **AWS-published vectors** (`get-vanilla`,
 ///   `get-vanilla-query-order-key-case`,
-///   `get-vanilla-query-order-value`, `get-utf8-path`): vector names
+///   `get-vanilla-query-order-value`, `get-utf8`): vector names
 ///   match the public
 ///   <https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html>
 ///   reference suite; expected outputs taken from the AWS

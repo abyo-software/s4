@@ -1,6 +1,6 @@
 # S4 operations runbook
 
-**Last reviewed:** v0.8.18 (2026-06-07)
+**Last reviewed:** v0.8.21 (2026-06-07)
 
 Procedures for operating an S4 gateway in production. Each
 section is structured as **Symptom → Diagnose → Mitigate →
@@ -85,10 +85,18 @@ sudo mv /var/lib/s4/access-log/$(date +%Y%m%d).log /backup/
 # trigger a snapshot dump (only access-log buffers drain on
 # shutdown). Before a planned `systemctl restart`, send
 # SIGUSR1 first so in-memory state changes since the last dump
-# survive the restart:
+# survive the restart. The dump is asynchronous (one tokio
+# task per signal); large state files (e.g. > 100 MB
+# versioning history) can take several seconds, so wait on
+# the journal log line rather than a fixed sleep:
 #
-#   sudo kill -USR1 $(pidof s4-server) && sleep 1 && sudo systemctl restart s4-server
+#   sudo kill -USR1 $(pidof s4-server)
+#   sudo journalctl -u s4-server -f --since "10 seconds ago" \
+#       | grep -m1 "SIGUSR1: dumped all state snapshots"
+#   sudo systemctl restart s4-server
 #
+# If you cannot tail the journal interactively, `sleep 5` is a
+# safer floor than `sleep 1` for typical state-file sizes.
 # Files are read at boot. Backing up to S3 / external storage
 # and truncating in place loses nothing as long as the gateway
 # is restarted before the next SIGUSR1 write.
@@ -530,8 +538,9 @@ names below are verified against
 
 Metric-naming note: S4 does **not** emit a generic
 `s4_backend_error_total` counter today — backend 5xx surfaces
-via the per-handler error counters in
-`s4_requests_total{status=~"5..."}` and the explicit
-replication outcome counters above. If a dedicated
-backend-error metric matters for your alerting story, treat
-it as a follow-up wire-up against the s3s middleware layer.
+via the per-handler error tally `s4_requests_total{result="err"}`
+(`result` label values are `"ok"` / `"err"`; there is no
+`status` label) and the explicit replication outcome counters
+above. If a dedicated backend-error metric matters for your
+alerting story, treat it as a follow-up wire-up against the
+s3s middleware layer.
