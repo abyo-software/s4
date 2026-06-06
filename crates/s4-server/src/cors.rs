@@ -47,6 +47,15 @@ use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
+/// v0.8.15 M-3: validation errors surfaced by [`CorsManager::validate`].
+#[derive(Debug, thiserror::Error)]
+pub enum CorsValidationError {
+    #[error(
+        "AllowedMethod {0:?} is not a valid AWS S3 CORS verb (must be one of GET / PUT / POST / DELETE / HEAD; `*` is rejected)"
+    )]
+    UnsupportedMethod(String),
+}
+
 /// 1つの CORS rule。AWS S3 `CORSRule` element に対応する。
 ///
 /// `id` は rule の human-readable label (operator が trace 用に付ける)。
@@ -114,6 +123,29 @@ impl CorsManager {
     pub fn put(&self, bucket: &str, config: CorsConfig) {
         crate::lock_recovery::recover_write(&self.by_bucket, "cors.by_bucket")
             .insert(bucket.to_owned(), config);
+    }
+
+    /// v0.8.15 M-3: validate a `CorsConfig` against the AWS S3 spec
+    /// before persisting. Returns the typed validation error so the
+    /// listener can surface `InvalidArgument` (mirrors what AWS S3
+    /// does at PutBucketCors time, instead of silently accepting a
+    /// non-compliant rule and returning a 404-shaped preflight
+    /// behaviour later).
+    ///
+    /// Current rules:
+    ///
+    /// - `AllowedMethods` ⊆ `{GET, PUT, POST, DELETE, HEAD}`. AWS S3
+    ///   rejects every other verb and the `*` wildcard.
+    pub fn validate(config: &CorsConfig) -> Result<(), CorsValidationError> {
+        const VALID_METHODS: &[&str] = &["GET", "PUT", "POST", "DELETE", "HEAD"];
+        for rule in &config.rules {
+            for m in &rule.allowed_methods {
+                if !VALID_METHODS.contains(&m.as_str()) {
+                    return Err(CorsValidationError::UnsupportedMethod(m.clone()));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `get_bucket_cors` handler から呼ぶ。configuration が無ければ `None`

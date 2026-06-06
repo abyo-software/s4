@@ -866,6 +866,18 @@ fn ip_in_cidr(ip: IpAddr, cidr: &str) -> bool {
 /// granularity). Returns unix epoch seconds. AWS also accepts the
 /// `+00:00` offset variants and millisecond fractions — out of scope
 /// for v0.3, can be relaxed later if a real policy needs them.
+///
+/// v0.8.15 H-f hardening: the year / month / day / hour / minute /
+/// second fields are now clamped to plausible bounds *before* the
+/// civil-from-date arithmetic and the unix-epoch multiply. Without
+/// this, a policy author writing
+/// `{"DateLessThan": {"aws:CurrentTime": "9999999999999-01-01T00:00:00Z"}}`
+/// (typo or attacker-supplied) would have wrapped the i64
+/// `days_from_epoch * 86_400` product into a tiny / negative value,
+/// silently flipping the comparison and turning an always-allow
+/// future bound into an always-deny gate (or, with the opposite
+/// timestamp shape, an attacker-friendly always-allow). Strict
+/// rejection at parse-time matches what `chrono` would do.
 fn parse_iso8601(s: &str) -> Option<i64> {
     // Accept `YYYY-MM-DDTHH:MM:SSZ` only; reject anything else.
     let s = s.strip_suffix('Z')?;
@@ -884,6 +896,22 @@ fn parse_iso8601(s: &str) -> Option<i64> {
     let h: i64 = time_parts[0].parse().ok()?;
     let m: i64 = time_parts[1].parse().ok()?;
     let s: i64 = time_parts[2].parse().ok()?;
+    // v0.8.15 H-f bounds. AWS bucket-policy timestamps in the real
+    // world fall in `[1970, 9999]` (the AWS console UI itself only
+    // allows years 1970-9999). 9999 keeps the civil-from-date
+    // arithmetic inside `i64` range comfortably.
+    if !(1970..=9999).contains(&year) {
+        return None;
+    }
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    if !(1..=31).contains(&day) {
+        return None;
+    }
+    if !(0..=23).contains(&h) || !(0..=59).contains(&m) || !(0..=60).contains(&s) {
+        return None;
+    }
     // Days from 1970-01-01 via a quick civil-from-date algorithm
     // (Howard Hinnant — public domain). Good for AD years.
     let y = if month <= 2 { year - 1 } else { year };

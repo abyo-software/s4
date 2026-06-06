@@ -473,13 +473,28 @@ pub async fn streaming_compress_to_frames_with(
     // would be computed against the partial input, the manifest would
     // look internally consistent, and a future GET would happily return
     // the truncated body — silent data loss.
-    if let Some(expected) = expected_size
-        && total_in < expected
-    {
-        return Err(CodecError::TruncatedStream {
-            expected,
-            got: total_in,
-        });
+    if let Some(expected) = expected_size {
+        if total_in < expected {
+            return Err(CodecError::TruncatedStream {
+                expected,
+                got: total_in,
+            });
+        }
+        // v0.8.15 M-4: over-length guard. The pre-M-4 code only
+        // failed on `total_in < expected`; a client sending
+        // `Content-Length: 1` followed by 1 GiB of body was
+        // silently accepted, the gateway stored 1 GiB, and the
+        // SDK had no signal that the declared length had been
+        // ignored. AWS S3 returns `RequestBodyLengthMismatch` for
+        // the same shape; we surface
+        // [`CodecError::OverlengthStream`] which the s4-server
+        // handler maps to a 400.
+        if total_in > expected {
+            return Err(CodecError::OverlengthStream {
+                expected,
+                got: total_in,
+            });
+        }
     }
 
     let total_framed = framed.len() as u64;

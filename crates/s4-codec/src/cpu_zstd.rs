@@ -62,16 +62,34 @@ pub fn decompress_blocking(input: &[u8], manifest: &ChunkManifest) -> Result<Vec
     // `read_to_end` (already bounded by `take(limit)` above) grows the
     // buffer naturally as actual decoded bytes arrive.
     let mut buf = Vec::with_capacity(allocated_orig_size.min(DECOMPRESS_BOOTSTRAP_CAPACITY));
-    (&mut decoder)
-        .take(limit)
-        .read_to_end(&mut buf)
-        .map_err(CodecError::Io)?;
-    if (buf.len() as u64) > manifest.original_size {
-        return Err(CodecError::Io(std::io::Error::other(format!(
-            "zstd decompression bomb detected: produced {} bytes, manifest claimed {}",
-            buf.len(),
-            manifest.original_size
-        ))));
+    {
+        let mut limited = (&mut decoder).take(limit);
+        limited.read_to_end(&mut buf).map_err(CodecError::Io)?;
+        // v0.8.15 M-9: distinguish "bomb truncated at the cap" from
+        // "decoder happened to land in (orig_size, orig_size+1024]".
+        // The earlier error message reported `produced N bytes,
+        // manifest claimed M` even when the upstream had many more
+        // bytes available — misleading the operator log. Probe one
+        // extra byte after `read_to_end` saturated `limit`; if it
+        // succeeds, we know the source had more decoded output than
+        // the cap, so the message reflects the real shape.
+        if buf.len() as u64 > manifest.original_size {
+            let mut peek = [0u8; 1];
+            let more_available = limited.read(&mut peek).map(|n| n > 0).unwrap_or(false);
+            return Err(CodecError::Io(std::io::Error::other(format!(
+                "zstd decompression bomb detected: produced at least {} bytes \
+                 (truncated at cap = manifest.original_size + 1024 = {}); \
+                 manifest claimed {}{}",
+                buf.len(),
+                limit,
+                manifest.original_size,
+                if more_available {
+                    "; decoder had more bytes available beyond the cap"
+                } else {
+                    ""
+                },
+            ))));
+        }
     }
     if buf.len() as u64 != manifest.original_size {
         return Err(CodecError::SizeMismatch {

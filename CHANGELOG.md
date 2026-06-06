@@ -7,6 +7,130 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.15] — 2026-06-06
+
+Post-launch security audit closeout. Picks up the HIGH (8) + MED (10)
+findings that were marked as "follow-up" in the v0.8.11–v0.8.14
+release notes (Codex CLI + Claude Code review of the wire format,
+codec layer, multipart pipeline, IAM / SigV4a stack, and operational
+surfaces). No CRIT remained. WASM client + multipart sidecar
+correctness + AWS-canonical SigV4 interop were the load-bearing
+gaps; this release closes them.
+
+### Fixed
+
+- **#130 H-a** — `FrameIndexEntry::original_end()` /
+  `compressed_end()` use `saturating_add` and `decode_index` rejects
+  `offset+size` overflow per entry (`index.rs:99 / 391`). A forged
+  sidecar entry with `original_offset = u64::MAX-10` no longer wraps
+  the range planner.
+- **#131 H-b / H-c** — 32-bit `usize` casts in the WASM decoder
+  hardened. `multipart.rs:135` uses `usize::try_from` on
+  `compressed_size` / pad length (new typed `PayloadTooLarge`
+  error). `index.rs:288 / 321` adds `MAX_FRAMES = 16M` and
+  `MAX_ETAG_BYTES = 4 KiB` upper bounds so a forged sidecar can't
+  trick `s4-codec-wasm` into a truncated payload read.
+- **#132 H-d** — `routing.rs::canonical_query_string` now decodes
+  each key/value, re-encodes per the AWS canonical RFC 3986
+  unreserved set, then sorts on the encoded form. Likewise
+  `canonical_uri_path` does AWS-canonical path encoding (slashes
+  literal). Real AWS SDK / aws-crt-cpp signatures now interop end-
+  to-end (in v0.8.12 #126 we fixed the string-to-sign shape, but
+  the canonical request preceding it still mismatched; #132 closes
+  the loop).
+- **#133 H-e** — `sigv4a.rs::verify_request` requires `host` in
+  `SignedHeaders=` and, when `x-amz-content-sha256` is present in
+  the headers, requires that name be in `SignedHeaders=` too. Two
+  new typed errors: `HostNotSigned`, `ContentSha256NotSigned`. AWS
+  S3 enforces both; closes the MITM `Host`-rewrite vector.
+- **#134 H-f** — `policy.rs::parse_iso8601` clamps year ∈
+  `[1970, 9999]` + month / day / time-of-day bounds *before* the
+  civil-from-date multiply. Policy `Condition: DateLessThan
+  ["9999999999...Z"]` no longer wraps the i64 product into a
+  silently-flipped comparison.
+- **#135 H-g** — multipart Complete now HEADs the freshly-completed
+  object and stamps `source_etag` / `source_compressed_size` on the
+  sidecar (`service.rs:4785`). Matches the single-PUT path. Without
+  the binding, a subsequent backend-side mutation (lifecycle move,
+  out-of-band CopyObject) wouldn't trip the stale-sidecar check on
+  the next Range GET.
+- **#136 H-h** — `decompress_multipart` enforces an aggregate
+  output cap of `--max-body-bytes` (default 5 GiB) across all
+  frames, in addition to the existing per-frame cap. Pre-flight
+  on `header.original_size` plus post-decode `produced` accounting.
+  A forged multi-frame body can no longer pin tens of GiB of
+  plaintext in `BytesMut::extend_from_slice`.
+- **#137 M-1** — reserved-name guard on PUT / Copy / Create
+  multipart. Keys ending in `.s4index` return `InvalidObjectName`
+  at the listener edge. Pairs with the new
+  `s4_codec::index::SIDECAR_SUFFIX` constant + the
+  `is_reserved_sidecar_key` helper as the single source of truth.
+- **#138 M-2** — `copy_object` with
+  `MetadataDirective: REPLACE` strips every `s4-*` key from the
+  client-supplied metadata before re-populating from the source
+  HEAD. Pre-M-2 `or_insert_with` preferred the client's value,
+  letting a malicious client inject e.g.
+  `s4-original-size=5368709120` for downstream misalloc / silent
+  data corruption.
+- **#139 M-3** — `PutBucketCors` rejects `AllowedMethods` outside
+  the canonical `{GET, PUT, POST, DELETE, HEAD}` set (including
+  the `*` wildcard) with `InvalidArgument`. New
+  `cors::CorsManager::validate` is the listener-side check;
+  matches AWS S3 behaviour.
+- **#140 M-4** — streaming PUT path adds an over-length guard via
+  the new `CodecError::OverlengthStream { expected, got }` variant.
+  A client sending `Content-Length: 1` followed by 1 GiB of body
+  now gets `RequestBodyLengthMismatch` (400) instead of silent
+  storage. Mirrors AWS S3 wire behaviour.
+- **#141 M-5** — `ObjectLockManager::apply_default_on_put` no
+  longer auto-applies bucket-default retention onto a key whose
+  only existing state is `legal_hold_on = true`. Pre-M-5 a
+  legal-hold-only key would silently pick up the Governance clock
+  on the next overwrite PUT.
+- **#142 M-6 / M-7** — `SamplingDispatcher` now requires the
+  bytes *after* a magic-byte hit to also show high entropy before
+  routing to `Passthrough`. User logs that happen to start with
+  `BZh` (or any other 2–3-byte magic by coincidence) keep getting
+  compressed. Adversarial-bypass limits (low-entropy prefix on
+  random body) are documented as a known sampling caveat; the
+  multi-window variant is a listener-side follow-up.
+- **#143 M-8** — `pad_to_minimum` doc / contract pinned. Maximum
+  overshoot is `PADDING_HEADER_BYTES - 1 = 11` bytes; doc no
+  longer claims a uniform 12-byte "ε". The `reserve(0)` no-op is
+  also gated behind `payload_len > 0`.
+- **#144 M-9** — `cpu_zstd` / `cpu_gzip` bomb-detection error
+  messages probe one byte past the truncation cap so the log
+  distinguishes "decoder happened to land in
+  `(orig, orig+1024]`" from "actual bomb, more bytes available".
+  Operators on a triage page get an actionable signal instead of
+  a misleading byte count.
+
+### Changed
+
+- **Inter-crate `version` pins** (`crates/s4-server/Cargo.toml`,
+  `crates/s4-codec-py/Cargo.toml`) widened from `0.8.10` to `0.8`
+  so end-users pulling `cargo install s4-server` always resolve
+  to the latest published `s4-codec` / `s4-config` for the
+  current minor — closes the "pinned to 0.8.10 publishes" hazard
+  that surfaced during the v0.8.14 crates.io rollout.
+
+### Tests
+
+- 438 lib + 45 integration tests green under
+  `RUSTFLAGS="-D warnings"`; `cargo fmt --all --check` clean;
+  `cargo clippy --workspace --all-targets` clean.
+
+### Notes
+
+- v0.8.15 is **the** version to target for the public Reddit
+  launch. Every CRIT + HIGH + MED finding from the multi-agent
+  pre-release review is now closed. Remaining LOW items
+  (`shannon_entropy` u32 saturation only-at-`4 GiB`-sample,
+  `INDEX_HEADER_BYTES` naming cosmetics, `pad_to_minimum`
+  `reserve` micro-optimisation, SigV4a skew at extreme tolerances)
+  are tracked in a `LOW.md` follow-up and don't block correctness
+  or AWS-compat.
+
 ## [0.8.14] — 2026-06-06
 
 Hotfix on top of v0.8.13. The v0.8.13 #127 (MED-B) "force buffered

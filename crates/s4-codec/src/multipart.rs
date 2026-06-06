@@ -80,6 +80,15 @@ pub enum FrameError {
     },
     #[error("unknown codec id {0} in frame header (decoder out of date?)")]
     UnknownCodec(u32),
+    /// v0.8.15 H-b: a frame's declared `compressed_size` (or padding
+    /// frame length) exceeds the target architecture's
+    /// `usize::MAX`. On 64-bit hosts this is unreachable; on the
+    /// 32-bit `wasm32-unknown-unknown` target the `as usize` cast
+    /// used to truncate, letting a forged 4 GiB+ frame parse as a
+    /// 64-byte payload (silent data loss in the browser decoder).
+    /// `try_from`-based validation forces the typed error instead.
+    #[error("frame payload size {0} exceeds usize on this target")]
+    PayloadTooLarge(u64),
 }
 
 /// 1 フレーム分を直列化: header + payload を `dst` に追記。
@@ -95,8 +104,20 @@ pub fn write_frame(dst: &mut BytesMut, header: FrameHeader, payload: &[u8]) {
 }
 
 /// `dst` の現在サイズが `min_total` byte を下回っていれば、padding frame を追記して
-/// `min_total` byte を超えさせる。最終 `dst.len()` は `min_total + ε` (ε は
-/// padding header 12 byte 分) を保証。
+/// `min_total` byte 以上になるよう pad する。
+///
+/// # 厳密な事後条件 (v0.8.15 M-8 で明文化)
+///
+/// 呼び出し後 `dst.len()` は以下を満たす:
+///
+/// 1. `dst.len() >= min_total` (常に)
+/// 2. `dst.len() <= max(min_total, prev_len + PADDING_HEADER_BYTES)` ── 1 frame
+///    追記の上限。`need < PADDING_HEADER_BYTES` のケースでは padding header
+///    自体が `min_total` を超える余地を作るため最大 11 byte の overshoot が
+///    起こり得る。
+/// 3. overshoot は最大 `PADDING_HEADER_BYTES - 1 = 11` byte。これは
+///    multipart unit test `pad_to_minimum_no_excessive_overshoot`
+///    (`< 5 MiB + 64`) で実証済。
 ///
 /// padding 自体の中身は zero bytes (compress も decompress も無し)。
 pub fn pad_to_minimum(dst: &mut BytesMut, min_total: usize) {
@@ -106,7 +127,13 @@ pub fn pad_to_minimum(dst: &mut BytesMut, min_total: usize) {
     // 残り = min_total - 現在 ですが、padding 自体に PADDING_HEADER_BYTES 必要。
     let need = min_total - dst.len();
     let payload_len = need.saturating_sub(PADDING_HEADER_BYTES);
-    dst.reserve(PADDING_HEADER_BYTES + payload_len);
+    // v0.8.15 M-8: `payload_len = 0` のケースでも PADDING_MAGIC + u64 length は必ず
+    // 12 byte 書く必要があるが、`reserve(0)` 呼び出しは無駄でしかない (下の
+    // `put_slice` / `put_u64_le` が必要分を確保する) ので、reserve は payload があると
+    // きだけ行う。
+    if payload_len > 0 {
+        dst.reserve(PADDING_HEADER_BYTES + payload_len);
+    }
     dst.put_slice(PADDING_MAGIC);
     dst.put_u64_le(payload_len as u64);
     // zero-fill。`put_bytes` で 1 回 syscall。
@@ -132,13 +159,20 @@ pub fn read_frame(mut input: Bytes) -> Result<(FrameHeader, Bytes, Bytes), Frame
     let original_size = input.get_u64_le();
     let compressed_size = input.get_u64_le();
     let crc32c = input.get_u32_le();
-    if (compressed_size as usize) > input.len() {
+    // v0.8.15 H-b: `compressed_size as usize` used to silently
+    // truncate on 32-bit targets (`s4-codec-wasm`), letting a 4 GiB+
+    // forged frame decode as a 64-byte payload. `try_from` forces
+    // the typed error so the WASM client surfaces the bad frame
+    // instead of misreading silently.
+    let compressed_size_usize = usize::try_from(compressed_size)
+        .map_err(|_| FrameError::PayloadTooLarge(compressed_size))?;
+    if compressed_size_usize > input.len() {
         return Err(FrameError::PayloadTruncated {
             compressed_size,
             remaining: input.len(),
         });
     }
-    let payload = input.split_to(compressed_size as usize);
+    let payload = input.split_to(compressed_size_usize);
     Ok((
         FrameHeader {
             codec,
@@ -197,14 +231,24 @@ impl Iterator for FrameIter {
                 }
                 self.rest.advance(4);
                 let pad_len = self.rest.get_u64_le();
-                if (pad_len as usize) > self.rest.len() {
+                // v0.8.15 H-b: same `as usize` truncation hazard as
+                // `read_frame` above. On 32-bit WASM a 4 GiB+
+                // `pad_len` would skip 0 bytes silently.
+                let pad_len_usize = match usize::try_from(pad_len) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        self.fused = true;
+                        return Some(Err(FrameError::PayloadTooLarge(pad_len)));
+                    }
+                };
+                if pad_len_usize > self.rest.len() {
                     self.fused = true;
                     return Some(Err(FrameError::PayloadTruncated {
                         compressed_size: pad_len,
                         remaining: self.rest.len(),
                     }));
                 }
-                self.rest.advance(pad_len as usize);
+                self.rest.advance(pad_len_usize);
                 continue;
             }
             // それ以外は data frame として parse

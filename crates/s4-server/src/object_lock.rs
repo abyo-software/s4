@@ -209,10 +209,23 @@ impl ObjectLockManager {
         };
         let mut guard = crate::lock_recovery::recover_write(&self.states, "object_lock.states");
         let key_pair = (bucket.to_owned(), key.to_owned());
-        // Skip if any retention is already in effect — auto-apply must not
-        // shorten an existing Compliance lock or wipe a legal hold.
+        // Skip if any prior protection is already in effect — auto-apply
+        // must not shorten an existing Compliance lock, wipe a legal hold,
+        // or *add* a fresh retention layer on a key that the operator
+        // explicitly cleared down to "legal hold only".
+        //
+        // v0.8.15 M-5 fix: the pre-v0.8.15 predicate only checked
+        // `mode.is_some() || retain_until.is_some()`. A key in the
+        // `{legal_hold_on = true}` state with no retention slots set
+        // would silently pick up the bucket default on the next PUT,
+        // implicitly adding a Governance / Compliance clock the
+        // operator never asked for. Including `legal_hold_on` in the
+        // predicate keeps the auto-apply additive only on truly fresh
+        // keys.
         if let Some(existing) = guard.get(&key_pair)
-            && (existing.mode.is_some() || existing.retain_until.is_some())
+            && (existing.mode.is_some()
+                || existing.retain_until.is_some()
+                || existing.legal_hold_on)
         {
             return;
         }

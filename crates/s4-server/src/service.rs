@@ -1871,6 +1871,18 @@ impl<B: S3> S4Service<B> {
     /// 異なる codec が混在していても透過的に解凍可能 (parquet 風 mixed columns 等)。
     async fn decompress_multipart(&self, bytes: bytes::Bytes) -> S3Result<bytes::Bytes> {
         let mut out = BytesMut::new();
+        // v0.8.15 H-h: cap the *aggregate* decoded output. Each
+        // individual frame is already bounded by
+        // `validate_decompress_manifest` (default 5 GiB per frame),
+        // but a forged multi-frame body can declare many frames
+        // each near the limit — without an object-level ceiling, a
+        // single GET could pin tens of GiB of plaintext in
+        // `BytesMut::extend_from_slice`. Use the gateway's
+        // `max_body_bytes` (same cap that bounds PUT bodies) so a
+        // GET can never produce more plaintext than a PUT can ever
+        // legitimately have stored.
+        let aggregate_cap = self.max_body_bytes;
+        let mut produced: usize = 0;
         for frame in FrameIter::new(bytes) {
             let (header, payload) = frame.map_err(|e| {
                 S3Error::with_message(
@@ -1884,11 +1896,36 @@ impl<B: S3> S4Service<B> {
                 compressed_size: header.compressed_size,
                 crc32c: header.crc32c,
             };
+            // v0.8.15 H-h: pre-flight check on the declared
+            // `original_size` so a forged manifest claiming a frame
+            // that would push us past the cap is rejected before we
+            // start decoding. Defence-in-depth alongside the
+            // post-decode `produced` check below.
+            if (produced as u64).saturating_add(header.original_size) > aggregate_cap as u64 {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!(
+                        "multipart aggregate output exceeds cap: would reach \
+                         {produced_total} bytes after this frame, cap is {aggregate_cap}",
+                        produced_total = (produced as u64).saturating_add(header.original_size),
+                    ),
+                ));
+            }
             let decompressed = self
                 .registry
                 .decompress(payload, &chunk_manifest)
                 .await
                 .map_err(internal("multipart frame decompress"))?;
+            produced = produced.saturating_add(decompressed.len());
+            if produced > aggregate_cap {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!(
+                        "multipart aggregate output exceeded cap: {produced} bytes \
+                         emitted, cap is {aggregate_cap}"
+                    ),
+                ));
+            }
             out.extend_from_slice(&decompressed);
         }
         Ok(out.freeze())
@@ -2280,6 +2317,25 @@ impl<B: S3> S3 for S4Service<B> {
         let put_start = Instant::now();
         let put_bucket = req.input.bucket.clone();
         let put_key = req.input.key.clone();
+        // v0.8.15 M-1: reject user PUTs targeting reserved sidecar
+        // names (`<key>.s4index`). Without this gate, a user
+        // uploading `report.s4index` would have their object silently
+        // hidden from `ListObjectsV2` (the list filter strips the
+        // `.s4index` suffix) and risk being deleted by the sidecar-
+        // cleanup path on a sibling DeleteObject. Fail fast with the
+        // AWS-canonical `InvalidObjectName` code.
+        if s4_codec::index::is_reserved_sidecar_key(&put_key) {
+            let code = S3ErrorCode::from_bytes(b"InvalidObjectName")
+                .unwrap_or(S3ErrorCode::InvalidArgument);
+            return Err(S3Error::with_message(
+                code,
+                format!(
+                    "object key {put_key:?} is reserved (suffix `{}` is used for S4 internal \
+                     sidecars); pick a different key",
+                    s4_codec::index::SIDECAR_SUFFIX,
+                ),
+            ));
+        }
         let access_preamble = self.access_log_preamble(&req);
         self.enforce_rate_limit(&req, &put_bucket)?;
         // v0.6 #39: parse `x-amz-tagging` (URL-encoded query string) so
@@ -2435,6 +2491,25 @@ impl<B: S3> S3 for S4Service<B> {
                         S3Error::with_message(
                             S3ErrorCode::IncompleteBody,
                             format!("PUT body truncated: expected {expected} bytes, got {got}"),
+                        )
+                    }
+                    // v0.8.15 M-4: 400
+                    // `RequestBodyLengthMismatch` for over-length
+                    // bodies. AWS S3 returns this when the declared
+                    // `Content-Length` is smaller than the wire body;
+                    // S4 used to silently accept the surplus bytes.
+                    // `IncompleteBody` is the closest typed variant
+                    // in the s3s enum — we widen the message so the
+                    // SDK / curl side sees the shape unambiguously.
+                    s4_codec::CodecError::OverlengthStream { expected, got } => {
+                        let code = S3ErrorCode::from_bytes(b"RequestBodyLengthMismatch")
+                            .unwrap_or(S3ErrorCode::IncompleteBody);
+                        S3Error::with_message(
+                            code,
+                            format!(
+                                "PUT body length mismatch: Content-Length declared {expected} \
+                                 bytes, body carried at least {got}"
+                            ),
                         )
                     }
                     other => internal("streaming framed compress")(other),
@@ -3972,6 +4047,21 @@ impl<B: S3> S3 for S4Service<B> {
         // copy is conceptually "GetObject src + PutObject dst" — enforce both.
         let dst_bucket = req.input.bucket.clone();
         let dst_key = req.input.key.clone();
+        // v0.8.15 M-1: same reserved-name guard as `put_object`. A
+        // copy whose destination would land at `<x>.s4index` carries
+        // the same listing / cleanup hazards.
+        if s4_codec::index::is_reserved_sidecar_key(&dst_key) {
+            let code = S3ErrorCode::from_bytes(b"InvalidObjectName")
+                .unwrap_or(S3ErrorCode::InvalidArgument);
+            return Err(S3Error::with_message(
+                code,
+                format!(
+                    "destination key {dst_key:?} is reserved (suffix `{}` is used for S4 \
+                     internal sidecars)",
+                    s4_codec::index::SIDECAR_SUFFIX,
+                ),
+            ));
+        }
         self.enforce_policy(&req, "s3:PutObject", &dst_bucket, Some(&dst_key))?;
         if let CopySource::Bucket { bucket, key, .. } = &req.input.copy_source {
             self.enforce_policy(&req, "s3:GetObject", bucket, Some(key))?;
@@ -4012,6 +4102,23 @@ impl<B: S3> S3 for S4Service<B> {
                 && let Some(src_meta) = head.output.metadata.as_ref()
             {
                 let dest_meta = req.input.metadata.get_or_insert_with(Default::default);
+                // v0.8.15 M-2: drop ANY client-supplied `s4-*` key
+                // first. The reserved `s4-*` namespace describes the
+                // wire format the codec layer relies on
+                // (`s4-original-size`, `s4-crc32c`, `s4-codec`,
+                // `s4-multipart`, `s4-framed`, plus the SSE flags
+                // `s4-encrypted` / `s4-sse-type` / `s4-sse-c-key-md5`
+                // / `s4-sse-kms-key-id`). The pre-M-2 code used
+                // `or_insert_with` which *preferred* the client's
+                // value — a malicious client could
+                // `aws s3 cp s3://src s3://dst
+                //  --metadata-directive REPLACE
+                //  --metadata 's4-original-size=5368709120'`
+                // and persuade S4 to misread the body on the next
+                // GET (silent data corruption or DoS through
+                // mis-sized buffer alloc). Strip the namespace and
+                // force the source values back in.
+                dest_meta.retain(|k, _| !k.to_ascii_lowercase().starts_with("s4-"));
                 for key in [
                     META_CODEC,
                     META_ORIGINAL_SIZE,
@@ -4021,17 +4128,26 @@ impl<B: S3> S3 for S4Service<B> {
                     META_FRAMED,
                 ] {
                     if let Some(v) = src_meta.get(key) {
-                        // 客が同じ key を指定していたら preserve しない (= 上書き許可)
-                        // していたら何もしない。指定していなければ insert
-                        dest_meta
-                            .entry(key.to_string())
-                            .or_insert_with(|| v.clone());
+                        dest_meta.insert(key.to_string(), v.clone());
+                    }
+                }
+                // SSE markers are equally reserved — propagate any
+                // source flags so a copy of an encrypted object stays
+                // marked as encrypted at the destination.
+                for sse_key in [
+                    "s4-encrypted",
+                    "s4-sse-type",
+                    "s4-sse-c-key-md5",
+                    "s4-sse-kms-key-id",
+                ] {
+                    if let Some(v) = src_meta.get(sse_key) {
+                        dest_meta.insert(sse_key.to_string(), v.clone());
                     }
                 }
                 debug!(
                     src_bucket = %bucket,
                     src_key = %key,
-                    "S4 copy_object: preserved s4-* metadata across REPLACE directive"
+                    "S4 copy_object: replaced client s4-* metadata with source values across REPLACE directive (v0.8.15 M-2)"
                 );
             }
         }
@@ -4182,6 +4298,19 @@ impl<B: S3> S3 for S4Service<B> {
         // by switching the client to the multipart wire path.
         let mp_bucket = req.input.bucket.clone();
         let mp_key = req.input.key.clone();
+        // v0.8.15 M-1: reserved-name guard on the multipart entry too.
+        if s4_codec::index::is_reserved_sidecar_key(&mp_key) {
+            let code = S3ErrorCode::from_bytes(b"InvalidObjectName")
+                .unwrap_or(S3ErrorCode::InvalidArgument);
+            return Err(S3Error::with_message(
+                code,
+                format!(
+                    "object key {mp_key:?} is reserved (suffix `{}` is used for S4 internal \
+                     sidecars)",
+                    s4_codec::index::SIDECAR_SUFFIX,
+                ),
+            ));
+        }
         self.enforce_policy(&req, "s3:PutObject", &mp_bucket, Some(&mp_key))?;
         self.enforce_rate_limit(&req, &mp_bucket)?;
         // Multipart object は per-part 圧縮 + frame 形式で書く。GET 時に
@@ -4692,8 +4821,48 @@ impl<B: S3> S3 for S4Service<B> {
             .unwrap_or(false);
         if let Some(ref body) = assembled_body
             && !mp_will_encrypt
-            && let Ok(index) = build_index_from_body(body)
+            && let Ok(mut index) = build_index_from_body(body)
         {
+            // v0.8.15 H-g: stamp the source-ETag / source-compressed-size
+            // binding on the multipart sidecar. The single-PUT path
+            // does this at L2519-L2521 via the backend's PUT response,
+            // but Complete returns its own ETag (an opaque manifest
+            // hash) so we have to HEAD the freshly-completed object
+            // to pick up what backend actually wrote, then bind the
+            // sidecar to those values. Without the binding, a
+            // subsequent backend-side mutation (lifecycle rewrite,
+            // out-of-band CopyObject) wouldn't trip the staleness
+            // check on the next Range GET — the GET would happily
+            // slice the new bytes at the old sidecar offsets, with
+            // silent data corruption.
+            if let Ok(uri) = safe_object_uri(&bucket, &key) {
+                let head_req = S3Request {
+                    input: HeadObjectInput {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        ..Default::default()
+                    },
+                    method: http::Method::HEAD,
+                    uri,
+                    headers: http::HeaderMap::new(),
+                    extensions: http::Extensions::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                    trailing_headers: None,
+                };
+                if let Ok(head) = self.backend.head_object(head_req).await {
+                    index.source_etag = head.output.e_tag.as_ref().map(|t| t.value().to_string());
+                    index.source_compressed_size = head
+                        .output
+                        .content_length
+                        .and_then(|n| u64::try_from(n).ok());
+                }
+                // HEAD failure is non-fatal — the sidecar still works
+                // as a v1-style best-effort fast path; the Range GET
+                // simply falls back to a full read on any consistency
+                // signal.
+            }
             self.write_sidecar(&bucket, &key, &index).await;
         }
         // From here on, post-processing depends on the context —
@@ -5861,6 +6030,18 @@ impl<B: S3> S3 for S4Service<B> {
                     })
                     .collect(),
             };
+            // v0.8.15 M-3: AWS S3 rejects `AllowedMethods` outside
+            // the canonical {GET,PUT,POST,DELETE,HEAD} set (including
+            // the `*` wildcard). Validate at PutBucketCors time so
+            // operators see the misconfiguration in the API response
+            // instead of having silently-broken preflights at the
+            // browser later.
+            if let Err(e) = crate::cors::CorsManager::validate(&cfg) {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    e.to_string(),
+                ));
+            }
             mgr.put(&req.input.bucket, cfg);
             return Ok(S3Response::new(PutBucketCorsOutput::default()));
         }

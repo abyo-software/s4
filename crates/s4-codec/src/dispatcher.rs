@@ -242,6 +242,23 @@ fn looks_columnar_integer(sample: &[u8]) -> bool {
     false
 }
 
+/// v0.8.15 M-7: confirm that the bytes *after* the magic-byte prefix
+/// look like compressed data (high entropy), not benign text whose
+/// leading 2-3 bytes happen to spell the magic. Returns `true` when
+/// the post-magic window has entropy `>= threshold` (default 7.5).
+/// Operates on `sample[16..]` ── 16 bytes of skip is enough to clear
+/// every magic this dispatcher knows about while leaving plenty of
+/// runway for the entropy estimate to be statistically meaningful.
+/// Returns `true` (skip the check) when the sample is too short to
+/// inspect, so behaviour matches the pre-M-7 path for tiny samples.
+fn post_magic_entropy_high(sample: &[u8], threshold: f64) -> bool {
+    const SKIP: usize = 16;
+    if sample.len() <= SKIP + 32 {
+        return true;
+    }
+    shannon_entropy(&sample[SKIP..]) >= threshold
+}
+
 /// 既圧縮データの magic bytes 検出。検出した場合は true を返す。
 fn looks_already_compressed(sample: &[u8]) -> bool {
     // gzip
@@ -299,11 +316,44 @@ impl SamplingDispatcher {
     /// Core sample-only decision shared by `pick` and `pick_with_size_hint`.
     /// Returns the pre-GPU-promotion choice; the size-hint-aware caller may
     /// rewrite a `CpuZstd` result to `NvcompZstd` when the body is big enough.
+    ///
+    /// # Adversarial limitations (v0.8.15 M-6 / M-7)
+    ///
+    /// The sample is just the prefix the listener captured (typically
+    /// the first 4 KiB). An attacker who controls the upload bytes
+    /// can:
+    ///
+    /// - **Trick passthrough into firing** by prefixing a gzip / zstd
+    ///   magic and following it with 10 GiB of zeros, costing the
+    ///   gateway disk space the operator expected to save. Mitigated
+    ///   by requiring the post-magic window to *also* show high
+    ///   entropy — real compressed bytes have both, an unscrupulous
+    ///   text payload won't.
+    /// - **Trick passthrough into NOT firing** by prefixing 4 KiB of
+    ///   zeros to an already-compressed body, costing CPU on a
+    ///   useless compress pass. The dispatcher cannot defend against
+    ///   this without re-sampling other windows (a v0.8.15 follow-up;
+    ///   would require listener-side changes to capture multiple
+    ///   windows, not just the prefix).
+    ///
+    /// The sample-only path is "best-effort", not "adversarial".
+    /// Operators who need an adversarial guarantee should set
+    /// `--dispatcher always --codec cpu-zstd` (compress everything)
+    /// or `--codec passthrough` (compress nothing) and bypass the
+    /// sampler entirely.
     fn pick_from_sample(&self, sample: &[u8]) -> CodecKind {
         if sample.len() < Self::MIN_SAMPLE_BYTES {
             return self.default;
         }
-        if looks_already_compressed(sample) {
+        // v0.8.15 M-7: magic-byte passthrough is only honoured when
+        // the post-magic window *also* exhibits high entropy. A user
+        // log file that happens to start with `BZh` (or any other
+        // 2-3 byte magic by coincidence) won't have a high-entropy
+        // body — those should keep being compressed, not silently
+        // passthrough'd. Real compressed data has both signals.
+        if looks_already_compressed(sample)
+            && post_magic_entropy_high(sample, self.entropy_threshold)
+        {
             return CodecKind::Passthrough;
         }
         if shannon_entropy(sample) >= self.entropy_threshold {
@@ -443,24 +493,70 @@ mod tests {
     #[tokio::test]
     async fn sampling_gzip_magic_picks_passthrough() {
         let d = SamplingDispatcher::new(CodecKind::CpuZstd);
+        // v0.8.15 M-7: the post-magic window must also look like
+        // compressed bytes (high entropy) for passthrough to fire.
+        // Use random-ish bytes instead of repeating `a` so the
+        // post-magic check passes.
         let mut payload = vec![0x1f, 0x8b, 0x08]; // gzip magic + DEFLATE method
-        payload.extend(std::iter::repeat_n(b'a', 256));
+        let mut state: u64 = 0xdead_c0de_feed_beef;
+        for _ in 0..512 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            payload.push((state & 0xff) as u8);
+        }
         assert_eq!(d.pick(&payload).await, CodecKind::Passthrough);
+    }
+
+    /// v0.8.15 M-7: a user log file starting with `BZh` followed by
+    /// English text (low entropy) MUST NOT trigger passthrough — the
+    /// pre-M-7 magic-byte check fired on that prefix alone, silently
+    /// skipping compression on customer logs that happened to begin
+    /// with bzip2's 3-byte magic.
+    #[tokio::test]
+    async fn sampling_magic_prefix_but_low_entropy_body_compresses() {
+        let d = SamplingDispatcher::new(CodecKind::CpuZstd);
+        let mut payload = b"BZh just a log line\n".to_vec();
+        // Append low-entropy English text to fill the sample window.
+        payload.extend(
+            "the quick brown fox jumps over the lazy dog. "
+                .repeat(20)
+                .into_bytes(),
+        );
+        assert_eq!(d.pick(&payload).await, CodecKind::CpuZstd);
     }
 
     #[tokio::test]
     async fn sampling_png_magic_picks_passthrough() {
         let d = SamplingDispatcher::new(CodecKind::CpuZstd);
+        // v0.8.15 M-7: real PNG bytes have high entropy after the
+        // magic — pseudo-random fill exercises the new "magic +
+        // post-magic high entropy" branch.
         let mut payload = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-        payload.extend(std::iter::repeat_n(b'b', 256));
+        let mut state: u64 = 0xc0de_f00d_dead_face;
+        for _ in 0..512 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            payload.push((state & 0xff) as u8);
+        }
         assert_eq!(d.pick(&payload).await, CodecKind::Passthrough);
     }
 
     #[tokio::test]
     async fn sampling_mp4_ftyp_picks_passthrough() {
         let d = SamplingDispatcher::new(CodecKind::CpuZstd);
-        let mut payload = vec![0u8; 256];
+        // v0.8.15 M-7: same shape — magic at bytes 4..8 plus a
+        // high-entropy body after for the post-magic check.
+        let mut payload = vec![0u8; 8];
         payload[4..8].copy_from_slice(b"ftyp");
+        let mut state: u64 = 0x1234_5678_dead_beef;
+        for _ in 0..512 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            payload.push((state & 0xff) as u8);
+        }
         assert_eq!(d.pick(&payload).await, CodecKind::Passthrough);
     }
 

@@ -391,7 +391,15 @@ fn build_canonical_request_bytes<B>(
     let mut buf = String::with_capacity(512);
     buf.push_str(req.method().as_str());
     buf.push('\n');
-    buf.push_str(req.uri().path());
+    // v0.8.15 H-d: canonical URI per RFC 3986 unreserved set. Real
+    // AWS SDKs decode + re-encode (uppercase hex, only unreserved
+    // chars left literal) before hashing, so receiving the same
+    // request through a normalising TLS terminator that lowercases
+    // `%2f` to `%2F` (or vice versa) would otherwise produce a
+    // different canonical form than what the SDK signed. `/`
+    // path-segment separators stay literal — S3 doesn't escape them
+    // in the canonical path.
+    buf.push_str(&canonical_uri_path(req.uri().path()));
     buf.push('\n');
     buf.push_str(&canonical_query_string(req.uri().query().unwrap_or("")));
     buf.push('\n');
@@ -446,15 +454,34 @@ fn canonical_query_string(query: &str) -> String {
     if query.is_empty() {
         return String::new();
     }
-    let mut pairs: Vec<(&str, &str)> = query
+    // v0.8.15 H-d: AWS SigV4 / SigV4a spec — decode each key/value to
+    // raw bytes, then re-encode with the AWS canonical form (RFC
+    // 3986 unreserved set, uppercase hex), then sort by the encoded
+    // key (and value as tiebreaker). The pre-H-d code took the raw
+    // wire bytes and sorted those, which produced a different
+    // canonical string than the SDK's output for any of these
+    // mismatches:
+    //
+    // 1. Lowercase `%2f` in the wire vs. SDK-canonical uppercase
+    //    `%2F` (some TLS terminators normalise).
+    // 2. Mixed encoding choices (one side encodes `=` as `%3D`, the
+    //    other leaves it bare).
+    // 3. Sort order on raw bytes vs. encoded bytes differs when one
+    //    side encodes a char the other left literal.
+    //
+    // Real AWS SDKs always emit fully-encoded canonical form, so the
+    // pre-H-d "verbatim sort" only matched signatures the gate itself
+    // produced, not signatures real clients ship.
+    let mut pairs: Vec<(String, String)> = query
         .split('&')
         .filter(|s| !s.is_empty())
         .map(|kv| match kv.split_once('=') {
-            Some((k, v)) => (k, v),
-            None => (kv, ""),
+            Some((k, v)) => (percent_decode_to_string(k), percent_decode_to_string(v)),
+            None => (percent_decode_to_string(kv), String::new()),
         })
+        .map(|(k, v)| (aws_canonical_encode(&k), aws_canonical_encode(&v)))
         .collect();
-    pairs.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)));
+    pairs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     let mut out = String::with_capacity(query.len());
     for (i, (k, v)) in pairs.iter().enumerate() {
         if i > 0 {
@@ -465,6 +492,53 @@ fn canonical_query_string(query: &str) -> String {
         out.push_str(v);
     }
     out
+}
+
+/// v0.8.15 H-d: AWS canonical URI path encoding. Pulls each segment
+/// out of the slash-separated path, decodes any percent-encoded
+/// bytes, then re-encodes with the canonical form. Slashes are
+/// preserved literal (S3 doesn't escape segment separators in the
+/// canonical path).
+fn canonical_uri_path(path: &str) -> String {
+    if path.is_empty() {
+        return "/".to_owned();
+    }
+    let mut out = String::with_capacity(path.len());
+    let mut first = true;
+    for segment in path.split('/') {
+        if !first {
+            out.push('/');
+        }
+        first = false;
+        let decoded = percent_decode_to_string(segment);
+        out.push_str(&aws_canonical_encode(&decoded));
+    }
+    out
+}
+
+/// v0.8.15 H-d: decode a percent-encoded UTF-8 string to its raw
+/// bytes, then interpret as `String` (lossy fallback on bad UTF-8 so
+/// we never panic on weird input). The `percent_encoding` crate
+/// gives us the decode iterator; we just collect.
+fn percent_decode_to_string(s: &str) -> String {
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+/// v0.8.15 H-d: encode a UTF-8 string per AWS SigV4 canonical form.
+/// Per RFC 3986 the unreserved set is `A-Z a-z 0-9 - _ . ~`; every
+/// other byte becomes `%XX` with uppercase hex. AWS treats this set
+/// identically (it's the AWS-canonical set).
+fn aws_canonical_encode(s: &str) -> String {
+    /// AWS canonical set per SigV4 spec — equivalent to RFC 3986
+    /// unreserved. Everything else gets `%XX`.
+    const AWS_CANONICAL_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'_')
+        .remove(b'.')
+        .remove(b'~');
+    percent_encoding::utf8_percent_encode(s, AWS_CANONICAL_SET).to_string()
 }
 
 /// SigV4 header-value canonicalisation: trim leading + trailing

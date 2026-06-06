@@ -69,16 +69,30 @@ pub fn decompress_blocking(input: &[u8], manifest: &ChunkManifest) -> Result<Vec
     // `DECOMPRESS_BOOTSTRAP_CAPACITY` doc.
     let mut buf = Vec::with_capacity(allocated_orig_size.min(DECOMPRESS_BOOTSTRAP_CAPACITY));
     let mut decoder = GzDecoder::new(input);
-    (&mut decoder)
-        .take(limit)
-        .read_to_end(&mut buf)
-        .map_err(CodecError::Io)?;
-    if (buf.len() as u64) > manifest.original_size {
-        return Err(CodecError::Io(std::io::Error::other(format!(
-            "gzip decompression bomb detected: produced {} bytes, manifest claimed {}",
-            buf.len(),
-            manifest.original_size
-        ))));
+    {
+        let mut limited = (&mut decoder).take(limit);
+        limited.read_to_end(&mut buf).map_err(CodecError::Io)?;
+        // v0.8.15 M-9: see cpu_zstd.rs for the rationale. Probe one
+        // byte past `limit` to distinguish a truncated bomb from a
+        // legitimate overshoot inside the 1024-byte zstd buffer
+        // flush window the cap was tuned for.
+        if buf.len() as u64 > manifest.original_size {
+            let mut peek = [0u8; 1];
+            let more_available = limited.read(&mut peek).map(|n| n > 0).unwrap_or(false);
+            return Err(CodecError::Io(std::io::Error::other(format!(
+                "gzip decompression bomb detected: produced at least {} bytes \
+                 (truncated at cap = manifest.original_size + 1024 = {}); \
+                 manifest claimed {}{}",
+                buf.len(),
+                limit,
+                manifest.original_size,
+                if more_available {
+                    "; decoder had more bytes available beyond the cap"
+                } else {
+                    ""
+                },
+            ))));
+        }
     }
     if buf.len() as u64 != manifest.original_size {
         return Err(CodecError::SizeMismatch {

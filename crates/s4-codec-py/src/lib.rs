@@ -96,6 +96,14 @@ fn codec_err_to_py(e: CodecError) -> PyErr {
         TruncatedStream { expected, got } => S4Error::new_err(format!(
             "stream truncated: expected {expected} input bytes, got {got}"
         )),
+        // v0.8.15 M-4: AWS S3 over-length analogue (declared
+        // Content-Length smaller than the wire body). Same shape as
+        // TruncatedStream — surface to Python callers via the
+        // generic `S4Error` since the in-process codec doesn't
+        // emit HTTP status codes.
+        OverlengthStream { expected, got } => S4Error::new_err(format!(
+            "stream over-length: expected {expected} input bytes, got at least {got}"
+        )),
         // `Join` is a tokio internal that surfaces only if a blocking worker
         // panics — surface as backend so retries hit the same class as
         // anyhow-wrapped backend faults.

@@ -244,6 +244,16 @@ pub enum CodecError {
     #[error("streaming compress truncated: expected {expected} input bytes, got {got}")]
     TruncatedStream { expected: u64, got: u64 },
 
+    /// v0.8.15 M-4: the client advertised a `Content-Length` of `expected`
+    /// bytes but kept feeding the gateway data past that point. AWS S3
+    /// returns `IncompleteBody` / `RequestBodyLengthMismatch` for the
+    /// same shape (under-length is `TruncatedStream`, over-length is
+    /// this variant). The s4-server PUT handler maps both to 400 so a
+    /// client retry can succeed instead of silently storing the
+    /// truncated-at-the-listener body.
+    #[error("streaming compress over-length: expected {expected} input bytes, got at least {got}")]
+    OverlengthStream { expected: u64, got: u64 },
+
     /// v0.8.5 #83 H-3: nvCOMP decompress refused to honour a manifest whose
     /// `original_size` exceeds the safety ceiling (default 5 GiB — AWS S3
     /// single-PUT max). Without this gate, a forged or corrupted manifest

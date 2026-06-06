@@ -103,6 +103,20 @@ pub enum SigV4aError {
     /// signature — must be present in the signed-headers list.
     #[error("x-amz-date must be in SignedHeaders list")]
     XAmzDateNotSigned,
+    /// v0.8.15 H-e: `host` is not listed in `SignedHeaders=`. Without
+    /// it, an attacker MITMing the connection could rewrite the
+    /// `Host` header to redirect the request to a different bucket /
+    /// virtual host on the same listener without invalidating the
+    /// signature. AWS S3 enforces this; S4 now matches.
+    #[error("host must be in SignedHeaders list")]
+    HostNotSigned,
+    /// v0.8.15 H-e: the request carries an `x-amz-content-sha256`
+    /// header but `SignedHeaders=` doesn't include it. Lets an
+    /// attacker flip the header from a real digest to
+    /// `UNSIGNED-PAYLOAD` to disable body integrity downstream
+    /// without breaking the signature.
+    #[error("x-amz-content-sha256 header present but not in SignedHeaders list")]
+    ContentSha256NotSigned,
     /// Credential-scope terminator (the trailing component) is not the
     /// literal string `aws4_request` AWS mandates.
     #[error("credential scope must end with /aws4_request")]
@@ -436,6 +450,35 @@ pub fn verify_request(
         .any(|h| h.eq_ignore_ascii_case("x-amz-date"))
     {
         return Err(SigV4aError::XAmzDateNotSigned);
+    }
+    // v0.8.15 H-e: AWS S3 requires `host` to be in `SignedHeaders=`
+    // for every SigV4 / SigV4a request. Without that gate an
+    // attacker MITMing the connection could rewrite the `Host`
+    // header to redirect the request to a different bucket /
+    // virtual host on the same listener — the signature would
+    // still verify because the host bytes never enter the canonical
+    // request. Mirror AWS' rule.
+    if !parsed
+        .signed_headers
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case("host"))
+    {
+        return Err(SigV4aError::HostNotSigned);
+    }
+    // v0.8.15 H-e: when the request carries an
+    // `x-amz-content-sha256` header, it MUST also be in the signed
+    // list. Otherwise an attacker could flip a sender-computed
+    // SHA-256 to `UNSIGNED-PAYLOAD` to disable downstream body
+    // integrity. (Requests without the header at all are fine —
+    // payload-integrity is the sender's choice; we just need the
+    // value, when present, to be covered by the signature.)
+    if lookup_header_ci(headers, "x-amz-content-sha256").is_some()
+        && !parsed
+            .signed_headers
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case("x-amz-content-sha256"))
+    {
+        return Err(SigV4aError::ContentSha256NotSigned);
     }
 
     // v0.8.12 #126 (MED-A): AWS SigV4 / SigV4a spec — the ECDSA

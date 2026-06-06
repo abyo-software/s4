@@ -97,11 +97,18 @@ pub struct FrameIndexEntry {
 }
 
 impl FrameIndexEntry {
+    /// v0.8.15 H-a: was plain `self.original_offset + self.original_size`,
+    /// which panics in `dev` (workspace `overflow_checks = true`) and
+    /// wraps in release on an attacker-supplied sidecar entry with
+    /// `original_offset = u64::MAX - 10` and `original_size = 100`.
+    /// `decode_index` now also pre-validates each entry below, so this
+    /// `saturating_add` is defence-in-depth — a corrupted in-memory
+    /// `FrameIndexEntry` cannot crash the gateway through `binary_search_by`.
     pub fn original_end(&self) -> u64 {
-        self.original_offset + self.original_size
+        self.original_offset.saturating_add(self.original_size)
     }
     pub fn compressed_end(&self) -> u64 {
-        self.compressed_offset + self.compressed_size
+        self.compressed_offset.saturating_add(self.compressed_size)
     }
 }
 
@@ -211,7 +218,46 @@ pub enum IndexError {
     UnsupportedVersion(u32),
     #[error("entry count {claimed} doesn't match buffer remaining {remaining}")]
     EntryCountMismatch { claimed: u64, remaining: usize },
+    /// v0.8.15 H-a: an entry's `original_offset + original_size` or
+    /// `compressed_offset + compressed_size` overflows `u64`. The
+    /// downstream `binary_search_by` / `lookup_range` machinery
+    /// assumes monotonically-increasing offsets — overflow would let
+    /// a forged sidecar drive the range planner into garbage state.
+    #[error(
+        "frame index entry overflows: original_offset={ooff}, original_size={osize}, \
+         compressed_offset={coff}, compressed_size={csize}"
+    )]
+    EntryOverflow {
+        ooff: u64,
+        osize: u64,
+        coff: u64,
+        csize: u64,
+    },
+    /// v0.8.15 H-c: per-sidecar entry-count cap. Pairs with the v0.8.12
+    /// `#124` `Vec::with_capacity` clamp — refuses pathologically-large
+    /// `n` at parse time even before the `expected_remaining == input.len()`
+    /// guard, so a 32-bit target can't be tricked into running `0..n`
+    /// past the buffer.
+    #[error("frame index entry count {got} exceeds MAX_FRAMES={max}")]
+    TooManyFrames { got: u64, max: u64 },
+    /// v0.8.15 H-c: `etag_len` exceeds the maximum addressable size on
+    /// this target (32-bit) or the operator-configured cap.
+    #[error("sidecar etag_len {got} exceeds MAX_ETAG_BYTES={max}")]
+    EtagTooLong { got: u32, max: u32 },
 }
+
+/// v0.8.15 H-c: hard upper bound on the number of entries
+/// [`decode_index`] will accept. 16 M × 32 B = 512 MiB sidecar
+/// body — orders of magnitude over any real workload (a typical
+/// 5 GiB object hits ~1280 frames at the 4 MiB default chunk).
+/// Above this we'd be parsing an attacker payload, not a legitimate
+/// sidecar.
+pub const MAX_FRAMES: u64 = 16 * 1024 * 1024;
+/// v0.8.15 H-c: hard upper bound on the etag-length field. AWS S3
+/// ETags are ≤ 64 bytes including quotes; MinIO / Garage match. The
+/// 4 KiB cap leaves room for non-canonical multipart ETags
+/// (`<hex>-<n>`) without admitting attacker-controlled payloads.
+pub const MAX_ETAG_BYTES: u32 = 4096;
 
 /// v0.8.4 #73 H-2: emit the **v2** layout (with `source_etag` /
 /// `source_compressed_size`). Pre-v0.8.4 deployments that PUT under v1 are
@@ -275,6 +321,17 @@ pub fn decode_index(mut input: Bytes) -> Result<FrameIndex, IndexError> {
     let n = input.get_u64_le();
     let _total_original = input.get_u64_le();
     let total_padded_size = input.get_u64_le();
+    // v0.8.15 H-c: hard cap on `n` *before* any size arithmetic. The
+    // existing `expected_remaining == input.len()` check is a
+    // necessary condition but not sufficient — on a 32-bit target,
+    // `n as usize` truncates a 33-bit value and the buffer check
+    // would silently pass with the wrong loop count. Reject early.
+    if n > MAX_FRAMES {
+        return Err(IndexError::TooManyFrames {
+            got: n,
+            max: MAX_FRAMES,
+        });
+    }
     // Dispatch on version. v1 jumps straight to the entry table; v2 reads
     // the additional fixed fields + variable-length etag before the entries.
     let (source_compressed_size, source_etag) = match version {
@@ -285,7 +342,17 @@ pub fn decode_index(mut input: Bytes) -> Result<FrameIndex, IndexError> {
                 return Err(IndexError::TooShort(input.len()));
             }
             let scs = input.get_u64_le();
-            let etag_len = input.get_u32_le() as usize;
+            let etag_len_u32 = input.get_u32_le();
+            // v0.8.15 H-c: bound `etag_len` *before* the `as usize`
+            // cast so the buffer check on a 32-bit WASM target can't
+            // be tricked into a usize-truncated value.
+            if etag_len_u32 > MAX_ETAG_BYTES {
+                return Err(IndexError::EtagTooLong {
+                    got: etag_len_u32,
+                    max: MAX_ETAG_BYTES,
+                });
+            }
+            let etag_len = etag_len_u32 as usize;
             if input.len() < etag_len {
                 return Err(IndexError::TooShort(input.len()));
             }
@@ -302,6 +369,11 @@ pub fn decode_index(mut input: Bytes) -> Result<FrameIndex, IndexError> {
         }
         other => return Err(IndexError::UnsupportedVersion(other)),
     };
+    // v0.8.15 H-c: `n * ENTRY_BYTES` cannot overflow `usize` here
+    // because `n <= MAX_FRAMES = 16M` and `ENTRY_BYTES = 32`, and on
+    // 32-bit targets the resulting value fits in `usize` (≤ 512
+    // MiB). The `as usize` cast on `n` is now bounded by the same
+    // ceiling.
     let expected_remaining = (n as usize).saturating_mul(ENTRY_BYTES);
     if input.len() != expected_remaining {
         return Err(IndexError::EntryCountMismatch {
@@ -331,6 +403,21 @@ pub fn decode_index(mut input: Bytes) -> Result<FrameIndex, IndexError> {
         let original_size = input.get_u64_le();
         let compressed_offset = input.get_u64_le();
         let compressed_size = input.get_u64_le();
+        // v0.8.15 H-a: refuse entries whose `offset + size` overflows
+        // `u64`. The downstream `binary_search_by` / `lookup_range`
+        // machinery relies on monotone offsets — a wrapped value
+        // would let a forged sidecar drive `RangePlan.byte_end_exclusive`
+        // to garbage.
+        if original_offset.checked_add(original_size).is_none()
+            || compressed_offset.checked_add(compressed_size).is_none()
+        {
+            return Err(IndexError::EntryOverflow {
+                ooff: original_offset,
+                osize: original_size,
+                coff: compressed_offset,
+                csize: compressed_size,
+            });
+        }
         entries.push(FrameIndexEntry {
             original_offset,
             original_size,
@@ -397,7 +484,24 @@ pub fn build_index_from_body(body: &Bytes) -> Result<FrameIndex, crate::multipar
 
 /// `<key>` から sidecar key を生成。
 pub fn sidecar_key(object_key: &str) -> String {
-    format!("{object_key}.s4index")
+    format!("{object_key}{SIDECAR_SUFFIX}")
+}
+
+/// v0.8.15 M-1: the per-object sidecar key suffix. Exposed publicly so
+/// the listener-side reserved-name guard
+/// (`s4-server::routing::is_reserved_object_key`) and the list-filter
+/// `ends_with(".s4index")` calls share one source of truth.
+pub const SIDECAR_SUFFIX: &str = ".s4index";
+
+/// v0.8.15 M-1: classify a candidate user-PUT object key as a
+/// reserved sidecar name. The S4 gateway uses `<key>.s4index` for
+/// its internal Range-GET fast-path; a user PUT under that name
+/// would either be hidden from `ListObjectsV2` (the filter strips
+/// `.s4index` suffixes) or get collected by the sidecar-cleanup
+/// path on `DeleteObject`. Returning a reserved-key error at the
+/// listener edge stops both before the user can be surprised.
+pub fn is_reserved_sidecar_key(object_key: &str) -> bool {
+    object_key.ends_with(SIDECAR_SUFFIX)
 }
 
 #[cfg(test)]
