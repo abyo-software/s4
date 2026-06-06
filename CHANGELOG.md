@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.14] — 2026-06-06
+
+Hotfix on top of v0.8.13. The v0.8.13 #127 (MED-B) "force buffered
+PUT path when a whole-body checksum is supplied" attempt regressed
+the MinIO E2E job — modern AWS SDKs auto-add an
+`x-amz-checksum-crc32` trailer by default, which made every SDK
+PUT lose the streaming-framed code path and therefore lose its
+sidecar. Range GET fast-path and `upload_part_copy` over an
+S4-framed source both depend on the sidecar being there.
+
+### Fixed
+
+- **#129 — streaming PUT path no longer downgraded to buffered on
+  client-supplied checksums (`service.rs:2396`).** Drops the
+  `!client_supplied_checksum` term from `use_framed`. Streaming
+  PUTs are framed again and the sidecar is produced as before.
+  This re-opens the v0.8.11 #122 fail-open hole for the streaming
+  case only — the buffered PUT branch and `UploadPart` continue
+  to verify. True streaming verify (tee-into-hasher on the
+  chained input + final digest check at end-of-stream) is the
+  tracked follow-up. Tests:
+  `range_get_falls_back_to_full_when_sidecar_etag_stale`,
+  `upload_part_copy_propagates_source_version_id`.
+
+### Notes
+
+- v0.8.14 is `v0.8.13` minus the use_framed downgrade. The MED-B
+  helper itself (`verify_client_body_checksums` with all six AWS
+  algorithms from MED-C) remains active on every buffered PUT and
+  `UploadPart` request — those paths are bit-for-bit unchanged.
+- Operators who want the buffered + verify behaviour on every PUT
+  can set `--dispatcher always` with `--codec passthrough`; the
+  sampling dispatcher continues to make the codec choice per-PUT.
+
 ## [0.8.13] — 2026-06-06
 
 Pre-release **MED sweep** — 4 MED findings from the same Codex CLI

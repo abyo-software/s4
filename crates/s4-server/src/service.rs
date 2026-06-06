@@ -2375,27 +2375,25 @@ impl<B: S3> S3 for S4Service<B> {
             // pass-through. So passthrough always uses the legacy raw-blob
             // path; only compressing codecs go through the framed path.
             //
-            // v0.8.12 #127 (MED-B): when the client supplied a
-            // whole-body integrity checksum (`Content-MD5` or any of
-            // the `x-amz-checksum-*` headers), force the buffered
-            // path so we can verify against the received bytes
-            // before stripping the headers. The streaming-framed
-            // path consumes the body chunk-by-chunk and can't
-            // produce a final whole-body digest without buffering
-            // the entire object — and accepting a checksum-signed
-            // body without verifying is the same fail-open the
-            // v0.8.11 #122 HIGH-12 fix closes for the buffered case.
-            // True streaming verify is a follow-up (tee the chained
-            // stream into a hasher) tracked separately.
-            let client_supplied_checksum = req.input.content_md5.is_some()
-                || req.input.checksum_crc32.is_some()
-                || req.input.checksum_crc32c.is_some()
-                || req.input.checksum_sha1.is_some()
-                || req.input.checksum_sha256.is_some()
-                || req.input.checksum_crc64nvme.is_some();
-            let use_framed = supports_streaming_compress(kind)
-                && kind != CodecKind::Passthrough
-                && !client_supplied_checksum;
+            // v0.8.14 follow-up to #127 MED-B: the previous attempt
+            // forced the buffered path whenever the client supplied
+            // any whole-body checksum so `verify_client_body_checksums`
+            // could run. Modern AWS SDKs auto-add an
+            // `x-amz-checksum-crc32` trailer by default, which made
+            // every SDK PUT lose the streaming-framed path and
+            // therefore lose its sidecar — silent data path
+            // regression caught by
+            // `range_get_falls_back_to_full_when_sidecar_etag_stale`
+            // and `upload_part_copy_propagates_source_version_id`
+            // on the MinIO E2E job. The streaming PUT path now
+            // passes through unchanged; client-supplied checksums on
+            // streaming PUTs are NOT verified (same fail-open as
+            // pre-v0.8.12). The buffered PUT branch and UploadPart
+            // do verify, which covers the buffered upload case the
+            // HIGH-12 audit was scoped to. True streaming verify
+            // (tee-into-hasher on the chained input) remains the
+            // tracked follow-up.
+            let use_framed = supports_streaming_compress(kind) && kind != CodecKind::Passthrough;
             let (compressed, manifest, is_framed) = if use_framed {
                 // streaming fast path: input は memory に collect しない
                 let chained = chain_sample_with_rest(sample, rest_stream);
