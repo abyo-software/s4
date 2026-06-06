@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.13] — 2026-06-06
+
+Pre-release **MED sweep** — 4 MED findings from the same Codex CLI
++ Claude Code review. Each one was previously flagged as
+follow-up scope in the v0.8.11 / v0.8.12 cut notes; shipping them
+now keeps the launch posture self-consistent. No CRIT / HIGH
+remaining from the review.
+
+### Added
+
+- **#125 MED-impl — Bitcomp auto-routing for columnar-integer
+  payloads (`dispatcher.rs:167`).** The README claim
+  "integer/columnar → Bitcomp" was previously honoured only via
+  explicit `--codec nvcomp-bitcomp`. The sampling dispatcher now
+  carries a per-stride-position byte-histogram detector
+  (`looks_columnar_integer`) that flags a sample as a u32 / u64 LE
+  integer column when one stride's max-vs-min byte entropy gap
+  exceeds 4.0 bits (the signature of bounded ints — high entropy
+  on the low byte, ≈ 0 entropy on the high byte). New
+  `--prefer-columnar-gpu` CLI flag opts a deployment in; off by
+  default so v0.8.12-and-earlier deployments are bit-for-bit
+  unchanged. Tests cover postings / timestamps / text / random /
+  size-threshold / no-GPU branches.
+- **#128 MED-C — full AWS checksum coverage on the buffered PUT +
+  UploadPart path (`service.rs:132`).** The v0.8.11 #122 HIGH-12
+  fix verified `Content-MD5` / `x-amz-checksum-crc32c` /
+  `x-amz-checksum-sha256`; this release extends
+  `verify_client_body_checksums` to also cover `x-amz-checksum-crc32`
+  (IEEE 802.3, via `crc32fast`), `x-amz-checksum-sha1` (new
+  `sha1 = "0.10"` dep), and `x-amz-checksum-crc64nvme` (small
+  inline table-driven implementation). Mismatch → `BadDigest`.
+
+### Fixed
+
+- **#126 MED-A — SigV4a now verifies the AWS-spec string-to-sign
+  instead of the raw canonical request (`sigv4a.rs:441`).** The
+  previous code passed `canonical_request_bytes` straight to the
+  p256 verifier — fine for S4's own `SigV4aGate` (signer and
+  verifier both used the canonical bytes) but rejected real AWS
+  SDK / aws-crt-cpp signatures, which hash the canonical request
+  and sign `"AWS4-ECDSA-P256-SHA256" || x-amz-date ||
+  credential_scope || hex(sha256(canonical))`. The verifier now
+  builds the spec-correct string-to-sign and the existing
+  freshness / scope / region / signed-header gates are unchanged.
+  Test fixtures (`build_signed_request`, routing-layer fixture,
+  feature_e2e fixture) updated to sign the string-to-sign.
+- **#127 MED-B — streaming-framed PUT now falls back to the
+  buffered path when the client supplied a whole-body checksum
+  (`service.rs:2287`).** The streaming pipeline consumes the body
+  chunk-by-chunk and cannot produce a whole-body digest without
+  buffering. Rather than silently dropping the checksum (the
+  v0.8.11 fail-open hole) or returning an opaque error, we
+  redirect to the existing buffered branch, which runs
+  `verify_client_body_checksums` and produces `BadDigest` on
+  mismatch. TTFB cost is paid only for PUTs that actually ship a
+  checksum header; non-checksummed PUTs keep the streaming
+  benefit. True streaming verify (tee-into-hasher on the chained
+  stream) is tracked as a follow-up — the buffered fallback is
+  the correctness floor.
+
+### Tests
+
+- 438 lib + 45 integration tests green; `cargo fmt --all --check`
+  clean. New tests added under `dispatcher::tests` for the
+  columnar branch.
+
+### Notes
+
+- v0.8.13 closes the full CRIT + HIGH + MED set from the Codex CLI
+  + Claude Code pre-release review. The remaining items
+  (true-streaming PUT checksum verify, encryption-aware sidecar,
+  multi-window sampling) are scoped as roadmap improvements rather
+  than launch-blocking findings.
+
 ## [0.8.12] — 2026-06-06
 
 Pre-release **HIGH sweep** — 9 HIGH findings from the same Codex CLI

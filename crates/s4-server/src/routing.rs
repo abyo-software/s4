@@ -989,7 +989,26 @@ mod sigv4a_gate_tests {
             .collect();
         let canonical =
             build_canonical_request_bytes(&pre, &signed_headers).expect("test fixture canonical");
-        let sig: p256::ecdsa::Signature = signing.sign(&canonical);
+        // v0.8.12 #126 (MED-A): sign the AWS-spec string-to-sign so
+        // the routing-layer SigV4a fixture matches the new
+        // `verify_request` body (which hashes the canonical request
+        // and signs the algo / date / scope / hash concatenation).
+        let canonical_hash = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&canonical);
+            let out = h.finalize();
+            let mut s = String::with_capacity(out.len() * 2);
+            for b in out {
+                use std::fmt::Write as _;
+                let _ = write!(s, "{b:02x}");
+            }
+            s
+        };
+        let sts = format!(
+            "AWS4-ECDSA-P256-SHA256\n20260513T120000Z\n20260513/s3/aws4_request\n{canonical_hash}"
+        );
+        let sig: p256::ecdsa::Signature = signing.sign(sts.as_bytes());
         let sig_hex = lower_hex(sig.to_der().as_bytes());
         let auth = build_auth_header(access_key, &signed_headers_list, &sig_hex);
 

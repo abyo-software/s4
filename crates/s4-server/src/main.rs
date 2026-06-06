@@ -128,6 +128,20 @@ struct Opt {
     #[clap(long, default_value_t = 1_048_576)]
     gpu_min_bytes: usize,
 
+    /// v0.8.12 #125: opt the sampling dispatcher into routing
+    /// columnar-integer payloads (Parquet, postings, time-series) to
+    /// `nvcomp-bitcomp` instead of `nvcomp-zstd` once the
+    /// `--gpu-min-bytes` threshold is met. The detector runs the
+    /// per-stride-position byte histogram from `looks_columnar_integer`
+    /// — a sample with high-entropy low bytes and near-zero-entropy
+    /// high bytes (the signature of u32 / u64 LE integer columns)
+    /// triggers the promotion. When this flag is off (default), large
+    /// CpuZstd picks always go to NvcompZstd, matching v0.8.11
+    /// behaviour. Has no effect under `--dispatcher always` or when
+    /// no GPU is detected at boot.
+    #[clap(long, default_value_t = false)]
+    prefer_columnar_gpu: bool,
+
     /// ログ出力形式 (pretty / json)。production では json 推奨
     #[clap(long, value_enum, default_value = "pretty")]
     log_format: LogFormat,
@@ -790,11 +804,14 @@ fn build_dispatcher(
     default: CodecKind,
     prefer_gpu: bool,
     gpu_min_bytes: usize,
+    prefer_columnar_gpu: bool,
 ) -> Arc<dyn CodecDispatcher> {
     match choice {
         DispatcherChoice::Always => Arc::new(AlwaysDispatcher(default)),
         DispatcherChoice::Sampling => Arc::new(
-            SamplingDispatcher::new(default).with_gpu_preference(prefer_gpu, gpu_min_bytes),
+            SamplingDispatcher::new(default)
+                .with_gpu_preference(prefer_gpu, gpu_min_bytes)
+                .with_columnar_gpu_preference(prefer_columnar_gpu),
         ),
     }
 }
@@ -937,12 +954,42 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     #[cfg(not(feature = "nvcomp-gpu"))]
     let prefer_gpu = false;
 
-    let dispatcher = build_dispatcher(opt.dispatcher, default_kind, prefer_gpu, opt.gpu_min_bytes);
+    // v0.8.12 #125: the Bitcomp routing flag is only meaningful when
+    // (a) the sampling dispatcher is in use, (b) we already chose to
+    // prefer GPU, and (c) the registry actually carries
+    // `nvcomp-bitcomp` (it does on `nvcomp-gpu` builds). We honour
+    // the operator's `--prefer-columnar-gpu` opt-in but drop it
+    // silently when the prerequisites aren't met — same shape as
+    // `prefer_gpu` falling through to `false` without the
+    // `nvcomp-gpu` feature.
+    let effective_columnar_gpu = opt.prefer_columnar_gpu && prefer_gpu;
+    if opt.prefer_columnar_gpu {
+        if effective_columnar_gpu {
+            info!(
+                "columnar-gpu routing enabled — u32 / u64 LE integer columns \
+                 promote to nvcomp-bitcomp at >= {} bytes",
+                opt.gpu_min_bytes
+            );
+        } else {
+            info!(
+                "--prefer-columnar-gpu requested but no GPU detected (or \
+                 nvcomp-gpu feature off) — flag has no effect"
+            );
+        }
+    }
+    let dispatcher = build_dispatcher(
+        opt.dispatcher,
+        default_kind,
+        prefer_gpu,
+        opt.gpu_min_bytes,
+        effective_columnar_gpu,
+    );
     info!(
         codec = ?opt.codec,
         dispatcher = ?opt.dispatcher,
         prefer_gpu,
         gpu_min_bytes = opt.gpu_min_bytes,
+        prefer_columnar_gpu = effective_columnar_gpu,
         registered = ?registry.kinds().collect::<Vec<_>>(),
         "S4 codec registry built"
     );

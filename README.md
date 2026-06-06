@@ -29,9 +29,16 @@ entropy + magic bytes and routes per object:
 
 - text / log → `cpu-zstd-3` (often beats GPU codecs both on ratio AND
   throughput at the input size where everything fits in L3)
-- columnar integers (Parquet / postings / time-series) → `nvcomp-bitcomp`
-  / `nvcomp-gdeflate` (GPU's strength; orders of magnitude faster at the
-  large-batch sizes columnar workloads produce)
+- columnar integers (Parquet / postings / time-series) →
+  `nvcomp-bitcomp` (GPU's strength on integer/columnar layouts).
+  Two modes:
+  - explicit: `--codec nvcomp-bitcomp` always picks Bitcomp regardless
+    of sample content
+  - automatic: `--prefer-columnar-gpu` (opt-in) lets the sampling
+    dispatcher detect a u32 / u64 LE integer column via per-stride
+    byte-position entropy and route to Bitcomp once the body is
+    `>= --gpu-min-bytes`. Default is off so v0.8.11-or-earlier
+    deployments are bit-for-bit unchanged
 - already-compressed (mp4 / jpeg / parquet-with-zstd-block-codec / `.gz`
   detected by magic byte) → `passthrough` (no harm done)
 - non-GPU build OR no GPU at runtime → CPU codecs end-to-end

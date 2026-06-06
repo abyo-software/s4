@@ -409,7 +409,24 @@ fn build_sigv4a_request(
         &signed_headers,
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     );
-    let sig: p256::ecdsa::Signature = signing.sign(&canonical);
+    // v0.8.12 #126 (MED-A): the gate now verifies against the
+    // AWS-spec string-to-sign, so the e2e fixture has to match.
+    let canonical_hash = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&canonical);
+        let out = h.finalize();
+        let mut s = String::with_capacity(out.len() * 2);
+        for b in out {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    };
+    let sts = format!(
+        "AWS4-ECDSA-P256-SHA256\n{x_amz_date}\n{scope_date}/s3/aws4_request\n{canonical_hash}"
+    );
+    let sig: p256::ecdsa::Signature = signing.sign(sts.as_bytes());
     let sig_hex = lower_hex(sig.to_der().as_bytes());
     let names: Vec<&str> = signed_headers.iter().map(|(n, _)| *n).collect();
     format!(

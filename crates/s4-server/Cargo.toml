@@ -123,6 +123,10 @@ s4-config = { path = "../s4-config", version = "0.8.10" }
 sqlparser = "0.51"
 csv = "1"
 crc32fast = "1"
+# v0.8.12 #128 (MED-C): SHA-1 verifier for `x-amz-checksum-sha1`.
+# RustCrypto crate, same `Digest` trait as `sha2` / `md-5` so the
+# helper shape stays consistent.
+sha1 = "0.10"
 # v0.6 #42: MFA Delete — RFC 6238 TOTP verification on DELETE / DELETE-version
 # / delete-marker requests when a bucket has Versioning + MfaDelete Enabled.
 # `default-features = false` keeps the dep tree minimal (no QR generation, no

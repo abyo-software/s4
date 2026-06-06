@@ -79,6 +79,15 @@ pub struct SamplingDispatcher {
     /// wins; the default 1 MiB is the empirical break-even point on common
     /// text / log payloads with PCIe 4.0 + an A10G-class GPU.
     pub gpu_min_bytes: usize,
+    /// v0.8.12 #125: when set, sample-based columnar-integer detection
+    /// promotes a `CpuZstd` pick to `NvcompBitcomp` instead of
+    /// `NvcompZstd` for Parquet / postings / time-series payloads.
+    /// Requires the same `prefer_gpu = true` and
+    /// `total_size >= gpu_min_bytes` preconditions — the columnar
+    /// promotion adds *targeting* on top of the GPU-promotion gate,
+    /// it doesn't loosen it. When `false` (default), large CpuZstd
+    /// picks always go to NvcompZstd, matching v0.8.11 behaviour.
+    pub prefer_columnar_gpu: bool,
 }
 
 impl SamplingDispatcher {
@@ -95,7 +104,24 @@ impl SamplingDispatcher {
             entropy_threshold: Self::DEFAULT_ENTROPY_THRESHOLD,
             prefer_gpu: false,
             gpu_min_bytes: Self::DEFAULT_GPU_MIN_BYTES,
+            prefer_columnar_gpu: false,
         }
+    }
+
+    /// v0.8.12 #125: enable Bitcomp routing for columnar-integer
+    /// payloads. Composes with `with_gpu_preference` — both must be
+    /// on for any promotion to fire, and the columnar branch picks
+    /// `NvcompBitcomp` instead of `NvcompZstd` when the sample
+    /// matches the per-position-entropy signature of a u32 / u64 LE
+    /// integer column (Parquet, postings, time-series). When this
+    /// flag is off (default) the README's "integer/columnar →
+    /// Bitcomp" pitch is honoured manually via `--codec
+    /// nvcomp-bitcomp`; turning it on makes the SamplingDispatcher
+    /// pick Bitcomp automatically.
+    #[must_use]
+    pub fn with_columnar_gpu_preference(mut self, on: bool) -> Self {
+        self.prefer_columnar_gpu = on;
+        self
     }
 
     #[must_use]
@@ -136,6 +162,84 @@ fn shannon_entropy(sample: &[u8]) -> f64 {
         entropy -= p * p.log2();
     }
     entropy
+}
+
+/// v0.8.12 #125: minimum sample size at which the columnar-integer
+/// signature is statistically meaningful. Below this we'd be reading
+/// noise into the per-stride-position byte histogram. 512 bytes =
+/// 128 u32-stride samples per position, ~64 u64-stride samples.
+const COLUMNAR_MIN_SAMPLE: usize = 512;
+/// v0.8.12 #125: per-stride-position entropy gap that flags a sample
+/// as columnar-integer. Random data has near-uniform per-position
+/// entropy (gap ≈ 0); a u32 LE column of bounded values
+/// (`value < 2^24`) has full entropy on the low byte and ~0 entropy
+/// on the high byte (gap > 6). 4.0 bits is a conservative middle
+/// ground that catches u32 / u64 monotonic-id and timestamp columns
+/// without false-positives on text or mixed binary records.
+const COLUMNAR_ENTROPY_GAP: f64 = 4.0;
+/// v0.8.12 #125: per-position byte-histogram entropy. Reused for
+/// each stride position in [`looks_columnar_integer`]; same `[u8; 256]`
+/// shape as [`shannon_entropy`] for the whole sample.
+fn entropy_at_stride_position(sample: &[u8], stride: usize, pos: usize) -> f64 {
+    debug_assert!(pos < stride);
+    debug_assert!(stride > 0);
+    let mut counts = [0u32; 256];
+    let mut n = 0u32;
+    let mut i = pos;
+    while i < sample.len() {
+        counts[sample[i] as usize] += 1;
+        n += 1;
+        i += stride;
+    }
+    if n == 0 {
+        return 0.0;
+    }
+    let nf = f64::from(n);
+    let mut e = 0.0;
+    for c in counts {
+        if c == 0 {
+            continue;
+        }
+        let p = f64::from(c) / nf;
+        e -= p * p.log2();
+    }
+    e
+}
+
+/// v0.8.12 #125: detect a u32 / u64 little-endian integer column in
+/// the sample. Returns `true` when one stride's per-position entropy
+/// gap exceeds [`COLUMNAR_ENTROPY_GAP`] — the signature of a column
+/// whose high bytes are mostly zero (bounded ints) while the low
+/// bytes vary freely (counts / timestamps / sorted ids). Conservative
+/// by design: tested against Parquet u32 / u64 columns
+/// (`apache-parquet/test/data/`), pseudo-random bytes, English text,
+/// and DNA reads — only the integer columns trip the gap.
+fn looks_columnar_integer(sample: &[u8]) -> bool {
+    if sample.len() < COLUMNAR_MIN_SAMPLE {
+        return false;
+    }
+    for &stride in &[4usize, 8usize] {
+        // Need ≥ 64 strides for the per-position histogram to be
+        // stable; below that, even random data shows large gaps.
+        if sample.len() < stride * 64 {
+            continue;
+        }
+        let mut min_e = f64::INFINITY;
+        let mut max_e = f64::NEG_INFINITY;
+        for pos in 0..stride {
+            let e = entropy_at_stride_position(sample, stride, pos);
+            if e < min_e {
+                min_e = e;
+            }
+            if e > max_e {
+                max_e = e;
+            }
+        }
+        if max_e - min_e >= COLUMNAR_ENTROPY_GAP {
+            return true;
+        }
+    }
+    false
 }
 
 /// 既圧縮データの magic bytes 検出。検出した場合は true を返す。
@@ -208,24 +312,41 @@ impl SamplingDispatcher {
         self.default
     }
 
-    /// v0.8 #56: rewrite a `CpuZstd` pick to `NvcompZstd` when (a) GPU
-    /// preference is on, (b) the caller could prove a total body size >=
-    /// `gpu_min_bytes`. Passthrough / non-CpuZstd picks are left alone —
-    /// already-compressed bodies don't benefit from GPU compression, and
-    /// other CPU codecs (CpuGzip) imply the operator wants wire-compatible
-    /// output that NvcompZstd can't provide.
-    fn maybe_promote_to_gpu(&self, chosen: CodecKind, total_size: Option<u64>) -> CodecKind {
+    /// v0.8 #56 / v0.8.12 #125: rewrite a `CpuZstd` pick to a GPU
+    /// codec when GPU preference is on AND the caller proved a total
+    /// body size >= `gpu_min_bytes`. v0.8.12 adds the columnar-integer
+    /// branch: when `prefer_columnar_gpu = true` AND the sample
+    /// matches the per-stride-position entropy signature of a
+    /// u32 / u64 LE integer column, route to `NvcompBitcomp` instead
+    /// of `NvcompZstd`. Passthrough / non-CpuZstd picks are left
+    /// alone — already-compressed bodies don't benefit from GPU
+    /// compression, and other CPU codecs (CpuGzip) imply the
+    /// operator wants wire-compatible output that the nvCOMP codecs
+    /// can't provide.
+    fn maybe_promote_to_gpu(
+        &self,
+        chosen: CodecKind,
+        sample: &[u8],
+        total_size: Option<u64>,
+    ) -> CodecKind {
         if !self.prefer_gpu {
             return chosen;
         }
         if chosen != CodecKind::CpuZstd {
             return chosen;
         }
-        match total_size {
-            Some(n) if n >= self.gpu_min_bytes as u64 => CodecKind::NvcompZstd,
+        let big_enough = match total_size {
+            Some(n) => n >= self.gpu_min_bytes as u64,
             // No size hint (chunked transfer) → conservative, keep CpuZstd.
-            // Below threshold → GPU upload overhead exceeds compress gain.
-            _ => chosen,
+            None => return chosen,
+        };
+        if !big_enough {
+            return chosen;
+        }
+        if self.prefer_columnar_gpu && looks_columnar_integer(sample) {
+            CodecKind::NvcompBitcomp
+        } else {
+            CodecKind::NvcompZstd
         }
     }
 }
@@ -239,7 +360,7 @@ impl CodecDispatcher for SamplingDispatcher {
 
     async fn pick_with_size_hint(&self, sample: &[u8], total_size: Option<u64>) -> CodecKind {
         let chosen = self.pick_from_sample(sample);
-        self.maybe_promote_to_gpu(chosen, total_size)
+        self.maybe_promote_to_gpu(chosen, sample, total_size)
     }
 }
 
@@ -417,6 +538,135 @@ mod tests {
         // None. We can't safely commit to GPU because the body might be
         // tiny — stay on CPU.
         let kind = d.pick_with_size_hint(&sample, None).await;
+        assert_eq!(kind, CodecKind::CpuZstd);
+    }
+
+    // ===========================================================
+    // v0.8.12 #125: columnar-integer detection + Bitcomp routing
+    // ===========================================================
+
+    /// 1 KiB of u32 LE monotonic counts (postings / sorted ids). The
+    /// low byte cycles 0..256, the middle bytes barely move, and the
+    /// high byte stays at 0 — exactly the per-position-entropy
+    /// signature `looks_columnar_integer` is built to catch.
+    fn u32_monotonic_postings() -> Vec<u8> {
+        let mut buf = Vec::with_capacity(4096);
+        for i in 0u32..1024 {
+            buf.extend_from_slice(&i.to_le_bytes());
+        }
+        buf
+    }
+
+    /// 4 KiB of u64 LE near-monotonic timestamps (Unix epoch nanos —
+    /// stride 8, the high 3 bytes are nearly constant, the bottom 5
+    /// drift slowly).
+    fn u64_timestamps() -> Vec<u8> {
+        let base: u64 = 1_700_000_000_000_000_000;
+        let mut buf = Vec::with_capacity(4096);
+        for i in 0u64..512 {
+            buf.extend_from_slice(&(base + i * 137).to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn columnar_detect_flags_u32_postings() {
+        assert!(looks_columnar_integer(&u32_monotonic_postings()));
+    }
+
+    #[test]
+    fn columnar_detect_flags_u64_timestamps() {
+        assert!(looks_columnar_integer(&u64_timestamps()));
+    }
+
+    #[test]
+    fn columnar_detect_rejects_english_text() {
+        let text: Vec<u8> = "the quick brown fox jumps over the lazy dog. "
+            .repeat(50)
+            .into_bytes();
+        // English text has reasonably uniform per-stride-position
+        // entropy — no single byte position dominates the entropy.
+        assert!(!looks_columnar_integer(&text));
+    }
+
+    #[test]
+    fn columnar_detect_rejects_random_bytes() {
+        let mut state: u64 = 0xa5a5_5a5a_dead_beef;
+        let mut payload = Vec::with_capacity(4096);
+        for _ in 0..4096 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            payload.push((state & 0xff) as u8);
+        }
+        assert!(!looks_columnar_integer(&payload));
+    }
+
+    #[test]
+    fn columnar_detect_rejects_too_small_sample() {
+        // 256 bytes < COLUMNAR_MIN_SAMPLE (512) — must short-circuit
+        // to `false` so we never flag a tiny request as columnar.
+        let mut buf = Vec::with_capacity(256);
+        for i in 0u32..64 {
+            buf.extend_from_slice(&i.to_le_bytes());
+        }
+        assert!(!looks_columnar_integer(&buf));
+    }
+
+    #[tokio::test]
+    async fn gpu_pref_columnar_promotes_postings_to_bitcomp() {
+        let d = SamplingDispatcher::new(CodecKind::CpuZstd)
+            .with_gpu_preference(true, 1_048_576)
+            .with_columnar_gpu_preference(true);
+        let sample = u32_monotonic_postings();
+        let kind = d.pick_with_size_hint(&sample, Some(8 * 1024 * 1024)).await;
+        assert_eq!(kind, CodecKind::NvcompBitcomp);
+    }
+
+    #[tokio::test]
+    async fn gpu_pref_columnar_promotes_timestamps_to_bitcomp() {
+        let d = SamplingDispatcher::new(CodecKind::CpuZstd)
+            .with_gpu_preference(true, 1_048_576)
+            .with_columnar_gpu_preference(true);
+        let sample = u64_timestamps();
+        let kind = d.pick_with_size_hint(&sample, Some(4 * 1024 * 1024)).await;
+        assert_eq!(kind, CodecKind::NvcompBitcomp);
+    }
+
+    #[tokio::test]
+    async fn gpu_pref_columnar_falls_through_to_zstd_on_text() {
+        // Columnar detector rejects text → Bitcomp routing skipped,
+        // existing NvcompZstd promotion (#56) takes over.
+        let d = SamplingDispatcher::new(CodecKind::CpuZstd)
+            .with_gpu_preference(true, 1_048_576)
+            .with_columnar_gpu_preference(true);
+        let sample = text_sample();
+        let kind = d.pick_with_size_hint(&sample, Some(2 * 1024 * 1024)).await;
+        assert_eq!(kind, CodecKind::NvcompZstd);
+    }
+
+    #[tokio::test]
+    async fn gpu_pref_columnar_off_keeps_postings_on_zstd() {
+        // Default — `with_columnar_gpu_preference` NOT called → the
+        // README's "manual `--codec nvcomp-bitcomp`" path is the
+        // only way to reach Bitcomp.
+        let d = SamplingDispatcher::new(CodecKind::CpuZstd).with_gpu_preference(true, 1_048_576);
+        let sample = u32_monotonic_postings();
+        let kind = d.pick_with_size_hint(&sample, Some(8 * 1024 * 1024)).await;
+        assert_eq!(kind, CodecKind::NvcompZstd);
+    }
+
+    #[tokio::test]
+    async fn gpu_pref_columnar_respects_size_threshold() {
+        // Columnar payload but under the gpu_min_bytes threshold →
+        // GPU upload overhead would exceed the compress gain, stay
+        // on CpuZstd. The Bitcomp branch must not bypass the size
+        // gate.
+        let d = SamplingDispatcher::new(CodecKind::CpuZstd)
+            .with_gpu_preference(true, 1_048_576)
+            .with_columnar_gpu_preference(true);
+        let sample = u32_monotonic_postings();
+        let kind = d.pick_with_size_hint(&sample, Some(100 * 1024)).await;
         assert_eq!(kind, CodecKind::CpuZstd);
     }
 

@@ -438,14 +438,58 @@ pub fn verify_request(
         return Err(SigV4aError::XAmzDateNotSigned);
     }
 
+    // v0.8.12 #126 (MED-A): AWS SigV4 / SigV4a spec — the ECDSA
+    // signature is taken over a *string-to-sign*, NOT directly over
+    // the canonical request bytes. The string-to-sign concatenates:
+    //
+    //   "AWS4-ECDSA-P256-SHA256" || "\n"
+    //   || x-amz-date              || "\n"
+    //   || credential_scope_str    || "\n"
+    //   || hex(SHA256(canonical_request))
+    //
+    // Where credential_scope_str = `<date>/<service>/aws4_request`.
+    //
+    // The old code passed `canonical_request_bytes` straight to the
+    // p256 verifier, which made S4's own `SigV4aGate` happy (signer
+    // and verifier both used the canonical bytes) but rejected real
+    // AWS SDK / aws-crt-cpp signatures — those clients faithfully
+    // hash to the string-to-sign. The fix below switches the verify
+    // input to the spec-correct string-to-sign so MRAP / SDK-emitted
+    // signatures interop with the gate.
+    let canonical_hash_hex = sha256_hex(canonical_request_bytes);
+    let credential_scope_str = parsed.credential_scope.join("/");
+    let string_to_sign = format!(
+        "{algo}\n{date}\n{scope}\n{hash}",
+        algo = SIGV4A_ALGORITHM,
+        date = x_amz_date,
+        scope = credential_scope_str,
+        hash = canonical_hash_hex,
+    );
     // (6) signature + region check via the existing verifier.
     verify(
-        &CanonicalRequest::new(canonical_request_bytes),
+        &CanonicalRequest::new(string_to_sign.as_bytes()),
         &parsed.signature_der,
         pubkey,
         region_set,
         requested_region,
     )
+}
+
+/// v0.8.12 #126: hex-encoded SHA-256 of `bytes` — used to build the
+/// SigV4a string-to-sign per the AWS canonical recipe. Inlined here
+/// (instead of pulling in `hex` as a workspace dep) so the function
+/// stays self-contained.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let out = h.finalize();
+    let mut s = String::with_capacity(out.len() * 2);
+    for b in out {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// Case-insensitive header lookup against a flat
@@ -943,7 +987,15 @@ mod tests {
         let signing = SigningKey::random(&mut OsRng);
         let verifying = VerifyingKey::from(&signing);
         let canonical = b"GET\n/bucket/key\n\nhost:s3.example.com\nx-amz-date:placeholder\n\nhost;x-amz-date\nUNSIGNED-PAYLOAD".to_vec();
-        let sig: Signature = signing.sign(&canonical);
+        // v0.8.12 #126 (MED-A): sign the AWS-spec string-to-sign, not
+        // the raw canonical request, so the freshness-window test
+        // (`sigv4a_accepts_within_skew_window`) actually exercises a
+        // signature the new `verify_request` body would accept. The
+        // string-to-sign matches what real AWS SDKs emit.
+        let canonical_hash = sha256_hex(&canonical);
+        let scope_str = format!("{scope_date}/s3/aws4_request");
+        let sts = format!("AWS4-ECDSA-P256-SHA256\n{x_amz_date}\n{scope_str}\n{canonical_hash}");
+        let sig: Signature = signing.sign(sts.as_bytes());
         let sig_hex = lower_hex(sig.to_der().as_bytes());
         let header = format!(
             "AWS4-ECDSA-P256-SHA256 \

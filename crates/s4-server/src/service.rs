@@ -145,11 +145,15 @@ pub(crate) fn safe_object_uri(bucket: &str, key: &str) -> S3Result<http::Uri> {
 /// are accepted and silently passed; verifying them needs new
 /// dependencies and was held back to keep the v0.8.12 surface
 /// bounded.
+#[allow(clippy::too_many_arguments)]
 fn verify_client_body_checksums(
     body: &[u8],
     content_md5_b64: Option<&str>,
+    checksum_crc32_b64: Option<&str>,
     checksum_crc32c_b64: Option<&str>,
+    checksum_sha1_b64: Option<&str>,
     checksum_sha256_b64: Option<&str>,
+    checksum_crc64nvme_b64: Option<&str>,
 ) -> S3Result<()> {
     use base64::Engine as _;
     use md5::Md5;
@@ -226,7 +230,107 @@ fn verify_client_body_checksums(
             return Err(bad("x-amz-checksum-sha256"));
         }
     }
+    // v0.8.12 #128 (MED-C): CRC32 (IEEE 802.3 — the non-Castagnoli
+    // variant AWS uses for `x-amz-checksum-crc32`). 4-byte
+    // big-endian value, base64-encoded.
+    if let Some(claimed) = checksum_crc32_b64 {
+        let want = b64.decode(claimed).map_err(|_| {
+            S3Error::with_message(S3ErrorCode::InvalidDigest, "malformed x-amz-checksum-crc32")
+        })?;
+        if want.len() != 4 {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidDigest,
+                "x-amz-checksum-crc32 must decode to 4 bytes (big-endian u32)",
+            ));
+        }
+        let mut h = crc32fast::Hasher::new();
+        h.update(body);
+        let got = h.finalize().to_be_bytes();
+        if got != want.as_slice() {
+            return Err(bad("x-amz-checksum-crc32"));
+        }
+    }
+    // v0.8.12 #128 (MED-C): SHA-1. 20-byte digest, base64-encoded.
+    if let Some(claimed) = checksum_sha1_b64 {
+        use sha1::Sha1;
+        let want = b64.decode(claimed).map_err(|_| {
+            S3Error::with_message(S3ErrorCode::InvalidDigest, "malformed x-amz-checksum-sha1")
+        })?;
+        if want.len() != 20 {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidDigest,
+                "x-amz-checksum-sha1 must decode to 20 bytes",
+            ));
+        }
+        let mut h = Sha1::new();
+        h.update(body);
+        let got = h.finalize();
+        if got.as_slice() != want.as_slice() {
+            return Err(bad("x-amz-checksum-sha1"));
+        }
+    }
+    // v0.8.12 #128 (MED-C): CRC64-NVME — AWS's newest checksum
+    // algorithm. NVMe spec: poly 0xad93d23594c93659, init / xorout
+    // 0xffffffffffffffff, refin / refout true. The reflected
+    // polynomial + 256-entry lookup table are computed lazily on
+    // first call (small enough to inline rather than pull in a
+    // dedicated crc64 crate).
+    if let Some(claimed) = checksum_crc64nvme_b64 {
+        let want = b64.decode(claimed).map_err(|_| {
+            S3Error::with_message(
+                S3ErrorCode::InvalidDigest,
+                "malformed x-amz-checksum-crc64nvme",
+            )
+        })?;
+        if want.len() != 8 {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidDigest,
+                "x-amz-checksum-crc64nvme must decode to 8 bytes (big-endian u64)",
+            ));
+        }
+        let got = crc64_nvme(body).to_be_bytes();
+        if got != want.as_slice() {
+            return Err(bad("x-amz-checksum-crc64nvme"));
+        }
+    }
     Ok(())
+}
+
+/// v0.8.12 #128 (MED-C): CRC-64/NVME (AWS S3 `x-amz-checksum-crc64nvme`).
+/// NVMe spec: poly 0xad93d23594c93659, init 0xffffffffffffffff, refin
+/// true, refout true, xorout 0xffffffffffffffff. The reflected
+/// polynomial table is computed lazily on first call via
+/// [`std::sync::OnceLock`]; subsequent calls share the 256-entry table.
+fn crc64_nvme(bytes: &[u8]) -> u64 {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<[u64; 256]> = OnceLock::new();
+    let tbl = TABLE.get_or_init(|| {
+        // Reflected polynomial (bit-reverse of 0xad93d23594c93659).
+        const POLY_REFLECTED: u64 = 0x9a6c_9329_ac4b_c9b5;
+        let mut t = [0u64; 256];
+        let mut i = 0usize;
+        while i < 256 {
+            let mut c = i as u64;
+            let mut j = 0;
+            while j < 8 {
+                c = if c & 1 != 0 {
+                    (c >> 1) ^ POLY_REFLECTED
+                } else {
+                    c >> 1
+                };
+                j += 1;
+            }
+            t[i] = c;
+            i += 1;
+        }
+        t
+    });
+    let mut crc: u64 = !0u64;
+    for &b in bytes {
+        let idx = ((crc as u8) ^ b) as usize;
+        crc = (crc >> 8) ^ tbl[idx];
+    }
+    !crc
 }
 
 /// v0.4 #20: captured at the start of a handler, before the request is
@@ -2268,7 +2372,28 @@ impl<B: S3> S3 for S4Service<B> {
             // overhead breaks size-sensitive callers that expect a true
             // pass-through. So passthrough always uses the legacy raw-blob
             // path; only compressing codecs go through the framed path.
-            let use_framed = supports_streaming_compress(kind) && kind != CodecKind::Passthrough;
+            //
+            // v0.8.12 #127 (MED-B): when the client supplied a
+            // whole-body integrity checksum (`Content-MD5` or any of
+            // the `x-amz-checksum-*` headers), force the buffered
+            // path so we can verify against the received bytes
+            // before stripping the headers. The streaming-framed
+            // path consumes the body chunk-by-chunk and can't
+            // produce a final whole-body digest without buffering
+            // the entire object — and accepting a checksum-signed
+            // body without verifying is the same fail-open the
+            // v0.8.11 #122 HIGH-12 fix closes for the buffered case.
+            // True streaming verify is a follow-up (tee the chained
+            // stream into a hasher) tracked separately.
+            let client_supplied_checksum = req.input.content_md5.is_some()
+                || req.input.checksum_crc32.is_some()
+                || req.input.checksum_crc32c.is_some()
+                || req.input.checksum_sha1.is_some()
+                || req.input.checksum_sha256.is_some()
+                || req.input.checksum_crc64nvme.is_some();
+            let use_framed = supports_streaming_compress(kind)
+                && kind != CodecKind::Passthrough
+                && !client_supplied_checksum;
             let (compressed, manifest, is_framed) = if use_framed {
                 // streaming fast path: input は memory に collect しない
                 let chained = chain_sample_with_rest(sample, rest_stream);
@@ -2321,17 +2446,20 @@ impl<B: S3> S3 for S4Service<B> {
                 let bytes = collect_with_sample(sample, rest_stream, self.max_body_bytes)
                     .await
                     .map_err(internal("collect put body (buffered path)"))?;
-                // v0.8.12 HIGH-12 fix: verify client-supplied
-                // checksums against the received body on the buffered
-                // path. The streaming-framed path above consumes the
-                // body chunk-by-chunk and cannot verify a whole-body
-                // digest without buffering the entire object —
-                // verification on that path is tracked as a follow-up.
+                // v0.8.12 HIGH-12 / #128 MED-C: verify all six AWS
+                // checksum algorithms against the received body on
+                // the buffered path. The streaming-framed branch
+                // above redirects here when ANY checksum header is
+                // present (#127 MED-B), so this is the single
+                // checkpoint for client-supplied integrity.
                 verify_client_body_checksums(
                     &bytes,
                     req.input.content_md5.as_deref(),
+                    req.input.checksum_crc32.as_deref(),
                     req.input.checksum_crc32c.as_deref(),
+                    req.input.checksum_sha1.as_deref(),
                     req.input.checksum_sha256.as_deref(),
+                    req.input.checksum_crc64nvme.as_deref(),
                 )?;
                 debug!(
                     bucket = ?req.input.bucket,
@@ -4328,20 +4456,16 @@ impl<B: S3> S3 for S4Service<B> {
             let bytes = collect_blob(blob, self.max_body_bytes)
                 .await
                 .map_err(internal("collect upload_part body"))?;
-            // v0.8.12 HIGH-12 fix: verify client-supplied integrity
-            // checksum against the received body BEFORE we replace
-            // `req.input` and strip the headers. Previously the part
-            // body was accepted, compressed, framed, and persisted
-            // even when the supplied `Content-MD5` or
-            // `x-amz-checksum-*` didn't match — so an in-transit
-            // corruption that the client signed against was silently
-            // committed under the gateway's own CRC32C (which still
-            // matches because S4 hashes the bytes it actually saw).
+            // v0.8.12 HIGH-12 / #128 MED-C: verify all six AWS
+            // checksum algorithms against the received part body.
             verify_client_body_checksums(
                 &bytes,
                 req.input.content_md5.as_deref(),
+                req.input.checksum_crc32.as_deref(),
                 req.input.checksum_crc32c.as_deref(),
+                req.input.checksum_sha1.as_deref(),
                 req.input.checksum_sha256.as_deref(),
+                req.input.checksum_crc64nvme.as_deref(),
             )?;
             let sample_len = bytes.len().min(SAMPLE_BYTES);
             // v0.8 #56: full part body is already in memory here; use its
