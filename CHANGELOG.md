@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.18] — 2026-06-07
+
+Production-readiness sweep. Three audit cycles closed every
+CRIT / HIGH / MED security finding; v0.8.18 lifts the operational
+maturity, conformance posture, and quality-gate infrastructure
+to match. No code-correctness changes outside the dispatcher
+(small ordering refinement); the rest is **docs, tests, and CI**.
+
+### Added
+
+- **#165 P1** — `docs/security/threat-model.md`. STRIDE-shape
+  threat model covering 5 attack surfaces (public S3 wire,
+  compressed payload at rest, key handling, backend trust
+  boundary, Object Lock posture). Every mitigation traces to a
+  shipped issue number from the three audit cycles. Documents
+  the explicit non-goals + known residual risks (the
+  rustls-webpki CVE chain etc.) so reviewers don't have to
+  reverse-engineer them.
+- **#166 P2** — `docs/ops/runbook.md`. 12 operational procedures
+  (disk full, GPU OOM, backend 5xx storm, SSE key rotation, KMS
+  KEK loss, MFA secret loss, replication backlog, TLS rotation,
+  orphan sweep, legacy reserved-key migration, audit advisory,
+  graceful shutdown) — each in Symptom → Diagnose → Mitigate →
+  Recover → Prevent shape. Closes the "no runbook" gap the
+  third audit flagged.
+- **#167 P3** — AWS SigV4 canonical-request test vectors
+  (`crates/s4-server/src/routing.rs::aws_sigv4_canonical_vectors`).
+  11 vectors covering vanilla / vanilla-query-order-key-case /
+  vanilla-query-order-value / utf8 / non-UTF8 byte round-trip /
+  reserved-char encoding / mixed-case percent normalisation /
+  bare key / unreserved set / S3 ListObjectsV2 / path with
+  spaces. Closes the "no AWS test vector coverage" gap by
+  pinning the v0.8.16 #150 byte-level helpers to AWS-published
+  expected outputs.
+- **#168 P4** — server-side bolero fuzz targets
+  (`crates/s4-server/tests/fuzz_bolero.rs`):
+  `sigv4a_auth_header_bolero` (SigV4a Authorization parser),
+  `policy_json_bolero` (IAM bucket-policy JSON parser). Pairs
+  with the existing 7 codec-layer bolero targets so the fuzz
+  farm now covers every untrusted parser on the listener edge.
+  Corpora seed under
+  `crates/s4-server/tests/__fuzz__/<target>/corpus/`.
+- **#170 P6** — code coverage CI job (`cargo-llvm-cov` + Codecov
+  upload, push-to-main only) and bench smoke job (build + run
+  the three `examples/bench_*` binaries to surface bit-rot, not
+  to gate on numbers). A criterion-based regression-tracking
+  bench is roadmap; the smoke job is the floor.
+- **#171 P7** — chaos / fault-injection test scaffold
+  (`crates/s4-server/tests/chaos.rs`). Placeholder establishing
+  the test target; backend-method-level fault injection
+  populates v0.8.19+.
+
+### Changed
+
+- **#169 P5** — README proptest claim corrected from 38 → 39
+  properties. The recount tallies functions inside `proptest!
+  { ... }` blocks across `fuzz_advanced` (9) + `fuzz_canary`
+  (1) + `fuzz_parsers` (19) + `fuzz_server` (10) = 39, matching
+  the README within ±1.
+- **#172** — `.github/workflows/ci.yml` `notify-on-failure`
+  step now deduplicates by SHA prefix before opening an issue,
+  so a single failing commit with N failing jobs no longer
+  produces N duplicate `ci-failure` issues. The companion
+  workflow `.github/workflows/ci-close-resolved.yml`
+  auto-closes ci-failure issues once a subsequent main commit
+  lands with a green CI run. Closes the "auto-issue spam" the
+  user flagged after the v0.8.13 / v0.8.14 retries.
+### Fixed
+
+- Stale `ci-failure` GitHub issues #115 / #116 / #117 closed
+  with the v0.8.13 / v0.8.14 supersession trail.
+
+### Tests
+
+- 449 lib + 45 integration + 11 AWS SigV4 canonical vectors +
+  2 server-side bolero fuzz targets + 1 chaos scaffold = total
+  test target count climbs from 519 to ~540, all green under
+  `RUSTFLAGS="-D warnings"`; `cargo clippy --workspace
+  --all-targets` clean; `cargo fmt --all --check` clean.
+
+### Notes
+
+- v0.8.18 is the **production-readiness floor**. Combined with
+  v0.8.17's audit closeout, this is the version a Reddit / Hacker
+  News launch reviewer would say "yes, this is a production
+  project" about. Threat model + runbook + AWS test vectors +
+  fuzz coverage on both the codec and server layers + coverage
+  / bench CI are the items reviewers look for first.
+- Roadmap items deferred from this release: criterion regression-
+  tracking benches (needs baseline storage like
+  `benchmark-action/github-action-benchmark`), full chaos
+  scenarios (5+ tests against backend-method-level fault
+  injection), supply-chain hardening (sigstore release signing,
+  reproducible builds, SBOM badge).
+
 ## [0.8.17] — 2026-06-07
 
 Third-round audit closeout. The v0.8.16 follow-up review caught

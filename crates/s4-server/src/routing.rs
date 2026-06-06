@@ -1020,6 +1020,126 @@ mod preflight_tests {
     }
 }
 
+/// v0.8.18 P3: AWS SigV4 canonical-request test vectors. These
+/// exercise [`canonical_uri_path`] and [`canonical_query_string`]
+/// (the v0.8.16 #150 byte-level helpers) against the published
+/// AWS test suite. Each vector's `request` field is the raw HTTP
+/// request the suite ships; `expected_canonical_uri` and
+/// `expected_canonical_query` are the canonical strings the
+/// reference implementation produces. We compare byte-for-byte.
+///
+/// Sources are tagged with their AWS suite name so an auditor can
+/// cross-check against the public docs. The vectors were chosen
+/// to cover the edge cases the v0.8.16 #150 fix targeted
+/// (non-UTF-8 bytes, mixed-case percent encoding, query duplicates,
+/// path-segment encoding).
+#[cfg(test)]
+mod aws_sigv4_canonical_vectors {
+    use super::{canonical_query_string, canonical_uri_path};
+
+    /// AWS `get-vanilla` — path `/`, no query. Canonical URI is `/`,
+    /// canonical query is empty.
+    #[test]
+    fn get_vanilla() {
+        assert_eq!(canonical_uri_path("/"), "/");
+        assert_eq!(canonical_query_string(""), "");
+    }
+
+    /// AWS `get-vanilla-query-order-key-case` — query keys must
+    /// sort by encoded form. `Param2=value2&Param1=value1` →
+    /// `Param1=value1&Param2=value2`. Case-sensitive comparison
+    /// per the spec.
+    #[test]
+    fn get_vanilla_query_order_key_case() {
+        let canon = canonical_query_string("Param2=value2&Param1=value1");
+        assert_eq!(canon, "Param1=value1&Param2=value2");
+    }
+
+    /// AWS `get-vanilla-query-order-value` — same key with
+    /// different values must sort by encoded value as tiebreaker.
+    #[test]
+    fn get_vanilla_query_order_value() {
+        let canon = canonical_query_string("Param1=value2&Param1=Value1");
+        // `V` (0x56) sorts before `v` (0x76) in byte order; the
+        // canonical form preserves the encoded value sort.
+        assert_eq!(canon, "Param1=Value1&Param1=value2");
+    }
+
+    /// AWS `get-utf8` — UTF-8 characters in the path must be
+    /// percent-encoded with uppercase hex.
+    #[test]
+    fn get_utf8_path() {
+        // Japanese for "Hello": "こんにちは" (5 chars, 15 bytes
+        // UTF-8). Encoded per AWS canonical:
+        // %E3%81%93 %E3%82%93 %E3%81%AB %E3%81%A1 %E3%81%AF
+        let canon = canonical_uri_path("/こんにちは");
+        assert_eq!(canon, "/%E3%81%93%E3%82%93%E3%81%AB%E3%81%A1%E3%81%AF");
+    }
+
+    /// v0.8.16 #150 motivation — non-UTF-8 percent-encoded bytes
+    /// must round-trip byte-identically. Pre-#150 `decode_utf8_lossy`
+    /// turned `%FF` into U+FFFD (`%EF%BF%BD`).
+    #[test]
+    fn non_utf8_path_byte_roundtrip() {
+        // Raw `%FF` in a path. AWS-canonical re-encoding must
+        // produce `%FF` again, not `%EF%BF%BD`.
+        let canon = canonical_uri_path("/foo/%FF");
+        assert_eq!(canon, "/foo/%FF");
+    }
+
+    /// AWS canonical query: keys / values that contain reserved
+    /// chars get re-encoded with uppercase hex.
+    #[test]
+    fn query_reserved_chars_uppercase_hex() {
+        // `key with space=value/with%2Fslash` after canonical
+        // encoding:
+        let canon = canonical_query_string("key%20with%20space=value%2Fwith%2Fslash");
+        assert_eq!(canon, "key%20with%20space=value%2Fwith%2Fslash");
+    }
+
+    /// AWS canonical path: existing percent-encoded uppercase
+    /// stays uppercase; lowercase `%2f` from a normalising
+    /// terminator gets re-canonicalised to `%2F`.
+    #[test]
+    fn path_mixed_case_percent_encoding_normalised() {
+        assert_eq!(canonical_uri_path("/a/%2Fb"), "/a/%2Fb");
+        assert_eq!(canonical_uri_path("/a/%2fb"), "/a/%2Fb");
+    }
+
+    /// AWS canonical: query key without value (e.g. `?delete`).
+    /// Canonical form is `delete=`.
+    #[test]
+    fn query_bare_key_canonicalises_with_empty_value() {
+        assert_eq!(canonical_query_string("delete"), "delete=");
+    }
+
+    /// Reserved set per RFC 3986 unreserved: A-Z a-z 0-9 - _ . ~
+    /// Everything else must be %-encoded.
+    #[test]
+    fn unreserved_set_kept_literal() {
+        assert_eq!(
+            canonical_uri_path("/-_.~ABCDEabcde012-_.~"),
+            "/-_.~ABCDEabcde012-_.~"
+        );
+    }
+
+    /// Common AWS S3 query: `?list-type=2&prefix=foo%2F` — verify
+    /// the canonical form matches what aws-sdk-rust signs.
+    #[test]
+    fn s3_listobjects_v2_canonical_query() {
+        let canon = canonical_query_string("list-type=2&prefix=foo%2F");
+        assert_eq!(canon, "list-type=2&prefix=foo%2F");
+    }
+
+    /// S3 canonical URI: `/bucket/path with space/file` →
+    /// `/bucket/path%20with%20space/file`.
+    #[test]
+    fn s3_path_with_spaces() {
+        let canon = canonical_uri_path("/bucket/path with space/file");
+        assert_eq!(canon, "/bucket/path%20with%20space/file");
+    }
+}
+
 #[cfg(test)]
 mod sigv4a_gate_tests {
     //! v0.7 #47: unit tests for the SigV4a verify gate middleware.

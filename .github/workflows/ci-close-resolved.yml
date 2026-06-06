@@ -1,0 +1,71 @@
+# v0.8.18 quality sweep: auto-close `ci-failure` issues once a
+# subsequent push to main has a green CI run. Pairs with the
+# auto-open step in `ci.yml::notify-on-failure`. Triggers on every
+# successful workflow run for the CI workflow, scans open
+# `ci-failure` issues, and closes any whose SHA prefix is no longer
+# the latest main HEAD (i.e. a newer commit has since landed and
+# passed).
+name: ci-close-resolved
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  close-resolved:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const latestSha = context.payload.workflow_run.head_sha;
+            const shortLatest = latestSha.slice(0, 7);
+            const existing = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                state: "open",
+                labels: "ci-failure",
+                per_page: 100,
+              }
+            );
+            // Title shape from `notify-on-failure` is
+            // `CI failed on main — <shortSha> (...)`. We close any
+            // ci-failure issue whose SHA prefix doesn't match the
+            // commit that just passed — that commit's CI succeeded,
+            // so older failures are by definition either fixed by
+            // this commit or transient.
+            for (const issue of existing) {
+              const m = issue.title.match(/CI failed on main — ([0-9a-f]{7,40})/);
+              if (!m) continue;
+              const failingSha = m[1];
+              if (failingSha === shortLatest) {
+                // Latest commit IS the failing one — leave the
+                // issue open, the failure is current.
+                continue;
+              }
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: issue.number,
+                body:
+                  `Auto-closing: CI on main is green at \`${shortLatest}\`, ` +
+                  `so the failure at \`${failingSha}\` is now superseded ` +
+                  `(transient or fixed by a later commit). Re-open manually ` +
+                  `if the underlying issue resurfaces.`,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: issue.number,
+                state: "closed",
+              });
+              core.info(`Closed #${issue.number} (SHA ${failingSha} superseded by ${shortLatest})`);
+            }
