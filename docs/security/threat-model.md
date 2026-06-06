@@ -17,8 +17,12 @@ service / Elevation of privilege) for each attack surface.
    configured.
 3. **Encryption keys** (`--sse-s4-key` + rotated keys, SSE-C
    customer keys, SSE-KMS DEKs in memory, KEKs on disk).
-4. **Bucket policy state** (in-memory, persisted via
-   `--state-dir` when configured).
+4. **Bucket policy + manager state** (in-memory; optionally
+   persisted via the per-manager `--<x>-state-file` flags
+   exposed for versioning, object_lock, mfa_delete,
+   cors, inventory, notifications, tagging, replication,
+   lifecycle — each manager owns one file; there is no
+   single `--state-dir` aggregating them).
 5. **IAM permissions** (SigV4 / SigV4a credentials, MFA-Delete
    secrets).
 6. **Object Lock state** (Compliance / Governance retention,
@@ -104,7 +108,9 @@ mechanisms. S4 enforces:
 
 - **`--max-body-bytes`** — refuses to forward bodies larger
   than the operator-set cap (default 5 GiB = AWS S3 single-PUT
-  limit).
+  limit). Exposed as a CLI flag since v0.8.19; older builds
+  could only set it via the `with_max_body_bytes` library
+  builder.
 - **No SSRF** — outbound HTTP only via `aws-sdk-s3` against the
   configured endpoint; cross-region replication is restricted
   to the same single-instance backend in v0.8.x.
@@ -160,8 +166,14 @@ These items are acknowledged and tracked, not silently hidden:
    lands (post-launch roadmap).
 4. **Versioned multipart Complete writes no sidecar** —
    v0.8.16 #151 skips sidecar emission entirely for those
-   bucket states. Range GET falls back to full read. A
-   shadow-key-bound sidecar is a follow-up.
+   bucket states. Range GET falls back to full read. **Cost
+   note**: for large multipart objects (≥ 100 MiB) on a
+   versioned bucket, a range-heavy client workload pays the
+   full-object read cost on every Range GET until the
+   shadow-key-bound sidecar lands as a follow-up. Operators
+   serving heavy Range traffic should weigh the option of
+   leaving versioning Disabled for that bucket against the
+   cost of full reads.
 
 ## Recovery procedures
 

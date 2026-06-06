@@ -26,11 +26,20 @@ use std::sync::atomic::AtomicU32;
 /// v0.8.18 P7 smoke. Ensures the chaos test target compiles and
 /// runs in CI; real scenarios populate the file as the
 /// infrastructure matures.
+///
+/// v0.8.19 D-10: holds a concrete assertion (rather than the
+/// silent no-op the v0.8.18 placeholder shipped) so a future
+/// refactor that breaks `Bytes::from_static` or `AtomicU32`'s
+/// type signature can't accidentally leave the placeholder
+/// compiling-but-useless. The assert verifies the
+/// `Ordering::Relaxed` load semantics on a freshly-constructed
+/// counter — trivially true, but it's an actual signal that
+/// `cargo test` exercises.
 #[test]
 fn chaos_scaffold_smoke() {
-    // Touch the building blocks future scenarios will use, so
-    // the placeholder isn't `cfg(unused)` and doesn't get
-    // stripped on the first refactor.
-    let _bytes = Bytes::from_static(b"placeholder");
-    let _counter = Arc::new(AtomicU32::new(0));
+    use std::sync::atomic::Ordering;
+    let bytes = Bytes::from_static(b"placeholder");
+    let counter = Arc::new(AtomicU32::new(0));
+    assert_eq!(bytes.len(), 11);
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
 }

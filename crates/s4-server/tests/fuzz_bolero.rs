@@ -1,26 +1,32 @@
 //! v0.8.18 P4: server-side fuzz coverage with bolero. Mirrors the
 //! `crates/s4-codec/tests/fuzz_bolero.rs` shape (`cargo bolero
 //! test --engine libfuzzer <target> -- -max_total_time=86400`)
-//! but covers parsers / decoders that the codec fuzz farm doesn't
-//! see:
+//! and covers two parsers that ingest fully attacker-controlled
+//! strings on the listener edge:
 //!
-//! - SigV4a Authorization header parser
-//!   (`sigv4a::parse_authorization_header`)
-//! - IAM bucket-policy JSON parser
-//!   (`policy::Policy::from_json_str_typed`)
-//! - SigV4 canonical query string canonicaliser
-//!   (`routing::canonical_query_string` via the `pub(crate)` test
-//!   re-export — exercises the v0.8.16 #150 byte-level path)
-//! - SSE chunked frame parser via the public buffered decrypt
-//!   API on a random key + random body
+//! - **`sigv4a_auth_header_bolero`** — the SigV4a Authorization
+//!   header parser (`sigv4a::parse_authorization_header`).
+//! - **`policy_json_bolero`** — the IAM bucket-policy JSON
+//!   parser (`policy::Policy::from_json_str`).
 //!
-//! All targets share the same correctness contract: **any input
-//! must produce a `Result` (or `()`) without panicking, without
-//! running for > 10 000 inner iterations, and without allocating
-//! more than the caller-bounded cap**. The corpora live under
+//! Both targets share the same correctness contract: **any input
+//! must produce a `Result` without panicking, without running
+//! for > 10 000 inner iterations, and without allocating more
+//! than the caller-bounded cap**. The corpora live under
 //! `crates/s4-server/tests/__fuzz__/<target>/corpus/` and are
 //! seeded by the nightly fuzz farm
 //! (`.github/workflows/fuzz-nightly.yml`).
+//!
+//! Two more targets are roadmap (v0.8.19+):
+//!
+//! - SigV4 canonical query / path encoders
+//!   (`routing::canonical_query_string` /
+//!   `routing::canonical_uri_path`). Needs a test-only
+//!   re-export so the `tests/` directory can call into the
+//!   currently-private helpers.
+//! - SSE chunked-frame decrypt against random keys / bodies
+//!   (via the public `sse::decrypt_chunked_buffered_default`
+//!   surface).
 //!
 //! Local invocation:
 //!

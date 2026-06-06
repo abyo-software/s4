@@ -1022,17 +1022,27 @@ mod preflight_tests {
 
 /// v0.8.18 P3: AWS SigV4 canonical-request test vectors. These
 /// exercise [`canonical_uri_path`] and [`canonical_query_string`]
-/// (the v0.8.16 #150 byte-level helpers) against the published
-/// AWS test suite. Each vector's `request` field is the raw HTTP
-/// request the suite ships; `expected_canonical_uri` and
-/// `expected_canonical_query` are the canonical strings the
-/// reference implementation produces. We compare byte-for-byte.
+/// (the v0.8.16 #150 byte-level helpers).
 ///
-/// Sources are tagged with their AWS suite name so an auditor can
-/// cross-check against the public docs. The vectors were chosen
-/// to cover the edge cases the v0.8.16 #150 fix targeted
-/// (non-UTF-8 bytes, mixed-case percent encoding, query duplicates,
-/// path-segment encoding).
+/// Provenance — mixed sources:
+///
+/// - **AWS-published vectors** (`get-vanilla`,
+///   `get-vanilla-query-order-key-case`,
+///   `get-vanilla-query-order-value`, `get-utf8`): vector names
+///   match the public
+///   <https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html>
+///   reference suite; expected outputs taken from the AWS
+///   canonical-request recipe.
+/// - **S3 spec-derived edge vectors** (`non_utf8_path_byte_roundtrip`,
+///   `query_reserved_chars_uppercase_hex`,
+///   `path_mixed_case_percent_encoding_normalised`,
+///   `query_bare_key_canonicalises_with_empty_value`,
+///   `unreserved_set_kept_literal`,
+///   `s3_listobjects_v2_canonical_query`, `s3_path_with_spaces`):
+///   derived from RFC 3986 + the SigV4 spec to pin the v0.8.16 #150
+///   byte-level fix against the cases that motivated it.
+///
+/// Both classes follow the same compare-byte-for-byte contract.
 #[cfg(test)]
 mod aws_sigv4_canonical_vectors {
     use super::{canonical_query_string, canonical_uri_path};

@@ -273,6 +273,20 @@ struct Opt {
     #[clap(long, default_value_t = false)]
     allow_legacy_reserved_key_reads: bool,
 
+    /// v0.8.19 D-1: cap on the per-request body bytes the gateway
+    /// is willing to compress / decompress / forward. AWS S3 single
+    /// PUT max is 5 GiB; the default matches. Lowering it makes the
+    /// gateway refuse oversized requests early, before the codec
+    /// pipeline allocates; raising it requires that the backend +
+    /// listener can actually move the bytes.
+    ///
+    /// Threading the value through `with_max_body_bytes` was a
+    /// library-builder-only knob before v0.8.19 — operators
+    /// running `s4-server` from the CLI had to recompile to change
+    /// it. This flag fixes that.
+    #[clap(long, default_value_t = 5 * 1024 * 1024 * 1024)]
+    max_body_bytes: usize,
+
     /// Optional S3-style access-log destination directory. When set,
     /// every completed PUT / GET / DELETE / List request is buffered
     /// and flushed to hourly-rotated `.log` files under the directory.
@@ -1041,6 +1055,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
              has been moved off the reserved suffix (v0.8.17 G-4)."
         );
     }
+    // v0.8.19 D-1: wire --max-body-bytes (the cap the threat model
+    // already documents). Pre-D-1 the only way to change the cap
+    // was the `with_max_body_bytes` library builder, which doesn't
+    // help an operator running `s4-server` from the CLI.
+    s4 = s4.with_max_body_bytes(opt.max_body_bytes);
+    info!(
+        max_body_bytes = opt.max_body_bytes,
+        "S4 max-body-bytes cap (v0.8.19 D-1: now CLI-tunable; default 5 GiB = AWS S3 single-PUT max)"
+    );
     // v0.8.5 #86 (audit M-2): cap the replication dispatcher pool. The
     // setter clamps to 1 if the operator passed 0 (would deadlock all
     // replicas); see the field-level doc on

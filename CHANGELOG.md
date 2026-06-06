@@ -7,6 +7,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.19] — 2026-06-07
+
+Fourth-round review caught fabrications in the v0.8.18 runbook +
+threat-model + bolero module doc, plus a missing CLI flag. Closes
+11 doc / minor items and ships `--max-body-bytes` as a first-class
+operator knob (the threat model already documented it).
+
+### Added
+
+- **#174 D-1** — `--max-body-bytes <BYTES>` CLI flag. The cap was
+  builder-only before v0.8.19 (`with_max_body_bytes`), but the
+  threat model already advertised it as an operator-tunable
+  defence — the doc was right; the missing piece was the CLI
+  flag. Default `5 GiB` matches the AWS S3 single-PUT max.
+
+### Fixed (docs / minor)
+
+- **#175 D-2** — `docs/security/threat-model.md` no longer
+  references a non-existent `--state-dir`. Replaced with the
+  per-manager `--<x>-state-file` list (versioning,
+  object_lock, mfa_delete, cors, inventory, notifications,
+  tagging, replication, lifecycle).
+- **#176 D-3** — `docs/ops/runbook.md` §1 (disk full) rewritten.
+  The pre-D-3 text told operators that `systemctl reload` would
+  "stop accepting new connections" — SIGHUP only rotates TLS
+  (see §8). Mitigation path now correctly says front S4 with a
+  load balancer + drain there, or change
+  `--max-concurrent-connections` and **restart** (not reload).
+- **#177 D-4** — Runbook §6 (MFA-Delete recovery) now points at
+  the `--mfa-delete-state-file <PATH>` operator-supplied file,
+  not the fictitious `mfa.json` under a fictitious
+  `--state-dir`.
+- **#178 D-5** — Runbook §12 (signals) SIGUSR1 description was
+  wrong: pre-D-5 it claimed access-log flush; reality is the
+  v0.8.5 #86 helper atomically dumps every in-memory state
+  manager (versioning / object_lock / mfa_delete / cors /
+  inventory / notifications / tagging / replication /
+  lifecycle) to its `--<x>-state-file`. Access-log buffer
+  drains on shutdown, not on SIGUSR1.
+- **#179 D-6** — Runbook metric reference table renamed every
+  metric to its canonical name in
+  `crates/s4-server/src/metrics.rs`. The pre-D-6 table cited
+  `s4_backend_error_total`, `s4_replication_pending_total`,
+  `s4_replication_completed_total`,
+  `s4_replication_failed_total`,
+  `s4_tls_cert_reload_failed_total`,
+  `s4_gpu_compress_oom_total` — none of those exist. Real
+  names: `s4_replication_dropped_total`,
+  `s4_replication_replicated_total`,
+  `s4_tls_cert_reload_total{result="err"}`,
+  `s4_gpu_oom_total`. The `s4_backend_error_total` shape is
+  noted as future-wire-up follow-up rather than silently
+  recommended.
+- **#180 D-7** — Runbook PromQL alert syntax corrected:
+  `action="s3:Bypass*"` (literal `*`, never matches) →
+  `action=~"s3:Bypass.*"` (regex matcher).
+- **#181 D-8** — Runbook §4 SSE-S4 rotation typo `retiredsl` →
+  `retired slots`.
+- **#182 D-9** — `crates/s4-server/tests/fuzz_bolero.rs` module
+  doc trimmed to the 2 targets actually shipped
+  (`sigv4a_auth_header_bolero`, `policy_json_bolero`). The
+  pre-D-9 text claimed 4 targets (including a "SigV4 canonical
+  query string canonicaliser via the `pub(crate)` test
+  re-export" that doesn't exist — `canonical_query_string` is
+  private). The two missing targets are explicitly tagged as
+  v0.8.19+ roadmap.
+- **#183 D-10** — `crates/s4-server/tests/chaos.rs` placeholder
+  smoke test now carries concrete `assert_eq!` checks so a
+  future refactor can't accidentally leave the file
+  compiling-but-useless.
+- **#184 D-11** — AWS SigV4 vectors module doc no longer claims
+  every vector comes from the AWS-published suite. Split
+  honestly into "AWS-published" (4 vectors) and "S3
+  spec-derived edge vectors" (7 vectors, motivated by the
+  v0.8.16 #150 byte-level fix).
+- **#185 D-12** — Threat-model residual risk #4 (versioned
+  multipart Range GET fall-back to full read) now includes the
+  cost note about large multipart objects + range-heavy
+  workloads so operators can weigh leaving versioning Disabled
+  against the full-read cost.
+
+### Tests
+
+- 449 lib + 45 integration + 11 SigV4 vectors + 2 bolero + 1
+  chaos = unchanged from v0.8.18; all green under
+  `RUSTFLAGS="-D warnings"`; `cargo clippy --workspace
+  --all-targets` clean; `cargo fmt --all --check` clean.
+
+### Notes
+
+- v0.8.19 has **no code-correctness changes** outside the
+  `--max-body-bytes` CLI flag plumbing (`#[clap(long)]` + one
+  `with_max_body_bytes(opt.max_body_bytes)` call). The
+  remaining 11 items are doc / cosmetic.
+- v0.8.19 closes the fourth-round audit. The doc fabrications
+  (#175–#180) were a reminder that runbooks written from memory
+  are unreliable; future doc work will be verified against the
+  source tree before each commit.
+
 ## [0.8.18] — 2026-06-07
 
 Production-readiness sweep. Three audit cycles closed every

@@ -31,7 +31,8 @@ a triage doc without reformatting.
 **Symptom**
 
 - New PUTs fail with 500 `InternalError`.
-- `df` shows `/var/lib/s4` or `/tmp` at 100 %.
+- `df` shows the volume backing the access log directory or
+  the per-manager state files at 100 %.
 - Logs include `IoError: ENOSPC`.
 
 **Diagnose**
@@ -46,39 +47,53 @@ S4 itself only buffers per-PUT in memory (size-capped by
 `--max-body-bytes`); the main on-disk consumers are:
 
 1. **Access log directory** (`--access-log <DIR>`) if used.
-2. **State directory** (`--state-dir <DIR>`) for versioning /
-   tagging / policy / lifecycle / object-lock snapshots.
+2. **Per-manager state files**, one per `--<x>-state-file` flag
+   the operator set at boot. The complete list:
+   `--versioning-state-file`, `--object-lock-state-file`,
+   `--mfa-delete-state-file`, `--cors-state-file`,
+   `--inventory-state-file`, `--notifications-state-file`,
+   `--tagging-state-file`, `--replication-state-file`,
+   `--lifecycle-state-file`. Each is an atomically-written
+   JSON snapshot (see §12 SIGUSR1 below for the write trigger).
 3. **`/tmp` overflow** for SDK retry buffers (uncommon).
 
 **Mitigate**
 
-```bash
-# Stop accepting NEW connections without killing in-flight ones.
-sudo systemctl reload s4-server   # SIGHUP — also rotates TLS
+S4 does **not** expose a "stop accepting new connections" knob
+that takes effect on `systemctl reload`. SIGHUP only rotates
+TLS certificates (see §8). To shed load on a disk-full
+condition the operator must either:
 
-# If reload is unavailable, set --max-concurrent-connections to 0
-# in the unit file and reload; existing connections drain.
-```
+- **Front S4 with a load balancer** (HAProxy / nginx / ALB) and
+  drain at the LB layer, OR
+- **Lower `--max-concurrent-connections`** in the systemd unit
+  file and `systemctl restart s4-server` — the value is read
+  at boot, so a `reload` won't pick it up.
+
+In flight requests survive a graceful restart (the
+`tokio::select!` arm on SIGTERM drains over the 10 s shutdown
+window).
 
 **Recover**
 
 ```bash
-# Rotate / archive access logs.
+# Rotate / archive access logs (or wire logrotate; see Prevent).
 sudo mv /var/lib/s4/access-log/$(date +%Y%m%d).log /backup/
-sudo systemctl reload s4-server
-```
 
-State-dir snapshots are JSON files keyed by manager
-(`policy.json`, `versioning.json`, …). They are restartable —
-backing up to s3 / external storage and truncating in-place
-loses nothing as long as the gateway is restarted before the
-next snapshot write.
+# State-file snapshots are restartable JSON. They're written
+# atomically on SIGUSR1 (and on graceful shutdown), and read at
+# boot. Backing up to S3 / external storage and truncating in
+# place loses nothing as long as the gateway is restarted
+# before the next SIGUSR1 / shutdown write.
+```
 
 **Prevent**
 
-- Set `--access-log-max-bytes` (TODO: roadmap) or use logrotate
-  on the dir.
-- Mount state-dir on a separate volume with monitoring at 70 %.
+- Wire `logrotate` (or a sidecar shipper like vector /
+  filebeat) on `--access-log <DIR>`. The repo doesn't yet ship
+  a `--access-log-max-bytes` knob — manage rotation externally.
+- Place each `--<x>-state-file` on a monitored volume; alert at
+  70 % full.
 
 ---
 
@@ -204,7 +219,7 @@ sudo mv /etc/s4/keys/active-new.key /etc/s4/keys/active.key
 
 # 3. Restart with both arguments:
 #    --sse-s4-key <active>
-#    --sse-s4-key-rotated id=2,key=<retired>   (repeat for older retiredsl)
+#    --sse-s4-key-rotated id=2,key=<retired>   (repeat for older retired slots)
 sudo systemctl edit s4-server   # adjust ExecStart
 sudo systemctl restart s4-server
 ```
@@ -269,13 +284,18 @@ journalctl -u s4-server | grep -E "kms|KEK"
 
 **Recovery**
 
-MFA-Delete state is per-bucket in the `mfa.json` state file
-(under `--state-dir`). To recover:
+MFA-Delete state lives in the JSON file the operator passed
+to `--mfa-delete-state-file <PATH>` at boot. The file is
+written by SIGUSR1 (see §12) and on graceful shutdown; it's
+read at boot. To recover:
 
 1. Identify the affected bucket from logs / config.
-2. Backup `mfa.json`, then edit to remove the bucket's
-   `state: Enabled` entry (set to `Disabled`).
-3. Restart S4. The bucket reverts to "no MFA required" on
+2. Stop the gateway (SIGTERM) so it doesn't overwrite the file
+   from memory.
+3. Back up the existing state file, then edit it to remove
+   the affected bucket's `Enabled` entry (set to `Disabled`,
+   or delete the per-bucket key).
+4. Restart S4. The bucket reverts to "no MFA required" on
    delete.
 
 This is a destructive recovery — it removes the MFA-Delete
@@ -455,17 +475,23 @@ k8s rollouts.
 **SIGHUP** — hot-reloads `--tls-cert` / `--tls-key`. Does NOT
 re-read other config; for those, use SIGTERM + restart.
 
-**SIGUSR1** — flushes access-log buffer immediately (v0.8.5
-#86 helper). Useful before suspending the host.
+**SIGUSR1** — atomically dumps every in-memory state manager
+to its `--<x>-state-file` JSON path (v0.8.5 #86). Affects
+versioning, object_lock, mfa_delete, cors, inventory,
+notifications, tagging, replication, lifecycle. Useful before
+a planned host suspend / reboot to capture in-memory changes
+that haven't yet reached disk. **It does NOT flush the
+access-log buffer** — access logs drain on shutdown via the
+graceful `tokio::select!` shutdown_notify path.
 
 ```bash
 # Drain + reboot
 sudo systemctl restart s4-server
 
-# Just rotate TLS without restart
+# Just rotate TLS without restart (SIGHUP)
 sudo systemctl reload s4-server
 
-# Force access log flush
+# Force state-manager snapshot dump (writes every --<x>-state-file)
 sudo kill -USR1 $(pidof s4-server)
 ```
 
@@ -474,14 +500,25 @@ sudo kill -USR1 $(pidof s4-server)
 ## Metric reference
 
 The complete list of `s4_*_total` / `s4_*_seconds` /
-`s4_*_bytes` metrics is in [`docs/observability.md`](../observability.md).
-Recommended alerts:
+`s4_*_bytes` metrics is in
+[`docs/observability.md`](../observability.md). All metric
+names below are verified against
+`crates/s4-server/src/metrics.rs`. Recommended alerts:
 
 | Alert | Threshold | Severity |
 |---|---|---|
-| `rate(s4_backend_error_total[5m]) > 5` | sustained 5 min | critical |
-| `s4_replication_pending_total > 10000` | sustained 10 min | warning |
-| `s4_tls_cert_reload_failed_total > 0` | any | warning |
-| `s4_policy_denials_total{action="s3:Bypass*"} > 0` | any | high (audit) |
-| `s4_gpu_compress_oom_total > 5` | over 5 min | warning |
-| `s4_rate_limit_throttled_total > 100` | over 1 min | info |
+| `rate(s4_replication_dropped_total[5m]) > 5` | sustained 5 min | critical |
+| `s4_replication_dropped_total - s4_replication_replicated_total > 10000` | sustained 10 min | warning |
+| `s4_tls_cert_reload_total{result="err"} > 0` | any | warning |
+| `s4_policy_denials_total{action=~"s3:Bypass.*"} > 0` | any | high (audit) |
+| `rate(s4_gpu_oom_total[5m]) > 1` | over 5 min | warning |
+| `rate(s4_rate_limit_throttled_total[1m]) > 100` | over 1 min | info |
+| `s4_acme_cert_expiry_seconds < 7 * 24 * 3600` | any | warning |
+
+Metric-naming note: S4 does **not** emit a generic
+`s4_backend_error_total` counter today — backend 5xx surfaces
+via the per-handler error counters in
+`s4_requests_total{status=~"5..."}` and the explicit
+replication outcome counters above. If a dedicated
+backend-error metric matters for your alerting story, treat
+it as a follow-up wire-up against the s3s middleware layer.
