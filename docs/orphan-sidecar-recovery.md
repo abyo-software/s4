@@ -38,7 +38,10 @@ those sidecars. Read the dry-run output before adding `--delete`.
 
 ```bash
 BUCKET=my-bucket
-ENDPOINT=https://s4.example.com
+ENDPOINT=https://s4.example.com         # the S4 gateway endpoint
+BACKEND_ENDPOINT=https://s3.example.com  # real backend (AWS S3 /
+                                         # MinIO / Garage / Ceph
+                                         # RGW); see Notes below.
 
 # 1. List candidate sidecars (S4 listing filter hides them; talk
 #    to the backend directly via its admin endpoint, NOT through
@@ -80,9 +83,10 @@ done < /tmp/s4_sidecars.txt > /tmp/s4_orphans.txt
   Garage) for the list step because the S4 gateway's
   `ListObjectsV2` filter hides `.s4index` entries from listings by
   design. Direct backend access is required to enumerate them.
-- v0.8.17 may add an `s4 admin sweep-orphan-sidecars` subcommand
-  that automates this loop. Until then, the manual recipe is the
-  supported path.
+- A future release (post-v1.0) may add an
+  `s4 admin sweep-orphan-sidecars` subcommand that automates
+  this loop. Until then, the manual recipe is the supported
+  path.
 - The sweep is **idempotent and safe** — deleting a stale
   `<key>.s4index` only forces the next Range GET on `<key>` to
   fall back to a full read, which is already the v0.8.15-window

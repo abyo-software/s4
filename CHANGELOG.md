@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.20] — 2026-06-07
+
+Fifth-round review caught that v0.8.19 D-6 only fixed runbook §12;
+the same metric-fabrications survived in **§1 / §2 / §3 / §7 / §8**
+plus README + SOCIAL_POSTS. v0.8.20 sweeps every remaining
+fabrication + tightens a 32-bit overflow corner.
+
+### Fixed
+
+- **#186 R5-1** — Runbook §1 "graceful shutdown also dumps state
+  files" claim removed. Only SIGUSR1 dumps manager state;
+  shutdown only drains the access-log buffer. Adds the
+  `kill -USR1 ... && systemctl restart` pre-restart recipe so
+  operators don't lose state since the last dump.
+- **#187 R5-2** — Runbook metric names across §2 / §3 / §7 / §8
+  (D-6 only covered §12's dedicated table). Fabricated names
+  removed: `s4_gpu_compress_oom_total` (real:
+  `s4_gpu_oom_total`), `s4_backend_error_total` (real:
+  `s4_requests_total{result="err"}`),
+  `s4_replication_pending_total`,
+  `s4_replication_completed_total`,
+  `s4_replication_failed_total` (real:
+  `s4_replication_dropped_total`,
+  `s4_replication_replicated_total`,
+  `s4_replication_status_swept_total`),
+  `s4_tls_cert_reload_failed_total` (real:
+  `s4_tls_cert_reload_total{result="err"}`).
+- **#188 R5-3** — README §metrics + SOCIAL_POSTS metric list
+  drop the fabricated `s4_codec_chosen_total{codec}`. Per-codec
+  request distribution comes via the `codec` label on the real
+  `s4_requests_total` counter:
+  `sum by (codec) (rate(s4_requests_total[5m]))`.
+- **#189 R5-4** — `docs/orphan-sidecar-recovery.md` shell
+  recipe defines `BACKEND_ENDPOINT` alongside `ENDPOINT` (was
+  undefined — copy-paste would fail with empty `--endpoint-url
+  ""`).
+- **#190 R5-5** — Stale "v0.8.17 may add" claim in
+  `docs/orphan-sidecar-recovery.md` advanced to "post-v1.0
+  release" since v0.8.17 has shipped without the subcommand.
+- **#191 R5-6** — `docs/security/threat-model.md` "Last
+  reviewed" stamp advanced from v0.8.18 to v0.8.20 (the v0.8.19
+  D-12 change to residual risk #4 made the v0.8.18 stamp
+  stale).
+- **#192 R5-7** — AWS SigV4 vectors provenance docstring says
+  `get-utf8-path` (matches actual fn name) instead of
+  `get-utf8`.
+- **#193 R5-8** — `--max-body-bytes` default literal computed
+  through `u64` then cast to `usize`, so the const-overflow
+  hazard on a 32-bit target (5 GiB > `u32::MAX`) is gone.
+  s4-server only ships 64-bit Linux today, but cross-compile
+  paths now stay honest.
+
+### Tests
+
+- 449 lib + 45 integration + 11 SigV4 vectors + 2 bolero + 1
+  chaos unchanged; all green under `RUSTFLAGS="-D warnings"`;
+  clippy + fmt clean.
+
+### Notes
+
+- v0.8.20 is the **fifth audit-cycle closeout**. The
+  D-6 → R5-2 progression illustrates the gotcha: fix one
+  occurrence of a documentation defect, miss the rest. v0.8.20
+  swept every remaining `grep -rn 's4_<wrong-name>'` hit.
+
 ## [0.8.19] — 2026-06-07
 
 Fourth-round review caught fabrications in the v0.8.18 runbook +

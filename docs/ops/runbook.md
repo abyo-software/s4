@@ -81,10 +81,17 @@ window).
 sudo mv /var/lib/s4/access-log/$(date +%Y%m%d).log /backup/
 
 # State-file snapshots are restartable JSON. They're written
-# atomically on SIGUSR1 (and on graceful shutdown), and read at
-# boot. Backing up to S3 / external storage and truncating in
-# place loses nothing as long as the gateway is restarted
-# before the next SIGUSR1 / shutdown write.
+# atomically on SIGUSR1 ONLY — graceful shutdown does NOT
+# trigger a snapshot dump (only access-log buffers drain on
+# shutdown). Before a planned `systemctl restart`, send
+# SIGUSR1 first so in-memory state changes since the last dump
+# survive the restart:
+#
+#   sudo kill -USR1 $(pidof s4-server) && sleep 1 && sudo systemctl restart s4-server
+#
+# Files are read at boot. Backing up to S3 / external storage
+# and truncating in place loses nothing as long as the gateway
+# is restarted before the next SIGUSR1 write.
 ```
 
 **Prevent**
@@ -102,7 +109,7 @@ sudo mv /var/lib/s4/access-log/$(date +%Y%m%d).log /backup/
 **Symptom**
 
 - PUTs that should reach nvCOMP path fall back to CPU codec.
-- Logs include `s4_gpu_compress_oom_total` metric increment,
+- Logs include `s4_gpu_oom_total` metric increment,
   `nvcomp: CUDA out of memory`.
 
 **Diagnose**
@@ -113,8 +120,10 @@ nvidia-smi
 # very high "Memory-Usage" per S4 process, or a leak.
 
 curl -s http://localhost:9091/metrics | grep s4_gpu
-# Key: s4_gpu_compress_oom_total, s4_gpu_compress_seconds,
-# s4_codec_chosen_total{codec="nvcomp-..."}
+# Key: s4_gpu_oom_total, s4_gpu_compress_seconds,
+# s4_gpu_in_flight, s4_gpu_throughput_bytes_per_sec.
+# Per-codec request distribution:
+#   sum by (codec) (rate(s4_requests_total[5m]))
 ```
 
 **Mitigate**
@@ -139,8 +148,8 @@ sudo systemctl restart s4-server
 
 - Production hosts should run S4 alone on the GPU; document
   this in the deployment manifest.
-- Wire `s4_gpu_compress_oom_total` to a Prometheus alert at
-  >5 events / 5 min.
+- Wire `s4_gpu_oom_total` to a Prometheus alert at >5 events /
+  5 min.
 
 ---
 
@@ -150,7 +159,9 @@ sudo systemctl restart s4-server
 
 - Many PUTs fail with `502 BadGateway` or `503 SlowDown`
   (mapped from backend error).
-- `s4_backend_error_total` metric climbs.
+- `s4_requests_total{result="err"}` rate climbs (S4 does not
+  emit a dedicated `s4_backend_error_total` counter — see the
+  Metric reference at the bottom of this file).
 
 **Diagnose**
 
@@ -160,7 +171,8 @@ aws --endpoint-url $BACKEND_ENDPOINT s3 ls
 # If `aws s3 ls` works direct-to-backend, S4 is the problem.
 # If `aws s3 ls` also fails, backend is the problem.
 
-curl -s http://localhost:9091/metrics | grep -E "s4_backend|s4_replication_failed"
+curl -s http://localhost:9091/metrics \
+  | grep -E "s4_requests_total\{.*result=\"err\"|s4_replication_(dropped|status_swept)_total"
 ```
 
 **Mitigate**
@@ -315,13 +327,14 @@ TOTP secret is irrecoverable.
 
 **Symptom**
 
-- `s4_replication_pending_total` climbs.
+- `s4_replication_dropped_total` rate climbs faster than
+  `s4_replication_replicated_total` rate.
 - Destination bucket lags behind source.
 
 **Diagnose**
 
 ```bash
-curl -s http://localhost:9091/metrics | grep -E "s4_replication_(pending|failed|completed)_total"
+curl -s http://localhost:9091/metrics | grep -E "s4_replication_(dropped|replicated|status_swept)_total"
 ```
 
 **Mitigate**
@@ -348,8 +361,8 @@ periodic cadence.
 
 - Monitor source PUT rate × destination's PUT capacity; size
   the cap accordingly.
-- Use Prometheus `rate(s4_replication_completed_total[5m])` as
-  the steady-state baseline.
+- Use Prometheus `rate(s4_replication_replicated_total[5m])`
+  as the steady-state baseline.
 
 ---
 
@@ -370,8 +383,8 @@ echo | openssl s_client -connect s4.example.com:443 -servername s4.example.com 2
 
 If reload fails (bad PEM, mismatched key), the listener keeps
 serving with the **previous** config; the failure is logged at
-WARN and `s4_tls_cert_reload_failed_total` increments. Fix the
-files and retry.
+WARN and `s4_tls_cert_reload_total{result="err"}` increments.
+Fix the files and retry.
 
 **ACME (`--acme`)**
 

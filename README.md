@@ -43,7 +43,9 @@ entropy + magic bytes and routes per object:
   detected by magic byte) → `passthrough` (no harm done)
 - non-GPU build OR no GPU at runtime → CPU codecs end-to-end
 
-Observe which codec was chosen via the `s4_codec_chosen_total{codec="..."}`
+Observe per-codec request distribution via PromQL
+`sum by (codec) (rate(s4_requests_total[5m]))` (the `codec`
+label on `s4_requests_total` carries the chosen codec name)
 Prometheus counter, or per-PUT in the structured JSON access log
 (`{"codec_chosen":"..."}`). GPU is a multiplier on the *integer/columnar*
 side of mixed workloads, not a blanket "compress with GPU" claim.

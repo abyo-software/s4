@@ -238,8 +238,9 @@ already-compressed payloads (entropy + magic-byte sniff).
   `/metrics` (Prometheus text)
 - Metrics: `s4_requests_total{op,codec,result}`, `s4_bytes_in_total`,
   `s4_bytes_out_total`, `s4_request_latency_seconds`,
-  `s4_policy_denials_total{action,bucket}`, `s4_codec_chosen_total{codec}`,
-  `s4_sse_aes_backend{kind}`
+  `s4_policy_denials_total{action,bucket}`,
+  `s4_sse_aes_backend{kind}` (per-codec request distribution
+  comes via the `codec` label on `s4_requests_total`)
 - Structured JSON access log (`--log-format json`) with `op`, `bucket`,
   `key`, `codec`, `bytes_in`, `bytes_out`, `ratio`, `latency_ms`, `ok`
 - OpenTelemetry OTLP traces (Jaeger / Tempo / Grafana / AWS X-Ray)

@@ -284,7 +284,13 @@ struct Opt {
     /// library-builder-only knob before v0.8.19 — operators
     /// running `s4-server` from the CLI had to recompile to change
     /// it. This flag fixes that.
-    #[clap(long, default_value_t = 5 * 1024 * 1024 * 1024)]
+    // v0.8.20 R5-8: the 5 GiB literal would const-overflow `usize`
+    // on a 32-bit target (5 GiB > u32::MAX). s4-server only ships
+    // 64-bit Linux today (per README §Supported targets), but
+    // computing through `u64` and asserting fits keeps the build
+    // honest on every target the workspace might be cross-compiled
+    // to in the future.
+    #[clap(long, default_value_t = (5_u64 * 1024 * 1024 * 1024) as usize)]
     max_body_bytes: usize,
 
     /// Optional S3-style access-log destination directory. When set,
