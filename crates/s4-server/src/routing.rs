@@ -293,14 +293,17 @@ pub fn try_sigv4a_verify_at<B>(
     requested_region: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<Result<(), Response<s3s::Body>>> {
-    let gate = gate?;
-    // v0.8.16 F-5: presigned URL form (`?X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256`)
-    // is not yet implemented. Pre-F-5 it silently fell through to
-    // the SigV4 path (which doesn't understand SigV4a query auth
-    // either), so the gate effectively accepted the request as
-    // unsigned. Surface a clean 501 NotImplemented so SDKs that
-    // emit presigned SigV4a URLs see a deterministic failure
-    // instead of an opaque 403 / 200.
+    // v0.8.17 G-1: presigned-URL detection runs BEFORE the
+    // `gate.is_none()` short-circuit. The v0.8.16 F-5 fix only
+    // emitted the 501 when a SigV4a verifier was already wired
+    // (`--sigv4a-credentials <DIR>`); operators who hadn't
+    // configured one had `?X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256`
+    // requests silently fall through to the SigV4 path, which
+    // doesn't understand SigV4a query auth either — request
+    // effectively accepted as unsigned. We now surface the 501
+    // unconditionally for SigV4a-shaped query auth, so the
+    // "deterministic failure" the F-5 comment promised holds for
+    // every deployment.
     if crate::sigv4a::detect_presigned(req) {
         return Some(Err(build_sigv4a_error_response(
             StatusCode::NOT_IMPLEMENTED,
@@ -309,6 +312,7 @@ pub fn try_sigv4a_verify_at<B>(
              use Authorization-header SigV4a instead",
         )));
     }
+    let gate = gate?;
     if !crate::sigv4a::detect(req) {
         // Not a SigV4a request — caller forwards to the SigV4 path.
         return None;

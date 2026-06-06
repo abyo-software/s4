@@ -543,6 +543,29 @@ pub struct S4Service<B: S3> {
     /// CIDR list; until then the boolean opt-in closes the immediate
     /// auth-bypass surface.
     trust_x_forwarded_for: bool,
+    /// v0.8.17 G-4 (#161): migration escape hatch. When `true`,
+    /// the v0.8.16 F-13 reserved-name guard does NOT block GET /
+    /// HEAD / DELETE on keys ending in `.s4index` — the operator
+    /// is asserting that the deployment may carry pre-v0.8.15
+    /// user objects with that suffix and wants a window to
+    /// migrate them off. Writes (PUT / Copy / Create-Multipart)
+    /// stay blocked regardless of this flag, so attacker
+    /// injection from M-1 / F-13 stays closed. Default
+    /// `false` matches the v0.8.16 behaviour.
+    allow_legacy_reserved_key_reads: bool,
+}
+
+/// v0.8.17 G-2: which AWS error shape the reserved-name guard
+/// should emit on hit. `Read`-mode endpoints (GET / HEAD /
+/// Attributes / Tagging-read) return `NoSuchKey` — consistent
+/// with the listing filter hiding the sidecar. `Mutating`-mode
+/// endpoints (PUT / Copy / DELETE / Tagging-write / ACL-write)
+/// return `InvalidObjectName` so the client sees the suffix is
+/// reserved by-design rather than coincidentally missing.
+#[derive(Clone, Copy, Debug)]
+enum ReservedKeyMode {
+    Read,
+    Mutating,
 }
 
 impl<B: S3> S4Service<B> {
@@ -606,7 +629,24 @@ impl<B: S3> S4Service<B> {
             // supplied `X-Forwarded-For` until the operator opts in
             // through `with_trust_x_forwarded_for(true)`.
             trust_x_forwarded_for: false,
+            // v0.8.17 G-4: closed by default; opt in via
+            // `with_allow_legacy_reserved_key_reads(true)` for the
+            // migration window only.
+            allow_legacy_reserved_key_reads: false,
         }
+    }
+
+    /// v0.8.17 G-4: opt in to a migration window where GET / HEAD /
+    /// DELETE on `<key>.s4index` are allowed even though new
+    /// writes against that suffix stay rejected. Used by operators
+    /// upgrading from pre-v0.8.15 deployments that may carry
+    /// legacy user-owned objects with the now-reserved suffix.
+    /// Defaults to `false`; turn off again once the legacy data
+    /// has been migrated.
+    #[must_use]
+    pub fn with_allow_legacy_reserved_key_reads(mut self, on: bool) -> Self {
+        self.allow_legacy_reserved_key_reads = on;
+        self
     }
 
     /// v0.8.11 CRIT-4 fix: opt in to consuming the leftmost token of
@@ -1466,6 +1506,49 @@ impl<B: S3> S4Service<B> {
         req.credentials.as_ref().map(|c| c.access_key.as_str())
     }
 
+    /// v0.8.17 G-2: shared reserved-name guard used by every per-object
+    /// API handler. `mode` chooses the AWS error shape: `Mutating`
+    /// (PUT / Copy / DELETE / Tagging-write) returns
+    /// `InvalidObjectName`; `Read` (GET / HEAD / Attributes / Tagging-read)
+    /// returns `NoSuchKey` so a curious client gets the same response
+    /// the listing filter has been giving them since v0.8.12 (the
+    /// sidecar is invisible to list).
+    ///
+    /// v0.8.17 G-4: when `--allow-legacy-reserved-key-reads` is set
+    /// AND the call is a `Read`, the guard returns `Ok(())` so
+    /// operators upgrading from pre-v0.8.15 deployments can still
+    /// access (and migrate off) any user-owned `<key>.s4index`
+    /// objects that landed before M-1 / F-13 closed the namespace.
+    /// Mutating operations stay blocked regardless of the flag —
+    /// the flag is a read-only migration aid, not an injection
+    /// re-opener.
+    fn check_not_reserved_key(&self, key: &str, mode: ReservedKeyMode) -> S3Result<()> {
+        if !s4_codec::index::is_reserved_sidecar_key(key) {
+            return Ok(());
+        }
+        if matches!(mode, ReservedKeyMode::Read) && self.allow_legacy_reserved_key_reads {
+            return Ok(());
+        }
+        match mode {
+            ReservedKeyMode::Read => Err(S3Error::with_message(
+                S3ErrorCode::NoSuchKey,
+                format!("object key {key:?} is reserved for S4 internal sidecars"),
+            )),
+            ReservedKeyMode::Mutating => {
+                let code = S3ErrorCode::from_bytes(b"InvalidObjectName")
+                    .unwrap_or(S3ErrorCode::InvalidArgument);
+                Err(S3Error::with_message(
+                    code,
+                    format!(
+                        "object key {key:?} is reserved (suffix `{}` is used for S4 internal \
+                         sidecars)",
+                        s4_codec::index::SIDECAR_SUFFIX,
+                    ),
+                ))
+            }
+        }
+    }
+
     /// v0.3 #13: build the per-request policy context from the incoming
     /// `S3Request`. Pulls `aws:UserAgent` from the User-Agent header,
     /// `aws:SourceIp` from the standard `X-Forwarded-For` header (most
@@ -2317,25 +2400,8 @@ impl<B: S3> S3 for S4Service<B> {
         let put_start = Instant::now();
         let put_bucket = req.input.bucket.clone();
         let put_key = req.input.key.clone();
-        // v0.8.15 M-1: reject user PUTs targeting reserved sidecar
-        // names (`<key>.s4index`). Without this gate, a user
-        // uploading `report.s4index` would have their object silently
-        // hidden from `ListObjectsV2` (the list filter strips the
-        // `.s4index` suffix) and risk being deleted by the sidecar-
-        // cleanup path on a sibling DeleteObject. Fail fast with the
-        // AWS-canonical `InvalidObjectName` code.
-        if s4_codec::index::is_reserved_sidecar_key(&put_key) {
-            let code = S3ErrorCode::from_bytes(b"InvalidObjectName")
-                .unwrap_or(S3ErrorCode::InvalidArgument);
-            return Err(S3Error::with_message(
-                code,
-                format!(
-                    "object key {put_key:?} is reserved (suffix `{}` is used for S4 internal \
-                     sidecars); pick a different key",
-                    s4_codec::index::SIDECAR_SUFFIX,
-                ),
-            ));
-        }
+        // v0.8.15 M-1 / v0.8.17 G-2: shared reserved-name guard.
+        self.check_not_reserved_key(&put_key, ReservedKeyMode::Mutating)?;
         let access_preamble = self.access_log_preamble(&req);
         self.enforce_rate_limit(&req, &put_bucket)?;
         // v0.6 #39: parse `x-amz-tagging` (URL-encoded query string) so
@@ -3163,19 +3229,8 @@ impl<B: S3> S3 for S4Service<B> {
         let get_start = Instant::now();
         let get_bucket = req.input.bucket.clone();
         let get_key = req.input.key.clone();
-        // v0.8.16 F-13: reserved-name guard now also fires on GET.
-        // The v0.8.15 #137 fix only blocked PUT / Copy / Create —
-        // a curious or hostile client could still
-        // `GetObject(<key>.s4index)` and read the raw sidecar
-        // (frame layout, source ETag, source compressed size).
-        // The list filter already hides the entry from listings;
-        // explicit reject closes the directed-read leak.
-        if s4_codec::index::is_reserved_sidecar_key(&get_key) {
-            return Err(S3Error::with_message(
-                S3ErrorCode::NoSuchKey,
-                format!("object key {get_key:?} is reserved for S4 internal sidecars"),
-            ));
-        }
+        // v0.8.16 F-13 / v0.8.17 G-2: shared reserved-name guard.
+        self.check_not_reserved_key(&get_key, ReservedKeyMode::Read)?;
         self.enforce_rate_limit(&req, &get_bucket)?;
         self.enforce_policy(&req, "s3:GetObject", &get_bucket, Some(&get_key))?;
         // Range request の事前検出 (decompress 後 slice する path に使う)。
@@ -3663,13 +3718,8 @@ impl<B: S3> S3 for S4Service<B> {
         // replication-status echo can look the entry up.
         let head_bucket = req.input.bucket.clone();
         let head_key = req.input.key.clone();
-        // v0.8.16 F-13: same reserved-name guard as `get_object`.
-        if s4_codec::index::is_reserved_sidecar_key(&head_key) {
-            return Err(S3Error::with_message(
-                S3ErrorCode::NoSuchKey,
-                format!("object key {head_key:?} is reserved for S4 internal sidecars"),
-            ));
-        }
+        // v0.8.16 F-13 / v0.8.17 G-2: shared reserved-name guard.
+        self.check_not_reserved_key(&head_key, ReservedKeyMode::Read)?;
         let mut resp = self.backend.head_object(req).await?;
         if let Some(manifest) = extract_manifest(&resp.output.metadata) {
             // 客側には decompress 後の意味のある content_length / checksum を返す。
@@ -3730,25 +3780,13 @@ impl<B: S3> S3 for S4Service<B> {
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
-        // v0.8.16 F-13: reserved-name guard on DELETE. Without it a
-        // hostile client could `DeleteObject(<key>.s4index)` to
-        // orphan the sidecar, silently disabling Range-GET
-        // partial-fetch for the corresponding `<key>`. The S4
-        // internal cleanup path (`write_sidecar` and friends)
-        // talks to `self.backend.delete_object(...)` directly, NOT
-        // through this trait method, so the guard doesn't break
+        // v0.8.16 F-13 / v0.8.17 G-2: shared reserved-name guard.
+        // The S4 internal sidecar cleanup path
+        // (`write_sidecar` and friends) talks to
+        // `self.backend.delete_object(...)` directly, NOT through
+        // this trait method, so the guard doesn't break
         // legitimate sidecar cleanup.
-        if s4_codec::index::is_reserved_sidecar_key(&key) {
-            let code = S3ErrorCode::from_bytes(b"InvalidObjectName")
-                .unwrap_or(S3ErrorCode::InvalidArgument);
-            return Err(S3Error::with_message(
-                code,
-                format!(
-                    "object key {key:?} is reserved (suffix `{}` is used for S4 internal sidecars)",
-                    s4_codec::index::SIDECAR_SUFFIX,
-                ),
-            ));
-        }
+        self.check_not_reserved_key(&key, ReservedKeyMode::Mutating)?;
         self.enforce_rate_limit(&req, &bucket)?;
         self.enforce_policy(&req, "s3:DeleteObject", &bucket, Some(&key))?;
         // v0.6 #42: MFA Delete enforcement. When the bucket has
@@ -4086,23 +4124,16 @@ impl<B: S3> S3 for S4Service<B> {
         // copy is conceptually "GetObject src + PutObject dst" — enforce both.
         let dst_bucket = req.input.bucket.clone();
         let dst_key = req.input.key.clone();
-        // v0.8.15 M-1: same reserved-name guard as `put_object`. A
-        // copy whose destination would land at `<x>.s4index` carries
-        // the same listing / cleanup hazards.
-        if s4_codec::index::is_reserved_sidecar_key(&dst_key) {
-            let code = S3ErrorCode::from_bytes(b"InvalidObjectName")
-                .unwrap_or(S3ErrorCode::InvalidArgument);
-            return Err(S3Error::with_message(
-                code,
-                format!(
-                    "destination key {dst_key:?} is reserved (suffix `{}` is used for S4 \
-                     internal sidecars)",
-                    s4_codec::index::SIDECAR_SUFFIX,
-                ),
-            ));
-        }
+        // v0.8.15 M-1 / v0.8.17 G-2: shared reserved-name guard.
+        self.check_not_reserved_key(&dst_key, ReservedKeyMode::Mutating)?;
         self.enforce_policy(&req, "s3:PutObject", &dst_bucket, Some(&dst_key))?;
         if let CopySource::Bucket { bucket, key, .. } = &req.input.copy_source {
+            // v0.8.17 G-2: source `<key>.s4index` would let
+            // CopyObject expose the raw sidecar (frame layout +
+            // source ETag) into a writable destination, bypassing
+            // the F-13 GET reject. Same guard, Read mode (returns
+            // NoSuchKey to match listing semantics).
+            self.check_not_reserved_key(key, ReservedKeyMode::Read)?;
             self.enforce_policy(&req, "s3:GetObject", bucket, Some(key))?;
         }
         // S4-aware copy: source object に s4-* metadata がある場合、それを
@@ -4334,19 +4365,8 @@ impl<B: S3> S3 for S4Service<B> {
         // by switching the client to the multipart wire path.
         let mp_bucket = req.input.bucket.clone();
         let mp_key = req.input.key.clone();
-        // v0.8.15 M-1: reserved-name guard on the multipart entry too.
-        if s4_codec::index::is_reserved_sidecar_key(&mp_key) {
-            let code = S3ErrorCode::from_bytes(b"InvalidObjectName")
-                .unwrap_or(S3ErrorCode::InvalidArgument);
-            return Err(S3Error::with_message(
-                code,
-                format!(
-                    "object key {mp_key:?} is reserved (suffix `{}` is used for S4 internal \
-                     sidecars)",
-                    s4_codec::index::SIDECAR_SUFFIX,
-                ),
-            ));
-        }
+        // v0.8.15 M-1 / v0.8.17 G-2: shared reserved-name guard.
+        self.check_not_reserved_key(&mp_key, ReservedKeyMode::Mutating)?;
         self.enforce_policy(&req, "s3:PutObject", &mp_bucket, Some(&mp_key))?;
         self.enforce_rate_limit(&req, &mp_bucket)?;
         // Multipart object は per-part 圧縮 + frame 形式で書く。GET 時に
@@ -5357,12 +5377,22 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<GetObjectAclInput>,
     ) -> S3Result<S3Response<GetObjectAclOutput>> {
+        // v0.8.17 G-2: reserved-name guard. Without it a hostile
+        // client can `GetObjectAcl(<key>.s4index)` to confirm the
+        // sidecar exists, an information leak the F-13 GET reject
+        // closed for the same object.
+        self.check_not_reserved_key(&req.input.key, ReservedKeyMode::Read)?;
         self.backend.get_object_acl(req).await
     }
     async fn put_object_acl(
         &self,
         req: S3Request<PutObjectAclInput>,
     ) -> S3Result<S3Response<PutObjectAclOutput>> {
+        // v0.8.17 G-2: reserved-name guard. `put-object-acl
+        // --acl public-read` against `<key>.s4index` would grant
+        // external read access to the internal sidecar, bypassing
+        // the F-13 GET reject via the backend's public-URL path.
+        self.check_not_reserved_key(&req.input.key, ReservedKeyMode::Mutating)?;
         self.backend.put_object_acl(req).await
     }
     // v0.6 #39: object tagging — when a `TagManager` is attached the
@@ -5374,6 +5404,8 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<GetObjectTaggingInput>,
     ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        // v0.8.17 G-2: reserved-name guard.
+        self.check_not_reserved_key(&req.input.key, ReservedKeyMode::Read)?;
         let Some(mgr) = self.tagging.as_ref() else {
             return self.backend.get_object_tagging(req).await;
         };
@@ -5389,6 +5421,8 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<PutObjectTaggingInput>,
     ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        // v0.8.17 G-2: reserved-name guard.
+        self.check_not_reserved_key(&req.input.key, ReservedKeyMode::Mutating)?;
         let Some(mgr) = self.tagging.as_ref() else {
             return self.backend.put_object_tagging(req).await;
         };
@@ -5415,6 +5449,8 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        // v0.8.17 G-2: reserved-name guard.
+        self.check_not_reserved_key(&req.input.key, ReservedKeyMode::Mutating)?;
         let Some(mgr) = self.tagging.as_ref() else {
             return self.backend.delete_object_tagging(req).await;
         };
@@ -5436,12 +5472,17 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<GetObjectAttributesInput>,
     ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
+        // v0.8.17 G-2: reserved-name guard. Attributes leak the
+        // sidecar's size + ETag, same shape as F-13's GET concern.
+        self.check_not_reserved_key(&req.input.key, ReservedKeyMode::Read)?;
         self.backend.get_object_attributes(req).await
     }
     async fn restore_object(
         &self,
         req: S3Request<RestoreObjectInput>,
     ) -> S3Result<S3Response<RestoreObjectOutput>> {
+        // v0.8.17 G-2: reserved-name guard.
+        self.check_not_reserved_key(&req.input.key, ReservedKeyMode::Mutating)?;
         self.backend.restore_object(req).await
     }
     async fn upload_part_copy(
@@ -5452,6 +5493,12 @@ impl<B: S3> S3 for S4Service<B> {
         // destination PUT + source GET.
         let dst_bucket = req.input.bucket.clone();
         let dst_key = req.input.key.clone();
+        // v0.8.17 G-2: reserved-name guard on both destination
+        // and source. Mirrors what `copy_object` enforces.
+        self.check_not_reserved_key(&dst_key, ReservedKeyMode::Mutating)?;
+        if let CopySource::Bucket { key, .. } = &req.input.copy_source {
+            self.check_not_reserved_key(key, ReservedKeyMode::Read)?;
+        }
         self.enforce_policy(&req, "s3:PutObject", &dst_bucket, Some(&dst_key))?;
         if let CopySource::Bucket { bucket, key, .. } = &req.input.copy_source {
             self.enforce_policy(&req, "s3:GetObject", bucket, Some(key))?;

@@ -351,19 +351,24 @@ impl SamplingDispatcher {
     /// or `--codec passthrough` (compress nothing) and bypass the
     /// sampler entirely.
     fn pick_from_sample(&self, sample: &[u8]) -> CodecKind {
-        if sample.len() < Self::MIN_SAMPLE_BYTES {
-            return self.default;
-        }
-        // v0.8.15 M-7: magic-byte passthrough is only honoured when
-        // the post-magic window *also* exhibits high entropy. A user
-        // log file that happens to start with `BZh` (or any other
-        // 2-3 byte magic by coincidence) won't have a high-entropy
-        // body — those should keep being compressed, not silently
-        // passthrough'd. Real compressed data has both signals.
+        // v0.8.17 G-3: run the magic-byte + post-magic-entropy
+        // check FIRST, regardless of `MIN_SAMPLE_BYTES`. The
+        // v0.8.16 F-12 guard inside `post_magic_entropy_high`
+        // was never reachable because the upstream
+        // `< MIN_SAMPLE_BYTES (=128)` short-circuit subsumed the
+        // `<= 48` short-sample case the comment cited. Promote
+        // the magic-byte arm above the short-circuit and let
+        // `post_magic_entropy_high` decide for itself how to
+        // handle short samples — that's the only place where the
+        // F-12 `false` default actually matters and where the
+        // `BZh:loglog:` motivation gets caught.
         if looks_already_compressed(sample)
             && post_magic_entropy_high(sample, self.entropy_threshold)
         {
             return CodecKind::Passthrough;
+        }
+        if sample.len() < Self::MIN_SAMPLE_BYTES {
+            return self.default;
         }
         if shannon_entropy(sample) >= self.entropy_threshold {
             return CodecKind::Passthrough;

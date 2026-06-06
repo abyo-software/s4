@@ -261,6 +261,18 @@ struct Opt {
     #[clap(long, default_value_t = false)]
     trust_x_forwarded_for: bool,
 
+    /// v0.8.17 G-4 (#161): migration escape hatch for operators
+    /// upgrading from pre-v0.8.15 deployments that may carry legacy
+    /// user-owned objects whose key ends in `.s4index`. When set,
+    /// the reserved-name guard does NOT block GET / HEAD / DELETE
+    /// on `.s4index` keys; writes (PUT / Copy / Create-Multipart /
+    /// tagging-write / ACL-write) stay blocked regardless so an
+    /// attacker can't inject into the namespace. Default `false`
+    /// matches v0.8.16 behaviour; turn the flag off again once the
+    /// legacy data has been migrated.
+    #[clap(long, default_value_t = false)]
+    allow_legacy_reserved_key_reads: bool,
+
     /// Optional S3-style access-log destination directory. When set,
     /// every completed PUT / GET / DELETE / List request is buffered
     /// and flushed to hourly-rotated `.log` files under the directory.
@@ -1016,6 +1028,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         info!(
             "S4 X-Forwarded-For trust: disabled (default) — aws:SourceIp / access-log \
              remote_ip stay None until --trust-x-forwarded-for is set (v0.8.11 CRIT-4 fix)."
+        );
+    }
+    // v0.8.17 G-4 (#161): migration escape hatch wiring. Off by
+    // default; loud info-log when on so the operator notices it
+    // in the boot output.
+    s4 = s4.with_allow_legacy_reserved_key_reads(opt.allow_legacy_reserved_key_reads);
+    if opt.allow_legacy_reserved_key_reads {
+        info!(
+            "S4 reserved-name guard: GET / HEAD / DELETE on `<key>.s4index` ALLOWED \
+             (migration mode; mutating ops still rejected). Disable once legacy data \
+             has been moved off the reserved suffix (v0.8.17 G-4)."
         );
     }
     // v0.8.5 #86 (audit M-2): cap the replication dispatcher pool. The

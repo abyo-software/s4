@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.17] — 2026-06-07
+
+Third-round audit closeout. The v0.8.16 follow-up review caught
+5 residual items (2 MED + 3 LOW): F-5 was gate-conditional, F-13
+missed 8 adjacent endpoints, F-12 was dead code, and pre-v0.8.15
+user data + v0.8.15 orphan sidecars needed operator hatches.
+All five closed. No CRIT / HIGH left.
+
+### Fixed
+
+- **#160 G-1** — F-5 presigned-URL 501 is now unconditional. The
+  v0.8.16 check ran AFTER `let gate = gate?;`, so deployments
+  without `--sigv4a-credentials` had `?X-Amz-Algorithm=AWS4-ECDSA-
+  P256-SHA256` URLs silently fall through to the SigV4 path
+  (which doesn't understand SigV4a query auth either). The
+  presigned-detect call now runs *before* the gate guard.
+- **#161 G-2** — reserved-name guard extended to 8 adjacent
+  per-object endpoints: `get_object_acl`, `put_object_acl`,
+  `get_object_attributes`, `get_object_tagging`,
+  `put_object_tagging`, `delete_object_tagging`, `restore_object`,
+  and `upload_part_copy` (both source + destination sides).
+  The v0.8.16 F-13 fix only covered GET / HEAD / DELETE. New
+  shared helper `S4Service::check_not_reserved_key(...)` +
+  `ReservedKeyMode` enum so every site uses the same code; the
+  three pre-existing F-13 sites + the M-1 PUT / Copy /
+  CreateMultipart sites refactor through the same helper.
+- **#162 G-3** — `post_magic_entropy_high` short-sample guard is
+  now reachable. The v0.8.16 F-12 check inside the helper
+  defaulted to `false` for `<= 48`-byte samples but the upstream
+  `MIN_SAMPLE_BYTES = 128` short-circuit in `pick_from_sample`
+  filtered every such sample before it could reach F-12. The
+  magic-byte arm now runs *above* the MIN_SAMPLE_BYTES gate, so a
+  40-byte `BZh:loglog:` user log actually hits the post-magic
+  entropy check and gets routed to the default codec (compressed)
+  rather than passed through uncompressed. Closes the v0.8.15 M-7
+  motivation that v0.8.16 F-12 thought it had closed.
+
+### Added
+
+- **#163 G-4** — `--allow-legacy-reserved-key-reads` CLI flag. A
+  migration escape hatch for operators upgrading from
+  pre-v0.8.15 deployments that may carry legitimate user-owned
+  objects whose key ends in `.s4index`. When set, the
+  reserved-name guard does NOT block GET / HEAD / DELETE on
+  `.s4index` keys; writes stay blocked regardless of the flag.
+  Default `false` matches v0.8.16 behaviour. Boot-time info-log
+  is loud when the flag is on so the operator notices the
+  migration window is open.
+- **#164 G-5** — `docs/orphan-sidecar-recovery.md`: operator
+  recipe for sweeping the orphan `<key>.s4index` artifacts that
+  v0.8.15 H-g left on versioning-Enabled buckets. v0.8.16 #151
+  F-7 stopped emitting new orphans by skipping the sidecar block
+  on versioned multipart Complete; this recipe handles the
+  one-time cleanup of pre-F-7 leftovers. A future release may
+  ship a `s4 admin sweep-orphan-sidecars` subcommand that
+  automates the same loop.
+
+### Tests
+
+- 438 lib + 45 integration tests green under `RUSTFLAGS="-D warnings"`;
+  `cargo clippy --workspace --all-targets` clean; `cargo fmt
+  --all --check` clean.
+
+### Notes
+
+- v0.8.17 is the public-launch target. Three full multi-agent
+  audit cycles have closed every CRIT / HIGH / MED finding from
+  the pre-release review. Remaining LOW items are tracked as
+  roadmap rather than launch-blocking.
+- `--allow-legacy-reserved-key-reads` is the **only** new
+  operator-visible knob since v0.8.16. The cumulative audit
+  surface area still totals two opt-ins
+  (`--trust-x-forwarded-for` since v0.8.11,
+  `--prefer-columnar-gpu` since v0.8.13) plus this v0.8.17
+  migration hatch.
+
 ## [0.8.16] — 2026-06-06
 
 Second-round audit closeout. The v0.8.15 HIGH + MED sweep landed
