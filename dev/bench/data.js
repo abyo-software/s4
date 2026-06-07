@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780830250831,
+  "lastUpdate": 1780830787430,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -1128,6 +1128,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "d078a45eb282f1385e8ed012876d63fcd0790bd0",
+          "message": "fix(audit): #106-audit-R5 P2-R5 — bounded sidecar fetch (OOM hardening)\n\nCodex round 5 integrated audit caught: `s4 verify-sidecar` and\n`sweep-orphan-sidecars` used to do an unbounded GET of every\n`<key>.s4index` body before `decode_index` could reject it. A\nmulti-GiB corrupt sidecar or legacy reserved-name user object\n(the v0.8.17 `--allow-legacy-reserved-key-reads` migration\nscenario) could OOM the operator's repair process — same DoS\nshape the codec already defends against on the server side via\nMAX_FRAMES / MAX_ETAG_BYTES.\n\nNew bounded `get_sidecar_bytes_capped` helper HEADs the sidecar\nfirst to learn its size; refuses to GET if Content-Length exceeds\n`MAX_SIDECAR_BODY_BYTES = 600 MiB`. The cap is comfortably above\nthe codec spec's max legitimate sidecar (MAX_FRAMES (16M) *\nENTRY_BYTES (32) + header = ~512 MiB) and well below attacker\npayload sizes.\n\nWired into both call sites:\n  - verify_sidecar: surfaces new typed\n    `RepairError::SidecarTooLarge { bucket, key, size, cap }`\n    (Display explains the threat model — OOM / legacy user data\n    / attack payload)\n  - classify_one (sweep): surfaces oversized entries as\n    `SidecarUndecodable` with a size-explaining message, so\n    one bad sidecar doesn't abort the whole sweep\n\nDead-code removal: the old `get_object_bytes` helper + its\n`GetOutcome` enum are no longer referenced after the cap fix\n(repair_sidecar uses the If-Match GET directly; classify_one and\nverify_sidecar now route through the capped helper).\n\nTests:\n  - Lib: `sidecar_too_large_error_shape` pins the variant\n    Display + field shape;\n    `max_sidecar_body_bytes_cap_value_pinned` derives the spec\n    max dynamically from `s4_codec::index::{MAX_FRAMES,\n    ENTRY_BYTES, HEADER_FIXED_V2, MAX_ETAG_BYTES}` and asserts\n    the cap exceeds it (any codec-side bump that pushes the\n    spec ceiling past 600 MiB will surface here loudly)\n  - MinIO E2E:\n    `sweep_classifies_oversized_lookalike_sidecar_as_undecodable`\n    walks the sweep path with a 1 MiB lookalike (full 600 MiB+\n    exercise too slow for CI; the cap value itself is pinned\n    by the lib unit test)\n\nCoverage: lib unit tests now 17 (was 15). Workspace 0 failed.\nfmt + clippy clean.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-07T20:05:10+09:00",
+          "tree_id": "1a04c2f028765dfe7befe37722b08f06948cd708",
+          "url": "https://github.com/abyo-software/s4/commit/d078a45eb282f1385e8ed012876d63fcd0790bd0"
+        },
+        "date": 1780830787104,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 47836,
+            "range": "± 2044",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 58017,
+            "range": "± 1104",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 427,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2215744,
+            "range": "± 13749",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50510255,
+            "range": "± 833319",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201188,
+            "range": "± 366",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 49924099,
+            "range": "± 1651003",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 922053211,
+            "range": "± 12394473",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3222430,
+            "range": "± 5115",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 27478,
+            "range": "± 1980",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 32775,
+            "range": "± 1184",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 423,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 589039,
+            "range": "± 2703",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1646733,
+            "range": "± 10096",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201273,
+            "range": "± 1362",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12277551,
+            "range": "± 133307",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 28829209,
+            "range": "± 109972",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3220909,
+            "range": "± 20479",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1472757,
+            "range": "± 30819",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2119277,
+            "range": "± 68907",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 313722269,
+            "range": "± 2527772",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 141,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 8528,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 919,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 14293,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2749,
+            "range": "± 80",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 21378,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 85285,
+            "range": "± 146",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 684,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4876,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19127,
+            "range": "± 160",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
             "range": "± 0",
             "unit": "ns/iter"
           }
