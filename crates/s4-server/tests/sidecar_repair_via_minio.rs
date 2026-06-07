@@ -770,6 +770,18 @@ async fn repair_sidecar_detects_post_get_overwrite_race() {
                 hit_get_race = true;
                 continue;
             }
+            // v0.9 #106-audit-R3 P2-R3 + v0.10 race-test follow-up:
+            // when the parallel overwrite lands BEFORE repair's
+            // initial HEAD (= fast CI runners), repair sees a raw-
+            // bytes body and correctly rejects with `NotFramed`.
+            // That's the same evidence as the GET-time If-Match race
+            // (Backend branch above) — proves the race detector
+            // works at the earliest possible layer. Accept as a
+            // valid retry outcome rather than panicking.
+            Err(RepairError::NotFramed { .. }) => {
+                hit_get_race = true;
+                continue;
+            }
             Ok(_) => continue,
             Err(other) => panic!("unexpected repair error: {other:?}"),
         }
