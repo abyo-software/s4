@@ -37,6 +37,19 @@ use thiserror::Error;
 /// instead of swapping the host.
 pub const DEFAULT_REPAIR_BODY_BYTES_CAP: u64 = 5 * 1024 * 1024 * 1024;
 
+/// v0.9 #106-audit-R5 P2-R5 (Codex): hard cap on `<key>.s4index` body
+/// bytes read by `verify-sidecar` / `sweep-orphan-sidecars`. The codec
+/// spec bounds a legitimate sidecar at `MAX_FRAMES (16M) * ENTRY_BYTES
+/// (32) + header (≤ 74 B)` ≈ 512 MiB. Any sidecar object larger than
+/// this cap is either an attacker payload aimed at OOM-ing the
+/// operator's repair process or a confused legacy reserved-name user
+/// data file — neither is something we want to load into RAM before
+/// `decode_index` can reject it. 600 MiB leaves a safety margin over
+/// the 512 MiB legitimate ceiling. Operators with anomalously large
+/// LEGITIMATE sidecars (multi-million-frame objects) should raise the
+/// cap explicitly; until then 600 MiB is the safe-by-default value.
+pub const MAX_SIDECAR_BODY_BYTES: u64 = 600 * 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum RepairError {
     #[error("S3 backend error on {op} {bucket}/{key}: {cause}")]
@@ -76,6 +89,27 @@ pub enum RepairError {
         bucket: String,
         key: String,
         head_etag: String,
+    },
+    /// v0.9 #106-audit-R5 P2-R5 (Codex): the `<key>.s4index` body
+    /// the backend reports exceeds [`MAX_SIDECAR_BODY_BYTES`], which
+    /// exceeds the codec spec's max legitimate sidecar (~512 MiB).
+    /// Surfaced before the GET to avoid loading a multi-GiB corrupt
+    /// or attacker-supplied `.s4index` blob into the operator's
+    /// repair process (DoS hardening). Operators with anomalously
+    /// large legitimate sidecars (multi-million-frame objects) can
+    /// raise the cap by changing the constant — but the practical
+    /// answer is "treat the underlying object as not-sidecared
+    /// (the GET path already falls back to a full read in that
+    /// case)" rather than chasing larger sidecars.
+    #[error(
+        "sidecar object {bucket}/{key} is {size} bytes (> {cap}-byte cap); refusing to load — \
+         most likely a legacy reserved-name user object or attacker payload aimed at OOM"
+    )]
+    SidecarTooLarge {
+        bucket: String,
+        key: String,
+        size: u64,
+        cap: u64,
     },
     /// v0.9 #106-audit-R3 P2-R3: the object body has no S4F2 frame
     /// magic — it's a passthrough / raw-bytes object the server
@@ -260,9 +294,13 @@ pub async fn verify_sidecar(
         size: live_size,
     } = head_main(client, bucket, key).await?;
     let sidecar_k = sidecar_key(key);
-    let bytes = match get_object_bytes(client, bucket, &sidecar_k).await {
-        Ok(b) => b,
-        Err(GetOutcome::NotFound) => {
+    // v0.9 #106-audit-R5 P2-R5 (Codex): bounded sidecar fetch.
+    // A multi-GiB corrupt or legacy reserved-name user `.s4index`
+    // object would OOM the operator's repair process if we did the
+    // naive unbounded GET. Cap on HEAD-reported size.
+    let bytes = match get_sidecar_bytes_capped(client, bucket, &sidecar_k).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
             // P2-C (Codex R3): disambiguate Missing via a body scan
             // before deciding whether this is a healthy single-frame
             // object or a real divergence.
@@ -280,7 +318,15 @@ pub async fn verify_sidecar(
                 .await?,
             });
         }
-        Err(GetOutcome::Other(msg)) => {
+        Err(SidecarFetchOutcome::TooLarge { size, cap }) => {
+            return Err(RepairError::SidecarTooLarge {
+                bucket: bucket.into(),
+                key: sidecar_k,
+                size,
+                cap,
+            });
+        }
+        Err(SidecarFetchOutcome::Other(msg)) => {
             return Err(RepairError::Backend {
                 op: "GET",
                 bucket: bucket.into(),
@@ -792,12 +838,31 @@ async fn classify_one(
     // `DeletePolicy::PairBoundOnly` would silently delete user data.
     // The rule is: bytes that don't parse as S4IX magic = user data,
     // never an orphan-eligible-for-default-delete.
-    let bytes = match get_object_bytes(client, bucket, sidecar_k).await {
-        Ok(b) => b,
+    // v0.9 #106-audit-R5 P2-R5 (Codex): bounded sidecar fetch.
+    // sweep walks every `*.s4index` in the bucket — a single
+    // multi-GiB attacker-supplied or legacy-user `.s4index` object
+    // would OOM the sweep process with the naive unbounded GET.
+    // TooLarge surfaces as a `SidecarUndecodable` orphan with a
+    // size-explaining message rather than aborting the whole sweep
+    // (one bad sidecar shouldn't stop the rest from being inspected).
+    let bytes = match get_sidecar_bytes_capped(client, bucket, sidecar_k).await {
+        Ok(Some(b)) => b,
         // ListObjectsV2 saw it; if GET says NotFound now, treat as a
         // sidecar that vanished mid-sweep — skip rather than report.
-        Err(GetOutcome::NotFound) => return Ok(()),
-        Err(GetOutcome::Other(msg)) => {
+        Ok(None) => return Ok(()),
+        Err(SidecarFetchOutcome::TooLarge { size, cap }) => {
+            out.push(OrphanReport {
+                sidecar_key: sidecar_k.into(),
+                paired_key: paired.into(),
+                reason: OrphanReason::SidecarUndecodable {
+                    message: format!(
+                        "sidecar size {size} > cap {cap}; refused to load (likely legacy user data or attack payload)"
+                    ),
+                },
+            });
+            return Ok(());
+        }
+        Err(SidecarFetchOutcome::Other(msg)) => {
             return Err(RepairError::Backend {
                 op: "GET",
                 bucket: bucket.into(),
@@ -999,33 +1064,72 @@ fn detect_sse_magic(body: &[u8]) -> Option<&'static str> {
     }
 }
 
-enum GetOutcome {
-    NotFound,
-    Other(String),
-}
-
-async fn get_object_bytes(
+/// v0.9 #106-audit-R5 P2-R5 (Codex): bounded sidecar fetch.
+/// HEADs the sidecar key first to learn its size; refuses to GET
+/// (and thus refuses to allocate) if the size exceeds
+/// [`MAX_SIDECAR_BODY_BYTES`]. Used by both `verify_sidecar` and
+/// `classify_one` (sweep) so a multi-GiB corrupt or legacy user
+/// `.s4index` object can't OOM the operator's repair process.
+///
+/// Returns:
+///   - `Ok(Some(bytes))` when the sidecar exists and fits in the cap
+///   - `Ok(None)` when the sidecar HEAD returns NotFound (caller
+///     classifies as `Missing*`)
+///   - `Err(SidecarFetchOutcome::Other)` when HEAD returns
+///     Content-Length missing or any other backend error
+///   - `Err(SidecarFetchOutcome::TooLarge { .. })` when size > cap
+async fn get_sidecar_bytes_capped(
     client: &Client,
     bucket: &str,
     key: &str,
-) -> Result<bytes::Bytes, GetOutcome> {
+) -> Result<Option<bytes::Bytes>, SidecarFetchOutcome> {
+    let head = match client.head_object().bucket(bucket).key(key).send().await {
+        Ok(h) => h,
+        Err(e) => {
+            return if is_head_not_found(&e) {
+                Ok(None)
+            } else {
+                Err(SidecarFetchOutcome::Other(format!("HEAD: {e}")))
+            };
+        }
+    };
+    let size = match head.content_length() {
+        Some(n) if n >= 0 => n as u64,
+        Some(_) | None => {
+            return Err(SidecarFetchOutcome::Other(
+                "sidecar HEAD returned no Content-Length; refusing to GET unbounded".into(),
+            ));
+        }
+    };
+    if size > MAX_SIDECAR_BODY_BYTES {
+        return Err(SidecarFetchOutcome::TooLarge {
+            size,
+            cap: MAX_SIDECAR_BODY_BYTES,
+        });
+    }
     match client.get_object().bucket(bucket).key(key).send().await {
         Ok(resp) => {
             let agg = resp
                 .body
                 .collect()
                 .await
-                .map_err(|e| GetOutcome::Other(format!("read body: {e}")))?;
-            Ok(agg.into_bytes())
+                .map_err(|e| SidecarFetchOutcome::Other(format!("read body: {e}")))?;
+            Ok(Some(agg.into_bytes()))
         }
         Err(e) => {
             if is_get_not_found(&e) {
-                Err(GetOutcome::NotFound)
+                // Race: existed at HEAD, gone by GET. Treat as missing.
+                Ok(None)
             } else {
-                Err(GetOutcome::Other(format!("{e}")))
+                Err(SidecarFetchOutcome::Other(format!("GET: {e}")))
             }
         }
     }
+}
+
+enum SidecarFetchOutcome {
+    Other(String),
+    TooLarge { size: u64, cap: u64 },
 }
 
 fn is_head_not_found(
@@ -1262,6 +1366,73 @@ mod tests {
         // Defensive: an empty etag stays empty (head responses with no
         // ETag header round-trip to the empty string in head_main).
         assert_eq!(normalize_etag(""), "");
+    }
+
+    /// P2-R5 (Codex R5 audit): the bounded sidecar fetch helper
+    /// must enforce [`MAX_SIDECAR_BODY_BYTES`] and surface a typed
+    /// `SidecarTooLarge` error before allocating. Pin the wire
+    /// shape of the variant so a future refactor can't silently
+    /// drop the cap and re-introduce the OOM vector.
+    #[test]
+    fn sidecar_too_large_error_shape() {
+        let err = RepairError::SidecarTooLarge {
+            bucket: "b".into(),
+            key: "k.s4index".into(),
+            size: 2 * MAX_SIDECAR_BODY_BYTES,
+            cap: MAX_SIDECAR_BODY_BYTES,
+        };
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("b/k.s4index"),
+            "Display must mention bucket/key — got {rendered:?}"
+        );
+        assert!(
+            rendered.contains(&MAX_SIDECAR_BODY_BYTES.to_string()),
+            "Display must mention the cap — got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("OOM") || rendered.contains("legacy") || rendered.contains("attack"),
+            "Display must hint at the threat model — got {rendered:?}"
+        );
+        match err {
+            RepairError::SidecarTooLarge {
+                bucket,
+                key,
+                size,
+                cap,
+            } => {
+                assert_eq!(bucket, "b");
+                assert_eq!(key, "k.s4index");
+                assert_eq!(size, 2 * MAX_SIDECAR_BODY_BYTES);
+                assert_eq!(cap, MAX_SIDECAR_BODY_BYTES);
+            }
+            _ => unreachable!("SidecarTooLarge must match its own variant"),
+        }
+    }
+
+    /// P2-R5: the cap value is load-bearing — too small breaks
+    /// legitimate sidecars, too large defeats the OOM guard. Pin
+    /// it at the codec-spec-derived ceiling (16M frames × 32 B per
+    /// entry + header ≈ 512 MiB, rounded up with safety margin to
+    /// 600 MiB). Bump only with explicit operator justification.
+    #[test]
+    fn max_sidecar_body_bytes_cap_value_pinned() {
+        assert_eq!(MAX_SIDECAR_BODY_BYTES, 600 * 1024 * 1024);
+        // Sanity: cap must comfortably exceed the codec spec's
+        // max legitimate sidecar geometry. Computed dynamically
+        // from the codec constants so a bump to either side
+        // surfaces here (clippy flags `assert!(const)` as
+        // pointless, so we use `assert_eq!` against `false` for
+        // the negative — if the cap ever DROPS below the spec
+        // max, this fails loudly).
+        let spec_max_legitimate: u64 = s4_codec::index::MAX_FRAMES
+            * (s4_codec::index::ENTRY_BYTES as u64)
+            + (s4_codec::index::HEADER_FIXED_V2 as u64)
+            + (s4_codec::index::MAX_ETAG_BYTES as u64);
+        assert!(
+            MAX_SIDECAR_BODY_BYTES > spec_max_legitimate,
+            "cap {MAX_SIDECAR_BODY_BYTES} must exceed spec-max {spec_max_legitimate}",
+        );
     }
 
     /// P2-R3 (Codex R3 audit): `repair-sidecar` on a passthrough /

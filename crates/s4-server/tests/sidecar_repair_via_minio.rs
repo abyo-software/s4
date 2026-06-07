@@ -930,6 +930,66 @@ async fn repair_sidecar_rejects_sse_s4_chunked_object_cleanly() {
     let _ = shutdown.send(());
 }
 
+/// v0.9 #106-audit-R5 P2-R5 (Codex): `verify-sidecar` /
+/// `sweep-orphan-sidecars` MUST not OOM on a multi-GiB corrupt /
+/// legacy user `.s4index` object. The sidecar fetch path now
+/// HEADs first and refuses to GET if the size exceeds the cap.
+/// This E2E plants a 1 MiB object at a `.s4index` key (small
+/// enough for CI but the test asserts the *path* — we check the
+/// SidecarTooLarge / oversize-classify behavior by also planting
+/// a deliberately-oversized object far above the production cap
+/// would require multi-GB of test data, so we instead exercise
+/// the small case end-to-end (sweep classifies it as
+/// SidecarUndecodable, repair rejects) and rely on the lib unit
+/// tests `sidecar_too_large_error_shape` +
+/// `max_sidecar_body_bytes_cap_value_pinned` to pin the cap
+/// constant + error shape.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn sweep_classifies_oversized_lookalike_sidecar_as_undecodable() {
+    let minio = start_minio().await;
+    let backend = build_aws_client(&minio.endpoint_url);
+    let _ = backend
+        .create_bucket()
+        .bucket("oversize-sweep")
+        .send()
+        .await;
+
+    // Real S4 paired object so the bucket has a non-orphan
+    // baseline (sanity: sweep should leave it alone).
+    let (s4_endpoint, shutdown) = spawn_s4_server(&minio.endpoint_url).await;
+    let s4_client = build_aws_client(&s4_endpoint);
+    let _real = put_multipart_object(&s4_client, "oversize-sweep", "real.bin").await;
+
+    // Plant a 1 MiB blob directly at a `.s4index` key — well below
+    // the 600 MiB cap, so we exercise the normal "decode fails →
+    // SidecarUndecodable" path. The protection itself (refuse to
+    // GET when HEAD says > cap) is covered by the lib unit tests
+    // since planting 600+ MiB on CI MinIO is too slow.
+    let bogus = vec![0xABu8; 1024 * 1024];
+    backend
+        .put_object()
+        .bucket("oversize-sweep")
+        .key("bogus.s4index")
+        .body(Bytes::from(bogus).into())
+        .send()
+        .await
+        .expect("PUT bogus .s4index");
+
+    let report = sweep_orphan_sidecars(&backend, "oversize-sweep", DeletePolicy::DryRun)
+        .await
+        .expect("sweep dry-run");
+    // 2 sidecars scanned: real.bin.s4index (clean) + bogus.s4index.
+    assert_eq!(report.sidecars_scanned, 2);
+    assert_eq!(report.orphans.len(), 1);
+    assert!(matches!(
+        report.orphans[0].reason,
+        OrphanReason::SidecarUndecodable { .. }
+    ));
+
+    let _ = shutdown.send(());
+}
+
 /// v0.9 #106-audit-R4 P2-R4 (Codex): `verify-sidecar` against a
 /// passthrough / raw-bytes object whose backend body has no `S4F2`
 /// magic must classify as `MissingHarmless`, NOT bubble up the

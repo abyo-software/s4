@@ -547,6 +547,33 @@ v0.9 roadmap in progress.
 
 ### Fixed
 
+- **#106-audit-R5 P2-R5** — `s4 verify-sidecar` /
+  `sweep-orphan-sidecars` used to do an unbounded GET of every
+  `<key>.s4index` body before `decode_index` could reject it. A
+  multi-GiB corrupt sidecar or legacy reserved-name user object
+  (the `--allow-legacy-reserved-key-reads` migration scenario)
+  could OOM the operator's repair process — same DoS shape the
+  codec already defends against on the server side via
+  `MAX_FRAMES` / `MAX_ETAG_BYTES`. Closed by a new bounded
+  `get_sidecar_bytes_capped` helper that HEADs first and
+  refuses to GET if Content-Length exceeds
+  `MAX_SIDECAR_BODY_BYTES = 600 MiB` (comfortably above the
+  codec spec's max legitimate sidecar of ~512 MiB, well below
+  attacker payload sizes). `verify-sidecar` surfaces a new
+  typed `RepairError::SidecarTooLarge { bucket, key, size,
+  cap }`; sweep surfaces oversized entries as
+  `SidecarUndecodable` with a size-explaining message (so one
+  bad sidecar doesn't abort the whole sweep). Two new lib
+  unit tests (`sidecar_too_large_error_shape`,
+  `max_sidecar_body_bytes_cap_value_pinned`) pin both the
+  variant Display and the cap value relative to the codec
+  spec ceiling computed from `MAX_FRAMES * ENTRY_BYTES +
+  HEADER_FIXED_V2 + MAX_ETAG_BYTES`. New MinIO E2E
+  `sweep_classifies_oversized_lookalike_sidecar_as_undecodable`
+  walks the sweep path with a 1 MiB lookalike (the full-size
+  600 MiB+ exercise would be too slow for CI; the cap value
+  itself is pinned by the lib unit test).
+
 - **#106-audit-R4 P2-R4** — `s4 verify-sidecar` on a passthrough /
   raw-bytes object (no `S4F2` magic, body ≥ 28 bytes so the inner
   frame parser reaches `BadMagic`) used to exit 1 with a confusing
