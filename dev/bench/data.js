@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780843394977,
+  "lastUpdate": 1780843635791,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -3371,6 +3371,232 @@ window.BENCHMARK_DATA = {
             "name": "decode_index/4096f",
             "value": 19630,
             "range": "± 2708",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "eddd7323479ca3e9825fd5cd687209ec080df622",
+          "message": "fix(audit): v0.10-W2-R2 P2 — gate branch/sha tags during back-fill\n\nCodex round 2 integrated audit caught: docker.yml back-fill mode\n(workflow_dispatch with `build_ref` set to an older tag like\nv0.9.0) still emitted `type=ref,event=branch` + `type=sha,format=short`\ntags from the dispatcher ref. Result: `gh workflow run docker.yml\n--ref main -f build_ref=v0.9.0 -f image_tag_override=0.9.0\n-f push=true` would publish the v0.9.0 binary under `:main` +\n`:sha-<current-main-sha>` IN ADDITION TO the intended `:0.9.0` +\n`:v0.9.0` raw tags. Consumers pulling `:main` would silently\nget the older binary.\n\nFix: add `enable=${{ inputs.build_ref == '' }}` to both the\n`type=ref,event=branch` and `type=sha,format=short` rules. Tag-\npush events (= dispatcher ref IS the tag, build_ref empty) keep\nemitting branch/sha as before. Back-fill events skip them — only\nthe explicit `image_tag_override` raw tags fire.\n\n**Operational followup (NOT in this commit)**: the in-flight\nv0.9.0 back-fill (run id 27094500626) was dispatched against\nthe previous docker.yml and ALREADY pushed `:main-gpu` pointing\nat v0.9.0-gpu content (GPU job completed 11m26s). When the CPU\njob finishes, it will also push `:main` + `:sha-<a1dfe20-ish>`\nwith v0.9.0 CPU content. Cleanup plan:\n\n  1. Let the CPU back-fill complete (cancelling mid-multi-arch\n     wastes the 40+ min already burned, doesn't prevent the\n     mis-tag because the GPU :main-gpu is already pushed).\n  2. Trigger a no-input workflow_dispatch from main once the\n     back-fill is done: `gh workflow run docker.yml --ref main\n     -f push=true` (NO build_ref, NO image_tag_override). This\n     rebuilds main HEAD with the corrected workflow and\n     overwrites the mis-tagged `:main` / `:main-gpu` /\n     `:sha-<sha>` with the actual current-main binary.\n\nFuture back-fills are protected by this commit's enable= gate.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-07T23:39:23+09:00",
+          "tree_id": "880cde5327d329e7cf130dbd215c2ffed4788560",
+          "url": "https://github.com/abyo-software/s4/commit/eddd7323479ca3e9825fd5cd687209ec080df622"
+        },
+        "date": 1780843634863,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 55083,
+            "range": "± 3763",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 56755,
+            "range": "± 3446",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 372,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2636570,
+            "range": "± 47266",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 41650515,
+            "range": "± 100355",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192299,
+            "range": "± 404",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 51984124,
+            "range": "± 1573159",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 753944800,
+            "range": "± 871210",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3068790,
+            "range": "± 58429",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 32496,
+            "range": "± 2676",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 40066,
+            "range": "± 2669",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 378,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 586211,
+            "range": "± 6494",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1616705,
+            "range": "± 30854",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192219,
+            "range": "± 1842",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 13395868,
+            "range": "± 346174",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27154032,
+            "range": "± 456252",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3076371,
+            "range": "± 11654",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1626196,
+            "range": "± 11814",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2674631,
+            "range": "± 26940",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 349798560,
+            "range": "± 2736252",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 144,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 7984,
+            "range": "± 70",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 793,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 12558,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2912,
+            "range": "± 78",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 22699,
+            "range": "± 425",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 90780,
+            "range": "± 1498",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 595,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4945,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19747,
+            "range": "± 57",
             "unit": "ns/iter"
           },
           {
