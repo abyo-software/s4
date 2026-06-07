@@ -77,6 +77,24 @@ pub enum RepairError {
         key: String,
         head_etag: String,
     },
+    /// v0.9 #106-audit-R3 P2-R3: the object body has no S4F2 frame
+    /// magic — it's a passthrough / raw-bytes object the server
+    /// intentionally never sidecared (service.rs::put_object only
+    /// builds a sidecar when `is_framed && !will_encrypt`). Writing
+    /// an empty `<key>.s4index` would silently break Range GET:
+    /// `FrameIndex::lookup_range` over zero entries returns `None`,
+    /// the GET path falls into the "invalid range" branch instead of
+    /// the correct passthrough-range fallback that exists for
+    /// sidecar-less objects. Surface as a typed error so the
+    /// operator knows the object isn't a candidate for sidecar
+    /// repair (and `verify-sidecar` will already classify it as
+    /// `MissingHarmless` with frame_count=0).
+    #[error(
+        "object {bucket}/{key} body has no S4F2 frame magic — it's a passthrough or \
+         raw-bytes object that the server intentionally never sidecared; \
+         sidecar repair would silently break Range GET. No action required."
+    )]
+    NotFramed { bucket: String, key: String },
     /// v0.9 #106-audit-R2 P2-INT-1: the object body the backend returned
     /// is an SSE-S4 (S4E1/S4E2/S4E3/S4E4/S4E5/S4E6) encrypted envelope.
     /// `repair_sidecar` runs against the BACKEND (not the gateway), so the
@@ -457,6 +475,20 @@ pub async fn repair_sidecar(
         key: key.into(),
         cause: e.to_string(),
     })?;
+    // v0.9 #106-audit-R3 P2-R3 (Codex): `build_index_from_body`
+    // on a non-S4F2 body (passthrough / raw bytes) returns Ok with
+    // an empty entries vec rather than an error. Writing that as a
+    // sidecar would silently break Range GET — `lookup_range` over
+    // zero entries returns None, and the GET path then takes the
+    // "no plan" branch instead of the passthrough-range fallback
+    // that exists for sidecar-less objects. Reject cleanly so the
+    // operator knows the object isn't a sidecar-repair candidate.
+    if idx.entries.is_empty() {
+        return Err(RepairError::NotFramed {
+            bucket: bucket.into(),
+            key: key.into(),
+        });
+    }
     // Stamp the NORMALIZED form so server-side
     // `sidecar_version_binding_ok` (which compares against the s3s
     // `ETag::value()` stripped form) sees a match. The raw form was
@@ -1213,6 +1245,35 @@ mod tests {
         // Defensive: an empty etag stays empty (head responses with no
         // ETag header round-trip to the empty string in head_main).
         assert_eq!(normalize_etag(""), "");
+    }
+
+    /// P2-R3 (Codex R3 audit): `repair-sidecar` on a passthrough /
+    /// raw-bytes object would previously write an empty sidecar
+    /// that silently breaks Range GET. Pin the typed error's wire
+    /// shape so a future refactor can't quietly drop the
+    /// `NotFramed` branch.
+    #[test]
+    fn not_framed_error_shape() {
+        let err = RepairError::NotFramed {
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("b/k"), "Display must mention bucket/key");
+        assert!(
+            rendered.contains("S4F2") || rendered.contains("passthrough"),
+            "Display must hint at the framing reason"
+        );
+        // Pattern-match guard: any rename of bucket/key here is a
+        // compile error both here AND at the repair_sidecar
+        // construction site.
+        match err {
+            RepairError::NotFramed { bucket, key } => {
+                assert_eq!(bucket, "b");
+                assert_eq!(key, "k");
+            }
+            _ => unreachable!("NotFramed must match its own variant"),
+        }
     }
 
     /// CI-unblock (post-v0.9 audit): the MinIO E2E race test

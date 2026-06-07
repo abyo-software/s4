@@ -929,3 +929,103 @@ async fn repair_sidecar_rejects_sse_s4_chunked_object_cleanly() {
 
     let _ = shutdown.send(());
 }
+
+/// v0.9 #106-audit-R3 P2-R3 (Codex): `repair-sidecar` on an object
+/// whose body `build_index_from_body` parses to **zero frames** must
+/// reject with `NotFramed` instead of writing an empty sidecar that
+/// would silently break Range GET (`lookup_range` over 0 entries
+/// returns `None` → InvalidRange).
+///
+/// `build_index_from_body` returns `Ok` with empty entries when the
+/// body has no S4F2 frame magic AND no readable header — the practical
+/// trip is an empty body (0 bytes) or a body shorter than the
+/// 28-byte frame header. Longer arbitrary raw-bytes bodies surface
+/// as `FrameScan` from the inner frame parser's `BadMagic` instead.
+/// Both error paths share the same outcome: NO sidecar is written.
+/// This test pins the `NotFramed` branch via the empty-body case.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn repair_sidecar_rejects_zero_frame_body() {
+    let minio = start_minio().await;
+    let backend = build_aws_client(&minio.endpoint_url);
+    let _ = backend.create_bucket().bucket("raw-repair").send().await;
+
+    // Empty body — guarantees `build_index_from_body` returns
+    // `Ok(FrameIndex { entries: [], .. })` and exercises the
+    // NotFramed guard (rather than the BadMagic / FrameScan path
+    // that catches any non-trivial non-framed body).
+    backend
+        .put_object()
+        .bucket("raw-repair")
+        .key("empty.bin")
+        .body(Bytes::new().into())
+        .send()
+        .await
+        .expect("PUT empty body");
+
+    let err = repair_sidecar(
+        &backend,
+        "raw-repair",
+        "empty.bin",
+        DEFAULT_REPAIR_BODY_BYTES_CAP,
+    )
+    .await
+    .expect_err("repair must reject a non-framed body");
+    match err {
+        RepairError::NotFramed { bucket, key } => {
+            assert_eq!(bucket, "raw-repair");
+            assert_eq!(key, "empty.bin");
+        }
+        other => panic!("expected NotFramed, got {other:?}"),
+    }
+
+    // No sidecar must have been written.
+    let head = backend
+        .head_object()
+        .bucket("raw-repair")
+        .key(format!("empty.bin{SIDECAR_SUFFIX}"))
+        .send()
+        .await;
+    assert!(
+        head.is_err(),
+        "no sidecar must be written when repair rejects (got Ok: {head:?})"
+    );
+
+    // Sibling sanity: a non-trivial raw-bytes body trips the
+    // BadMagic / FrameScan path before our NotFramed guard fires,
+    // but BOTH paths must avoid writing a sidecar (same end-state
+    // the operator cares about).
+    backend
+        .put_object()
+        .bucket("raw-repair")
+        .key("raw.bin")
+        .body(Bytes::from_static(b"not an s4f2 frame body, just raw bytes").into())
+        .send()
+        .await
+        .expect("PUT raw body");
+    let err = repair_sidecar(
+        &backend,
+        "raw-repair",
+        "raw.bin",
+        DEFAULT_REPAIR_BODY_BYTES_CAP,
+    )
+    .await
+    .expect_err("repair must reject a raw body");
+    assert!(
+        matches!(
+            err,
+            RepairError::FrameScan { .. } | RepairError::NotFramed { .. }
+        ),
+        "expected FrameScan or NotFramed, got {err:?}"
+    );
+    let head = backend
+        .head_object()
+        .bucket("raw-repair")
+        .key(format!("raw.bin{SIDECAR_SUFFIX}"))
+        .send()
+        .await;
+    assert!(
+        head.is_err(),
+        "no sidecar must be written when raw-body repair rejects"
+    );
+}

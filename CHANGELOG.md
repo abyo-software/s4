@@ -547,6 +547,30 @@ v0.9 roadmap in progress.
 
 ### Fixed
 
+- **#106-audit-R3 P2-R3** — `s4 repair-sidecar` against a
+  passthrough / raw-bytes object (no `S4F2` frame magic in the
+  body) used to silently write an empty `<key>.s4index`
+  sidecar — `build_index_from_body` returns `Ok` with an empty
+  entries vec rather than an error for non-framed bodies, and
+  the repair tool encoded that anyway. The resulting sidecar
+  broke Range GET on the same key (`FrameIndex::lookup_range`
+  over zero entries returns `None`, and the GET path then took
+  the "no plan" branch instead of the passthrough-range
+  fallback that exists for sidecar-less objects). Closed by
+  adding an `idx.entries.is_empty()` guard before the
+  `encode_index` call; rejects with a new typed
+  `RepairError::NotFramed { bucket, key }` whose Display tells
+  the operator the object isn't a sidecar-repair candidate
+  (`verify-sidecar` separately classifies it as
+  `MissingHarmless` with `frame_count = 0`, which is correct).
+  New lib unit test `not_framed_error_shape` pins the
+  variant's wire shape + Display; new MinIO E2E
+  `repair_sidecar_rejects_zero_frame_body` plants an empty
+  body (the exact case `build_index_from_body` returns
+  `Ok` with zero entries) AND a non-trivial raw-bytes body
+  (which trips the inner BadMagic / `FrameScan` path), and
+  proves BOTH paths reject cleanly without writing a sidecar.
+
 - **#106-audit-R2 P2-INT-1** — `s4 repair-sidecar` on an SSE-S4
   encrypted object (S4E1..S4E6 envelope, written by a gateway
   configured with `--sse-s4-key` and `--sse-chunk-size > 0`) used
