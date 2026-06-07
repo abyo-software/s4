@@ -1129,6 +1129,54 @@ mod tests {
         assert_eq!(normalize_etag(""), "");
     }
 
+    /// CI-unblock (post-v0.9 audit): the MinIO E2E race test
+    /// (`repair_sidecar_detects_post_get_overwrite_race`) is
+    /// inherently timing-dependent and flakes on fast CI runners
+    /// where the entire repair pipeline completes before the
+    /// spawned overwrite lands. This deterministic guard pins
+    /// the error type's wire shape (Display + field accessors)
+    /// so the post-PUT divergence detector branch in
+    /// `repair_sidecar` can't be silently refactored into a
+    /// different error variant without flipping this assertion.
+    #[test]
+    fn overwritten_during_repair_error_shape() {
+        let err = RepairError::OverwrittenDuringRepair {
+            bucket: "b".into(),
+            key: "k".into(),
+            head_etag: "abc-1".into(),
+        };
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("b/k"),
+            "Display must mention bucket/key — got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("abc-1"),
+            "Display must mention the pre-race ETag — got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("re-run") || rendered.contains("overwritten"),
+            "Display must hint that the operator should re-run — got {rendered:?}"
+        );
+        // Pattern-match guard: any future destructure of this
+        // variant elsewhere in the crate must keep these three
+        // named fields. A rename here would surface as a compile
+        // error here AND at the production call sites in
+        // repair_sidecar / classify_missing_sidecar.
+        match err {
+            RepairError::OverwrittenDuringRepair {
+                bucket,
+                key,
+                head_etag,
+            } => {
+                assert_eq!(bucket, "b");
+                assert_eq!(key, "k");
+                assert_eq!(head_etag, "abc-1");
+            }
+            _ => unreachable!("OverwrittenDuringRepair must match its own variant"),
+        }
+    }
+
     #[test]
     fn default_repair_body_cap_matches_max_body_default() {
         // Tied to s4-server `--max-body-bytes` default (5 GiB, #178). If

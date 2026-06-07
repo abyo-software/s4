@@ -67,14 +67,48 @@ jobs:
             | tee bench-output.txt
         timeout-minutes: 20
 
-      # Store the result in gh-pages (auto-creates the branch on the
-      # first successful run; if `gh-pages` does not yet exist the
-      # action initialises it). `alert-threshold: 110%` means a
-      # regression of 1.1× over the previous best fires an alert;
-      # `fail-on-alert: false` keeps CI green so the alert is
-      # advisory (a hard fail-the-PR knob is roadmap once we have
-      # enough history to know the natural noise floor of each
-      # benchmark).
+      # Bootstrap the `gh-pages` branch if it doesn't exist yet.
+      # benchmark-action/github-action-benchmark@v1 does NOT
+      # auto-create the branch — it does a plain
+      # `git fetch origin gh-pages:gh-pages` that fails closed
+      # with `fatal: couldn't find remote ref gh-pages` on a
+      # repo that has never had a Pages deploy. We create an
+      # orphan branch with a one-line landing page so the next
+      # step's fetch succeeds and the action can append the
+      # bencher JSON to it.
+      - name: Bootstrap gh-pages branch if missing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" gh-pages >/dev/null 2>&1; then
+            echo "gh-pages branch already present — skipping bootstrap"
+            exit 0
+          fi
+          echo "gh-pages branch missing — creating orphan branch"
+          tmp=$(mktemp -d)
+          cd "$tmp"
+          git init -q -b gh-pages
+          cat > index.html <<'HTML'
+          <!DOCTYPE html>
+          <title>S4 benchmarks</title>
+          <p>S4 criterion regression history — see <a href="dev/bench/">dev/bench/</a>.
+          HTML
+          git config user.name github-actions
+          git config user.email actions@github.com
+          git add index.html
+          git commit -q -m "Bootstrap gh-pages for criterion benchmark trend"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git push -q origin gh-pages
+
+      # Store the result in gh-pages. `alert-threshold: 110%`
+      # means a regression of 1.1× over the previous best fires an
+      # alert; `fail-on-alert: false` keeps CI green so the alert
+      # is advisory (a hard fail-the-PR knob is roadmap once we
+      # have enough history to know the natural noise floor of
+      # each benchmark).
       - name: Store benchmark result + regression alert
         uses: benchmark-action/github-action-benchmark@v1
         with:
