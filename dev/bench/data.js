@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780840115638,
+  "lastUpdate": 1780840633587,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -2032,6 +2032,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "4b64e43de33890ecffab42a89df25c11314e1b59",
+          "message": "fix(ci): v0.10 race test must accept NotFramed as race outcome\n\nCI failure on commit b052319 (v0.10 wave-1): the race E2E\n`repair_sidecar_detects_post_get_overwrite_race` panic'd because\nthe parallel overwrite landed BEFORE repair's initial HEAD on\nfast CI runners. Repair then saw a raw-bytes body (the spawned\nPUT was `b\"overwritten attempt 0\"`, no S4F2 magic) and\ncorrectly rejected with `RepairError::NotFramed` (added by\nv0.9 audit R3 P2-R3).\n\nThe race test enumerates accepted \"race detected at some layer\"\noutcomes — already covered `Backend` (If-Match 412) and the\npost-PUT-HEAD `OverwrittenDuringRepair` path. NotFramed is the\nthird valid race outcome: overwrite landed before HEAD = body\nis raw = repair rejects = race detector at the earliest layer.\nAccept as `hit_get_race` retry rather than panicking.\n\nThe R3 NotFramed branch shipped in v0.9 audit but the existing\nrace test was written before R3 so its `Err(other) =>\npanic!(...)` arm covered it accidentally. CI surfaced the\noversight on the first fast-runner schedule where overwrite\nbeat HEAD.\n\nLocal repro of the fix: `cargo test -p s4-server --test\nsidecar_repair_via_minio --release repair_sidecar_detects_post_get_overwrite_race\n-- --ignored --test-threads=1` passes.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-07T22:49:12+09:00",
+          "tree_id": "dbff984f934a9eddcc98ecfc528049fecdf91b12",
+          "url": "https://github.com/abyo-software/s4/commit/4b64e43de33890ecffab42a89df25c11314e1b59"
+        },
+        "date": 1780840633268,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 48993,
+            "range": "± 1748",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 58115,
+            "range": "± 2846",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 428,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2224120,
+            "range": "± 33825",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50612737,
+            "range": "± 172054",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201626,
+            "range": "± 510",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 48583022,
+            "range": "± 233419",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 924129610,
+            "range": "± 1986377",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3216130,
+            "range": "± 8892",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 27106,
+            "range": "± 1069",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 32938,
+            "range": "± 895",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 419,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 573876,
+            "range": "± 5352",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1646994,
+            "range": "± 15404",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201470,
+            "range": "± 972",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12247804,
+            "range": "± 79086",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 28559786,
+            "range": "± 263775",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3220896,
+            "range": "± 18529",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1462804,
+            "range": "± 18153",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2266477,
+            "range": "± 19347",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 313814254,
+            "range": "± 2643578",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 136,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 9418,
+            "range": "± 189",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 886,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13755,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2759,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 21411,
+            "range": "± 48",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 85556,
+            "range": "± 218",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 632,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 5286,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 20819,
+            "range": "± 101",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
             "range": "± 0",
             "unit": "ns/iter"
           }
