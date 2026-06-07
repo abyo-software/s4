@@ -1107,21 +1107,61 @@ async fn get_sidecar_bytes_capped(
             cap: MAX_SIDECAR_BODY_BYTES,
         });
     }
-    match client.get_object().bucket(bucket).key(key).send().await {
+    // v0.9 #106-audit-R6 P2-R6 (Codex): pin the GET to the HEAD's
+    // ETag so a sidecar swap between HEAD and GET can't bypass
+    // the cap. Without this, an attacker who races
+    // HEAD(small) → swap(massive) → GET could still OOM the
+    // process because `collect()` reads whatever the GET response
+    // delivers, ignoring the HEAD-reported size. With If-Match
+    // pinned, the swap surfaces as 412 PreconditionFailed → we
+    // refuse the body without allocating it.
+    //
+    // Backends that don't return ETags fall back to a post-GET
+    // length check below (still a window where collect() runs to
+    // completion, but the typed `TooLarge` exit replaces what
+    // would otherwise be a silent OOM-pass).
+    let raw_etag = head.e_tag().map(str::to_owned);
+    let get_builder = client.get_object().bucket(bucket).key(key);
+    let get_builder = match raw_etag {
+        Some(ref t) => get_builder.if_match(t.clone()),
+        None => get_builder,
+    };
+    match get_builder.send().await {
         Ok(resp) => {
             let agg = resp
                 .body
                 .collect()
                 .await
                 .map_err(|e| SidecarFetchOutcome::Other(format!("read body: {e}")))?;
-            Ok(Some(agg.into_bytes()))
+            let bytes = agg.into_bytes();
+            // Defense-in-depth: ETag-less backends bypass
+            // If-Match; If-Match-non-honouring backends also exist.
+            // Check the actual body length AFTER collect to catch
+            // a race-during-collect that exceeded the cap.
+            if (bytes.len() as u64) > MAX_SIDECAR_BODY_BYTES {
+                return Err(SidecarFetchOutcome::TooLarge {
+                    size: bytes.len() as u64,
+                    cap: MAX_SIDECAR_BODY_BYTES,
+                });
+            }
+            Ok(Some(bytes))
         }
         Err(e) => {
+            let s = format!("{e}");
             if is_get_not_found(&e) {
                 // Race: existed at HEAD, gone by GET. Treat as missing.
                 Ok(None)
+            } else if s.contains("PreconditionFailed") || s.contains("412") {
+                // Race: sidecar replaced between HEAD and GET. The
+                // new sidecar's size is whatever the swap-in is;
+                // we refuse to load it without re-HEAD'ing under
+                // operator supervision.
+                Err(SidecarFetchOutcome::Other(format!(
+                    "sidecar at {bucket}/{key} was replaced between HEAD and GET (412 \
+                     PreconditionFailed); re-run when the sidecar is stable"
+                )))
             } else {
-                Err(SidecarFetchOutcome::Other(format!("GET: {e}")))
+                Err(SidecarFetchOutcome::Other(format!("GET: {s}")))
             }
         }
     }

@@ -547,6 +547,19 @@ v0.9 roadmap in progress.
 
 ### Fixed
 
+- **#106-audit-R6 P2-R6** — the R5 P2-R5 bounded sidecar fetch
+  HEADed first and GETed second, leaving a TOCTOU window where a
+  sidecar swap between the two could bypass the cap (race
+  HEAD-tiny → swap-massive → GET would still let `collect()`
+  pull the full new body into memory). Closed by pinning the GET
+  to the HEAD ETag via `If-Match` so the swap surfaces as 412
+  PreconditionFailed before any bytes are read, plus a
+  defense-in-depth post-GET length check that catches races on
+  ETag-less / If-Match-non-honouring backends. Race → typed
+  `SidecarFetchOutcome::Other` with a re-run hint; post-GET
+  length overrun → `SidecarTooLarge` (same surface as the
+  HEAD-time rejection so callers can branch uniformly).
+
 - **#106-audit-R5 P2-R5** — `s4 verify-sidecar` /
   `sweep-orphan-sidecars` used to do an unbounded GET of every
   `<key>.s4index` body before `decode_index` could reject it. A
