@@ -43,6 +43,12 @@ fn build_index(n_frames: usize) -> FrameIndex {
         // serialized size honest.
         source_etag: Some("\"d41d8cd98f00b204e9800998ecf8427e-32\"".to_owned()),
         source_compressed_size: Some(comp_off),
+        // v0.9 #106: bench fixture stays on the v2 layout (= no SSE
+        // binding) so the encode/decode microbenchmark numbers stay
+        // comparable to the pre-#106 baseline. A v3-with-binding
+        // microbench can land separately if SSE chunked Range GET
+        // ever becomes a hot path.
+        sse_v3: None,
     }
 }
 

@@ -139,11 +139,14 @@ proptest! {
             comp_off += comp + 16;
         }
         // v0.8.4 #73 H-2: fuzz harness doesn't exercise version binding.
+        // v0.9 #106: same default-None for `sse_v3`; the bit-flip below
+        // operates on the encoded sidecar bytes regardless of version.
         let idx = FrameIndex {
             total_padded_size: comp_off,
             entries,
             source_etag: None,
             source_compressed_size: None,
+            sse_v3: None,
         };
         let mut bytes = encode_index(&idx).to_vec();
         if !bytes.is_empty() {

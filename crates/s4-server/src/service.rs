@@ -1794,6 +1794,192 @@ impl<B: S3> S4Service<B> {
         Ok(backend_resp)
     }
 
+    /// v0.9 #106: SSE-S4 chunked (S4E6) encryption-aware partial
+    /// Range GET. The sidecar carries an [`s4_codec::index::SseChunkBinding`]
+    /// (salt + key_id + chunk geometry) that lets us:
+    ///
+    /// 1. Map the [`s4_codec::index::RangePlan`]'s pre-encrypt byte range
+    ///    to an encrypted chunk-range via
+    ///    [`FrameIndex::encrypted_lookup`].
+    /// 2. Partial-GET only those S4E6 chunks from backend (instead of
+    ///    the entire encrypted body).
+    /// 3. Decrypt the fetched chunks via
+    ///    [`crate::sse::decrypt_s4e6_chunk_range`] (per-chunk
+    ///    independently sealed — no need for the full body's tag).
+    /// 4. Frame-parse + decompress the decrypted plaintext and slice
+    ///    out the client-requested bytes via the existing
+    ///    [`Self::partial_range_get`] machinery (re-used to keep one
+    ///    source of truth for the response shaping).
+    ///
+    /// Returns `Err(...)` on any failure (auth, range, parse) so the
+    /// caller can decide to fall back to the buffered full-GET path.
+    /// In practice we surface a clear `InternalError` and let it
+    /// bubble — Range GET on an encrypted body that fails partial
+    /// fetch is a genuine error condition (sidecar / body mismatch,
+    /// keyring rotated, etc.), not a quietly-degrade case.
+    #[allow(clippy::too_many_arguments)]
+    async fn partial_range_get_encrypted(
+        &self,
+        req: &S3Request<GetObjectInput>,
+        plan: s4_codec::index::RangePlan,
+        enc_plan: s4_codec::index::EncryptedRangePlan,
+        sse: s4_codec::index::SseChunkBinding,
+        client_start: u64,
+        client_end_exclusive: u64,
+        total_original: u64,
+        get_start: Instant,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        let keyring = self.sse_keyring.as_ref().ok_or_else(|| {
+            S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                "object is SSE-S4 chunked but no --sse-s4-key is configured on this gateway",
+            )
+        })?;
+        // Partial-fetch the enc byte range that covers the needed
+        // chunks. Note that `byte_end_exclusive - 1` is the inclusive
+        // last byte (matches the existing partial_range_get
+        // convention).
+        let backend_range = s3s::dto::Range::Int {
+            first: enc_plan.enc_byte_start,
+            last: Some(enc_plan.enc_byte_end_exclusive - 1),
+        };
+        let backend_input = GetObjectInput {
+            bucket: req.input.bucket.clone(),
+            key: req.input.key.clone(),
+            range: Some(backend_range),
+            ..Default::default()
+        };
+        let backend_req = S3Request {
+            input: backend_input,
+            method: req.method.clone(),
+            uri: req.uri.clone(),
+            headers: req.headers.clone(),
+            extensions: http::Extensions::new(),
+            credentials: req.credentials.clone(),
+            region: req.region.clone(),
+            service: req.service.clone(),
+            trailing_headers: None,
+        };
+        let mut backend_resp = self.backend.get_object(backend_req).await?;
+        let blob = backend_resp.output.body.take().ok_or_else(|| {
+            S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "backend partial GET returned empty body (SSE-S4 chunked Range)",
+            )
+        })?;
+        let enc_bytes = collect_blob(blob, self.max_body_bytes)
+            .await
+            .map_err(internal("collect SSE-S4 chunked partial body"))?;
+
+        // Decrypt the partial chunks → pre-encrypt (= compressed-framed) plaintext.
+        let plaintext = crate::sse::decrypt_s4e6_chunk_range(
+            &enc_bytes,
+            keyring.as_ref(),
+            sse.enc_chunk_size,
+            sse.enc_chunk_count,
+            sse.enc_key_id,
+            &sse.enc_salt,
+            sse.enc_plaintext_len,
+            enc_plan.chunk_idx_start,
+            enc_plan.chunk_idx_last_inclusive,
+        )
+        .map_err(|e| {
+            S3Error::with_message(
+                S3ErrorCode::InternalError,
+                format!("SSE-S4 chunked partial decrypt failed: {e}"),
+            )
+        })?;
+        // Slice the decrypted concatenation down to the requested
+        // pre-encrypt byte range (= the `RangePlan.byte_start..
+        // byte_end_exclusive` range, expressed inside the chunks we
+        // fetched).
+        let s = enc_plan.pre_encrypt_slice_start_in_concat as usize;
+        let e = enc_plan.pre_encrypt_slice_end_in_concat as usize;
+        if e > plaintext.len() {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "SSE-S4 chunked partial decrypt produced fewer bytes than the sidecar declared",
+            ));
+        }
+        let pre_encrypt_slice = plaintext.slice(s..e);
+
+        // Frame-parse + decompress the pre-encrypt slice, then slice
+        // again on the original byte range. The plan's
+        // slice_start_in_combined / slice_end_in_combined account for
+        // the original_offset of the first frame we fetched — they
+        // are pre-encrypt-domain offsets, identical to the
+        // non-encrypted partial-range path.
+        let mut combined = BytesMut::new();
+        for frame in FrameIter::new(pre_encrypt_slice) {
+            let (header, payload) = frame.map_err(|fe| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("SSE-S4 chunked partial frame parse: {fe}"),
+                )
+            })?;
+            let chunk_manifest = ChunkManifest {
+                codec: header.codec,
+                original_size: header.original_size,
+                compressed_size: header.compressed_size,
+                crc32c: header.crc32c,
+            };
+            let decompressed = self
+                .registry
+                .decompress(payload, &chunk_manifest)
+                .await
+                .map_err(internal("SSE-S4 chunked partial decompress"))?;
+            combined.extend_from_slice(&decompressed);
+        }
+        let combined = combined.freeze();
+        let sliced = combined
+            .slice(plan.slice_start_in_combined as usize..plan.slice_end_in_combined as usize);
+
+        // Response shaping: identical to the unencrypted partial
+        // path (clear backend checksums / e_tag since they describe
+        // the encrypted body, not the plaintext slice).
+        let returned_size = sliced.len() as u64;
+        backend_resp.output.content_length = Some(returned_size as i64);
+        backend_resp.output.content_range = Some(format!(
+            "bytes {client_start}-{}/{total_original}",
+            client_end_exclusive - 1
+        ));
+        backend_resp.output.checksum_crc32 = None;
+        backend_resp.output.checksum_crc32c = None;
+        backend_resp.output.checksum_crc64nvme = None;
+        backend_resp.output.checksum_sha1 = None;
+        backend_resp.output.checksum_sha256 = None;
+        backend_resp.output.e_tag = None;
+        backend_resp.output.body = Some(bytes_to_blob(sliced));
+        backend_resp.status = Some(http::StatusCode::PARTIAL_CONTENT);
+
+        let elapsed = get_start.elapsed();
+        // Use the encrypted bytes_in for the bandwidth-saved metric —
+        // that's what actually traversed the wire, vs. the full
+        // encrypted body that the buffered fallback would have
+        // fetched.
+        crate::metrics::record_get(
+            "sse-s4-chunked-partial",
+            enc_plan.enc_byte_end_exclusive - enc_plan.enc_byte_start,
+            returned_size,
+            elapsed.as_secs_f64(),
+            true,
+        );
+        info!(
+            op = "get_object",
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            bytes_in = enc_plan.enc_byte_end_exclusive - enc_plan.enc_byte_start,
+            bytes_out = returned_size,
+            total_object_size = total_original,
+            range = true,
+            path = "sidecar-partial-sse-s4-chunked",
+            chunks_fetched = (enc_plan.chunk_idx_last_inclusive - enc_plan.chunk_idx_start + 1) as u64,
+            latency_ms = elapsed.as_millis() as u64,
+            "S4 partial Range GET via v3 sidecar (SSE-S4 chunked fast-path)"
+        );
+        Ok(backend_resp)
+    }
+
     /// `<key>.s4index` sidecar object を backend に書く。失敗しても本体 PUT は
     /// 成功扱いにしたいので、err は warn ログのみ (Range GET の partial path が
     /// 使えなくなるが、full read fallback で意味的には正しい結果を返す)。
@@ -2885,11 +3071,29 @@ impl<B: S3> S3 for S4Service<B> {
             // entirely when SSE is going to be applied below;
             // encrypted-object Range GET falls back to the buffered
             // path (decrypt full body → frame parse → slice), trading
-            // partial-fetch performance for correctness. An
-            // encryption-aware sidecar format is a follow-up issue.
+            // partial-fetch performance for correctness.
+            //
+            // v0.9 #106 (encryption-aware sidecar): re-enable sidecar
+            // emission for the **SSE-S4 chunked (S4E6) path only** —
+            // S4E6 chunks are per-chunk independently sealed so the
+            // GET path can compute encrypted byte ranges, partial-fetch
+            // just the needed chunks, decrypt + frame-parse + slice.
+            // The pre-encrypt `compressed` offsets in the sidecar are
+            // still load-bearing (the GET path decrypts into the
+            // pre-encrypt domain before frame-parsing), with the new
+            // v3 SSE binding (`sse_v3`) stamped below once the
+            // encrypt path runs and reveals the per-PUT salt /
+            // chunk_count / key_id. SSE-KMS / SSE-C / S4E2 buffered
+            // (`--sse-chunk-size 0`) keep the v0.8.12 #120 buffered
+            // fallback (= sidecar suppressed) — multi-mode plumbing
+            // is the v0.10+ roadmap.
             let will_encrypt =
                 sse_c_material.is_some() || kms_key_id.is_some() || self.sse_keyring.is_some();
-            let sidecar_index = if is_framed && !will_encrypt {
+            let sse_s4_chunked_path = sse_c_material.is_none()
+                && kms_key_id.is_none()
+                && self.sse_keyring.is_some()
+                && self.sse_chunk_size > 0;
+            let sidecar_index = if is_framed && (!will_encrypt || sse_s4_chunked_path) {
                 s4_codec::index::build_index_from_body(&compressed).ok()
             } else {
                 None
@@ -3035,6 +3239,45 @@ impl<B: S3> S3 for S4Service<B> {
             } else {
                 compressed.clone()
             };
+            // v0.9 #106: when the SSE-S4 chunked path ran (and only
+            // that path — SSE-KMS / SSE-C / S4E2 buffered keep the
+            // buffered fallback), parse the S4E6 header bytes back
+            // out of `body_to_send` to recover the per-PUT salt /
+            // key_id / chunk_count and stamp them onto the sidecar's
+            // SSE binding. The salt isn't secret (it lives in the
+            // encrypted body's plaintext header) so duplicating it
+            // in the sidecar saves the GET path an extra HEAD/GET to
+            // re-derive it. `parse_s4e6_header` reads the fixed-
+            // layout fields only — any failure leaves `sse_binding`
+            // as `None`, which falls through to the legacy buffered
+            // fallback on GET (= safe degradation, not corruption).
+            let sse_binding: Option<s4_codec::index::SseChunkBinding> = if sse_s4_chunked_path {
+                match crate::sse::parse_s4e6_header(&body_to_send) {
+                    Ok(hdr) => Some(s4_codec::index::SseChunkBinding {
+                        enc_chunk_size: hdr.chunk_size,
+                        enc_chunk_count: hdr.chunk_count,
+                        enc_key_id: hdr.key_id,
+                        enc_salt: *hdr.salt,
+                        enc_plaintext_len: compressed.len() as u64,
+                        // S4E6_HEADER_BYTES = 24 today; carried
+                        // explicitly so a future bump (e.g. S4E7
+                        // with a different fixed-header size) can't
+                        // silently break v3 sidecar decode.
+                        enc_header_bytes: crate::sse::S4E6_HEADER_BYTES as u32,
+                    }),
+                    Err(e) => {
+                        tracing::warn!(
+                            bucket = %put_bucket,
+                            key = %put_key,
+                            "S4 sidecar SSE-binding stamp failed (Range GET will fall back \
+                             to buffered): {e}"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             // v0.6 #40: capture the about-to-be-sent body + metadata so
             // the replication dispatcher (run after the source PUT
             // succeeds) can hand the same backend bytes to the
@@ -3088,9 +3331,25 @@ impl<B: S3> S3 for S4Service<B> {
             // backend-side mutation.
             let backend_object_size = req.input.content_length.and_then(|n| u64::try_from(n).ok());
             let mut backend_resp = self.backend.put_object(req).await;
+            // v0.9 #106 (Codex P2): on the SSE-S4 chunked PUT path,
+            // if we *couldn't* recover the per-PUT salt / key_id /
+            // chunk_count (= `sse_binding.is_none()`), we MUST NOT
+            // emit any sidecar — the bytes on disk are S4E6-encrypted
+            // and the offsets in `sidecar_index` are pre-encrypt. A
+            // v2 sidecar (sans SSE binding) would skip the encryption-
+            // aware GET fast-path AND skip the v0.8.12 #120 buffered
+            // fallback (the GET path treats a present sidecar as
+            // "use partial_range_get on the backend body"), so it
+            // would slice ciphertext at plaintext offsets, hand wrong
+            // bytes to the frame parser, and 500 (or worse, return
+            // garbage that decodes by accident). Drop the sidecar so
+            // the GET falls back to buffered = correct.
+            let suppress_sidecar_for_failed_sse_binding =
+                sse_s4_chunked_path && sse_binding.is_none();
             if let Some(mut idx) = sidecar_index
                 && let Ok(ref resp) = backend_resp
                 && idx.entries.len() > 1
+                && !suppress_sidecar_for_failed_sse_binding
             {
                 // 1 chunk しかない (small object) なら sidecar は意味がない (=
                 // partial fetch しても full body と同じ範囲) ので省略。
@@ -3109,6 +3368,11 @@ impl<B: S3> S3 for S4Service<B> {
                 let source_etag = resp.output.e_tag.as_ref().map(|t| t.value().to_string());
                 idx.source_etag = source_etag;
                 idx.source_compressed_size = backend_object_size;
+                // v0.9 #106: stamp the SSE chunked binding so the GET
+                // path can run the encrypted Range partial-fetch
+                // fast-path. `None` keeps the sidecar at v2 layout
+                // (= existing behaviour for non-SSE-S4-chunked PUTs).
+                idx.sse_v3 = sse_binding;
                 self.write_sidecar(&put_bucket, &put_key, &idx).await;
             }
             // v0.5 #34: commit the new version into the manager only on
@@ -3526,9 +3790,62 @@ impl<B: S3> S3 for S4Service<B> {
                 }
             };
             if let Some(plan) = index.lookup_range(start, end_exclusive) {
-                return self
-                    .partial_range_get(&req, plan, start, end_exclusive, total, get_start)
-                    .await;
+                // v0.9 #106: v3 sidecar with an SSE chunked binding →
+                // encrypted partial-fetch fast-path. SSE-S4 chunked
+                // (S4E6) is the only scope-in encryption mode; for
+                // every other case (v1 / v2 sidecar) we fall through
+                // to the existing pre-encrypt `partial_range_get`.
+                // SSE-KMS / SSE-C / S4E2 buffered never get a
+                // sidecar emitted (see PUT path `sidecar_index`
+                // condition), so they trivially take the existing
+                // buffered fallback further down.
+                //
+                // Codex P2 (round 2): when the sidecar HAS an SSE
+                // binding but `encrypted_lookup` returns `None` (=
+                // stale / corrupted chunk geometry, or a Range that
+                // falls outside the declared `enc_plaintext_len`),
+                // we must NOT fall through to `partial_range_get`
+                // — that would slice the S4E6 ciphertext at
+                // pre-encrypt offsets and either 500 or return
+                // garbage. Skip the fast-path entirely so the
+                // buffered fallback below decrypts + frame-parses
+                // correctly.
+                if let Some(sse) = index.sse_v3.as_ref() {
+                    if let Some(enc_plan) = index.encrypted_lookup(&plan) {
+                        return self
+                            .partial_range_get_encrypted(
+                                &req,
+                                plan,
+                                enc_plan,
+                                *sse,
+                                start,
+                                end_exclusive,
+                                total,
+                                get_start,
+                            )
+                            .await;
+                    }
+                    // Encrypted body + binding present but
+                    // `encrypted_lookup` refused (= sidecar /
+                    // body mismatch). Fall through to the buffered
+                    // full-GET below — safer than slicing
+                    // ciphertext with pre-encrypt offsets.
+                    //
+                    // Data-flow note: `req.input.range` was
+                    // already `.take()`-ed into `range_request` at
+                    // L3695, so the subsequent
+                    // `self.backend.get_object(req)` carries no
+                    // Range header (= full body fetch). The local
+                    // `range_request` is then re-applied to the
+                    // *decrypted + decompressed* plaintext by the
+                    // buffered slice path further down. Without
+                    // the `.take()` above, we'd have to clear it
+                    // explicitly here or we'd slice ciphertext.
+                } else {
+                    return self
+                        .partial_range_get(&req, plan, start, end_exclusive, total, get_start)
+                        .await;
+                }
             }
         }
         let mut resp = self.backend.get_object(req).await?;

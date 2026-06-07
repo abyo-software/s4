@@ -405,6 +405,121 @@ v0.9 roadmap in progress.
   PUTs are unaffected — the tee runs on plaintext upstream
   of the encrypt step.
 
+- **#106 encryption-aware sidecar (SSE-S4 chunked Range
+  GET fast-path)** — closes the v0.8.12 #120 buffered-
+  fallback regression on SSE-encrypted Range GETs for the
+  scope-in `--sse-chunk-size > 0` (= S4E6 chunked frame)
+  case. Pre-#106, a Range GET on a 5 GiB SSE-S4 object
+  would fetch the full encrypted body from backend, decrypt
+  the entire thing, frame-parse, and slice — turning a
+  100 B Range request into a 5 GiB transfer. With #106 the
+  GET path partial-fetches just the enclosing S4E6
+  chunk(s), decrypts them independently, and slices.
+
+  New `index.rs` v3 sidecar format. v3 extends v2 with a
+  fixed 30-byte SSE chunk-geometry block appended after
+  the etag payload (before the entries table): `enc_chunk_size`,
+  `enc_chunk_count`, `enc_key_id`, `enc_salt` (8 B for
+  S4E6), `enc_plaintext_len`, `enc_header_bytes`. The
+  writer emits v3 only when an SSE binding is attached
+  (`FrameIndex::sse_v3 = Some(..)`) — non-SSE PUTs keep
+  emitting v2 bit-for-bit. The on-wire `version` field
+  dispatches in `decode_index` so v0.8.x readers
+  encountering a v3 sidecar surface `UnsupportedVersion(3)`
+  → the GET path treats the sidecar as missing and falls
+  back to the existing buffered full-GET (forward-safe
+  degradation, not corruption).
+
+  New `FrameIndex::encrypted_lookup(&RangePlan)` returns
+  `EncryptedRangePlan { chunk_idx_start, chunk_idx_last_inclusive,
+  enc_byte_start, enc_byte_end_exclusive,
+  pre_encrypt_slice_start_in_concat,
+  pre_encrypt_slice_end_in_concat }` — handles non-final-
+  chunk stride (= `chunk_size + 16`-byte tag) vs final-
+  chunk residual sizing (= `plaintext_len - prior * chunk_size + 16`).
+  New `sse::decrypt_s4e6_chunk_range(...)` decrypts a
+  contiguous chunk range out of a partial-fetched body
+  slice — fail-closed length check (`expected_len ==
+  body_slice.len()`) refuses forged / truncated bodies
+  before any AES-GCM verify runs.
+
+  PUT path (`service.rs` `put_object`) — the
+  `sidecar_index` build condition extends to admit the
+  SSE-S4 chunked branch (`sse_s4_chunked_path = sse_c_material.is_none()
+  && kms_key_id.is_none() && self.sse_keyring.is_some()
+  && self.sse_chunk_size > 0`); after the S4E6 encrypt
+  runs, `parse_s4e6_header` reads back the per-PUT salt /
+  key_id / chunk_count out of the encrypted body's fixed
+  header and stamps the binding onto `idx.sse_v3` before
+  `write_sidecar`. Any parse failure leaves
+  `sse_binding = None` (= sidecar stays at v2 layout, GET
+  falls back to buffered — degradation, not data loss).
+
+  GET path (`service.rs` `get_object`) — the existing
+  sidecar fast-path branch now checks for `idx.sse_v3.is_some()`
+  and dispatches into the new `partial_range_get_encrypted`
+  which: (1) maps the `RangePlan` to an `EncryptedRangePlan`,
+  (2) issues a backend `Range: bytes=enc_byte_start-...`
+  GET, (3) calls `decrypt_s4e6_chunk_range`, (4) slices
+  the decrypted concatenation down to the pre-encrypt
+  range, (5) frame-parses + decompresses + final-slice via
+  the existing pre-encrypt machinery. Bandwidth saved is
+  visible on `s4_request_latency_seconds{op="get_object",
+  codec="sse-s4-chunked-partial"}` + the `bytes_in` field
+  in the access log (= partial enc range, not full body).
+
+  Scope-out (still buffered fallback, no v3 sidecar
+  emitted): SSE-KMS (separate DEK envelope shape), SSE-C
+  (per-request customer-key plumbing), SSE-S4 buffered
+  (`--sse-chunk-size 0`, S4E2 frame), multipart (per-part
+  SSE applied at Complete time — separate design).
+  Multi-mode plumbing is the v0.10+ roadmap.
+
+  Back-compat strategy: v1 / v2 sidecar decode is
+  bit-for-bit unchanged (the version dispatcher in
+  `decode_index` keeps v1 / v2 / v3 arms separate;
+  `encode_index` only bumps to v3 when an SSE binding is
+  attached). Four new tests in
+  `crates/s4-server/tests/roundtrip.rs::sse_s4_chunked_range_get`:
+  `sse_s4_chunked_range_get_uses_v3_sidecar_partial_fetch`
+  (asserts the v3 sidecar is written + the binding is
+  populated + Range GET returns the right bytes),
+  `sse_s4_chunked_range_get_round_trip_correctness` (three
+  ranges: in-chunk, crossing an S4E6 chunk boundary,
+  suffix range), `sse_s4_buffered_range_get_still_falls_back`
+  (regression fence: SSE-S4 `--sse-chunk-size 0` keeps
+  emitting S4E2 + no sidecar), `non_sse_put_still_emits_v2_sidecar`
+  (regression fence: plain CpuZstd PUT keeps emitting v2).
+  Five new tests in `crates/s4-codec/src/index.rs::tests`
+  cover the v3 encode/decode round-trip, v2 → v3-reader
+  back-compat, the v3 forward-safe (`enc_chunk_size = 0`)
+  shape, and the `encrypted_lookup` math (single chunk,
+  crossing chunks, final-chunk residual). The
+  `MemoryBackend` mock in `tests/roundtrip.rs` was
+  extended to honour `Range: bytes=N-M` (pre-#106 it
+  returned the full body and downstream tolerated trailing
+  junk — fine for the unencrypted partial path because
+  `FrameIter` stops at the requested frame's end, but the
+  encrypted chunk-walk needs the slice length to match
+  exactly or the AES-GCM tag walk mis-aligns).
+
+  Touched files: `crates/s4-codec/src/index.rs` (v3 format
+  + `SseChunkBinding` + `EncryptedRangePlan` +
+  `encrypted_lookup` + v3 round-trip tests),
+  `crates/s4-server/src/sse.rs` (new
+  `decrypt_s4e6_chunk_range` helper),
+  `crates/s4-server/src/service.rs` (sidecar build
+  condition + post-encrypt binding stamp + new
+  `partial_range_get_encrypted` method + GET dispatch),
+  `crates/s4-server/tests/roundtrip.rs` (4 new tests +
+  Range-honouring `MemoryBackend`),
+  `crates/s4-codec/tests/{fuzz_bolero,fuzz_parsers,fuzz_advanced}.rs`
+  + `crates/s4-codec/benches/index_codec.rs` (`sse_v3:
+  None` in `FrameIndex` literal sites — fuzz / bench
+  fixtures stay on v2 layout),
+  `docs/security/threat-model.md` + `README.md` (status
+  updated, follow-up roadmap clarified).
+
   Six new E2E tests in
   `crates/s4-server/tests/roundtrip.rs::streaming_checksum_e2e`
   pin the behaviour:

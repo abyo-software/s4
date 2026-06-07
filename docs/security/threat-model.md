@@ -87,7 +87,7 @@ service / Elevation of privilege) for each attack surface.
 |---|---|---|
 | Tampering | Attacker with backend write access flips bits in a compressed object | Per-frame CRC32C verified on GET; SSE modes wrap with AES-256-GCM whose tag covers the framed bytes. Out-of-band overwrite without ETag change still possible — `s4index` sidecar's `source_etag` + `source_compressed_size` binding (v0.8.4 #73 H-2) trips the staleness check on Range GET. |
 | Tampering | Sidecar entry overflow / non-monotonic offsets to crash the range planner | v0.8.15 #130, v0.8.16 #146 — per-entry `checked_add` + inter-entry monotonicity check, typed errors. |
-| Info disclosure | Range GET on encrypted object slices ciphertext at pre-encrypt offsets | v0.8.12 #120 suppresses sidecar when SSE is on; encrypted Range GET buffers + decrypts + frame-parses + slices. Trade partial-fetch perf for correctness. |
+| Info disclosure | Range GET on encrypted object slices ciphertext at pre-encrypt offsets | v0.8.12 #120 suppressed sidecar when any SSE mode was on; encrypted Range GET buffered + decrypted + frame-parsed + sliced. v0.9 #106 re-enables the sidecar fast-path for **SSE-S4 chunked (S4E6 / `--sse-chunk-size > 0`)** via a v3 sidecar that carries per-chunk salt + key_id + chunk geometry — Range GET partial-fetches just the enclosing S4E6 chunks, decrypts them independently, then frame-parses and slices. SSE-KMS / SSE-C / S4E2 buffered keep the v0.8.12 #120 buffered fallback (multi-mode plumbing is the v0.10+ roadmap). |
 | DoS | Decompression bomb — small compressed manifest, huge decompressed output | v0.8.6 #89 — `Decoder::take(manifest.original_size + 1024)` cap. v0.8.16 #145 fixes the dead-code probe so log messages distinguish "truncated at cap" from "decoder hit EOF". v0.8.16 #136 caps aggregate multipart output at `--max-body-bytes`. |
 | DoS | 32-bit WASM client (`s4-codec-wasm`) tricked by forged `compressed_size = 4 GiB+` | v0.8.15 #131 — `usize::try_from` rejects with `PayloadTooLarge` instead of silent truncation. |
 
@@ -177,9 +177,16 @@ These items are acknowledged and tracked, not silently hidden:
    use the existing buffered `verify_client_body_checksums`
    (#122 / #128), which covers all six AWS checksum
    algorithms.
-3. **Range GET on encrypted objects is buffered** — no
-   sidecar fast-path until an encryption-aware sidecar format
-   lands (post-launch roadmap).
+3. **Range GET on encrypted objects** — v0.9 #106 shipped
+   the SSE-S4 chunked (S4E6 / `--sse-chunk-size > 0`) path
+   via a v3 sidecar carrying per-chunk salt + key_id + chunk
+   geometry; Range GET partial-fetches just the enclosing
+   S4E6 chunks. SSE-KMS / SSE-C / S4E2 buffered
+   (`--sse-chunk-size 0`) and per-part multipart SSE still
+   use the buffered fallback (full decrypt → frame-parse →
+   slice); covering them needs separate plumbing (KMS DEK
+   envelope shape, customer-key per-request material,
+   multipart per-part SSE) and is the v0.10+ roadmap.
 4. **Versioned multipart Complete writes no sidecar** —
    v0.8.16 #151 skips sidecar emission entirely for those
    bucket states. Range GET falls back to full read. **Cost

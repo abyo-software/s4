@@ -2013,6 +2013,119 @@ pub fn decrypt_chunked_buffered_default(
     decrypt_chunked_buffered(body, keyring, DEFAULT_MAX_BODY_BYTES)
 }
 
+/// v0.9 #106: decrypt a contiguous **chunk range** out of an S4E6
+/// body that was fetched via a Range GET (i.e. the caller did NOT
+/// fetch the body's fixed header — only the byte slice covering
+/// chunks `[chunk_idx_start..=chunk_idx_last_inclusive]`). Used by
+/// the encryption-aware sidecar fast-path: the sidecar carries the
+/// header fields (`salt`, `key_id`, `chunk_count`) in plaintext so
+/// the GET path can derive per-chunk nonce/AAD without paying for an
+/// extra HEAD/GET to grab the encrypted body's 24-byte fixed header.
+///
+/// `body_slice` must contain **exactly** the on-disk bytes
+/// `[chunk_idx_start..=chunk_idx_last_inclusive]` — i.e. for each
+/// chunk in that range, its 16-byte AES-GCM tag followed by its
+/// ciphertext. The non-final chunks carry `chunk_size` ciphertext
+/// bytes (+ 16-byte tag); the final chunk (only when
+/// `chunk_idx_last_inclusive + 1 == chunk_count`) carries
+/// `enc_plaintext_len - chunk_idx_last_inclusive * chunk_size`
+/// ciphertext bytes (+ tag).
+///
+/// Returns the concatenated plaintext of the decrypted chunks (so the
+/// caller can slice off the user-requested byte range within this
+/// concatenation). Any chunk that fails AES-GCM auth surfaces as
+/// [`SseError::ChunkAuthFailed`] with the failing index.
+///
+/// **Note**: this helper trusts the caller to pass `chunk_count` /
+/// `chunk_size` / `salt` / `key_id` exactly as they appeared in the
+/// encrypted body's header at PUT time — those values are part of
+/// the per-chunk AAD, so any mismatch surfaces as a tag-verify
+/// failure on the first chunk (fail-closed by design). The sidecar
+/// reader is responsible for refusing the fast-path on any
+/// inconsistency (binding mismatch, etc.) before invoking this.
+#[allow(clippy::too_many_arguments)]
+pub fn decrypt_s4e6_chunk_range(
+    body_slice: &[u8],
+    keyring: &SseKeyring,
+    chunk_size: u32,
+    chunk_count: u32,
+    key_id: u16,
+    salt: &[u8; 8],
+    enc_plaintext_len: u64,
+    chunk_idx_start: u32,
+    chunk_idx_last_inclusive: u32,
+) -> Result<Bytes, SseError> {
+    if chunk_size == 0 || chunk_count == 0 {
+        return Err(SseError::ChunkSizeInvalid);
+    }
+    if chunk_idx_last_inclusive >= chunk_count || chunk_idx_start > chunk_idx_last_inclusive {
+        return Err(SseError::ChunkFrameTruncated {
+            what: "chunk index out of range",
+        });
+    }
+    let key = keyring
+        .get(key_id)
+        .ok_or(SseError::KeyNotInKeyring { id: key_id })?;
+    let cipher = Aes256Gcm::new(key.as_aes_key());
+    let salt_carrier = ChunkedSalt::V6(*salt);
+    let chunk_size_usize = chunk_size as usize;
+
+    // Pre-compute expected slice length so a forged/short body fails
+    // closed with a typed error instead of silently truncating the
+    // final chunk's ciphertext.
+    let expected_len: u64 = (chunk_idx_start..=chunk_idx_last_inclusive)
+        .map(|i| {
+            let pt_len = if i + 1 < chunk_count {
+                chunk_size as u64
+            } else {
+                let prior = (i as u64) * (chunk_size as u64);
+                enc_plaintext_len.saturating_sub(prior)
+            };
+            pt_len + TAG_LEN as u64
+        })
+        .sum();
+    if (body_slice.len() as u64) != expected_len {
+        return Err(SseError::ChunkFrameTruncated {
+            what: "chunk-range body length mismatch",
+        });
+    }
+
+    // Worst-case plaintext = full stride × range, but the final chunk
+    // may be smaller; use `expected_len - (range_len * TAG_LEN)`.
+    let range_len = (chunk_idx_last_inclusive - chunk_idx_start + 1) as usize;
+    let mut out = Vec::with_capacity((expected_len as usize).saturating_sub(range_len * TAG_LEN));
+
+    let mut cursor: usize = 0;
+    for i in chunk_idx_start..=chunk_idx_last_inclusive {
+        let pt_len = if i + 1 < chunk_count {
+            chunk_size_usize
+        } else {
+            let prior = (i as usize) * chunk_size_usize;
+            (enc_plaintext_len as usize).saturating_sub(prior)
+        };
+        let tag_off = cursor;
+        let ct_off = tag_off + TAG_LEN;
+        let ct_end = ct_off + pt_len;
+        // Buffer-length check is redundant with `expected_len ==
+        // body_slice.len()` above, but it costs nothing and keeps
+        // the slice indexing trivially in-bounds for future refactors.
+        if ct_end > body_slice.len() {
+            return Err(SseError::ChunkFrameTruncated {
+                what: "chunk ciphertext",
+            });
+        }
+        let mut tag = [0u8; TAG_LEN];
+        tag.copy_from_slice(&body_slice[tag_off..ct_off]);
+        let ct = &body_slice[ct_off..ct_end];
+        let plain =
+            decrypt_chunked_chunk(&cipher, i, chunk_count, key_id, &salt_carrier, &tag, ct)?;
+        crate::metrics::record_sse_streaming_chunk("decrypt");
+        out.extend_from_slice(&plain);
+        cursor = ct_end;
+    }
+    Ok(Bytes::from(out))
+}
+
 /// v0.8 #52 (S4E5) / v0.8.1 #57 (S4E6): stream-decrypt API for
 /// chunked SSE-S4 bodies. Returns a [`futures::Stream`] that yields
 /// one `Bytes` per chunk in order. Each chunk is emitted only after

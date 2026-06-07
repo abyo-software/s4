@@ -757,6 +757,16 @@ with backend (no network RTT to amortise). TTFB excludes TLS handshake
 - **Range GET via sidecar `<key>.s4index`**: only the needed compressed bytes
   are fetched from backend, decoded, and sliced. Falls back to full read when
   sidecar is absent
+- **Encryption-aware Range GET fast-path** (v0.9 #106): SSE-S4 chunked
+  (`--sse-chunk-size > 0`, S4E6 frame) Range GETs now partial-fetch just
+  the enclosing S4E6 chunks from backend instead of pulling the full
+  encrypted body. The v3 `<key>.s4index` sidecar carries the per-PUT salt +
+  chunk geometry so the GET path can compute the encrypted byte range
+  without re-fetching the header. SSE-KMS / SSE-C / SSE-S4 buffered
+  (`--sse-chunk-size 0`) keep the v0.8.12 #120 buffered fallback (= full
+  decrypt → frame-parse → slice); covering them needs separate plumbing
+  (KMS DEK envelope shape, customer-key per-request material) and is on
+  the v0.10+ roadmap
 - **Byte-range aware `upload_part_copy`** (v0.2): when the source is S4-framed,
   the user-visible byte range is what gets copied (decompressed and re-framed),
   not raw compressed bytes

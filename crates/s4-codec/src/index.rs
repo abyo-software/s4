@@ -65,15 +65,77 @@
 //!   と扱う (= 既存挙動保持)。
 //! - **新規 PUT**: 常に v2 を書く。`source_etag` は backend response の e_tag、
 //!   `source_compressed_size` は put body 長 (= `total_padded_size`) が原則。
+//!
+//! ## v0.9 #106 encryption-aware sidecar (v3 header)
+//!
+//! v0.8.12 #120 で SSE 有効時の sidecar emission を全 skip にしたため、SSE-S4 /
+//! SSE-KMS / SSE-C いずれかが有効な object の Range GET は **常に buffered fallback**
+//! (full body fetch → 全 decrypt → frame parse → slice) になっていた。5 GiB の
+//! SSE-S4 object に 100 byte の Range GET を投げると 5 GiB 転送が発生する。
+//!
+//! v0.9 #106 はこれを SSE-S4 chunked (S4E6 / `--sse-chunk-size > 0`) **だけ** で
+//! 解消する。S4E6 は per-chunk 独立 decrypt 可能なので、必要な chunk 範囲だけを
+//! backend に partial GET → 該当 chunk(s) を decrypt → frame parse → slice という
+//! partial-fetch 経路が成立する。SSE-KMS / SSE-C / S4E2 buffered は引き続き
+//! v0.8.12 #120 の buffered fallback (= sidecar 全 skip)。
+//!
+//! v3 header は v2 の etag 末尾に SSE chunk geometry block を 30 byte 追加した形:
+//!
+//! ```text
+//! ┌──── v3 header (variable) ──┐
+//! │ S4IX magic (4)             │
+//! │ version u32 (4) = 3        │
+//! │ total_frames u64 (8)       │
+//! │ total_original u64 (8)     │
+//! │ total_padded u64 (8)       │   ← S3 上の post-encrypt object サイズ
+//! │ source_compressed_size u64 │   ← v2 から継承
+//! │ etag_len u32 (4)           │
+//! │ etag bytes (etag_len)      │
+//! │ ── v3 SSE block (30 B) ─── │   ← v3 で追加
+//! │ enc_chunk_size  u32 LE (4) │   ← S4E6 plaintext bytes per chunk
+//! │ enc_chunk_count u32 LE (4) │
+//! │ enc_key_id      u16 LE (2) │
+//! │ enc_salt        [u8; 8]    │   ← S4E6 per-PUT salt (nonce derivation 用)
+//! │ enc_plaintext_len u64 LE   │   ← pre-encrypt body 長 (= post-compress)
+//! │ enc_header_bytes u32 LE    │   ← 24 (S4E6_HEADER_BYTES)
+//! └────────────────────────────┘
+//! ```
+//!
+//! v3 では `compressed_offset` / `compressed_size` は **pre-encrypt body** (=
+//! post-compress framed body) の offset のまま。 GET 側は、その offset を
+//! `enc_chunk_size` で割って enclosing chunk index を計算し、そのチャンク群だけを
+//! backend から partial GET、decrypt、frame parse、slice する。
+//!
+//! - **back-compat**: v1 / v2 sidecar の decode 経路は 1 bit も触らない。
+//!   `decode_index` の version dispatch に `v if v == 3` arm を増やすだけ。
+//!   v3 sidecar を v0.8.x server (v2 のみ) が GET しても `UnsupportedVersion(3)` で
+//!   sidecar 無効化 → 既存 buffered fallback に落ちるので破壊しない。
+//! - **GET path**: v3 sidecar の `enc_chunk_size > 0` を見たら encrypted Range GET
+//!   fast-path 起動。`enc_chunk_size == 0` は「非 SSE で v3 を書きたい場合」用の
+//!   将来余地 (現状 server は SSE-S4 chunked 専用に v3 を emit、 他は v2 のまま)。
+//! - **scope out**: SSE-KMS / SSE-C / S4E2 buffered (`--sse-chunk-size 0`) /
+//!   multipart は v3 sidecar を emit しない (= 既存 v0.8.12 #120 挙動保持、
+//!   buffered fallback 経路)。 v0.10+ の roadmap。
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
 pub const INDEX_MAGIC: &[u8; 4] = b"S4IX";
-/// v0.8.4 #73 H-2: bumped 1 → 2. v2 appends `source_compressed_size` (u64) +
-/// `etag_len` (u32) + variable-length `etag` bytes to the fixed header. v1
-/// readers are kept as a back-compat path (see [`decode_index`]).
-pub const INDEX_VERSION: u32 = 2;
+/// v0.9 #106: bumped 2 → 3. v3 appends a 30-byte SSE chunk-geometry
+/// block (enc_chunk_size, enc_chunk_count, enc_key_id, enc_salt,
+/// enc_plaintext_len, enc_header_bytes) after the v2 etag payload so
+/// the GET path can compute encrypted byte ranges for SSE-S4 chunked
+/// (S4E6) objects and run partial-fetch + per-chunk decrypt without a
+/// full body read. v1 / v2 readers stay as back-compat paths
+/// (`decode_index` dispatches on the version field — a v3 sidecar
+/// read by a v0.8.x server surfaces as `UnsupportedVersion(3)` and
+/// drops out to the existing buffered fallback).
+pub const INDEX_VERSION: u32 = 3;
+/// v0.8.4 #73 H-2 era version. Retained as a write-side option for
+/// non-encrypted single-PUT objects (see [`encode_index`] — emits v3
+/// only when `enc_chunk_size > 0`, i.e. SSE-S4 chunked is active,
+/// otherwise v2). Decode-side keeps reading both.
+pub const INDEX_VERSION_V2: u32 = 2;
 /// Legacy v1 fixed header — kept for tests / back-compat readers.
 pub const INDEX_VERSION_V1: u32 = 1;
 /// v1 fixed header layout (kept for back-compat readers).
@@ -81,6 +143,11 @@ pub const HEADER_FIXED_V1: usize = 4 + 4 + 8 + 8 + 8; // 32
 /// v2 fixed header layout (`HEADER_FIXED_V1` + `source_compressed_size` u64 +
 /// `etag_len` u32). The variable-length `etag` payload follows.
 pub const HEADER_FIXED_V2: usize = HEADER_FIXED_V1 + 8 + 4; // 44
+/// v0.9 #106: v3 SSE chunk-geometry block size (always appended after the
+/// v2 etag payload when `version == 3`). Fields: `enc_chunk_size u32 +
+/// enc_chunk_count u32 + enc_key_id u16 + enc_salt [u8;8] +
+/// enc_plaintext_len u64 + enc_header_bytes u32`.
+pub const SSE_BLOCK_V3: usize = 4 + 4 + 2 + 8 + 8 + 4; // = 30
 /// v0.8.16 F-15: kept for back-compat with external consumers that
 /// imported the v0.8.10-era constant. **DEPRECATED** — the value
 /// `40` was a typo (it should have been `44` for the v2 fixed
@@ -139,6 +206,46 @@ pub struct FrameIndex {
     /// the bytes without a fresh ETag, so a size mismatch is independently
     /// load-bearing. `None` on legacy v1 sidecars.
     pub source_compressed_size: Option<u64>,
+    /// v0.9 #106: SSE-S4 chunked (S4E6) geometry binding. `Some(..)` if
+    /// the source object was encrypted with `--sse-chunk-size > 0` —
+    /// in that case the on-disk body is an S4E6 frame and the GET path
+    /// can map `compressed_offset` (pre-encrypt) → enclosing chunk
+    /// index → encrypted byte range, fetch just those chunks, and
+    /// decrypt them independently. `None` for v1 / v2 sidecars and
+    /// for v3 sidecars written under non-SSE / SSE-KMS / SSE-C /
+    /// S4E2-buffered (which keep the v0.8.12 #120 buffered fallback).
+    pub sse_v3: Option<SseChunkBinding>,
+}
+
+/// v0.9 #106: per-object SSE-S4 chunked (S4E6) geometry, stored in v3
+/// sidecars. The salt + key_id let the GET path derive the per-chunk
+/// AES-GCM nonce + AAD without re-fetching the encrypted body's
+/// header bytes. Salt is **not secret** (it lives in the on-disk
+/// S4E6 header in plaintext anyway); duplicating it here saves one
+/// HEAD/GET round-trip per Range request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SseChunkBinding {
+    /// S4E6 plaintext bytes per chunk (matches `--sse-chunk-size`).
+    /// Must be `> 0` for an SSE binding to be considered valid.
+    pub enc_chunk_size: u32,
+    /// Total number of S4E6 chunks in the body (= `ceil(plaintext.len() /
+    /// enc_chunk_size)`, always `>= 1`).
+    pub enc_chunk_count: u32,
+    /// Keyring slot the active key was at PUT time. The GET path uses
+    /// it to look up the same key for decrypt.
+    pub enc_key_id: u16,
+    /// 8-byte per-PUT random salt (S4E6). Fed into the nonce + AAD
+    /// derivation; lives in the encrypted body's header in plaintext
+    /// anyway, so duplicating it in the sidecar leaks nothing.
+    pub enc_salt: [u8; 8],
+    /// Pre-encrypt plaintext body length (= post-compress, post-frame
+    /// body length). Used to validate the chunk-walk math against the
+    /// encrypted body length the backend reports.
+    pub enc_plaintext_len: u64,
+    /// Fixed header size of the S4E6 frame (== `S4E6_HEADER_BYTES` =
+    /// 24 today). Carried explicitly so a future S4E7-style bump
+    /// doesn't silently break v3 sidecar decode.
+    pub enc_header_bytes: u32,
 }
 
 impl FrameIndex {
@@ -216,6 +323,133 @@ pub struct RangePlan {
     pub slice_end_in_combined: u64,
 }
 
+/// v0.9 #106: encrypted partial-fetch plan for the SSE-S4 chunked
+/// (S4E6) Range GET fast-path. Given a [`RangePlan`] (which describes
+/// the *pre-encrypt* byte range to fetch) plus the per-object SSE
+/// binding, computes the actual encrypted byte range to send the
+/// backend, the S4E6 chunk index range to walk, and where the
+/// pre-encrypt byte range lands inside the decrypted chunk
+/// concatenation.
+///
+/// Caller workflow:
+///
+/// 1. backend partial GET `body[enc_byte_start..enc_byte_end_exclusive)`
+///    plus the S4E6 fixed header (already cached in the sidecar's
+///    `SseChunkBinding`, no extra fetch).
+/// 2. for `chunk_idx in chunk_idx_start..=chunk_idx_last_inclusive`,
+///    `decrypt_chunk(chunk_idx, &body[..])` — the sidecar's salt +
+///    key_id provide the AAD / nonce material.
+/// 3. concatenate the decrypted plaintext, slice off
+///    `pre_encrypt_slice_start_in_concat..pre_encrypt_slice_end_in_concat`
+///    to land at the [`RangePlan`]'s `byte_start..byte_end_exclusive`
+///    (= pre-encrypt) range.
+/// 4. frame-parse + decompress + final slice via the existing
+///    [`RangePlan`] machinery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncryptedRangePlan {
+    /// First S4E6 chunk that overlaps the requested pre-encrypt range
+    /// (inclusive).
+    pub chunk_idx_start: u32,
+    /// Last S4E6 chunk that overlaps the requested pre-encrypt range
+    /// (inclusive).
+    pub chunk_idx_last_inclusive: u32,
+    /// Byte offset within the **encrypted** backend body where the
+    /// fetch starts (covers chunk `chunk_idx_start`'s tag + ciphertext).
+    pub enc_byte_start: u64,
+    /// Byte offset (exclusive) within the encrypted backend body where
+    /// the fetch ends (covers through chunk `chunk_idx_last_inclusive`).
+    pub enc_byte_end_exclusive: u64,
+    /// Offset within the decrypted-chunk concatenation where the
+    /// pre-encrypt slice starts (= `RangePlan.byte_start - chunk_idx_start *
+    /// enc_chunk_size`).
+    pub pre_encrypt_slice_start_in_concat: u64,
+    /// Offset within the decrypted-chunk concatenation where the
+    /// pre-encrypt slice ends (exclusive).
+    pub pre_encrypt_slice_end_in_concat: u64,
+}
+
+impl SseChunkBinding {
+    /// Per-chunk on-disk byte cost: ciphertext (= plaintext bytes,
+    /// AES-GCM is CTR-mode) + 16-byte auth tag. Final chunk may carry
+    /// fewer plaintext bytes; this helper returns the *non-final*
+    /// chunk cost.
+    pub fn enc_chunk_stride(&self) -> u64 {
+        self.enc_chunk_size as u64 + 16
+    }
+
+    /// On-disk byte length of chunk `chunk_idx`. Non-final chunks
+    /// carry `enc_chunk_size` plaintext bytes (+ 16-byte tag); the
+    /// final chunk carries `enc_plaintext_len - (chunk_count - 1) *
+    /// enc_chunk_size` plaintext bytes (+ tag).
+    pub fn enc_chunk_on_disk_size(&self, chunk_idx: u32) -> u64 {
+        if chunk_idx + 1 < self.enc_chunk_count {
+            self.enc_chunk_stride()
+        } else {
+            // Final chunk: total plaintext minus the chunks before it.
+            let prior = (chunk_idx as u64).saturating_mul(self.enc_chunk_size as u64);
+            let final_pt = self.enc_plaintext_len.saturating_sub(prior);
+            final_pt + 16
+        }
+    }
+
+    /// Encrypted-body byte offset of the *start* of chunk `chunk_idx`
+    /// (= the chunk's tag byte). Non-final chunks stride at
+    /// `enc_chunk_stride()`.
+    pub fn enc_chunk_byte_offset(&self, chunk_idx: u32) -> u64 {
+        self.enc_header_bytes as u64 + (chunk_idx as u64).saturating_mul(self.enc_chunk_stride())
+    }
+}
+
+impl FrameIndex {
+    /// v0.9 #106: extend a [`RangePlan`] (pre-encrypt byte range) to
+    /// an [`EncryptedRangePlan`] that names the actual encrypted
+    /// chunks to fetch + decrypt. Returns `None` if the index lacks
+    /// an [`SseChunkBinding`] (= non-SSE / v1 / v2 sidecar), or if
+    /// the [`RangePlan`]'s pre-encrypt range falls outside the SSE
+    /// binding's declared plaintext length (= sidecar / body
+    /// mismatch — caller should fall back to the buffered path).
+    pub fn encrypted_lookup(&self, plan: &RangePlan) -> Option<EncryptedRangePlan> {
+        let sse = self.sse_v3.as_ref()?;
+        if sse.enc_chunk_size == 0 || sse.enc_chunk_count == 0 {
+            return None;
+        }
+        if plan.byte_end_exclusive > sse.enc_plaintext_len
+            || plan.byte_start >= plan.byte_end_exclusive
+        {
+            return None;
+        }
+        let chunk_size = sse.enc_chunk_size as u64;
+        let chunk_idx_start_u64 = plan.byte_start / chunk_size;
+        let chunk_idx_last_u64 = (plan.byte_end_exclusive - 1) / chunk_size;
+        // Belt-and-braces: refuse any chunk index outside the declared
+        // chunk_count window. Either the sidecar is internally
+        // inconsistent or `compressed_offset` exceeded the SSE
+        // plaintext length (caught above) — both mean the sidecar is
+        // not trustworthy for this Range, so the GET path should fall
+        // back to the buffered full read.
+        if chunk_idx_last_u64 >= sse.enc_chunk_count as u64 {
+            return None;
+        }
+        let chunk_idx_start = chunk_idx_start_u64 as u32;
+        let chunk_idx_last_inclusive = chunk_idx_last_u64 as u32;
+        let enc_byte_start = sse.enc_chunk_byte_offset(chunk_idx_start);
+        let enc_byte_end_exclusive = sse.enc_chunk_byte_offset(chunk_idx_last_inclusive)
+            + sse.enc_chunk_on_disk_size(chunk_idx_last_inclusive);
+        let pre_encrypt_slice_start_in_concat =
+            plan.byte_start - (chunk_idx_start as u64) * chunk_size;
+        let pre_encrypt_slice_end_in_concat =
+            plan.byte_end_exclusive - (chunk_idx_start as u64) * chunk_size;
+        Some(EncryptedRangePlan {
+            chunk_idx_start,
+            chunk_idx_last_inclusive,
+            enc_byte_start,
+            enc_byte_end_exclusive,
+            pre_encrypt_slice_start_in_concat,
+            pre_encrypt_slice_end_in_concat,
+        })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum IndexError {
     #[error("index too short: {0} bytes")]
@@ -284,17 +518,28 @@ pub const MAX_FRAMES: u64 = 16 * 1024 * 1024;
 /// (`<hex>-<n>`) without admitting attacker-controlled payloads.
 pub const MAX_ETAG_BYTES: u32 = 4096;
 
-/// v0.8.4 #73 H-2: emit the **v2** layout (with `source_etag` /
+/// v0.8.4 #73 H-2: emit the v2 layout (with `source_etag` /
 /// `source_compressed_size`). Pre-v0.8.4 deployments that PUT under v1 are
 /// still readable (decode_index dispatches on the version field) — only the
 /// writer path is bumped here.
+///
+/// v0.9 #106: when `idx.sse_v3` is `Some(..)` (= source object was
+/// SSE-S4 chunked / S4E6), emit v3 instead — same v2 layout plus a
+/// trailing 30-byte SSE chunk-geometry block before the entries
+/// table. v0.8.x readers ignore unknown versions (`UnsupportedVersion(3)`)
+/// → sidecar is treated as missing → Range GET falls back to the
+/// existing buffered fallback, so v3 is forward-safe.
 pub fn encode_index(idx: &FrameIndex) -> Bytes {
     let etag_bytes = idx.source_etag.as_deref().unwrap_or("").as_bytes();
-    let mut buf = BytesMut::with_capacity(
-        HEADER_FIXED_V2 + etag_bytes.len() + idx.entries.len() * ENTRY_BYTES,
-    );
+    let (version, fixed_header) = if idx.sse_v3.is_some() {
+        (INDEX_VERSION, HEADER_FIXED_V2 + SSE_BLOCK_V3)
+    } else {
+        (INDEX_VERSION_V2, HEADER_FIXED_V2)
+    };
+    let mut buf =
+        BytesMut::with_capacity(fixed_header + etag_bytes.len() + idx.entries.len() * ENTRY_BYTES);
     buf.put_slice(INDEX_MAGIC);
-    buf.put_u32_le(INDEX_VERSION);
+    buf.put_u32_le(version);
     buf.put_u64_le(idx.entries.len() as u64);
     buf.put_u64_le(idx.total_original_size());
     buf.put_u64_le(idx.total_padded_size);
@@ -302,6 +547,15 @@ pub fn encode_index(idx: &FrameIndex) -> Bytes {
     buf.put_u64_le(idx.source_compressed_size.unwrap_or(0));
     buf.put_u32_le(etag_bytes.len() as u32);
     buf.put_slice(etag_bytes);
+    // v3 SSE block, only when an SSE binding is present.
+    if let Some(sse) = idx.sse_v3.as_ref() {
+        buf.put_u32_le(sse.enc_chunk_size);
+        buf.put_u32_le(sse.enc_chunk_count);
+        buf.put_u16_le(sse.enc_key_id);
+        buf.put_slice(&sse.enc_salt);
+        buf.put_u64_le(sse.enc_plaintext_len);
+        buf.put_u32_le(sse.enc_header_bytes);
+    }
     for e in &idx.entries {
         buf.put_u64_le(e.original_offset);
         buf.put_u64_le(e.original_size);
@@ -357,11 +611,13 @@ pub fn decode_index(mut input: Bytes) -> Result<FrameIndex, IndexError> {
             max: MAX_FRAMES,
         });
     }
-    // Dispatch on version. v1 jumps straight to the entry table; v2 reads
-    // the additional fixed fields + variable-length etag before the entries.
-    let (source_compressed_size, source_etag) = match version {
-        v if v == INDEX_VERSION_V1 => (None, None),
-        v if v == INDEX_VERSION => {
+    // Dispatch on version. v1 jumps straight to the entry table; v2
+    // reads the additional fixed fields + variable-length etag before
+    // the entries; v3 reads the v2 layout plus the SSE chunk-geometry
+    // block.
+    let (source_compressed_size, source_etag, sse_v3) = match version {
+        v if v == INDEX_VERSION_V1 => (None, None, None),
+        v if v == INDEX_VERSION_V2 || v == INDEX_VERSION => {
             // v2 fixed-header tail: source_compressed_size (u64) + etag_len (u32).
             if input.len() < 8 + 4 {
                 return Err(IndexError::TooShort(input.len()));
@@ -390,7 +646,40 @@ pub fn decode_index(mut input: Bytes) -> Result<FrameIndex, IndexError> {
             } else {
                 std::str::from_utf8(&etag_bytes).ok().map(str::to_owned)
             };
-            (if scs == 0 { None } else { Some(scs) }, etag)
+            // v0.9 #106: v3 appends the 30-byte SSE chunk-geometry
+            // block after the etag payload (before the entries table).
+            // A v3 sidecar with `enc_chunk_size == 0` is treated as
+            // "no SSE binding" (= equivalent to v2 semantics) so the
+            // writer side has a forward-safe encoding for the
+            // non-SSE-S4-chunked path if it ever needs to bump
+            // version without populating the SSE binding.
+            let sse_binding = if v == INDEX_VERSION {
+                if input.len() < SSE_BLOCK_V3 {
+                    return Err(IndexError::TooShort(input.len()));
+                }
+                let enc_chunk_size = input.get_u32_le();
+                let enc_chunk_count = input.get_u32_le();
+                let enc_key_id = input.get_u16_le();
+                let mut enc_salt = [0u8; 8];
+                input.copy_to_slice(&mut enc_salt);
+                let enc_plaintext_len = input.get_u64_le();
+                let enc_header_bytes = input.get_u32_le();
+                if enc_chunk_size == 0 || enc_chunk_count == 0 {
+                    None
+                } else {
+                    Some(SseChunkBinding {
+                        enc_chunk_size,
+                        enc_chunk_count,
+                        enc_key_id,
+                        enc_salt,
+                        enc_plaintext_len,
+                        enc_header_bytes,
+                    })
+                }
+            } else {
+                None
+            };
+            (if scs == 0 { None } else { Some(scs) }, etag, sse_binding)
         }
         other => return Err(IndexError::UnsupportedVersion(other)),
     };
@@ -479,6 +768,7 @@ pub fn decode_index(mut input: Bytes) -> Result<FrameIndex, IndexError> {
         entries,
         source_etag,
         source_compressed_size,
+        sse_v3,
     })
 }
 
@@ -565,6 +855,10 @@ pub fn build_index_from_body(body: &Bytes) -> Result<FrameIndex, crate::multipar
         // and cannot fabricate a server-blessed ETag.
         source_etag: None,
         source_compressed_size: None,
+        // v0.9 #106: SSE binding is also stamped by the caller after the
+        // S4E6 encrypt path runs (`build_index_from_body` only sees the
+        // pre-encrypt compressed body and cannot know the salt / key_id).
+        sse_v3: None,
     })
 }
 
@@ -624,6 +918,10 @@ mod tests {
             // paths that don't care about the version-binding fields.
             source_etag: None,
             source_compressed_size: None,
+            // v0.9 #106: default-None so this fixture exercises the v2
+            // emit path (writer only bumps to v3 when an SSE binding
+            // is attached).
+            sse_v3: None,
         }
     }
 
@@ -635,29 +933,232 @@ mod tests {
         assert_eq!(decoded, idx);
     }
 
-    /// v0.8.4 #73 H-2: v2 round-trip with the new `source_etag` /
+    /// v0.8.4 #73 H-2: v2 round-trip with the `source_etag` /
     /// `source_compressed_size` fields populated.
+    ///
+    /// v0.9 #106: with `sse_v3 = None` the writer keeps emitting v2 so
+    /// non-SSE-S4-chunked PUTs are bit-for-bit unchanged from v0.8.x
+    /// on-disk.
     #[test]
     fn encode_decode_roundtrip_v2_with_source_binding() {
         let mut idx = sample_index();
         idx.source_etag = Some("\"deadbeefcafe\"".into());
         idx.source_compressed_size = Some(987_654);
         let bytes = encode_index(&idx);
-        // First 4 bytes magic + next 4 bytes LE = INDEX_VERSION (2).
         assert_eq!(&bytes[..4], INDEX_MAGIC);
         let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        assert_eq!(version, INDEX_VERSION, "writer must always emit v2");
+        assert_eq!(
+            version, INDEX_VERSION_V2,
+            "writer must emit v2 when no SSE binding is attached"
+        );
         let decoded = decode_index(bytes).unwrap();
         assert_eq!(decoded, idx);
     }
 
+    /// v0.9 #106: v3 round-trip with an SSE chunked binding. Writer
+    /// must emit v3 exactly when `sse_v3 = Some(..)`; decode must
+    /// restore the binding byte-for-byte.
+    #[test]
+    fn encode_decode_roundtrip_v3_with_sse_binding() {
+        let mut idx = sample_index();
+        idx.source_etag = Some("\"abc123\"".into());
+        idx.source_compressed_size = Some(2048);
+        idx.sse_v3 = Some(SseChunkBinding {
+            enc_chunk_size: 1024,
+            enc_chunk_count: 2,
+            enc_key_id: 7,
+            enc_salt: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+            enc_plaintext_len: 2048,
+            enc_header_bytes: 24,
+        });
+        let bytes = encode_index(&idx);
+        let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        assert_eq!(
+            version, INDEX_VERSION,
+            "writer must emit v3 when SSE binding is attached"
+        );
+        let decoded = decode_index(bytes).unwrap();
+        assert_eq!(decoded, idx);
+        assert!(decoded.sse_v3.is_some());
+    }
+
+    /// v0.9 #106: a v3 sidecar with `enc_chunk_size = 0` decodes
+    /// with `sse_v3 = None` (= forward-safe encoding for a future
+    /// non-SSE v3 use case).
+    #[test]
+    fn v3_with_zero_enc_chunk_size_decodes_as_no_sse() {
+        let mut bytes_mut = bytes::BytesMut::new();
+        bytes_mut.put_slice(INDEX_MAGIC);
+        bytes_mut.put_u32_le(INDEX_VERSION); // 3
+        bytes_mut.put_u64_le(0); // n entries
+        bytes_mut.put_u64_le(0); // total_original
+        bytes_mut.put_u64_le(0); // total_padded
+        bytes_mut.put_u64_le(0); // source_compressed_size
+        bytes_mut.put_u32_le(0); // etag_len
+        // SSE block — all zero
+        bytes_mut.put_u32_le(0); // enc_chunk_size
+        bytes_mut.put_u32_le(0); // enc_chunk_count
+        bytes_mut.put_u16_le(0); // enc_key_id
+        bytes_mut.put_slice(&[0u8; 8]); // enc_salt
+        bytes_mut.put_u64_le(0); // enc_plaintext_len
+        bytes_mut.put_u32_le(0); // enc_header_bytes
+        let decoded = decode_index(bytes_mut.freeze()).unwrap();
+        assert!(decoded.sse_v3.is_none());
+    }
+
+    /// v0.9 #106: back-compat — a real v0.8.x server hands a v2
+    /// sidecar to a v0.9 decoder unchanged. Writer side already
+    /// covered by `encode_decode_roundtrip_v2_with_source_binding`
+    /// (no SSE binding → v2 layout), but this test also synthesizes
+    /// raw v2 bytes via `encode_index_v1_for_test`-style spelling to
+    /// prove the on-wire format hasn't drifted.
+    #[test]
+    fn v2_sidecar_decoded_by_v3_reader_with_no_sse_binding() {
+        let mut idx = sample_index();
+        idx.source_etag = Some("\"v2-only\"".into());
+        idx.source_compressed_size = Some(123);
+        let v2_bytes = encode_index(&idx); // sse_v3 = None → v2 emit
+        let v2_version = u32::from_le_bytes(v2_bytes[4..8].try_into().unwrap());
+        assert_eq!(v2_version, INDEX_VERSION_V2);
+        let decoded = decode_index(v2_bytes).unwrap();
+        assert!(decoded.sse_v3.is_none());
+        assert_eq!(decoded.source_etag.as_deref(), Some("\"v2-only\""));
+    }
+
+    /// v0.9 #106: `encrypted_lookup` covers a Range that lands inside
+    /// a single chunk (no chunk-boundary crossing). Verifies the
+    /// computed enc byte range targets exactly one chunk.
+    #[test]
+    fn encrypted_lookup_single_chunk() {
+        let idx = FrameIndex {
+            total_padded_size: 0,
+            entries: vec![],
+            source_etag: None,
+            source_compressed_size: None,
+            sse_v3: Some(SseChunkBinding {
+                enc_chunk_size: 1024,
+                enc_chunk_count: 4,
+                enc_key_id: 1,
+                enc_salt: [0u8; 8],
+                enc_plaintext_len: 4096,
+                enc_header_bytes: 24,
+            }),
+        };
+        let plan = RangePlan {
+            first_frame_idx: 0,
+            last_frame_idx_inclusive: 0,
+            byte_start: 100,
+            byte_end_exclusive: 500,
+            slice_start_in_combined: 0,
+            slice_end_in_combined: 400,
+        };
+        let enc = idx.encrypted_lookup(&plan).unwrap();
+        assert_eq!(enc.chunk_idx_start, 0);
+        assert_eq!(enc.chunk_idx_last_inclusive, 0);
+        assert_eq!(enc.enc_byte_start, 24);
+        // Non-final chunk: 1024 + 16 = 1040 bytes on disk
+        assert_eq!(enc.enc_byte_end_exclusive, 24 + 1040);
+        assert_eq!(enc.pre_encrypt_slice_start_in_concat, 100);
+        assert_eq!(enc.pre_encrypt_slice_end_in_concat, 500);
+    }
+
+    /// v0.9 #106: `encrypted_lookup` covers a Range that crosses two
+    /// chunks. Verifies the fetched enc range covers both chunks.
+    #[test]
+    fn encrypted_lookup_crossing_chunk_boundary() {
+        let idx = FrameIndex {
+            total_padded_size: 0,
+            entries: vec![],
+            source_etag: None,
+            source_compressed_size: None,
+            sse_v3: Some(SseChunkBinding {
+                enc_chunk_size: 1024,
+                enc_chunk_count: 4,
+                enc_key_id: 1,
+                enc_salt: [0u8; 8],
+                enc_plaintext_len: 4096,
+                enc_header_bytes: 24,
+            }),
+        };
+        let plan = RangePlan {
+            first_frame_idx: 0,
+            last_frame_idx_inclusive: 0,
+            byte_start: 900,          // chunk 0
+            byte_end_exclusive: 1200, // chunk 1
+            slice_start_in_combined: 0,
+            slice_end_in_combined: 300,
+        };
+        let enc = idx.encrypted_lookup(&plan).unwrap();
+        assert_eq!(enc.chunk_idx_start, 0);
+        assert_eq!(enc.chunk_idx_last_inclusive, 1);
+        assert_eq!(enc.enc_byte_start, 24);
+        assert_eq!(enc.enc_byte_end_exclusive, 24 + 2 * 1040);
+        assert_eq!(enc.pre_encrypt_slice_start_in_concat, 900);
+        assert_eq!(enc.pre_encrypt_slice_end_in_concat, 1200);
+    }
+
+    /// v0.9 #106: `encrypted_lookup` for the final (possibly smaller)
+    /// chunk computes its on-disk size from `enc_plaintext_len` not
+    /// the stride.
+    #[test]
+    fn encrypted_lookup_final_chunk_uses_residual_size() {
+        // 3 chunks of 1024 bytes plus a final chunk of 500 bytes (4 chunks,
+        // 3572 byte plaintext total).
+        let idx = FrameIndex {
+            total_padded_size: 0,
+            entries: vec![],
+            source_etag: None,
+            source_compressed_size: None,
+            sse_v3: Some(SseChunkBinding {
+                enc_chunk_size: 1024,
+                enc_chunk_count: 4,
+                enc_key_id: 1,
+                enc_salt: [0u8; 8],
+                enc_plaintext_len: 3572,
+                enc_header_bytes: 24,
+            }),
+        };
+        let plan = RangePlan {
+            first_frame_idx: 0,
+            last_frame_idx_inclusive: 0,
+            byte_start: 3100,
+            byte_end_exclusive: 3500,
+            slice_start_in_combined: 0,
+            slice_end_in_combined: 400,
+        };
+        let enc = idx.encrypted_lookup(&plan).unwrap();
+        assert_eq!(enc.chunk_idx_start, 3);
+        assert_eq!(enc.chunk_idx_last_inclusive, 3);
+        // Final chunk on disk: (3572 - 3*1024) + 16 = 500 + 16 = 516
+        let expected_start = 24 + 3 * 1040;
+        assert_eq!(enc.enc_byte_start, expected_start);
+        assert_eq!(enc.enc_byte_end_exclusive, expected_start + 516);
+    }
+
+    /// v0.9 #106: when the SSE binding is absent, `encrypted_lookup`
+    /// returns `None` (caller falls back to buffered path).
+    #[test]
+    fn encrypted_lookup_without_binding_returns_none() {
+        let idx = sample_index();
+        let plan = RangePlan {
+            first_frame_idx: 0,
+            last_frame_idx_inclusive: 0,
+            byte_start: 0,
+            byte_end_exclusive: 10,
+            slice_start_in_combined: 0,
+            slice_end_in_combined: 10,
+        };
+        assert!(idx.encrypted_lookup(&plan).is_none());
+    }
+
     /// v0.8.4 #73 H-2: a sidecar produced by a pre-v0.8.4 deployment
-    /// (= raw v1 bytes) must still decode cleanly under the v2 reader
-    /// with `source_etag = None` / `source_compressed_size = None`. The
-    /// GET path treats the `None` shape as "legacy — verify skip" so
-    /// existing on-disk sidecars keep serving partial fetches without a
-    /// flag day. This locks in the `decode_index` dispatch on the
-    /// `version` field that makes the back-compat path real.
+    /// (= raw v1 bytes) must still decode cleanly under the v2/v3
+    /// reader with `source_etag = None` / `source_compressed_size =
+    /// None` / `sse_v3 = None`. The GET path treats the `None` shape
+    /// as "legacy — verify skip" so existing on-disk sidecars keep
+    /// serving partial fetches without a flag day. This locks in the
+    /// `decode_index` dispatch on the `version` field that makes the
+    /// back-compat path real.
     #[test]
     fn sidecar_header_back_compat_old_format_no_source_etag() {
         let v2_idx = {
@@ -676,13 +1177,14 @@ mod tests {
         assert_eq!(version, INDEX_VERSION_V1);
         let decoded = decode_index(v1_bytes).expect("v1 sidecar must still decode");
         // Frame entries + total_padded_size survive (the partial-fetch
-        // logic still works), but the new v2-only fields surface as None
-        // so the GET path knows it cannot do an etag-bind verify and
+        // logic still works), but the newer fields surface as None so
+        // the GET path knows it cannot do an etag-bind verify and
         // applies the legacy "best-effort + fallback to full GET" rule.
         assert_eq!(decoded.entries, v2_idx.entries);
         assert_eq!(decoded.total_padded_size, v2_idx.total_padded_size);
         assert_eq!(decoded.source_etag, None);
         assert_eq!(decoded.source_compressed_size, None);
+        assert!(decoded.sse_v3.is_none());
     }
 
     #[test]

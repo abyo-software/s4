@@ -180,6 +180,11 @@ fn index_roundtrip_bolero() {
                 // assertion below covers the (entries, padded_size) shape.
                 source_etag: None,
                 source_compressed_size: None,
+                // v0.9 #106: bolero harness doesn't fuzz the SSE binding
+                // either (= no S4E6 frame in scope here); None keeps the
+                // encoder on the v2 layout to match the pre-#106
+                // round-trip expectations.
+                sse_v3: None,
             };
             let bytes = encode_index(&idx);
             let decoded = decode_index(bytes).expect("encoded index must decode");

@@ -188,6 +188,9 @@ fn arb_frame_index(max_entries: usize) -> impl Strategy<Value = FrameIndex> {
                 // adversarial coverage is unchanged.
                 source_etag: None,
                 source_compressed_size: None,
+                // v0.9 #106: same default-None for the SSE binding so the
+                // encoder stays on v2 layout for this fuzz path.
+                sse_v3: None,
             }
         })
 }

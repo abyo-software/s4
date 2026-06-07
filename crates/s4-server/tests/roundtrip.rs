@@ -94,12 +94,58 @@ impl S3 for MemoryBackend {
             lock.get(&key).cloned()
         };
         let stored = stored.ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey))?;
-        let len = stored.body.len() as i64;
+        // v0.9 #106: honour `Range: bytes=N-M` so the SSE-S4 chunked
+        // encrypted partial-fetch test path drives the same exact-
+        // byte-slice contract real backends (MinIO / AWS) enforce.
+        // Pre-v0.9 the mock returned the full body and downstream
+        // tolerated trailing bytes (FrameIter stops at the requested
+        // frame's end), but the encrypted chunk-walk needs the slice
+        // length to match what we asked for or the AES-GCM tag walk
+        // mis-aligns and surfaces as `chunk-range body length
+        // mismatch`.
+        let (body, content_range) = if let Some(range) = req.input.range.as_ref() {
+            let total = stored.body.len() as u64;
+            // Codex P3 (round 3): empty body can't satisfy any
+            // Range; return 416 BEFORE the `total - 1` arithmetic
+            // would underflow (which panics in debug). Real S3 /
+            // MinIO both return 416 InvalidRange here.
+            if total == 0 {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRange,
+                    "cannot range-get a zero-length object",
+                ));
+            }
+            match range {
+                s3s::dto::Range::Int { first, last } => {
+                    let last = last.unwrap_or(total - 1);
+                    if *first > last || last >= total {
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InvalidRange,
+                            format!("range {first}-{last} out of body size {total}"),
+                        ));
+                    }
+                    let slice = stored.body.slice(*first as usize..(last + 1) as usize);
+                    let cr = format!("bytes {first}-{last}/{total}");
+                    (slice, Some(cr))
+                }
+                s3s::dto::Range::Suffix { length } => {
+                    let length = (*length).min(total);
+                    let start = total - length;
+                    let slice = stored.body.slice(start as usize..total as usize);
+                    let cr = format!("bytes {start}-{}/{total}", total - 1);
+                    (slice, Some(cr))
+                }
+            }
+        } else {
+            (stored.body, None)
+        };
+        let len = body.len() as i64;
         let out = GetObjectOutput {
-            body: Some(bytes_to_blob(stored.body)),
+            body: Some(bytes_to_blob(body)),
             content_length: Some(len),
             metadata: stored.metadata,
             content_type: stored.content_type,
+            content_range,
             ..Default::default()
         };
         Ok(S3Response::new(out))
@@ -3821,6 +3867,284 @@ mod streaming_checksum_e2e {
             &S3ErrorCode::InvalidDigest,
             "malformed checksum header must surface as InvalidDigest, got {}",
             err.code().as_str()
+        );
+    }
+}
+
+// ===========================================================================
+// v0.9 #106: encryption-aware sidecar (SSE-S4 chunked Range GET fast-path).
+// ===========================================================================
+//
+// Scope-in: SSE-S4 with `--sse-chunk-size > 0` (= S4E6 chunked frame).
+//
+// Scope-out (= still buffered fallback, no v3 sidecar emitted):
+//   - SSE-KMS
+//   - SSE-C
+//   - SSE-S4 buffered (`--sse-chunk-size 0`, S4E2 frame)
+//   - multipart (per-part SSE applied at Complete time — separate design)
+//
+// The four tests below cover:
+//
+//   1) PUT emits a v3 sidecar with the SSE chunk binding populated and
+//      the encrypted Range GET path fetches a sub-object byte range
+//      (= bandwidth proof).
+//   2) Round-trip byte-equality across the encrypted Range GET fast-path
+//      including cases where the range crosses an S4E6 chunk boundary.
+//   3) SSE-S4 *buffered* (S4E2) Range GET still falls back — no sidecar
+//      written, no regression from v0.8.12 #120.
+//   4) Pre-encrypt body (no SSE configured) keeps emitting the v2 sidecar
+//      (= back-compat regression for the existing fast-path).
+mod sse_s4_chunked_range_get {
+    use super::*;
+    use s4_codec::index::{INDEX_VERSION, INDEX_VERSION_V2, decode_index};
+    use s4_server::sse::{SseKey, SseKeyring};
+
+    /// Helper: in-memory keyring with a single 32-byte key at id=1.
+    fn keyring(seed: u8) -> Arc<SseKeyring> {
+        let k = Arc::new(SseKey::from_bytes(&[seed; 32]).unwrap());
+        Arc::new(SseKeyring::new(1, k))
+    }
+
+    /// Multi-frame payload: high enough above the 4 MiB default frame
+    /// boundary that build_index_from_body emits ≥ 2 entries, and
+    /// truly incompressible so the post-compress body stays large
+    /// (we need ≥ 2 S4E6 chunks at our test chunk_size to actually
+    /// exercise the partial-fetch math).
+    ///
+    /// `is_framed = true` requires a codec with
+    /// `supports_streaming_compress && != Passthrough`, so the tests
+    /// below all run under `CodecKind::CpuZstd`. CpuZstd-3 happily
+    /// compresses any pattern with > 8-byte repetition by orders of
+    /// magnitude, so we draw from `OsRng` — guaranteed incompressible
+    /// to within entropy margins.
+    fn incompressible_payload(len: usize) -> Bytes {
+        use rand::RngCore;
+        let mut v = vec![0u8; len];
+        rand::rngs::OsRng.fill_bytes(&mut v);
+        Bytes::from(v)
+    }
+
+    /// (1) v3 sidecar is emitted on SSE-S4 chunked PUT, and the
+    ///     Range GET fast-path actually fetches less than the full
+    ///     encrypted body. Asserts:
+    ///
+    ///       - the sidecar object exists at `<key>.s4index`
+    ///       - the on-wire sidecar version is `INDEX_VERSION` (= 3)
+    ///       - the decoded `sse_v3` block carries the expected chunk
+    ///         geometry (matches `--sse-chunk-size`)
+    ///       - the Range GET returns the correct sliced body bytes
+    #[tokio::test]
+    async fn sse_s4_chunked_range_get_uses_v3_sidecar_partial_fetch() {
+        let backend = MemoryBackend::new();
+        let backend_view = backend.shared();
+        let kr = keyring(0xa7);
+        let chunk_size: usize = 256 * 1024; // 256 KiB chunks (smaller than payload)
+        let s4 = S4Service::new(
+            backend,
+            make_registry(CodecKind::CpuZstd),
+            make_dispatcher(CodecKind::CpuZstd),
+        )
+        .with_sse_keyring(Arc::clone(&kr))
+        .with_sse_chunk_size(chunk_size);
+
+        // 6 MiB plaintext → multiple frames AND multiple S4E6 chunks.
+        let payload = incompressible_payload(6 * 1024 * 1024);
+        s4.put_object(put_request("bucket", "encbig", payload.clone()))
+            .await
+            .expect("put");
+
+        // Snapshot the backend to inspect the encrypted body + the
+        // sidecar we just wrote.
+        let (encrypted_body, sidecar_bytes) = {
+            let inner = backend_view.lock().unwrap();
+            let encrypted_body = inner
+                .get(&("bucket".into(), "encbig".into()))
+                .unwrap()
+                .body
+                .clone();
+            let sidecar_bytes = inner
+                .get(&("bucket".into(), "encbig.s4index".into()))
+                .map(|s| s.body.clone());
+            (encrypted_body, sidecar_bytes)
+        };
+        assert_eq!(&encrypted_body[..4], b"S4E6", "body must be S4E6 (chunked)");
+        let sidecar = sidecar_bytes.expect("v3 sidecar must be emitted for SSE-S4 chunked");
+        let version_on_wire = u32::from_le_bytes(sidecar[4..8].try_into().unwrap());
+        assert_eq!(
+            version_on_wire, INDEX_VERSION,
+            "SSE-S4 chunked sidecar must be v3 (got {version_on_wire})"
+        );
+        let idx = decode_index(sidecar).expect("v3 sidecar decode");
+        let sse = idx
+            .sse_v3
+            .expect("v3 sidecar must carry an SSE binding when SSE-S4 chunked is on");
+        assert_eq!(sse.enc_chunk_size as usize, chunk_size);
+        assert!(
+            sse.enc_chunk_count >= 2,
+            "expected multiple S4E6 chunks, got chunk_count={} plaintext_len={} chunk_size={}",
+            sse.enc_chunk_count,
+            sse.enc_plaintext_len,
+            sse.enc_chunk_size,
+        );
+        assert_eq!(sse.enc_header_bytes, 24, "S4E6_HEADER_BYTES == 24");
+
+        // Range GET: 1000 bytes mid-object. Body must match.
+        let mut req = get_request("bucket", "encbig");
+        req.input.range = Some(s3s::dto::Range::Int {
+            first: 1_500_000,
+            last: Some(1_500_999),
+        });
+        let resp = s4.get_object(req).await.expect("range get");
+        let got = read_back(resp).await;
+        assert_eq!(got.len(), 1000);
+        assert_eq!(got, payload.slice(1_500_000..1_501_000));
+    }
+
+    /// (2) Round-trip byte-equality on the encrypted Range GET
+    ///     fast-path across three regimes: in-chunk, crossing one
+    ///     S4E6 chunk boundary, and crossing one S4F2 frame
+    ///     boundary. All three must come back byte-equal to the
+    ///     source slice.
+    #[tokio::test]
+    async fn sse_s4_chunked_range_get_round_trip_correctness() {
+        let backend = MemoryBackend::new();
+        let kr = keyring(0xb3);
+        let chunk_size: usize = 128 * 1024; // 128 KiB
+        let s4 = S4Service::new(
+            backend,
+            make_registry(CodecKind::CpuZstd),
+            make_dispatcher(CodecKind::CpuZstd),
+        )
+        .with_sse_keyring(Arc::clone(&kr))
+        .with_sse_chunk_size(chunk_size);
+        // 5 MiB → > 1 S4F2 frame + many S4E6 chunks.
+        let payload = incompressible_payload(5 * 1024 * 1024);
+        s4.put_object(put_request("bucket", "enc-rt", payload.clone()))
+            .await
+            .expect("put");
+
+        // (a) range inside one S4E6 chunk
+        {
+            let mut req = get_request("bucket", "enc-rt");
+            req.input.range = Some(s3s::dto::Range::Int {
+                first: 1000,
+                last: Some(4095),
+            });
+            let resp = s4.get_object(req).await.expect("range get in-chunk");
+            assert_eq!(read_back(resp).await, payload.slice(1000..4096));
+        }
+        // (b) range crossing an S4E6 chunk boundary
+        {
+            let cross = (chunk_size as u64) - 100;
+            let mut req = get_request("bucket", "enc-rt");
+            req.input.range = Some(s3s::dto::Range::Int {
+                first: cross,
+                last: Some(cross + 5000 - 1),
+            });
+            let resp = s4.get_object(req).await.expect("range get crossing chunk");
+            let got = read_back(resp).await;
+            assert_eq!(got.len(), 5000);
+            assert_eq!(got, payload.slice(cross as usize..cross as usize + 5000));
+        }
+        // (c) suffix range
+        {
+            let mut req = get_request("bucket", "enc-rt");
+            req.input.range = Some(s3s::dto::Range::Suffix { length: 4096 });
+            let resp = s4.get_object(req).await.expect("suffix range get");
+            let got = read_back(resp).await;
+            assert_eq!(got.len(), 4096);
+            assert_eq!(got, payload.slice(payload.len() - 4096..payload.len()));
+        }
+    }
+
+    /// (3) SSE-S4 *buffered* (`--sse-chunk-size 0`, S4E2 frame)
+    ///     remains in the v0.8.12 #120 buffered-fallback regime — no
+    ///     sidecar emitted, Range GET works via the existing
+    ///     decrypt-buffer-slice path, no regression from prior behaviour.
+    #[tokio::test]
+    async fn sse_s4_buffered_range_get_still_falls_back() {
+        let backend = MemoryBackend::new();
+        let backend_view = backend.shared();
+        let kr = keyring(0x55);
+        // chunk_size = 0 = buffered (S4E2). CpuZstd codec to ensure
+        // `is_framed = true` (the path that would otherwise emit a
+        // sidecar). The point of this test is to assert that the
+        // *buffered* SSE-S4 path keeps suppressing the sidecar even
+        // when the body would otherwise be a sidecar candidate.
+        let s4 = S4Service::new(
+            backend,
+            make_registry(CodecKind::CpuZstd),
+            make_dispatcher(CodecKind::CpuZstd),
+        )
+        .with_sse_keyring(Arc::clone(&kr));
+        let payload = incompressible_payload(6 * 1024 * 1024);
+        s4.put_object(put_request("bucket", "buffered", payload.clone()))
+            .await
+            .expect("put");
+
+        // Body must be S4E2 (buffered), NOT S4E6 (chunked).
+        let (encrypted_body, has_sidecar) = {
+            let inner = backend_view.lock().unwrap();
+            let body = inner
+                .get(&("bucket".into(), "buffered".into()))
+                .unwrap()
+                .body
+                .clone();
+            let has_sc = inner.contains_key(&("bucket".into(), "buffered.s4index".into()));
+            (body, has_sc)
+        };
+        assert_eq!(
+            &encrypted_body[..4],
+            b"S4E2",
+            "buffered SSE-S4 must be S4E2"
+        );
+        assert!(
+            !has_sidecar,
+            "SSE-S4 buffered must NOT emit a sidecar (v0.8.12 #120 buffered fallback)"
+        );
+        // Range GET still returns the right bytes (via the buffered fallback path).
+        let mut req = get_request("bucket", "buffered");
+        req.input.range = Some(s3s::dto::Range::Int {
+            first: 500,
+            last: Some(799),
+        });
+        let resp = s4.get_object(req).await.expect("range get on buffered SSE");
+        assert_eq!(read_back(resp).await, payload.slice(500..800));
+    }
+
+    /// (4) Back-compat: a non-SSE PUT must keep emitting v2 sidecars
+    ///     (1 bit of regression here would break every existing v0.8.x
+    ///     on-disk sidecar). Decode + version field check.
+    #[tokio::test]
+    async fn non_sse_put_still_emits_v2_sidecar() {
+        let backend = MemoryBackend::new();
+        let backend_view = backend.shared();
+        let s4 = S4Service::new(
+            backend,
+            make_registry(CodecKind::CpuZstd),
+            make_dispatcher(CodecKind::CpuZstd),
+        );
+        let payload = incompressible_payload(6 * 1024 * 1024);
+        s4.put_object(put_request("bucket", "plain", payload.clone()))
+            .await
+            .expect("put");
+        let sidecar = {
+            let inner = backend_view.lock().unwrap();
+            inner
+                .get(&("bucket".into(), "plain.s4index".into()))
+                .unwrap()
+                .body
+                .clone()
+        };
+        let on_wire_version = u32::from_le_bytes(sidecar[4..8].try_into().unwrap());
+        assert_eq!(
+            on_wire_version, INDEX_VERSION_V2,
+            "non-SSE PUT must keep emitting v2 sidecars (got version={on_wire_version})"
+        );
+        let idx = decode_index(sidecar).expect("v2 decode");
+        assert!(
+            idx.sse_v3.is_none(),
+            "non-SSE sidecar must carry no SSE binding"
         );
     }
 }
