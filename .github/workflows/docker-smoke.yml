@@ -152,12 +152,18 @@ jobs:
           echo "Trying to pull $IMAGE"
           docker pull "$IMAGE"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+      # v0.10 wave-2 #B2-audit R1 P2: the Dockerfile uses
+      # `ENTRYPOINT ["/usr/local/bin/s4"]` + `CMD ["--host", ...]`.
+      # Passing `s4 --help` as the docker run command would make the
+      # container execute `s4 s4 --help` (entrypoint prepended) and
+      # fail with "unknown subcommand". Pass JUST the flag to let the
+      # entrypoint receive it as args.
       - name: smoke — s4 --help
         if: steps.pull.outcome == 'success'
-        run: docker run --rm "${{ steps.pull.outputs.image }}" s4 --help > /dev/null
+        run: docker run --rm "${{ steps.pull.outputs.image }}" --help > /dev/null
       - name: smoke — s4 --version
         if: steps.pull.outcome == 'success'
-        run: docker run --rm "${{ steps.pull.outputs.image }}" s4 --version
+        run: docker run --rm "${{ steps.pull.outputs.image }}" --version
       - name: skip notice (image not published)
         if: steps.pull.outcome != 'success'
         run: |

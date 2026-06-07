@@ -212,8 +212,8 @@ docker compose -f docker-compose.gpu.yml config > /dev/null
 
 # Image smoke (run this after a release lands on ghcr.io)
 docker pull ghcr.io/abyo-software/s4:0.9.0
-docker run --rm ghcr.io/abyo-software/s4:0.9.0 s4 --help
-docker run --rm ghcr.io/abyo-software/s4:0.9.0 s4 --version
+docker run --rm ghcr.io/abyo-software/s4:0.9.0 --help
+docker run --rm ghcr.io/abyo-software/s4:0.9.0 --version
 ```
 
 ### Python (pip)
