@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780829809583,
+  "lastUpdate": 1780830250831,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -902,6 +902,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "1e05404902dd90fb79dce403d34ceaa8cdf41785",
+          "message": "fix(audit): #106-audit-R4 P2-R4 — verify-sidecar MissingHarmless on non-framed bodies\n\nCodex round 4 integrated audit caught the verify-side twin of R3\nP2-R3: `s4 verify-sidecar` on a passthrough / raw-bytes object\n(no S4F2 magic, body long enough to clear the 28-byte FRAME_HEADER\nprobe) used to exit 1 with a confusing `FrameScan` error. The\nserver never sidecars those objects by design, so absence of a\nsidecar is the correct steady state — CI / cron jobs would\nfalse-alert on healthy passthrough workloads.\n\nFix: in `classify_missing_sidecar`, catch the `FrameError::BadMagic`\nvariant from `build_index_from_body` and surface\n`MissingHarmless { frame_count: 0 }` (exit 0) instead of bubbling\nthe error. Non-BadMagic FrameScan errors still propagate so genuine\ncorruption surfaces loud (e.g. half-written multipart with a partial\nframe, attacker-supplied forged header).\n\nE2E: `verify_sidecar_reports_missing_harmless_for_non_framed_body`\nplants raw bytes directly via the backend, asserts MissingHarmless\n+ is_clean. Sibling to the R3 `repair_sidecar_rejects_zero_frame_body`\ntest — both prove the verify / repair paths handle non-framed\nbodies with the right shape for their respective semantics\n(verify = clean, repair = NotFramed reject).\n\nCoverage: workspace 0 failed. fmt + clippy clean.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-07T19:56:16+09:00",
+          "tree_id": "1ea711177c1de073276e7de85805b413669a4ae7",
+          "url": "https://github.com/abyo-software/s4/commit/1e05404902dd90fb79dce403d34ceaa8cdf41785"
+        },
+        "date": 1780830249601,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 54622,
+            "range": "± 3631",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 57493,
+            "range": "± 3590",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 373,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2689250,
+            "range": "± 68303",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 41748271,
+            "range": "± 152020",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192569,
+            "range": "± 615",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 54650147,
+            "range": "± 1093890",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 754861461,
+            "range": "± 1431635",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3078032,
+            "range": "± 12768",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 33377,
+            "range": "± 3031",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 38338,
+            "range": "± 2675",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 378,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 571388,
+            "range": "± 9796",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1554004,
+            "range": "± 30606",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192553,
+            "range": "± 512",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 13434966,
+            "range": "± 376700",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27292497,
+            "range": "± 136271",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3084679,
+            "range": "± 18846",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1534264,
+            "range": "± 23509",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2658056,
+            "range": "± 18870",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 353559178,
+            "range": "± 3496437",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 141,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 7736,
+            "range": "± 70",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 827,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13074,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2912,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 22700,
+            "range": "± 231",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 90782,
+            "range": "± 1275",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 599,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4958,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19738,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
             "range": "± 0",
             "unit": "ns/iter"
           }
