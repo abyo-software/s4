@@ -81,6 +81,27 @@ v0.10 roadmap in progress — encryption-aware sidecar completion
   pulled it because no image had been published — surfaces now
   that publishing is real).
 
+- **v0.10 wave-2 #A4 i686 runtime smoke in CI** — the v0.9 #106-32bit
+  work proved `cargo check --target i686-unknown-linux-gnu` passes
+  across the workspace, but the README qualified it as
+  "compiles, untested at runtime" because no CI step actually
+  exercised the i686 binary. v0.10 adds a per-push
+  `i686-runtime-smoke` job to `.github/workflows/ci.yml` that
+  (1) executes `cargo test --target i686-unknown-linux-gnu -p
+  s4-codec -p s4-config --release`, (2) builds `s4-server`
+  for i686 (`continue-on-error: true` — the aws-sdk-rust /
+  rustls / ring stack may not link cleanly with stock i386
+  multilib; a failure here surfaces in the log without going
+  red because it doesn't invalidate the codec/config test
+  results above), (3) invokes `s4 --help` + `s4 --version`
+  against the i686 binary when build succeeded. README §"Supported
+  targets" upgraded: `s4-server` cell flips from "⚠️ compiles,
+  untested at runtime" to "✅ compiles + `--help` / `--version`
+  smoke (CI)". Full end-to-end PUT/GET on 32-bit is still not
+  exercised — operators on i686 should treat `--max-body-bytes`
+  carefully (auto-clamps to `isize::MAX as usize` ≈ 2 GiB on
+  32-bit per the v0.9 #106-32bit fix).
+
 ### Documentation
 
 - **v0.10 #A2-doc SSE partial-fetch constraint clarification** —

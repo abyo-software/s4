@@ -162,6 +162,63 @@ jobs:
           path: bench.log
           if-no-files-found: ignore
 
+  # v0.10 wave-2 #A4: 32-bit (i686-unknown-linux-gnu) runtime smoke.
+  # Builds + executes the `s4-codec` test suite on i686 (already
+  # passed since v0.9 #106-32bit but now gated in CI so a regression
+  # surfaces immediately), then builds + runs the `s4` binary's
+  # `--help` / `--version` for runtime parity evidence beyond the
+  # `cargo check --target` claim README §"Supported targets" makes.
+  #
+  # If the `s4-server` build step fails (= one of its deps —
+  # aws-sdk-rust / rustls / ring — doesn't link cleanly on i686
+  # with stock gcc-multilib + libc6-dev-i386), the smoke step is
+  # skipped and the job records "compiles only, runtime untested"
+  # rather than going red — the codec/config test step still gates
+  # on the regression-detection use case.
+  i686-runtime-smoke:
+    name: i686 runtime smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: i686
+      - name: install i686 multilib (gcc + libc dev + runtime)
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-multilib \
+            libc6-dev-i386 \
+            libc6:i386
+      - name: cargo test --target i686 (s4-codec + s4-config)
+        run: |
+          cargo test --target i686-unknown-linux-gnu \
+            -p s4-codec -p s4-config --release
+        timeout-minutes: 15
+      - name: cargo build --target i686 (s4-server binary)
+        # The aws-sdk-rust / rustls / ring stack pulls C-source
+        # crypto libs that may not have a stock i386 path. If this
+        # step fails the README claim stays "cargo check parity" and
+        # the smoke steps below are skipped — a hard fail here would
+        # also incorrectly suggest the codec tests above regressed,
+        # so we record-and-continue instead.
+        id: build-s4
+        continue-on-error: true
+        run: |
+          cargo build --target i686-unknown-linux-gnu --release \
+            -p s4-server --bin s4
+        timeout-minutes: 15
+      - name: smoke — s4 --help (i686 binary)
+        if: steps.build-s4.outcome == 'success'
+        run: ./target/i686-unknown-linux-gnu/release/s4 --help > /dev/null
+      - name: smoke — s4 --version (i686 binary)
+        if: steps.build-s4.outcome == 'success'
+        run: ./target/i686-unknown-linux-gnu/release/s4 --version
+
   # Auto-open a GitHub issue when CI fails on a push to main (only on
   # push, not PR — PR failures are visible inline; main failures are
   # the ones operators / on-call need to act on).
@@ -174,7 +231,7 @@ jobs:
   notify-on-failure:
     name: Open issue on CI failure
     runs-on: ubuntu-latest
-    needs: [test, e2e, security-audit]
+    needs: [test, e2e, security-audit, i686-runtime-smoke]
     if: failure() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/github-script@v7

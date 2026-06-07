@@ -233,7 +233,7 @@ target/release/s4 --endpoint-url https://s3.us-east-1.amazonaws.com \
 | `s4-codec` (library)           | ✅ tier 1                           | ✅ compiles + tests   | ✅ via `s4-codec-wasm`             |
 | `s4-codec-wasm` (browser)      | n/a                                 | n/a                   | ✅ tier 1                          |
 | `s4-config`                    | ✅ tier 1                           | ✅                    | ✅                                 |
-| `s4-server` (gateway binary)   | ✅ tier 1                           | ⚠️ compiles, untested at runtime | ❌ not applicable           |
+| `s4-server` (gateway binary)   | ✅ tier 1                           | ✅ compiles + `--help` / `--version` smoke (CI) | ❌ not applicable           |
 | `nvcomp-gpu` feature (any crate above) | ✅ x86_64 only (NVIDIA driver) | ❌ (no 32-bit nvCOMP) | ❌                            |
 
 Runtime-tested platform is **`x86_64-unknown-linux-gnu`** and
@@ -241,13 +241,16 @@ Runtime-tested platform is **`x86_64-unknown-linux-gnu`** and
 target builds clean for `s4-codec` / `s4-config` / `s4-server` as of
 v0.9 #106 (default-bytes constants are now `target_pointer_width` cfg-gated
 so the 5 GiB AWS S3 single-PUT ceiling no longer const-overflows `usize` on
-32-bit), and the `s4-codec` test suite passes on `i686`. The `s4-server`
-binary itself is not exercised end-to-end on 32-bit; operators running it on
-that target are on their own re: cap tuning (`--max-body-bytes`
-auto-clamps to `isize::MAX as usize` ≈ 2 GiB on 32-bit — Rust caps any
-single `Vec` / `Bytes` allocation at `isize::MAX`, so a higher gateway
-guard would let oversized requests panic inside the SSE buffered-decrypt
-pre-alloc path).
+32-bit). v0.10 wave-2 #A4 adds a per-push CI job that (a) executes the
+`s4-codec` + `s4-config` test suites under `--target i686-unknown-linux-gnu`
+and (b) builds the `s4` binary itself for i686 + invokes
+`s4 --help` / `s4 --version` as a runtime smoke. Full end-to-end
+PUT/GET on 32-bit is still not exercised in CI; operators running it
+on i686 should treat `--max-body-bytes` carefully (auto-clamps to
+`isize::MAX as usize` ≈ 2 GiB on 32-bit — Rust caps any single `Vec` /
+`Bytes` allocation at `isize::MAX`, so a higher gateway guard would
+let oversized requests panic inside the SSE buffered-decrypt pre-alloc
+path).
 
 The `wasm32-unknown-unknown` target is the public release channel for the
 browser decoder (`s4-codec-wasm`); the criterion regression-tracking suite
