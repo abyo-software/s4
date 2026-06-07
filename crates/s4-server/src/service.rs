@@ -298,6 +298,88 @@ fn verify_client_body_checksums(
     Ok(())
 }
 
+/// v0.9 #106-audit-R2 P2-INT-2: verify SigV4-streaming **trailer**-supplied
+/// checksums against an already-finalised [`ComputedDigests`].
+///
+/// Shared between the streaming-framed branch (digests computed via the
+/// tee wrapper) and the buffered branch (digests computed in one shot
+/// over the in-memory body via [`crate::streaming_checksum::compute_digests`]).
+/// Centralising the logic prevents the pre-#106 fail-open shape —
+/// where one branch verified trailers and the other silently skipped
+/// them — from regressing. Both branches now go through the same
+/// announce-parsing / fail-closed / per-name `compare_b64` pipeline.
+///
+/// Fail-closed posture (matches the streaming branch's behaviour):
+///
+/// - No `x-amz-trailer` header → returns Ok (no verification claimed).
+/// - Header announces only non-checksum trailers (`x-amz-trailer-signature`,
+///   custom) → returns Ok (filter selects checksum names only).
+/// - Header announces `x-amz-checksum-*` but the trailing-headers handle
+///   was absent → `BadDigest`.
+/// - Handle present but trailers were never delivered (`read` returns
+///   None) → `BadDigest`.
+/// - Trailer announced but value missing in the delivered block → `BadDigest`.
+/// - Value present but malformed / mismatched / refers to an unhashed
+///   algorithm → `BadDigest` / `InvalidDigest` per [`ComputedDigests::compare_b64`].
+fn verify_client_trailer_checksums(
+    announced: Option<&str>,
+    trailers_handle: Option<&s3s::TrailingHeaders>,
+    computed: &crate::streaming_checksum::ComputedDigests,
+) -> S3Result<()> {
+    let Some(announced) = announced else {
+        return Ok(());
+    };
+    let promised_checksum_trailers: Vec<String> = announced
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|n| {
+            // RFC 9110 §5.1: HTTP header names are
+            // case-insensitive — match accordingly.
+            n.to_ascii_lowercase().starts_with("x-amz-checksum-")
+        })
+        .collect();
+    if promised_checksum_trailers.is_empty() {
+        return Ok(());
+    }
+    let bad_digest = |msg: String| -> S3Error {
+        let code = S3ErrorCode::from_bytes(b"BadDigest").unwrap_or(S3ErrorCode::InvalidArgument);
+        S3Error::with_message(code, msg)
+    };
+    let Some(th) = trailers_handle else {
+        return Err(bad_digest(
+            "client announced checksum trailer(s) via x-amz-trailer but \
+             no trailing-headers handle was attached to the request"
+                .into(),
+        ));
+    };
+    let result = th.read(|hmap| {
+        for name in &promised_checksum_trailers {
+            match hmap.get(name.as_str()).and_then(|v| v.to_str().ok()) {
+                Some(val) => {
+                    computed.compare_b64(name, val)?;
+                }
+                None => {
+                    return Err(bad_digest(format!(
+                        "client announced trailer {name} via \
+                         x-amz-trailer but the trailer value was \
+                         missing or unparseable"
+                    )));
+                }
+            }
+        }
+        Ok::<(), S3Error>(())
+    });
+    match result {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(e),
+        None => Err(bad_digest(
+            "client announced checksum trailer(s) via x-amz-trailer \
+             but no trailing-headers block was delivered with the body"
+                .into(),
+        )),
+    }
+}
+
 /// v0.8.12 #128 (MED-C): CRC-64/NVME (AWS S3 `x-amz-checksum-crc64nvme`).
 /// NVMe spec: poly 0xad93d23594c93659, init 0xffffffffffffffff, refin
 /// true, refout true, xorout 0xffffffffffffffff. The reflected
@@ -2873,92 +2955,44 @@ impl<B: S3> S3 for S4Service<B> {
                 // at EOF (mismatch surfaces as `BadDigest` through
                 // the `CodecError::Io` branch above). Now that the
                 // body has been fully consumed, request trailers are
-                // available — check any checksum trailers the
-                // client promised via `x-amz-trailer`.
+                // available — delegate to the shared trailer-verify
+                // helper (also used by the buffered branch below,
+                // see v0.9 #106-audit-R2 P2-INT-2).
                 //
                 // **Fail-closed when announced trailers are
                 // missing**: if the client announced
                 // `x-amz-trailer: x-amz-checksum-*` but did NOT
                 // deliver the trailer value (or the trailers block
-                // never arrived), we refuse the PUT with
+                // never arrived), the helper refuses the PUT with
                 // `BadDigest`. Skipping the comparison in that case
                 // would silently re-open the streaming fail-open
                 // this issue closes — a client could declare an
                 // integrity check and then omit the value to bypass
                 // verification.
-                if let Some(handle) = digest_handle.as_ref()
-                    && let Some(announced) = req
+                if let Some(handle) = digest_handle.as_ref() {
+                    let announced = req
                         .headers
                         .get("x-amz-trailer")
-                        .and_then(|v| v.to_str().ok())
-                {
-                    let promised_checksum_trailers: Vec<String> = announced
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|n| {
-                            // RFC 9110 §5.1: HTTP header names are
-                            // case-insensitive — match accordingly.
-                            n.to_ascii_lowercase().starts_with("x-amz-checksum-")
-                        })
-                        .collect();
-                    if !promised_checksum_trailers.is_empty() {
-                        let computed = handle.lock().expect("digest handle lock poisoned").clone();
-                        let trailers_handle = req.trailing_headers.as_ref();
-                        let bad_digest = |msg: String| -> S3Error {
-                            let code = S3ErrorCode::from_bytes(b"BadDigest")
-                                .unwrap_or(S3ErrorCode::InvalidArgument);
-                            S3Error::with_message(code, msg)
-                        };
-                        // If the tee never finalised (computed is
-                        // None) the body was incomplete; the
-                        // CodecError path would have already
-                        // surfaced — defensive belt for any future
-                        // refactor.
-                        let Some(computed) = computed else {
-                            return Err(bad_digest(
-                                "client announced checksum trailer(s) but the streaming body \
-                                 did not produce a finalised digest"
-                                    .into(),
-                            ));
-                        };
-                        let Some(th) = trailers_handle else {
-                            return Err(bad_digest(
-                                "client announced checksum trailer(s) via x-amz-trailer but \
-                                 no trailing-headers handle was attached to the request"
-                                    .into(),
-                            ));
-                        };
-                        // `TrailingHeaders::read` returns None when
-                        // the trailers block has not been delivered.
-                        let result = th.read(|hmap| {
-                            for name in &promised_checksum_trailers {
-                                match hmap.get(name.as_str()).and_then(|v| v.to_str().ok()) {
-                                    Some(val) => {
-                                        computed.compare_b64(name, val)?;
-                                    }
-                                    None => {
-                                        return Err(bad_digest(format!(
-                                            "client announced trailer {name} via \
-                                             x-amz-trailer but the trailer value was \
-                                             missing or unparseable"
-                                        )));
-                                    }
-                                }
-                            }
-                            Ok::<(), S3Error>(())
-                        });
-                        match result {
-                            Some(Ok(())) => {} // verified
-                            Some(Err(e)) => return Err(e),
-                            None => {
-                                return Err(bad_digest(
-                                    "client announced checksum trailer(s) via x-amz-trailer \
-                                     but no trailing-headers block was delivered with the body"
-                                        .into(),
-                                ));
-                            }
-                        }
-                    }
+                        .and_then(|v| v.to_str().ok());
+                    // If the tee never finalised (computed is None)
+                    // the body was incomplete; the CodecError path
+                    // would have already surfaced — defensive belt
+                    // for any future refactor. We still need a
+                    // ComputedDigests instance to feed the helper
+                    // when trailers were announced, so synthesise
+                    // an empty one and let `compare_b64` reject
+                    // every claim as BadDigest (every algorithm
+                    // slot is None).
+                    let computed = handle
+                        .lock()
+                        .expect("digest handle lock poisoned")
+                        .clone()
+                        .unwrap_or_default();
+                    verify_client_trailer_checksums(
+                        announced,
+                        req.trailing_headers.as_ref(),
+                        &computed,
+                    )?;
                 }
                 (body, manifest, true)
             } else {
@@ -2982,6 +3016,46 @@ impl<B: S3> S3 for S4Service<B> {
                     req.input.checksum_sha256.as_deref(),
                     req.input.checksum_crc64nvme.as_deref(),
                 )?;
+                // v0.9 #106-audit-R2 P2-INT-2: SigV4-streaming trailer
+                // checksums must verify on the buffered path too. Pre-fix
+                // the streaming-framed branch above handled
+                // `x-amz-trailer` while this branch silently dropped
+                // it — a client could PUT through a GPU codec / non-
+                // streaming dispatch and bypass trailer verification.
+                // We have the full body in memory here, so a one-shot
+                // `compute_digests` followed by the shared
+                // `verify_client_trailer_checksums` helper closes the
+                // gap. The hasher selector is derived from the same
+                // `x-amz-trailer` header parser the streaming branch
+                // uses (`WhichHashers::from_trailer_header`).
+                if let Some(announced) = req
+                    .headers
+                    .get("x-amz-trailer")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    let which =
+                        crate::streaming_checksum::WhichHashers::from_trailer_header(announced);
+                    if which.any() {
+                        let computed = crate::streaming_checksum::compute_digests(&bytes, which);
+                        verify_client_trailer_checksums(
+                            Some(announced),
+                            req.trailing_headers.as_ref(),
+                            &computed,
+                        )?;
+                    } else {
+                        // Header announced only non-checksum trailers
+                        // (e.g. `x-amz-trailer-signature`). The helper
+                        // would return Ok in that case — invoke it
+                        // anyway for symmetry with the streaming branch
+                        // so a future change to the filter logic stays
+                        // wired through both paths.
+                        verify_client_trailer_checksums(
+                            Some(announced),
+                            req.trailing_headers.as_ref(),
+                            &crate::streaming_checksum::ComputedDigests::default(),
+                        )?;
+                    }
+                }
                 debug!(
                     bucket = ?req.input.bucket,
                     key = ?req.input.key,
@@ -8467,5 +8541,68 @@ mod tests {
             rendered.contains("kind=\"replication\""),
             "expected kind=\"replication\" label in metrics output, got: {rendered}"
         );
+    }
+
+    /// v0.9 #106-audit-R2 P2-INT-2: the shared trailer-verify helper
+    /// short-circuits when the `x-amz-trailer` header is absent (no
+    /// claim → nothing to verify).
+    #[test]
+    fn verify_client_trailer_checksums_passes_when_no_header() {
+        let computed = crate::streaming_checksum::ComputedDigests::default();
+        verify_client_trailer_checksums(None, None, &computed).expect("no claim → Ok");
+    }
+
+    /// Helper that only announces non-checksum trailers (e.g. the
+    /// `x-amz-trailer-signature` SDKs add for SigV4 streaming) is also
+    /// a no-op — the filter discards them before anything else runs.
+    #[test]
+    fn verify_client_trailer_checksums_ignores_non_checksum_trailers() {
+        let computed = crate::streaming_checksum::ComputedDigests::default();
+        verify_client_trailer_checksums(Some("x-amz-trailer-signature"), None, &computed)
+            .expect("non-checksum trailers must not fail");
+    }
+
+    /// Fail-closed: announced checksum trailer + no trailing-headers
+    /// handle = `BadDigest`. This is the core regression fence for the
+    /// buffered-path silent-skip the P2-INT-2 fix closes.
+    #[test]
+    fn verify_client_trailer_checksums_no_handle_fails_closed() {
+        let computed = crate::streaming_checksum::ComputedDigests::default();
+        let err = verify_client_trailer_checksums(Some("x-amz-checksum-crc32c"), None, &computed)
+            .expect_err("announced trailer with no handle must fail closed");
+        assert_eq!(err.code().as_str(), "BadDigest");
+        assert!(
+            err.message()
+                .unwrap_or_default()
+                .contains("trailing-headers handle"),
+            "error message must hint at the missing handle, got {err:?}"
+        );
+    }
+
+    /// Case-insensitive trailer name match — AWS SDKs may use any
+    /// casing per RFC 9110 §5.1. The filter must still detect the
+    /// `x-amz-checksum-` prefix; the helper then propagates the bad-
+    /// digest reject via the missing handle.
+    #[test]
+    fn verify_client_trailer_checksums_case_insensitive_filter() {
+        let computed = crate::streaming_checksum::ComputedDigests::default();
+        let err = verify_client_trailer_checksums(Some("X-Amz-Checksum-Crc32c"), None, &computed)
+            .expect_err("upper-case trailer name must still be detected");
+        assert_eq!(err.code().as_str(), "BadDigest");
+    }
+
+    /// Mixed announce: one checksum trailer and one unrelated trailer.
+    /// The filter retains the checksum one and routes to the fail-closed
+    /// branch when the handle is absent.
+    #[test]
+    fn verify_client_trailer_checksums_mixed_announce_still_validates() {
+        let computed = crate::streaming_checksum::ComputedDigests::default();
+        let err = verify_client_trailer_checksums(
+            Some("x-amz-checksum-sha256, x-amz-trailer-signature"),
+            None,
+            &computed,
+        )
+        .expect_err("mixed announce with checksum entry must still fail closed");
+        assert_eq!(err.code().as_str(), "BadDigest");
     }
 }

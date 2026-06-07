@@ -545,6 +545,61 @@ v0.9 roadmap in progress.
   `streaming_compress_truncated_input_returns_400`)
   continue to pass.
 
+### Fixed
+
+- **#106-audit-R2 P2-INT-1** — `s4 repair-sidecar` on an SSE-S4
+  encrypted object (S4E1..S4E6 envelope, written by a gateway
+  configured with `--sse-s4-key` and `--sse-chunk-size > 0`) used
+  to feed the ciphertext to `build_index_from_body`, surface a
+  confusing `FrameScan` error, and leave the operator without a
+  recovery path. The repair binary runs against the BACKEND (not
+  the gateway), so the body it sees is the post-encrypt envelope;
+  it has no access to the SSE keyring needed to decrypt + walk
+  the chunk layout for a v3 sidecar's `sse_v3` binding. Closed
+  by detecting the S4Ex magic prefix before frame scanning and
+  surfacing a typed `RepairError::EncryptedSidecarUnsupported
+  { bucket, key, message }` whose `Display` directs the operator
+  to a server-mode rebuild path (re-PUT the object) until v0.10
+  plumbs `--sse-s4-key <path>` through the CLI. New unit tests
+  (`detect_sse_magic_covers_all_envelope_variants`,
+  `repair_sidecar_rejects_encrypted_body_with_typed_error`) pin
+  the magic table and the Display text; new MinIO E2E test
+  `repair_sidecar_rejects_sse_s4_chunked_object_cleanly` proves
+  the rejection on a real S4E6 object and asserts the pre-
+  existing sidecar state is byte-equal after the failed repair.
+
+- **#106-audit-R2 P2-INT-2** — `verify_client_body_checksums` on
+  the buffered PUT branch (passthrough codec / non-streaming-
+  framed dispatch) verified the six header-supplied AWS checksum
+  algorithms but silently dropped `x-amz-trailer`-announced
+  SigV4-streaming trailer checksums. A client could declare
+  `x-amz-trailer: x-amz-checksum-crc32c` and then omit the
+  trailer value to bypass verification on any PUT routed through
+  a GPU codec or passthrough. Closed by routing the buffered
+  branch through a new shared `verify_client_trailer_checksums`
+  helper (also adopted by the streaming-framed branch via an
+  in-line refactor) that re-uses `ComputedDigests::compare_b64`
+  and the `WhichHashers::from_trailer_header` parser. The helper
+  fails closed when announced trailers are missing the value /
+  block / handle. New buffered-path roundtrip tests
+  (`buffered_path_trailer_checksum_announced_without_handle_rejected`,
+  `buffered_path_trailer_only_signature_does_not_reject`) and 5
+  unit tests on the helper (`verify_client_trailer_checksums_*`)
+  pin the announce-parsing, case-insensitive filter, fail-closed
+  paths, and the legitimate non-checksum-trailer pass-through.
+
+### Notes
+
+- **v0.10 roadmap — encrypted sidecar repair**: the P2-INT-1
+  fix above intentionally rejects rather than supporting
+  encrypted-body repair. The full fix requires plumbing the
+  SSE keyring into the standalone sidecar binary so it can
+  decrypt the S4E1..S4E6 envelope and walk the chunk layout
+  to rebuild the v3 sidecar's `sse_v3` binding. Tracked as a
+  v0.10 follow-up: add `--sse-s4-key <path>` to `s4
+  repair-sidecar` (and the matching verify / sweep
+  subcommands), mirroring the server CLI's existing flag.
+
 ## [0.8.22] — 2026-06-07
 
 Seventh-round review caught that R6-6 introduced a fresh

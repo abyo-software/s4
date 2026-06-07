@@ -77,6 +77,31 @@ pub enum RepairError {
         key: String,
         head_etag: String,
     },
+    /// v0.9 #106-audit-R2 P2-INT-1: the object body the backend returned
+    /// is an SSE-S4 (S4E1/S4E2/S4E3/S4E4/S4E5/S4E6) encrypted envelope.
+    /// `repair_sidecar` runs against the BACKEND (not the gateway), so the
+    /// body it sees is ciphertext — feeding that to the frame scanner
+    /// would surface as a confusing `FrameScan` because the S4F2 frame
+    /// magic is hidden inside the encrypted payload. Worse, the v3
+    /// sidecar's `sse_v3` binding (key_id / salt / chunk_size etc.)
+    /// cannot be reconstructed from the backend bytes alone — it
+    /// requires the SSE keyring to decrypt the body and walk the chunk
+    /// layout. The CLI does not (yet) accept `--sse-s4-key`; v0.10
+    /// roadmap is to plumb that through. Until then, surface a clean
+    /// typed error so the operator can route the repair through a
+    /// server-mode rebuild path (re-PUT the object) instead of receiving
+    /// a misleading frame-scan failure.
+    #[error(
+        "object {bucket}/{key} body is an SSE-S4 encrypted envelope ({message}); \
+         encrypted-sidecar repair requires server-mode access to the SSE keyring \
+         (CLI `--sse-s4-key` plumbing is the v0.10 roadmap), \
+         use a server-mode rebuild path or re-PUT the object to regenerate the sidecar"
+    )]
+    EncryptedSidecarUnsupported {
+        bucket: String,
+        key: String,
+        message: String,
+    },
 }
 
 /// Status reported by [`verify_sidecar`]. Discriminates the outcomes a
@@ -400,6 +425,23 @@ pub async fn repair_sidecar(
                 body.len(),
                 live_size
             ),
+        });
+    }
+    // v0.9 #106-audit-R2 P2-INT-1: detect SSE-S4 encrypted envelopes
+    // BEFORE handing the body to the frame scanner. The backend serves
+    // the on-disk ciphertext (S4E1..S4E6 magic prefix); `build_index_from_body`
+    // would scan for `S4F2` frame magic inside that ciphertext and surface
+    // an opaque `FrameScan` error. Worse, the v3 sidecar's `sse_v3` binding
+    // (key_id / salt / chunk_size) cannot be reconstructed from backend
+    // bytes alone — the SSE keyring is required to decrypt + walk chunks.
+    // Surface a typed error directing the operator to a server-mode rebuild
+    // path; v0.10 roadmap is to add `--sse-s4-key <path>` to the CLI so
+    // sidecar repair can decrypt the body in-process. See CHANGELOG.
+    if let Some(magic) = detect_sse_magic(&body) {
+        return Err(RepairError::EncryptedSidecarUnsupported {
+            bucket: bucket.into(),
+            key: key.into(),
+            message: format!("body magic {magic} indicates SSE-S4 envelope"),
         });
     }
     let sidecar_k = sidecar_key(key);
@@ -864,6 +906,36 @@ fn normalize_etag(s: &str) -> String {
     s.trim_matches('"').to_owned()
 }
 
+/// v0.9 #106-audit-R2 P2-INT-1: detect SSE-S4 encrypted envelopes by
+/// magic prefix. Returns `Some(name)` when the first four bytes match
+/// one of the SSE frame magics (`S4E1`..`S4E6`); returns `None` for any
+/// other body, including S4 framed plaintext (`S4F2`) and raw
+/// compressed / passthrough bodies.
+///
+/// Intentionally duplicated here as a 4-byte prefix compare instead of
+/// reusing `sse::peek_magic` because `peek_magic` length-gates on the
+/// full S4E1/S4E2 header size (36 bytes) and would return `None` for a
+/// very short S4E6 stub the way an empty-key edge-case might land —
+/// the gate is for cryptographic frame validity, not for the
+/// "is encrypted at all" question this helper answers. The exact magic
+/// bytes are stable wire-format constants (see `sse::SSE_MAGIC_V{1..6}`)
+/// and are echoed here so the repair module has no circular dep on the
+/// SSE module's full surface.
+fn detect_sse_magic(body: &[u8]) -> Option<&'static str> {
+    if body.len() < 4 {
+        return None;
+    }
+    match &body[..4] {
+        b"S4E1" => Some("S4E1"),
+        b"S4E2" => Some("S4E2"),
+        b"S4E3" => Some("S4E3"),
+        b"S4E4" => Some("S4E4"),
+        b"S4E5" => Some("S4E5"),
+        b"S4E6" => Some("S4E6"),
+        _ => None,
+    }
+}
+
 enum GetOutcome {
     NotFound,
     Other(String),
@@ -1182,5 +1254,72 @@ mod tests {
         // Tied to s4-server `--max-body-bytes` default (5 GiB, #178). If
         // the default changes there, update both in lockstep.
         assert_eq!(DEFAULT_REPAIR_BODY_BYTES_CAP, 5 * 1024 * 1024 * 1024);
+    }
+
+    /// v0.9 #106-audit-R2 P2-INT-1: `detect_sse_magic` returns the
+    /// correct frame label for every S4Ex prefix, and `None` for the
+    /// plaintext frame magic (`S4F2`) and short / random inputs. The
+    /// helper is the discriminator the `EncryptedSidecarUnsupported`
+    /// branch in `repair_sidecar` relies on; pinning its outputs
+    /// guards against a silent regression that would resurrect the
+    /// confusing `FrameScan` failure on encrypted bodies.
+    #[test]
+    fn detect_sse_magic_covers_all_envelope_variants() {
+        assert_eq!(detect_sse_magic(b"S4E1\0\0\0\0"), Some("S4E1"));
+        assert_eq!(detect_sse_magic(b"S4E2\0\0\0\0"), Some("S4E2"));
+        assert_eq!(detect_sse_magic(b"S4E3\0\0\0\0"), Some("S4E3"));
+        assert_eq!(detect_sse_magic(b"S4E4\0\0\0\0"), Some("S4E4"));
+        assert_eq!(detect_sse_magic(b"S4E5\0\0\0\0"), Some("S4E5"));
+        assert_eq!(detect_sse_magic(b"S4E6\0\0\0\0"), Some("S4E6"));
+        // S4F2 = plaintext framed body; must NOT match (or repair
+        // would falsely reject every framed object as encrypted).
+        assert_eq!(detect_sse_magic(b"S4F2\0\0\0\0"), None);
+        // Random bytes, short inputs, and empty body all return None.
+        assert_eq!(detect_sse_magic(b"NOPE\0"), None);
+        assert_eq!(detect_sse_magic(b"S4"), None);
+        assert_eq!(detect_sse_magic(b""), None);
+    }
+
+    /// v0.9 #106-audit-R2 P2-INT-1: pin the Display text + struct shape
+    /// of the new variant so refactors can't silently drop the operator
+    /// guidance (server-mode rebuild / re-PUT) or rename the fields the
+    /// CLI's error formatter reads. Mirrors the existing
+    /// `overwritten_during_repair_error_shape` test pattern.
+    #[test]
+    fn repair_sidecar_rejects_encrypted_body_with_typed_error() {
+        let err = RepairError::EncryptedSidecarUnsupported {
+            bucket: "b".into(),
+            key: "k".into(),
+            message: "body magic S4E6 indicates SSE-S4 envelope".into(),
+        };
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("b/k"),
+            "Display must mention bucket/key — got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("S4E6"),
+            "Display must echo the body magic for operator triage — got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("encrypted-sidecar repair"),
+            "Display must name the failure mode — got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("re-PUT") || rendered.contains("server-mode"),
+            "Display must hint at the recovery path — got {rendered:?}"
+        );
+        match err {
+            RepairError::EncryptedSidecarUnsupported {
+                bucket,
+                key,
+                message,
+            } => {
+                assert_eq!(bucket, "b");
+                assert_eq!(key, "k");
+                assert!(message.contains("S4E6"));
+            }
+            _ => unreachable!("EncryptedSidecarUnsupported must match its own variant"),
+        }
     }
 }

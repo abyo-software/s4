@@ -70,6 +70,27 @@ fn build_aws_client(endpoint_url: &str) -> aws_sdk_s3::Client {
 }
 
 async fn spawn_s4_server(backend_endpoint: &str) -> (String, oneshot::Sender<()>) {
+    spawn_s4_server_inner(backend_endpoint, None).await
+}
+
+/// v0.9 #106-audit-R2 P2-INT-1: spawn an S4 gateway with SSE-S4 chunked
+/// PUTs enabled (S4E6 envelope), so the test can plant a real encrypted
+/// object on the backend and exercise the encrypted-body reject path in
+/// `repair_sidecar`. The chunk size is small enough (256 KiB) to produce
+/// multiple S4E6 chunks on a few-MiB body, mirroring the geometry the
+/// production gateway emits for v3 sidecars.
+async fn spawn_s4_server_with_sse_s4_chunked(
+    backend_endpoint: &str,
+) -> (String, oneshot::Sender<()>) {
+    let key = Arc::new(s4_server::sse::SseKey::from_bytes(&[0x9au8; 32]).expect("32-byte raw key"));
+    let keyring = Arc::new(s4_server::sse::SseKeyring::new(1, key));
+    spawn_s4_server_inner(backend_endpoint, Some((keyring, 256 * 1024))).await
+}
+
+async fn spawn_s4_server_inner(
+    backend_endpoint: &str,
+    sse: Option<(s4_server::sse::SharedSseKeyring, usize)>,
+) -> (String, oneshot::Sender<()>) {
     let backend_client = build_aws_client(backend_endpoint);
     let proxy = s3s_aws::Proxy::from(backend_client);
     let registry = Arc::new(
@@ -78,7 +99,10 @@ async fn spawn_s4_server(backend_endpoint: &str) -> (String, oneshot::Sender<()>
             .with(Arc::new(CpuZstd::default())),
     );
     let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::CpuZstd));
-    let s4 = S4Service::new(proxy, registry, dispatcher);
+    let mut s4 = S4Service::new(proxy, registry, dispatcher);
+    if let Some((keyring, chunk_size)) = sse {
+        s4 = s4.with_sse_keyring(keyring).with_sse_chunk_size(chunk_size);
+    }
 
     let mut svc = S3ServiceBuilder::new(s4);
     svc.set_auth(SimpleAuth::from_single(MINIO_USER, MINIO_PASS));
@@ -758,6 +782,150 @@ async fn repair_sidecar_detects_post_get_overwrite_race() {
              `repair::tests::overwritten_during_repair_error_shape`."
         );
     }
+
+    let _ = shutdown.send(());
+}
+
+/// v0.9 #106-audit-R2 P2-INT-1: when the on-disk body is an SSE-S4
+/// chunked envelope (S4E6), `repair_sidecar` must reject cleanly with
+/// `EncryptedSidecarUnsupported` instead of surfacing a confusing
+/// frame-scan failure. Any pre-existing sidecar must remain untouched
+/// so the operator can route the repair through a server-mode rebuild
+/// path without losing whatever binding the gateway already wrote.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn repair_sidecar_rejects_sse_s4_chunked_object_cleanly() {
+    use rand::RngCore;
+    let minio = start_minio().await;
+    let (s4_endpoint, shutdown) = spawn_s4_server_with_sse_s4_chunked(&minio.endpoint_url).await;
+    let backend = build_aws_client(&minio.endpoint_url);
+    let _ = backend.create_bucket().bucket("enc-repair").send().await;
+    let s4_client = build_aws_client(&s4_endpoint);
+
+    // PUT a multi-MiB incompressible body via the SSE-S4 chunked
+    // gateway so the on-disk envelope is S4E6. The test does NOT
+    // depend on a sidecar existing pre-call; the property under
+    // verification is "repair must NOT proceed against an encrypted
+    // body", regardless of whether a v3 sidecar was emitted on the
+    // PUT (the multi-frame gate `entries.len() > 1` is a separate
+    // codepath we don't need to exercise here).
+    let mut body_bytes = vec![0u8; 4 * 1024 * 1024];
+    rand::rngs::OsRng.fill_bytes(&mut body_bytes);
+    let body = Bytes::from(body_bytes);
+    s4_client
+        .put_object()
+        .bucket("enc-repair")
+        .key("enc.bin")
+        .body(body.clone().into())
+        .send()
+        .await
+        .expect("PUT SSE-S4 chunked object");
+
+    // The backend body must start with the S4E6 envelope magic —
+    // that's the precondition the repair-side detector reads.
+    let on_disk = backend
+        .get_object()
+        .bucket("enc-repair")
+        .key("enc.bin")
+        .send()
+        .await
+        .expect("backend GET")
+        .body
+        .collect()
+        .await
+        .expect("body")
+        .into_bytes();
+    assert_eq!(
+        &on_disk[..4],
+        b"S4E6",
+        "precondition: backend body must be S4E6 (chunked SSE-S4)"
+    );
+
+    // Snapshot whatever sidecar state currently exists so we can
+    // assert the failed repair did NOT mutate it. Pre-existing v3
+    // sidecar is the normal multi-frame case; an absent sidecar
+    // (single-frame body) is also valid — both must round-trip
+    // unchanged across the rejected repair.
+    let sidecar = sidecar_key("enc.bin");
+    let pre_sidecar_bytes: Option<bytes::Bytes> = match backend
+        .get_object()
+        .bucket("enc-repair")
+        .key(&sidecar)
+        .send()
+        .await
+    {
+        Ok(resp) => Some(
+            resp.body
+                .collect()
+                .await
+                .expect("sidecar body")
+                .into_bytes(),
+        ),
+        Err(_) => None, // single-frame body → no sidecar planted
+    };
+
+    // The actual fix: repair_sidecar must reject with the typed
+    // variant (NOT FrameScan / Backend / anything else).
+    let err = repair_sidecar(
+        &backend,
+        "enc-repair",
+        "enc.bin",
+        DEFAULT_REPAIR_BODY_BYTES_CAP,
+    )
+    .await
+    .expect_err("repair must reject an SSE-encrypted object");
+    match &err {
+        RepairError::EncryptedSidecarUnsupported {
+            bucket,
+            key,
+            message,
+        } => {
+            assert_eq!(bucket, "enc-repair");
+            assert_eq!(key, "enc.bin");
+            assert!(
+                message.contains("S4E6"),
+                "message must name the detected envelope magic, got {message:?}"
+            );
+        }
+        other => panic!(
+            "expected EncryptedSidecarUnsupported, got {other:?} \
+             (repair must NOT surface FrameScan / Backend on encrypted bodies)"
+        ),
+    }
+    // Pin the human-readable Display so the CLI keeps surfacing the
+    // operator guidance.
+    let rendered = format!("{err}");
+    assert!(
+        rendered.contains("SSE-S4 encrypted envelope"),
+        "Display must name the failure mode — got {rendered:?}"
+    );
+    assert!(
+        rendered.contains("server-mode") || rendered.contains("re-PUT"),
+        "Display must point at a recovery path — got {rendered:?}"
+    );
+
+    // Post-condition: whatever sidecar state existed before the
+    // failed repair is preserved byte-equal afterwards.
+    let post_sidecar_bytes: Option<bytes::Bytes> = match backend
+        .get_object()
+        .bucket("enc-repair")
+        .key(&sidecar)
+        .send()
+        .await
+    {
+        Ok(resp) => Some(
+            resp.body
+                .collect()
+                .await
+                .expect("sidecar body")
+                .into_bytes(),
+        ),
+        Err(_) => None,
+    };
+    assert_eq!(
+        post_sidecar_bytes, pre_sidecar_bytes,
+        "failed repair must NOT mutate the pre-existing sidecar state"
+    );
 
     let _ = shutdown.send(());
 }

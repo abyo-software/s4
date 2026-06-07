@@ -736,6 +736,24 @@ pub fn tee_into_hashers(inner: StreamingBlob, expected: ClientChecksums) -> Stre
     blob
 }
 
+/// v0.9 #106-audit-R2 P2-INT-2: compute the algorithms named by `which`
+/// over `body` in one shot, producing a [`ComputedDigests`] suitable
+/// for trailer comparison via [`ComputedDigests::compare_b64`]. This is
+/// the **buffered-path** counterpart of the streaming tee: the body is
+/// already in memory (e.g. GPU codec branch or non-streaming-framed
+/// PUT), so we don't need the chunk-by-chunk wrapper — a single
+/// in-place hash run suffices.
+///
+/// Lives in this module so the trailer-verify logic on both paths
+/// (streaming-framed and buffered) calls the same finaliser
+/// (`compare_b64`) and the test surface that covers it
+/// (`computed_digests_compare_b64_*`) keeps both paths honest.
+pub fn compute_digests(body: &[u8], which: WhichHashers) -> ComputedDigests {
+    let mut hashers = HasherSet::new(ClientChecksums::default(), which);
+    hashers.update(body);
+    hashers.finalize()
+}
+
 /// Walk an `io::Error` source chain looking for a
 /// [`StreamingChecksumError`]. Returns the algorithm name when found.
 /// Used by the PUT handler to decide whether a `CodecError::Io` was

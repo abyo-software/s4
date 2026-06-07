@@ -3869,6 +3869,108 @@ mod streaming_checksum_e2e {
             err.code().as_str()
         );
     }
+
+    /// v0.9 #106-audit-R2 P2-INT-2: buffered branch must verify
+    /// SigV4-streaming trailer checksums the same way the streaming-
+    /// framed branch does. Pre-fix the buffered branch silently
+    /// dropped `x-amz-trailer`-announced trailers, so a client could
+    /// declare `x-amz-trailer: x-amz-checksum-crc32c` and never deliver
+    /// the trailer value to bypass verification. The fix routes the
+    /// buffered branch through the shared `verify_client_trailer_checksums`
+    /// helper, which fails closed when the trailers handle is absent.
+    ///
+    /// Force the buffered path by using a passthrough dispatcher
+    /// (passthrough bypasses streaming-framed per service.rs's
+    /// `use_framed = supports_streaming_compress(kind) && kind !=
+    /// CodecKind::Passthrough` gate).
+    #[tokio::test]
+    async fn buffered_path_trailer_checksum_announced_without_handle_rejected() {
+        let backend = MemoryBackend::new();
+        let s4 = S4Service::new(
+            backend,
+            make_registry(CodecKind::Passthrough),
+            make_dispatcher(CodecKind::Passthrough),
+        );
+        let body = Bytes::from(vec![b'p'; 16 * 1024]);
+        let len = body.len() as i64;
+        let input = PutObjectInput {
+            bucket: "bk".into(),
+            key: "buffered-trailer".into(),
+            body: Some(s4_server::blob::bytes_to_blob(body)),
+            content_length: Some(len),
+            ..Default::default()
+        };
+        // Announce a checksum trailer but omit `trailing_headers` —
+        // mirrors the wire shape `aws-sdk` would produce if it sent
+        // `x-amz-trailer: x-amz-checksum-crc32c` and then never
+        // emitted the trailer block.
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-amz-trailer", "x-amz-checksum-crc32c".parse().unwrap());
+        let req = S3Request {
+            input,
+            method: http::Method::PUT,
+            uri: "/bk/buffered-trailer".parse().unwrap(),
+            headers,
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let err = s4
+            .put_object(req)
+            .await
+            .expect_err("buffered path must reject announced-but-undeliverable trailer");
+        assert_eq!(
+            err.code().as_str(),
+            "BadDigest",
+            "announced trailer + no trailer block must surface BadDigest on buffered path \
+             (pre-fix this was a silent skip), got {}",
+            err.code().as_str()
+        );
+    }
+
+    /// Companion fence: an `x-amz-trailer` announcing ONLY a non-
+    /// checksum trailer (e.g. the `x-amz-trailer-signature` aws-sdk
+    /// emits for SigV4 streaming) must NOT trigger BadDigest on the
+    /// buffered path — the filter discards non-checksum names before
+    /// the fail-closed branch runs. Without this guard the fix would
+    /// over-reject every SigV4-streaming PUT through a passthrough /
+    /// GPU codec.
+    #[tokio::test]
+    async fn buffered_path_trailer_only_signature_does_not_reject() {
+        let backend = MemoryBackend::new();
+        let s4 = S4Service::new(
+            backend,
+            make_registry(CodecKind::Passthrough),
+            make_dispatcher(CodecKind::Passthrough),
+        );
+        let body = Bytes::from(vec![b'q'; 8 * 1024]);
+        let len = body.len() as i64;
+        let input = PutObjectInput {
+            bucket: "bk".into(),
+            key: "buffered-sig-only".into(),
+            body: Some(s4_server::blob::bytes_to_blob(body)),
+            content_length: Some(len),
+            ..Default::default()
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-amz-trailer", "x-amz-trailer-signature".parse().unwrap());
+        let req = S3Request {
+            input,
+            method: http::Method::PUT,
+            uri: "/bk/buffered-sig-only".parse().unwrap(),
+            headers,
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        s4.put_object(req)
+            .await
+            .expect("non-checksum trailer announce must NOT fail the buffered PUT");
+    }
 }
 
 // ===========================================================================
