@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780832198253,
+  "lastUpdate": 1780840115638,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -1806,6 +1806,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "b0523192e4e7f3e53b52907f9523cb83e9032165",
+          "message": "feat(v0.10): #A1 + #B1 + #A2-doc — encryption-aware sidecar completion + Docker publish + AEAD constraint docs\n\nThree parallel agents landed the v0.10 wave-1 themes in one\nbatch (file scope was strictly partitioned so the work composes\ncleanly):\n\n**A1 — SSE-S4 keyring CLI plumbing for `repair-sidecar`**\n  New `--sse-s4-key <PATH>` + `--sse-s4-key-rotated id=N,key=PATH`\n  flags on `s4 repair-sidecar` (matches the server-mode shape).\n  New lib entry point `s4_server::repair::repair_sidecar_with_keyring`;\n  existing `repair_sidecar` preserved as a None-keyring shim. When\n  the backend body is an S4E6 envelope AND a keyring is supplied,\n  the repair path decrypts in-process via `decrypt_chunked_buffered`,\n  frame-scans the recovered plaintext, and stamps a v3 sidecar so\n  subsequent Range GETs hit the encryption-aware partial-fetch fast\n  path. New `RepairError::SseDecryptFailed` for keyring mismatches;\n  refreshed `EncryptedSidecarUnsupported` message. Hardened against\n  attacker-controlled S4E6 header inflation via\n  `SSE_S4_REPAIR_MAX_OVERHEAD_BYTES` + `SSE_S4_REPAIR_MAX_CHUNK_SLACK_BYTES`\n  caps. 3 new E2E + 4 new unit tests. 14/14 MinIO E2E pass.\n\n**B1 — ghcr.io container image publishing**\n  New `.github/workflows/docker.yml` builds + pushes\n  `ghcr.io/abyo-software/s4:<version>` (CPU, multi-arch\n  amd64+arm64) and `ghcr.io/abyo-software/s4:<version>-gpu`\n  (nvCOMP GPU, amd64) on every `v*.*.*` tag push, plus\n  workflow_dispatch for back-filling pre-workflow tags. SLSA\n  provenance (mode=max) + SPDX SBOM + OCI labels. GHA Buildx\n  cache. GITHUB_TOKEN auth, no PAT. Public ghcr package (no\n  pull secrets). Mutable tags (`latest`, `<major>.<minor>`)\n  push-only AND non-prerelease-only so back-fills / RC pushes\n  can't move stable refs backward. Dockerfile gains `wget` for\n  HEALTHCHECK. Helm chart bumps to 0.2.0 / appVersion 0.9.0,\n  default `image.repository` flipped from the never-published\n  `docker.io/abyosoftware/s4` to `ghcr.io/abyo-software/s4`.\n  README §\"Kubernetes (Helm)\" rewritten with ghcr install\n  example. docker-compose.{,gpu}.yml gain `image:` alongside\n  `build:`.\n\n**A2-doc — SSE partial-fetch AEAD constraint clarification**\n  New `docs/security/sse-partial-fetch-constraint.md` (252\n  lines) walks the AEAD authenticated-encryption contract (NIST\n  SP 800-38D §7.2 quoted), per-mode wire layout, why S4E6\n  alone escapes the constraint (per-chunk nonce+tag), provisional\n  S4E7/S4E8 roadmap candidates for chunked KMS/SSE-C, and a\n  4-condition operator checklist. threat-model.md §2 row +\n  §3 #3 rewritten in AEAD framing — \"deferred plumbing\"\n  wording removed; now explicit that S4E2/E3/E4 can't partial-\n  decrypt by algorithm contract, not implementation gap. README\n  §\"Server-side encryption — Range GET fast-path matrix\" new\n  subsection with the 5-row support matrix + operator guidance.\n\nCoordination: CHANGELOG `[Unreleased]` was pre-partitioned into\n`### Added` / `### Documentation` / `### Fixed` so each agent\nappended to its own subsection — zero merge conflicts.\n\nAudit posture: each agent ran its own Codex review loop to clean.\nA1 = 5 rounds (4 P2 fixed + 1 clean), B1 = 4 rounds (5 P2 fixed +\n1 clean), A2-doc = 1 round clean. Integrated audit pending; will\nrun after this lands.\n\nCoverage: 14 MinIO E2E pass on the sidecar suite (3 new A1 tests\n+ 11 existing). Lib unit tests in repair module now 21 (was 17,\n+4 A1 unit). workspace tests 0 failed. fmt + clippy clean.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-07T22:40:42+09:00",
+          "tree_id": "e8e0f6b2e7fbad4997190410465353f79374901a",
+          "url": "https://github.com/abyo-software/s4/commit/b0523192e4e7f3e53b52907f9523cb83e9032165"
+        },
+        "date": 1780840114430,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 58546,
+            "range": "± 4705",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 55821,
+            "range": "± 3552",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 371,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2697476,
+            "range": "± 160326",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 41860204,
+            "range": "± 569436",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192828,
+            "range": "± 421",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 51931240,
+            "range": "± 769957",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 754904536,
+            "range": "± 4281833",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3070032,
+            "range": "± 5194",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 32345,
+            "range": "± 3101",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 38879,
+            "range": "± 3167",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 377,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 573517,
+            "range": "± 22686",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1560794,
+            "range": "± 29692",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192576,
+            "range": "± 432",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 13929175,
+            "range": "± 99288",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27048318,
+            "range": "± 177034",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3083223,
+            "range": "± 9564",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1600662,
+            "range": "± 20834",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2659624,
+            "range": "± 24574",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 351140044,
+            "range": "± 6806882",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 140,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 6812,
+            "range": "± 141",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 816,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13120,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2915,
+            "range": "± 89",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 20811,
+            "range": "± 672",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 83534,
+            "range": "± 3022",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 622,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4491,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 17961,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
             "range": "± 0",
             "unit": "ns/iter"
           }
