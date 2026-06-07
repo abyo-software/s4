@@ -219,6 +219,34 @@ target/release/s4 --endpoint-url https://s3.us-east-1.amazonaws.com \
     --host 0.0.0.0 --port 8014 --codec cpu-zstd --log-format json
 ```
 
+### Supported targets
+
+| Crate                          | 64-bit Linux (`x86_64` / `aarch64`) | 32-bit Linux (`i686`) | Browser (`wasm32-unknown-unknown`) |
+|--------------------------------|:-----------------------------------:|:---------------------:|:----------------------------------:|
+| `s4-codec` (library)           | ✅ tier 1                           | ✅ compiles + tests   | ✅ via `s4-codec-wasm`             |
+| `s4-codec-wasm` (browser)      | n/a                                 | n/a                   | ✅ tier 1                          |
+| `s4-config`                    | ✅ tier 1                           | ✅                    | ✅                                 |
+| `s4-server` (gateway binary)   | ✅ tier 1                           | ⚠️ compiles, untested at runtime | ❌ not applicable           |
+| `nvcomp-gpu` feature (any crate above) | ✅ x86_64 only (NVIDIA driver) | ❌ (no 32-bit nvCOMP) | ❌                            |
+
+Runtime-tested platform is **`x86_64-unknown-linux-gnu`** and
+**`aarch64-unknown-linux-gnu`** (CI matrix). The 32-bit `i686-unknown-linux-gnu`
+target builds clean for `s4-codec` / `s4-config` / `s4-server` as of
+v0.9 #106 (default-bytes constants are now `target_pointer_width` cfg-gated
+so the 5 GiB AWS S3 single-PUT ceiling no longer const-overflows `usize` on
+32-bit), and the `s4-codec` test suite passes on `i686`. The `s4-server`
+binary itself is not exercised end-to-end on 32-bit; operators running it on
+that target are on their own re: cap tuning (`--max-body-bytes`
+auto-clamps to `isize::MAX as usize` ≈ 2 GiB on 32-bit — Rust caps any
+single `Vec` / `Bytes` allocation at `isize::MAX`, so a higher gateway
+guard would let oversized requests panic inside the SSE buffered-decrypt
+pre-alloc path).
+
+The `wasm32-unknown-unknown` target is the public release channel for the
+browser decoder (`s4-codec-wasm`); the criterion regression-tracking suite
+and `cargo check --target wasm32-unknown-unknown` keep it green on every CI
+push to `main`.
+
 ## How it Compares
 
 | Feature | S4 | [MinIO](https://github.com/minio/minio) | [Garage](https://git.deuxfleurs.fr/Deuxfleurs/garage) | Wasabi / B2 | AWS S3 |

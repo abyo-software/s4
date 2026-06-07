@@ -465,6 +465,15 @@ mod manifest_validate_tests {
         }
     }
 
+    /// 64-bit only: `MAX_DECOMPRESSED_BYTES` = 5 GiB > `usize::MAX` on
+    /// 32-bit targets, so the ceiling itself isn't representable as
+    /// `usize` there — the `validate_decompress_manifest` `usize::try_from`
+    /// arm correctly rejects with `ManifestSizeExceedsLimit { limit:
+    /// u32::MAX }`. That rejection is exercised by the dedicated
+    /// `decompress_rejects_u64_to_usize_overflow_on_32bit_targets` test
+    /// below. On 64-bit the ceiling does narrow to `usize`, so the
+    /// "well-formed at the ceiling" sanity belongs here (v0.9 #106).
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn decompress_validates_well_formed_manifest() {
         // Sanity: a manifest whose original_size is at the ceiling

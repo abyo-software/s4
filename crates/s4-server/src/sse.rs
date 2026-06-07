@@ -353,7 +353,25 @@ pub enum SseError {
 /// PUT ceiling — anything larger is unreachable on the AWS-compatible
 /// API surface and is therefore safe to reject pre-alloc as a malformed
 /// / malicious header (v0.8.2 #64).
+///
+/// v0.9 #106 (32-bit target support): split on `target_pointer_width` so
+/// the `usize` const doesn't const-overflow when someone runs
+/// `cargo check --target i686-unknown-linux-gnu` (or similar 32-bit
+/// target). On 32-bit the cap collapses to `isize::MAX as usize`
+/// (≈ 2 GiB on 32-bit), which is the largest allocation any Rust
+/// `Vec` / `Bytes` buffer can hold: the language ABI caps single-
+/// allocation byte counts at `isize::MAX` (not `usize::MAX`), so
+/// `usize::MAX` would let the guard accept sizes that subsequently
+/// panic inside `Vec::with_capacity`. Codex review (v0.9 #106 P2)
+/// caught this on the initial cut. s4-server itself is still 64-bit-
+/// only at runtime (README §"Supported targets"), but a clean
+/// compile + an *allocatable* upper bound lets s4-codec downstream
+/// consumers cross-check the workspace without risking an OOM in
+/// the SSE buffered-decrypt pre-alloc path.
+#[cfg(target_pointer_width = "64")]
 pub const DEFAULT_MAX_BODY_BYTES: usize = 5 * 1024 * 1024 * 1024;
+#[cfg(target_pointer_width = "32")]
+pub const DEFAULT_MAX_BODY_BYTES: usize = isize::MAX as usize;
 
 /// 32-byte symmetric key. `bytes` is `pub` so call sites can construct
 /// keys directly from already-validated bytes (e.g. KMS-decrypted DEKs)
@@ -2208,6 +2226,35 @@ fn encrypt_v2_chunked_s4e5_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.9 #106: pin the cfg-gate on `DEFAULT_MAX_BODY_BYTES` so a future
+    /// refactor can't silently drop the 32-bit arm (the literal
+    /// `5 * 1024 * 1024 * 1024` const-overflows `usize` on a 32-bit target
+    /// and breaks `cargo check --target i686-unknown-linux-gnu`). The
+    /// 64-bit arm asserts the AWS 5 GiB ceiling; the 32-bit arm asserts
+    /// `isize::MAX as usize` (≈ 2 GiB on 32-bit), which is the largest
+    /// allocation any Rust buffer can hold — Codex P2 caught that the
+    /// initial cut used `usize::MAX`, which would have let the gateway
+    /// guard accept sizes that subsequently panic inside
+    /// `Vec::with_capacity`.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn default_max_body_bytes_is_aws_5gib_on_64bit() {
+        assert_eq!(DEFAULT_MAX_BODY_BYTES, 5 * 1024 * 1024 * 1024);
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn default_max_body_bytes_clamps_to_isize_max_on_32bit() {
+        // Rust caps any single allocation (Vec, Bytes, Box<[u8]>, etc.)
+        // at `isize::MAX` bytes (not `usize::MAX`); pre-allocation guards
+        // must respect the same ceiling or they'll let oversized inputs
+        // OOM-panic downstream. Pin the choice here.
+        assert_eq!(DEFAULT_MAX_BODY_BYTES, isize::MAX as usize);
+        // sanity: 32-bit cap ≈ 2 GiB, well under the AWS 5 GiB single-PUT
+        // ceiling, so the runtime cap stays valid (just lower).
+        assert!((DEFAULT_MAX_BODY_BYTES as u64) < 5 * 1024 * 1024 * 1024);
+    }
 
     fn key32(seed: u8) -> Arc<SseKey> {
         Arc::new(SseKey::from_bytes(&[seed; 32]).unwrap())

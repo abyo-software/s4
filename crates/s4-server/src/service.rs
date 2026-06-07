@@ -569,8 +569,21 @@ enum ReservedKeyMode {
 }
 
 impl<B: S3> S4Service<B> {
-    /// AWS S3 単発 PUT の API 上限 (5 GiB)
+    /// AWS S3 単発 PUT の API 上限 (5 GiB)。
+    ///
+    /// v0.9 #106 (32-bit target support): `target_pointer_width` で gating して
+    /// 32-bit target の const-overflow を回避。 32-bit では `isize::MAX as usize`
+    /// (≈ 2 GiB on 32-bit) に collapse ── Rust 言語仕様で `Vec` / `Bytes`
+    /// 1 回の allocation は `isize::MAX` byte が上限 (`usize::MAX` ではない) で、
+    /// `usize::MAX` を cap にすると oversized-body guard を通過した後で
+    /// `Vec::with_capacity` 側が panic することがある (Codex review P2 で発覚)。
+    /// s4-server runtime は 64-bit only (README §"Supported targets") だが、
+    /// workspace-wide `cargo check --target wasm32-*` 等で blocking しない + 32-bit
+    /// build で SSE buffered-decrypt が OOM panic しないためのガード。
+    #[cfg(target_pointer_width = "64")]
     pub const DEFAULT_MAX_BODY_BYTES: usize = 5 * 1024 * 1024 * 1024;
+    #[cfg(target_pointer_width = "32")]
+    pub const DEFAULT_MAX_BODY_BYTES: usize = isize::MAX as usize;
 
     /// v0.8.5 #86 (audit M-2): default cap on simultaneously-in-flight
     /// replication dispatcher tasks. See the `replication_semaphore`

@@ -11,6 +11,69 @@ v0.9 roadmap in progress.
 
 ### Added
 
+- **#106 32-bit target support** — `s4-codec` / `s4-config` /
+  `s4-server` now cross-compile cleanly to
+  `i686-unknown-linux-gnu` (32-bit x86 Linux) in addition to the
+  existing tier-1 64-bit targets and `wasm32-unknown-unknown`
+  (the browser decoder's native target, also 32-bit).
+
+  The blocker was the `usize` 5 GiB AWS-S3-single-PUT ceiling
+  baked into `DEFAULT_MAX_BODY_BYTES` (`crates/s4-server/src/sse.rs`
+  and `crates/s4-server/src/service.rs`) and the corresponding
+  `--max-body-bytes` clap default in `crates/s4-server/src/main.rs`:
+  the literal `5 * 1024 * 1024 * 1024` const-overflows `usize` on
+  any 32-bit target (`u32::MAX` ≈ 4 GiB < 5 GiB). v0.8.20 R5-8
+  attempted to fix this with `(5_u64 * 1024 * 1024 * 1024) as
+  usize` and was reverted in v0.8.21 #194 because the cast silently
+  truncates to 1 GiB on 32-bit (`0x1_4000_0000 & 0xFFFF_FFFF =
+  0x4000_0000`).
+
+  The v0.9 fix splits both constants on
+  `target_pointer_width`: 64-bit keeps the bare 5 GiB literal,
+  32-bit clamps to `isize::MAX as usize` (≈ 2 GiB on 32-bit —
+  Rust caps single-allocation byte counts at `isize::MAX`, not
+  `usize::MAX`, so the gateway guard has to match or oversized
+  inputs will pass the guard and then OOM-panic inside
+  `Vec::with_capacity`). The clap `default_value_t` now references
+  the cfg-gated constant so the CLI flag inherits the same
+  arm. Two new `target_pointer_width`-gated regression tests pin
+  the 64-bit (= 5 GiB) and 32-bit (= `isize::MAX`) values so a
+  future refactor can't quietly drop either arm.
+
+  Codex review caught a P2 on the initial cut: the 32-bit arm
+  originally used `usize::MAX` (≈ 4 GiB), which would have let
+  the SSE buffered-decrypt pre-alloc accept sizes that subsequently
+  panic inside `Vec::with_capacity` (the Rust ABI caps any single
+  allocation at `isize::MAX` bytes, not `usize::MAX`). Closed by
+  switching all three arm definitions + the regression test +
+  README §"Supported targets" to `isize::MAX as usize` in round 2.
+
+  The sidecar repair CLI flags (`verify-sidecar
+  --max-body-bytes` / `repair-sidecar --max-body-bytes`, added in
+  #106's earlier landing) are typed `u64` and already platform-
+  independent; they now reference a shared `DEFAULT_REPAIR_BODY_BYTES_CLI`
+  constant for discoverability symmetry with the server flag.
+
+  `s4-codec` itself never carried the `usize` cap (it uses
+  `MAX_DECOMPRESSED_BYTES: u64` and `usize::try_from`-narrows at
+  alloc sites — the v0.8.15 H-b / H-c / v0.8.16 F-3 sweeps closed
+  the cast hazards in `multipart::read_frame` / `index::decode_index`
+  / `build_index_from_body`), so this change is purely a const-
+  expression fix at the server level; the codec already passes
+  its full test suite on `i686-unknown-linux-gnu` and on
+  `wasm32-unknown-unknown`.
+
+  Runtime support for `i686` `s4-server` is **not** claimed (the
+  binary isn't smoked end-to-end on 32-bit; the AWS SDK / rustls /
+  tokio dep stack hasn't been audited there). What is claimed is
+  that the workspace `cargo check --target` no longer trips on
+  the const literals, which unblocks downstream crates that
+  depend on `s4-codec` and want to verify their own 32-bit
+  builds against the workspace.
+
+  README §"Supported targets" documents the per-crate / per-target
+  matrix.
+
 - **#106 sidecar repair / verify / sweep CLI** — three new
   subcommands on the `s4` binary cover the orphan-sidecar /
   stale-sidecar / missing-sidecar operator stories that were

@@ -27,6 +27,29 @@ use s4_server::routing::{HealthRouter, ReadyCheck};
 use tokio::net::TcpListener;
 use tracing::info;
 
+/// v0.9 #106 (32-bit target support): mirror the
+/// `S4Service::DEFAULT_MAX_BODY_BYTES` cfg-gate at the CLI's
+/// `default_value_t` site. Can't `S4Service::<_>::DEFAULT_MAX_BODY_BYTES`
+/// directly because clap's `default_value_t` needs a non-generic
+/// constexpr. The 32-bit arm clamps to `isize::MAX as usize` (≈ 2 GiB
+/// on 32-bit), not `usize::MAX` — Rust caps single-allocation byte
+/// counts at `isize::MAX`, so a cap above that would let oversized
+/// requests pass the gateway guard and then OOM panic inside
+/// downstream `Vec::with_capacity`. See `service.rs` for the full
+/// rationale on the `target_pointer_width` split + the Codex P2
+/// finding that drove the `isize::MAX` choice.
+#[cfg(target_pointer_width = "64")]
+const DEFAULT_MAX_BODY_BYTES_CLI: usize = 5 * 1024 * 1024 * 1024;
+#[cfg(target_pointer_width = "32")]
+const DEFAULT_MAX_BODY_BYTES_CLI: usize = isize::MAX as usize;
+
+/// v0.9 #106 companion: u64-typed default for the sidecar repair
+/// CLI flags (`verify-sidecar` / `repair-sidecar --max-body-bytes`).
+/// Distinct constant because the surrounding `default_value_t = ...`
+/// site needs a `u64` literal; the 5 GiB value is the same on either
+/// pointer width because `u64` always represents it.
+const DEFAULT_REPAIR_BODY_BYTES_CLI: u64 = 5 * 1024 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CodecChoice {
     /// 無圧縮 (開発・比較用)
@@ -292,15 +315,18 @@ struct Opt {
     /// library-builder-only knob before v0.8.19 — operators
     /// running `s4-server` from the CLI had to recompile to change
     /// it. This flag fixes that.
-    // v0.8.21 R6-1: keep the 5 GiB literal as-is. On a 32-bit
-    // target this is a loud compile-time const-overflow error,
-    // which is the **correct** failure mode — silently truncating
-    // (the v0.8.20 R5-8 attempt) substituted a 1 GiB default
-    // without telling the operator. s4-server only ships 64-bit
-    // Linux per README §Supported targets; a future 32-bit port
-    // needs to think about this cap explicitly rather than rely
-    // on a cast.
-    #[clap(long, default_value_t = 5 * 1024 * 1024 * 1024)]
+    // v0.8.21 R6-1 → v0.9 #106: route the default through the
+    // `cfg(target_pointer_width)`-gated `S4Service::DEFAULT_MAX_BODY_BYTES`
+    // (declared in `service.rs`). On 64-bit the value is the bare
+    // 5 GiB AWS S3 single-PUT ceiling; on 32-bit it collapses to
+    // `usize::MAX` (≈ 4 GiB) so `cargo check` against a 32-bit
+    // target doesn't const-overflow at this `default_value_t`. The
+    // v0.8.20 R5-8 attempted `(5_u64 * 1024 * 1024 * 1024) as usize`
+    // was rejected (silent 1 GiB truncation on 32-bit); the cfg
+    // gate is the explicit / loud alternative. s4-server runtime
+    // is still 64-bit-only per README §"Supported targets"; this
+    // change only unblocks compile-time checks.
+    #[clap(long, default_value_t = DEFAULT_MAX_BODY_BYTES_CLI)]
     max_body_bytes: usize,
 
     /// Optional S3-style access-log destination directory. When set,
@@ -730,7 +756,7 @@ struct SidecarTargetArgs {
     /// from a real "MissingDivergent" (P2-C). Default 5 GiB matches
     /// `repair-sidecar --max-body-bytes`; objects above the cap
     /// surface as `MissingUnknown` rather than false-alerting.
-    #[clap(long, value_name = "BYTES", default_value_t = 5 * 1024 * 1024 * 1024)]
+    #[clap(long, value_name = "BYTES", default_value_t = DEFAULT_REPAIR_BODY_BYTES_CLI)]
     max_body_bytes: u64,
 }
 
@@ -744,7 +770,7 @@ struct RepairSidecarArgs {
     /// single-pass frame scan. Default 5 GiB matches the server's
     /// `--max-body-bytes`. Raise this when repairing larger objects
     /// (and make sure you actually have the RAM).
-    #[clap(long, value_name = "BYTES", default_value_t = 5 * 1024 * 1024 * 1024)]
+    #[clap(long, value_name = "BYTES", default_value_t = DEFAULT_REPAIR_BODY_BYTES_CLI)]
     max_body_bytes: u64,
 }
 
