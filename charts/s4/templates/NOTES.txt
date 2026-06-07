@@ -32,8 +32,10 @@ NOTE: backend.region is empty. The AWS SDK in the pod will fall back to
 
 {{- if eq .Values.image.repository "docker.io/abyosoftware/s4" }}
 
-NOTE: The official Docker Hub image (docker.io/abyosoftware/s4) is NOT yet
-      published as of chart 0.1.0. Build it locally and load it into your
-      cluster (kind / minikube / k3d), or push to your own registry and
-      override --set image.repository=...
+NOTE: image.repository is still set to the legacy `docker.io/abyosoftware/s4`
+      value which was never published. The official image is now
+      `ghcr.io/abyo-software/s4` — either remove your `--set image.repository=`
+      override to use the chart default, or set it explicitly:
+
+        --set image.repository=ghcr.io/abyo-software/s4
 {{- end }}

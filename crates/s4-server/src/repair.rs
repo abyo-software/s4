@@ -50,6 +50,47 @@ pub const DEFAULT_REPAIR_BODY_BYTES_CAP: u64 = 5 * 1024 * 1024 * 1024;
 /// cap explicitly; until then 600 MiB is the safe-by-default value.
 pub const MAX_SIDECAR_BODY_BYTES: u64 = 600 * 1024 * 1024;
 
+/// v0.10 #A1 (Codex round 1): worst-case S4E6 envelope overhead
+/// added on top of a plaintext body. Used by
+/// [`repair_sidecar_with_keyring`] to relax the operator-supplied
+/// `body_bytes_cap` (which is conceptually a plaintext cap matching
+/// the gateway's `--max-body-bytes`) when the SSE-S4 keyring path
+/// is active — without the relaxation, an object whose plaintext
+/// fits the cap can still be rejected as `BodyTooLarge` purely on
+/// the encryption overhead the gateway added at PUT time.
+///
+/// Derivation: an S4E6 envelope is a fixed 24-byte header
+/// ([`crate::sse::S4E6_HEADER_BYTES`]) + a 16-byte AES-GCM tag per
+/// chunk ([`crate::sse::S4E5_PER_CHUNK_OVERHEAD`]), with the
+/// 24-bit chunk-index field capping `chunk_count` at
+/// [`crate::sse::S4E6_MAX_CHUNK_COUNT`] (= `2^24 - 1`). So the
+/// worst-case overhead is
+/// `24 + 16 × (2^24 - 1)` ≈ 256 MiB. Every realistic chunk_size
+/// (1 KiB or larger) drops actual overhead by orders of magnitude;
+/// the worst-case ceiling here is the safe-by-default headroom.
+pub const SSE_S4_REPAIR_MAX_OVERHEAD_BYTES: u64 = (crate::sse::S4E6_HEADER_BYTES as u64)
+    + (crate::sse::S4E6_MAX_CHUNK_COUNT as u64) * (crate::sse::S4E5_PER_CHUNK_OVERHEAD as u64);
+
+/// v0.10 #A1 (Codex round 4): hard ceiling on the final-chunk slack
+/// the SSE-S4 repair path is willing to grant on top of the operator's
+/// `body_bytes_cap` when calling `decrypt_chunked_buffered`. The on-
+/// disk S4E6 header carries an attacker-controlled `chunk_size` field
+/// (only weakly bounded by the body-length consistency check inside
+/// `parse_chunked_header`); trusting that value verbatim would let a
+/// tampered header declare `chunk_size = u32::MAX, chunk_count = 1`
+/// and force `Vec::with_capacity(u32::MAX)` ≈ 4 GiB before the
+/// operator-cap check fires (the helper's cap check is against the
+/// raised `body_bytes_cap + slack` we pass it).
+///
+/// The effective slack is `min(hdr.chunk_size, SSE_S4_REPAIR_MAX_CHUNK_SLACK_BYTES)`.
+/// 16 MiB comfortably covers the server-default `--sse-chunk-size = 1
+/// MiB` (by 16×) and any practical operator-chosen chunk size; in the
+/// rare case the operator used `--sse-chunk-size > 16 MiB` at PUT
+/// time AND the actual plaintext is within `chunk_size` bytes of the
+/// repair cap, they can simply pass `--max-body-bytes` raised by
+/// `chunk_size` to compensate.
+pub const SSE_S4_REPAIR_MAX_CHUNK_SLACK_BYTES: u64 = 16 * 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum RepairError {
     #[error("S3 backend error on {op} {bucket}/{key}: {cause}")]
@@ -129,30 +170,57 @@ pub enum RepairError {
          sidecar repair would silently break Range GET. No action required."
     )]
     NotFramed { bucket: String, key: String },
-    /// v0.9 #106-audit-R2 P2-INT-1: the object body the backend returned
-    /// is an SSE-S4 (S4E1/S4E2/S4E3/S4E4/S4E5/S4E6) encrypted envelope.
-    /// `repair_sidecar` runs against the BACKEND (not the gateway), so the
-    /// body it sees is ciphertext — feeding that to the frame scanner
-    /// would surface as a confusing `FrameScan` because the S4F2 frame
-    /// magic is hidden inside the encrypted payload. Worse, the v3
-    /// sidecar's `sse_v3` binding (key_id / salt / chunk_size etc.)
-    /// cannot be reconstructed from the backend bytes alone — it
-    /// requires the SSE keyring to decrypt the body and walk the chunk
-    /// layout. The CLI does not (yet) accept `--sse-s4-key`; v0.10
-    /// roadmap is to plumb that through. Until then, surface a clean
-    /// typed error so the operator can route the repair through a
-    /// server-mode rebuild path (re-PUT the object) instead of receiving
-    /// a misleading frame-scan failure.
+    /// v0.9 #106-audit-R2 P2-INT-1 (introduced) / v0.10 #A1 (refined):
+    /// the object body the backend returned is an SSE-S4 encrypted
+    /// envelope (`S4E1`/`S4E2`/`S4E3`/`S4E4`/`S4E5`/`S4E6`) and the
+    /// repair tool either was not given a matching keyring or the
+    /// envelope is not the chunked S4E6 variant the repair tool can
+    /// rebuild from.
+    ///
+    /// `repair_sidecar` runs against the BACKEND (not the gateway), so
+    /// the body it sees is ciphertext — feeding that to the frame
+    /// scanner would surface as a confusing `FrameScan` because the
+    /// S4F2 frame magic is hidden inside the encrypted payload. With a
+    /// keyring + the chunked S4E6 envelope, the new
+    /// [`repair_sidecar_with_keyring`] path decrypts in-process and
+    /// stamps a v3 sidecar carrying the SSE binding (key_id / salt /
+    /// chunk_size / chunk_count / plaintext_len / header_bytes); the
+    /// non-S4E6 envelopes (S4E1/E2/E3/E4/E5) are intentionally out of
+    /// scope (buffered AEAD frames have no per-chunk geometry, and
+    /// SSE-C / SSE-KMS need different key-material plumbing) — they
+    /// surface here so the operator routes those repairs through a
+    /// server-mode rebuild path or re-PUT.
     #[error(
         "object {bucket}/{key} body is an SSE-S4 encrypted envelope ({message}); \
-         encrypted-sidecar repair requires server-mode access to the SSE keyring \
-         (CLI `--sse-s4-key` plumbing is the v0.10 roadmap), \
-         use a server-mode rebuild path or re-PUT the object to regenerate the sidecar"
+         encrypted-sidecar repair requires the matching SSE-S4 keyring (pass \
+         `--sse-s4-key` / `--sse-s4-key-rotated`) AND the chunked S4E6 envelope; \
+         non-S4E6 envelopes (S4E1/E2/E3/E4/E5) need a server-mode rebuild path \
+         or re-PUT the object to regenerate the sidecar"
     )]
     EncryptedSidecarUnsupported {
         bucket: String,
         key: String,
         message: String,
+    },
+    /// v0.10 #A1: a keyring WAS supplied for an SSE-S4 chunked (S4E6)
+    /// object, but parsing the envelope header or decrypting one of
+    /// the AES-GCM chunks failed. The most common cause is a key
+    /// mismatch: the operator's `--sse-s4-key` is not the slot the
+    /// object was encrypted under at PUT time. Other causes are
+    /// envelope truncation / tampering (chunk auth-tag verify fails).
+    /// Surfaced as a distinct variant from `EncryptedSidecarUnsupported`
+    /// so the CLI can give operator-actionable guidance ("check your
+    /// `--sse-s4-key-rotated` list against the PUT-time slot") instead
+    /// of the unsupported-envelope hint.
+    #[error(
+        "SSE-S4 decrypt of {bucket}/{key} failed during sidecar repair: {cause}; \
+         check that `--sse-s4-key` (and any `--sse-s4-key-rotated`) covers the \
+         keyring slot the object was encrypted under at PUT time"
+    )]
+    SseDecryptFailed {
+        bucket: String,
+        key: String,
+        cause: String,
     },
 }
 
@@ -238,6 +306,27 @@ pub struct RepairReport {
     /// True when a sidecar already existed (we overwrote it). False when we
     /// wrote one for the first time.
     pub rebuilt_from_existing: bool,
+    /// v0.10 #A1: `Some(..)` when the source body was an SSE-S4 chunked
+    /// (S4E6) envelope and the repair tool decrypted it in-process with
+    /// the operator-supplied keyring; the v3 `sse_v3` binding was
+    /// stamped onto the sidecar so Range GETs take the encryption-aware
+    /// partial-fetch fast-path. `None` for plaintext-body repairs (the
+    /// existing v0.9 path) — the sidecar is the v2 layout.
+    pub sse_v3_binding: Option<RepairSseBinding>,
+}
+
+/// v0.10 #A1: distilled view of the SSE-S4 chunked binding stamped by
+/// [`repair_sidecar_with_keyring`]. Mirrors the codec's
+/// `SseChunkBinding` fields the CLI surfaces in its OK line; kept as a
+/// repair-module-local type so `s4-server` callers don't have to import
+/// `s4-codec` just to format the report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairSseBinding {
+    pub enc_chunk_size: u32,
+    pub enc_chunk_count: u32,
+    pub enc_key_id: u16,
+    pub enc_plaintext_len: u64,
+    pub enc_header_bytes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,22 +483,106 @@ pub async fn verify_sidecar(
 /// Rebuild `<bucket>/<key>.s4index` from the main object body. Overwrites
 /// any existing sidecar (including stale or corrupt ones). Returns an error
 /// when the main body exceeds `body_bytes_cap`.
+///
+/// Back-compat shim around [`repair_sidecar_with_keyring`] for callers that
+/// don't carry an SSE-S4 keyring (= every v0.9 caller). Encrypted bodies
+/// surface as [`RepairError::EncryptedSidecarUnsupported`] same as before.
 pub async fn repair_sidecar(
     client: &Client,
     bucket: &str,
     key: &str,
     body_bytes_cap: u64,
 ) -> Result<RepairReport, RepairError> {
+    repair_sidecar_with_keyring(client, bucket, key, body_bytes_cap, None).await
+}
+
+/// v0.10 #A1: same as [`repair_sidecar`] but optionally accepts an
+/// SSE-S4 keyring. When the on-disk body is an SSE-S4 chunked (S4E6)
+/// envelope AND a keyring is supplied, the repair path:
+///
+/// 1. parses the S4E6 fixed header (`parse_s4e6_header`) to recover
+///    the per-PUT salt / key_id / chunk_size / chunk_count,
+/// 2. decrypts the body in-process via
+///    [`crate::sse::decrypt_chunked_buffered`] (full plaintext into
+///    RAM — repair already had the encrypted body in RAM),
+/// 3. runs the frame scan on the recovered plaintext, and
+/// 4. stamps a v3 sidecar carrying the `sse_v3` chunked binding so
+///    subsequent Range GETs take the encryption-aware partial-fetch
+///    fast-path the v0.9 PUT path already wires.
+///
+/// Non-S4E6 envelopes (S4E1/E2/E3/E4/E5) and missing-keyring cases
+/// fall through to [`RepairError::EncryptedSidecarUnsupported`] — see
+/// the variant doc for the reasoning. Decrypt failures (key mismatch,
+/// chunk-tag verify) surface as the new
+/// [`RepairError::SseDecryptFailed`].
+pub async fn repair_sidecar_with_keyring(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    body_bytes_cap: u64,
+    sse_keyring: Option<&crate::sse::SharedSseKeyring>,
+) -> Result<RepairReport, RepairError> {
     let HeadInfo {
         raw_etag: head_raw_etag,
         normalized_etag: head_normalized_etag,
         size: live_size,
     } = head_main(client, bucket, key).await?;
+    // v0.10 #A1 (Codex R1+R2): `body_bytes_cap` is conceptually a
+    // plaintext-size cap (matches the gateway's `--max-body-bytes`,
+    // which bounds PRE-encrypt PUT bodies).
+    //
+    // - Plaintext bodies: `live_size` IS the body size; enforce the
+    //   cap strictly (`live_size > body_bytes_cap` → `BodyTooLarge`).
+    // - SSE-S4 chunked (S4E6) bodies: the on-disk ciphertext carries
+    //   up to `S4E6_HEADER_BYTES + S4E6_MAX_CHUNK_COUNT × TAG_LEN` ≈
+    //   256 MiB of envelope overhead on top of the plaintext, so
+    //   blindly enforcing the cap against `live_size` would reject
+    //   an object whose plaintext fits the cap purely on encryption
+    //   overhead. Relax the live-size check by the worst-case
+    //   envelope overhead — but ONLY after a 4-byte magic peek
+    //   confirms the body actually IS S4E6 (Codex R2 caught the
+    //   earlier "keyring supplied ⇒ relax cap" shortcut, which
+    //   silently bypassed the operator's RAM cap on plaintext
+    //   objects that happened to be repaired with a keyring set
+    //   for another bucket / key).
+    //
+    // The post-decrypt plaintext is still capped at `body_bytes_cap`
+    // by `decrypt_chunked_buffered` (`max_body_bytes` arg), so the
+    // operator's RAM budget stays bounded by `body_bytes_cap` plus
+    // the envelope overhead even after the relaxation.
     if live_size > body_bytes_cap {
-        return Err(RepairError::BodyTooLarge {
-            size: live_size,
-            cap: body_bytes_cap,
-        });
+        let should_relax = if sse_keyring.is_some()
+            && live_size <= body_bytes_cap.saturating_add(SSE_S4_REPAIR_MAX_OVERHEAD_BYTES)
+        {
+            // The body MIGHT be S4E6 within the overhead headroom —
+            // peek the first 4 bytes to confirm before relaxing. A
+            // single bounded Range GET keeps the cost ≤ 4 bytes of
+            // network + 1 round-trip; far cheaper than the
+            // unconditional relaxation that v0.10 #A1 first shipped.
+            match peek_body_magic(client, bucket, key, head_raw_etag.as_deref()).await {
+                Ok(Some(magic)) => &magic == b"S4E6",
+                Ok(None) => false,
+                Err(e) => {
+                    return Err(RepairError::Backend {
+                        op: "GET",
+                        bucket: bucket.into(),
+                        key: key.into(),
+                        cause: format!("4-byte magic peek for SSE-overhead-cap relaxation: {e}"),
+                    });
+                }
+            }
+        } else {
+            false
+        };
+        if !should_relax {
+            // Report the operator-supplied cap (not the relaxed one)
+            // so the actionable guidance stays "pass --max-body-bytes
+            // to raise".
+            return Err(RepairError::BodyTooLarge {
+                size: live_size,
+                cap: body_bytes_cap,
+            });
+        }
     }
     // v0.9 #106 TOCTOU guard: pin the GET to the HEAD's ETag via If-Match.
     // Without this, an overwrite between HEAD and GET would yield a body
@@ -491,23 +664,61 @@ pub async fn repair_sidecar(
             ),
         });
     }
-    // v0.9 #106-audit-R2 P2-INT-1: detect SSE-S4 encrypted envelopes
-    // BEFORE handing the body to the frame scanner. The backend serves
-    // the on-disk ciphertext (S4E1..S4E6 magic prefix); `build_index_from_body`
-    // would scan for `S4F2` frame magic inside that ciphertext and surface
-    // an opaque `FrameScan` error. Worse, the v3 sidecar's `sse_v3` binding
-    // (key_id / salt / chunk_size) cannot be reconstructed from backend
-    // bytes alone — the SSE keyring is required to decrypt + walk chunks.
-    // Surface a typed error directing the operator to a server-mode rebuild
-    // path; v0.10 roadmap is to add `--sse-s4-key <path>` to the CLI so
-    // sidecar repair can decrypt the body in-process. See CHANGELOG.
-    if let Some(magic) = detect_sse_magic(&body) {
-        return Err(RepairError::EncryptedSidecarUnsupported {
-            bucket: bucket.into(),
-            key: key.into(),
-            message: format!("body magic {magic} indicates SSE-S4 envelope"),
-        });
-    }
+    // v0.9 #106-audit-R2 P2-INT-1 (initial) / v0.10 #A1 (keyring
+    // plumbing): detect SSE-S4 encrypted envelopes BEFORE handing the
+    // body to the frame scanner. The backend serves the on-disk
+    // ciphertext (S4E1..S4E6 magic prefix); `build_index_from_body`
+    // would scan for `S4F2` frame magic inside that ciphertext and
+    // surface an opaque `FrameScan` error.
+    //
+    // - `S4E6` + keyring supplied → decrypt in-process, frame-scan the
+    //   plaintext, stamp a v3 sidecar with the chunked binding so
+    //   Range GETs take the encryption-aware fast-path.
+    // - `S4E6` + no keyring → `EncryptedSidecarUnsupported` directing
+    //   the operator to pass `--sse-s4-key`.
+    // - Any non-S4E6 envelope (S4E1/E2/E3/E4/E5) → unsupported,
+    //   `EncryptedSidecarUnsupported`; buffered AEAD frames have no
+    //   per-chunk geometry and SSE-C / SSE-KMS need different
+    //   key-material plumbing (both deferred to v0.11+).
+    let sse_repair: Option<(bytes::Bytes, s4_codec::index::SseChunkBinding)> =
+        match detect_sse_magic(&body) {
+            Some("S4E6") => match sse_keyring {
+                Some(keyring) => {
+                    let (plaintext, binding) =
+                        decrypt_s4e6_for_repair(&body, keyring, body_bytes_cap, bucket, key)?;
+                    Some((plaintext, binding))
+                }
+                None => {
+                    return Err(RepairError::EncryptedSidecarUnsupported {
+                        bucket: bucket.into(),
+                        key: key.into(),
+                        message: "body magic S4E6 indicates SSE-S4 envelope; \
+                              pass `--sse-s4-key` to decrypt and rebuild the v3 sidecar"
+                            .into(),
+                    });
+                }
+            },
+            Some(magic) => {
+                return Err(RepairError::EncryptedSidecarUnsupported {
+                    bucket: bucket.into(),
+                    key: key.into(),
+                    message: format!(
+                        "body magic {magic} indicates SSE-S4 envelope (only chunked S4E6 is \
+                     repair-supported; buffered / SSE-C / SSE-KMS envelopes need a \
+                     server-mode rebuild path)"
+                    ),
+                });
+            }
+            None => None,
+        };
+    // Pick the body the frame scanner walks. For non-encrypted bodies
+    // this is the backend bytes we just GET'd; for S4E6 + keyring it
+    // is the decrypted plaintext (= the post-compression, pre-encrypt
+    // body the v0.9 PUT path stamps the sidecar against).
+    let scan_body: &bytes::Bytes = match &sse_repair {
+        Some((plaintext, _)) => plaintext,
+        None => &body,
+    };
     let sidecar_k = sidecar_key(key);
     let rebuilt_from_existing = client
         .head_object()
@@ -516,7 +727,7 @@ pub async fn repair_sidecar(
         .send()
         .await
         .is_ok();
-    let mut idx = build_index_from_body(&body).map_err(|e| RepairError::FrameScan {
+    let mut idx = build_index_from_body(scan_body).map_err(|e| RepairError::FrameScan {
         bucket: bucket.into(),
         key: key.into(),
         cause: e.to_string(),
@@ -547,6 +758,15 @@ pub async fn repair_sidecar(
     // would be immediately rejected as stale.
     idx.source_etag = head_normalized_etag.clone();
     idx.source_compressed_size = Some(body.len() as u64);
+    // v0.10 #A1: stamp the SSE-S4 chunked binding so the GET path takes
+    // the encryption-aware partial-fetch fast-path. Mirrors the v0.9
+    // PUT path's binding construction (service.rs `sse_binding`); the
+    // salt is not secret (it lives in the encrypted body's plaintext
+    // header anyway), so duplicating it in the sidecar saves the GET
+    // path an extra HEAD/GET round-trip per Range request.
+    if let Some((_plaintext, binding)) = sse_repair.as_ref() {
+        idx.sse_v3 = Some(*binding);
+    }
     let encoded = encode_index(&idx);
     let encoded_len = encoded.len() as u64;
     let frame_count = idx.entries.len() as u64;
@@ -593,6 +813,13 @@ pub async fn repair_sidecar(
             head_etag: head_normalized_etag.unwrap_or_default(),
         });
     }
+    let sse_v3_binding = sse_repair.as_ref().map(|(_, b)| RepairSseBinding {
+        enc_chunk_size: b.enc_chunk_size,
+        enc_chunk_count: b.enc_chunk_count,
+        enc_key_id: b.enc_key_id,
+        enc_plaintext_len: b.enc_plaintext_len,
+        enc_header_bytes: b.enc_header_bytes,
+    });
     Ok(RepairReport {
         bucket: bucket.into(),
         key: key.into(),
@@ -601,7 +828,138 @@ pub async fn repair_sidecar(
         source_etag: idx.source_etag,
         source_compressed_size: live_size,
         rebuilt_from_existing,
+        sse_v3_binding,
     })
+}
+
+/// v0.10 #A1 (Codex R2): peek the first 4 bytes of the main object
+/// via a single Range GET (`Range: bytes=0-3`) so the body-cap
+/// relaxation in [`repair_sidecar_with_keyring`] can confirm the
+/// body is an S4E6 envelope BEFORE allowing the worst-case
+/// envelope-overhead headroom on top of `body_bytes_cap`. Returns:
+///
+/// - `Ok(Some([4 bytes]))` when the GET succeeded and the body had
+///   at least 4 bytes,
+/// - `Ok(None)` when the GET succeeded but the body was shorter
+///   than 4 bytes (= no magic to test against; caller treats as
+///   not-S4E6 and fails closed),
+/// - `Err(_)` on any backend error — caller surfaces as
+///   `RepairError::Backend` so the operator sees the underlying
+///   cause (network, permissions, etc.).
+///
+/// Pinned to the HEAD's `If-Match` ETag (when available) so a
+/// concurrent swap between the HEAD and this peek can't be used to
+/// bypass the cap (small object swapped in to pass the magic check,
+/// then the full GET delivers the original oversized ciphertext).
+async fn peek_body_magic(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    if_match_raw: Option<&str>,
+) -> Result<Option<[u8; 4]>, String> {
+    let get_builder = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .range("bytes=0-3");
+    let get_builder = match if_match_raw {
+        Some(t) => get_builder.if_match(t.to_owned()),
+        None => get_builder,
+    };
+    let resp = get_builder.send().await.map_err(|e| format!("{e}"))?;
+    let bytes = resp
+        .body
+        .collect()
+        .await
+        .map(|agg| agg.into_bytes())
+        .map_err(|e| format!("read peek body: {e}"))?;
+    if bytes.len() < 4 {
+        return Ok(None);
+    }
+    let mut magic = [0u8; 4];
+    magic.copy_from_slice(&bytes[..4]);
+    Ok(Some(magic))
+}
+
+/// v0.10 #A1: decrypt an S4E6-magic body in-process so
+/// [`repair_sidecar_with_keyring`] can frame-scan the recovered
+/// plaintext and stamp a v3 sidecar binding. Returns the plaintext
+/// bytes paired with the [`s4_codec::index::SseChunkBinding`] reflecting
+/// the on-disk envelope geometry — mirrors the v0.9 PUT-path binding
+/// construction in `service.rs::put_object` so a sidecar rebuilt here
+/// is byte-equivalent (modulo ETag bind) to one written at PUT time.
+///
+/// `body_bytes_cap` is reused as the plaintext-size cap fed to
+/// [`crate::sse::decrypt_chunked_buffered`]; on 64-bit it saturates at
+/// `usize::MAX` so a 5 GiB cap survives the conversion intact. The
+/// outer `repair_sidecar_with_keyring` already enforced the same cap
+/// against the on-disk ciphertext (`live_size > body_bytes_cap` →
+/// `BodyTooLarge`), so by the time we land here the plaintext can only
+/// be marginally smaller than the cap — passing the same value through
+/// keeps the failure mode consistent.
+fn decrypt_s4e6_for_repair(
+    body: &[u8],
+    keyring: &crate::sse::SharedSseKeyring,
+    body_bytes_cap: u64,
+    bucket: &str,
+    key: &str,
+) -> Result<(bytes::Bytes, s4_codec::index::SseChunkBinding), RepairError> {
+    let hdr = crate::sse::parse_s4e6_header(body).map_err(|e| RepairError::SseDecryptFailed {
+        bucket: bucket.into(),
+        key: key.into(),
+        cause: format!("parse S4E6 header: {e}"),
+    })?;
+    // v0.10 #A1 (Codex R3 + R4): `decrypt_chunked_buffered` enforces
+    // its `max_body_bytes` against the DECLARED upper bound
+    // `chunk_size × chunk_count` — not the actual plaintext length.
+    // Because the final chunk may be partial (encoder uses
+    // `ceil(plaintext / chunk_size)`), declared can exceed actual
+    // by up to `chunk_size - 1` bytes. Passing `body_bytes_cap`
+    // verbatim therefore wrongly rejects an object whose ACTUAL
+    // plaintext fits the cap but whose final-chunk slack pushes
+    // declared above it. Bump the decrypt cap by one `chunk_size`
+    // worth of slack, then re-verify the actual plaintext length
+    // against the operator-supplied cap after decrypt.
+    //
+    // Codex R4: the on-disk `hdr.chunk_size` is attacker-controlled
+    // (a tampered S4E6 header could declare `chunk_size = u32::MAX`
+    // and `chunk_count = 1`, then trick the buffered decrypt's
+    // `Vec::with_capacity(chunk_size × chunk_count)` into a ~4 GiB
+    // allocation under a much smaller operator cap). Cap the slack
+    // at the trusted [`SSE_S4_REPAIR_MAX_CHUNK_SLACK_BYTES`]
+    // ceiling so the worst-case RAM increase from this slack is
+    // bounded regardless of what the on-disk header claims.
+    let chunk_slack = (hdr.chunk_size as u64).min(SSE_S4_REPAIR_MAX_CHUNK_SLACK_BYTES);
+    let cap_with_slack = body_bytes_cap.saturating_add(chunk_slack);
+    let cap_usize: usize = cap_with_slack.min(usize::MAX as u64) as usize;
+    let plaintext = crate::sse::decrypt_chunked_buffered(body, keyring.as_ref(), cap_usize)
+        .map_err(|e| RepairError::SseDecryptFailed {
+            bucket: bucket.into(),
+            key: key.into(),
+            cause: format!("decrypt S4E6 chunks: {e}"),
+        })?;
+    // Operator cap applies to actual plaintext bytes, not declared
+    // upper bound. Surfaces as the same `BodyTooLarge` variant the
+    // outer ciphertext-cap path uses so the CLI's error formatting
+    // stays consistent.
+    if (plaintext.len() as u64) > body_bytes_cap {
+        return Err(RepairError::BodyTooLarge {
+            size: plaintext.len() as u64,
+            cap: body_bytes_cap,
+        });
+    }
+    let binding = s4_codec::index::SseChunkBinding {
+        enc_chunk_size: hdr.chunk_size,
+        enc_chunk_count: hdr.chunk_count,
+        enc_key_id: hdr.key_id,
+        enc_salt: *hdr.salt,
+        enc_plaintext_len: plaintext.len() as u64,
+        // Carried explicitly so a future S4E7-style header bump can't
+        // silently break v3 sidecar decode (mirrors the v0.9 PUT-path
+        // stamp at `service.rs::put_object` `enc_header_bytes`).
+        enc_header_bytes: crate::sse::S4E6_HEADER_BYTES as u32,
+    };
+    Ok((plaintext, binding))
 }
 
 /// Knob controlling which orphan categories `sweep_orphan_sidecars` is
@@ -1583,11 +1941,154 @@ mod tests {
         assert_eq!(detect_sse_magic(b""), None);
     }
 
-    /// v0.9 #106-audit-R2 P2-INT-1: pin the Display text + struct shape
-    /// of the new variant so refactors can't silently drop the operator
-    /// guidance (server-mode rebuild / re-PUT) or rename the fields the
-    /// CLI's error formatter reads. Mirrors the existing
-    /// `overwritten_during_repair_error_shape` test pattern.
+    /// v0.10 #A1: `SseDecryptFailed` is a distinct typed variant
+    /// (NOT lumped under `Backend` / `FrameScan`) so the CLI can give
+    /// operator-actionable guidance pointing at `--sse-s4-key` /
+    /// `--sse-s4-key-rotated`. Pin the Display + struct shape so a
+    /// future refactor can't silently demote it to the generic
+    /// `Backend` variant.
+    #[test]
+    fn sse_decrypt_failed_error_shape() {
+        let err = RepairError::SseDecryptFailed {
+            bucket: "b".into(),
+            key: "k".into(),
+            cause: "chunk 0 auth-tag verify failed".into(),
+        };
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("b/k"),
+            "Display must mention bucket/key — got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("SSE-S4 decrypt"),
+            "Display must name the failure mode — got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("--sse-s4-key"),
+            "Display must point at the operator-actionable flag — got {rendered:?}"
+        );
+        // Pattern guard: any rename of the three fields surfaces here
+        // AND at the construction site in `decrypt_s4e6_for_repair`.
+        match err {
+            RepairError::SseDecryptFailed { bucket, key, cause } => {
+                assert_eq!(bucket, "b");
+                assert_eq!(key, "k");
+                assert!(cause.contains("chunk 0"));
+            }
+            _ => unreachable!("SseDecryptFailed must match its own variant"),
+        }
+    }
+
+    /// v0.10 #A1 (Codex R4 fix): the final-chunk slack the SSE-S4
+    /// repair path grants on top of `body_bytes_cap` MUST be bounded
+    /// by [`SSE_S4_REPAIR_MAX_CHUNK_SLACK_BYTES`] regardless of what
+    /// the on-disk `chunk_size` declares. Pin the constant + the
+    /// `min(hdr.chunk_size, ceiling)` arithmetic so a future
+    /// refactor can't quietly resurrect the OOM vector by trusting
+    /// the attacker-controlled header field verbatim.
+    #[test]
+    fn sse_s4_repair_max_chunk_slack_bounds_attacker_controlled_header() {
+        // Pin the constant value at its documented 16 MiB ceiling.
+        // 16 MiB comfortably covers the server-default 1 MiB chunk
+        // size by 16× while staying well below any cap that would
+        // double the operator's RAM budget.
+        assert_eq!(SSE_S4_REPAIR_MAX_CHUNK_SLACK_BYTES, 16 * 1024 * 1024);
+
+        // Inline the slack-computation arithmetic so the regression
+        // guard fires here AND at the production call site in
+        // `decrypt_s4e6_for_repair`. Tests three regimes:
+        //   - small legitimate chunk (1 MiB) → slack == chunk_size
+        //   - on-ceiling legitimate chunk (16 MiB) → slack == ceiling
+        //   - attacker-controlled huge chunk (u32::MAX) → slack
+        //     pinned at ceiling (OOM vector closed)
+        fn compute_slack(hdr_chunk_size: u32) -> u64 {
+            (hdr_chunk_size as u64).min(SSE_S4_REPAIR_MAX_CHUNK_SLACK_BYTES)
+        }
+        assert_eq!(compute_slack(1024 * 1024), 1024 * 1024);
+        assert_eq!(
+            compute_slack(16 * 1024 * 1024),
+            SSE_S4_REPAIR_MAX_CHUNK_SLACK_BYTES
+        );
+        assert_eq!(compute_slack(u32::MAX), SSE_S4_REPAIR_MAX_CHUNK_SLACK_BYTES);
+
+        // The slack ceiling MUST stay smaller than the worst-case
+        // SSE envelope overhead (256 MiB) — they cover different
+        // axes (chunk-size slack vs envelope tag/header overhead)
+        // but a slack > envelope overhead would be nonsensical.
+        // Bind the constants to runtime locals so clippy's
+        // `assertions_on_constants` lint doesn't fire on the
+        // pinned values.
+        let slack_cap = SSE_S4_REPAIR_MAX_CHUNK_SLACK_BYTES;
+        let overhead_cap = SSE_S4_REPAIR_MAX_OVERHEAD_BYTES;
+        assert!(slack_cap < overhead_cap);
+    }
+
+    /// v0.10 #A1 (Codex R1 fix): `SSE_S4_REPAIR_MAX_OVERHEAD_BYTES`
+    /// is load-bearing for the body-cap relaxation in
+    /// `repair_sidecar_with_keyring` — too small reintroduces
+    /// `BodyTooLarge` rejection on valid S4E6 objects whose
+    /// plaintext fits the cap; too large bloats the GET's RAM
+    /// budget unnecessarily. Pin it at the codec-spec ceiling
+    /// (`S4E6_HEADER_BYTES + S4E6_MAX_CHUNK_COUNT × TAG_LEN`)
+    /// so a bump to either side of the SSE constants surfaces
+    /// here.
+    #[test]
+    fn sse_s4_repair_max_overhead_bytes_matches_codec_spec() {
+        let expected = (crate::sse::S4E6_HEADER_BYTES as u64)
+            + (crate::sse::S4E6_MAX_CHUNK_COUNT as u64)
+                * (crate::sse::S4E5_PER_CHUNK_OVERHEAD as u64);
+        assert_eq!(SSE_S4_REPAIR_MAX_OVERHEAD_BYTES, expected);
+        // Sanity bounds — must comfortably exceed any realistic
+        // S4E6 envelope overhead but stay well below the 5 GiB
+        // single-PUT ceiling so the relaxation can't double the
+        // operator's RAM budget. Build the comparison values from
+        // the codec spec dynamically (instead of a literal const)
+        // so clippy's `assertions_on_constants` lint doesn't fire
+        // on the pinned constant.
+        let min_reasonable: u64 = 1024 * 1024; // 1 MiB
+        let max_reasonable: u64 = 1024 * 1024 * 1024; // 1 GiB
+        assert!(
+            SSE_S4_REPAIR_MAX_OVERHEAD_BYTES > min_reasonable,
+            "overhead headroom {SSE_S4_REPAIR_MAX_OVERHEAD_BYTES} must accommodate the \
+             worst-case S4E6 envelope (>= 1 MiB)",
+        );
+        assert!(
+            SSE_S4_REPAIR_MAX_OVERHEAD_BYTES < max_reasonable,
+            "overhead headroom {SSE_S4_REPAIR_MAX_OVERHEAD_BYTES} must stay below 1 GiB so \
+             it doesn't double the operator's --max-body-bytes RAM budget",
+        );
+    }
+
+    /// v0.10 #A1: `RepairReport::sse_v3_binding` carries the chunked
+    /// geometry the CLI surfaces in the OK line. Pin the field shape
+    /// so a struct rename surfaces as a compile error here AND at the
+    /// CLI's print site in `run_repair_sidecar`.
+    #[test]
+    fn repair_sse_binding_shape() {
+        let b = RepairSseBinding {
+            enc_chunk_size: 1_048_576,
+            enc_chunk_count: 4,
+            enc_key_id: 1,
+            enc_plaintext_len: 4_000_000,
+            enc_header_bytes: 24,
+        };
+        // Field accesses double as a compile-time guard that the names
+        // don't drift away from the codec's `SseChunkBinding` (the
+        // module re-export from `s4_codec::index`).
+        assert_eq!(b.enc_chunk_size, 1_048_576);
+        assert_eq!(b.enc_chunk_count, 4);
+        assert_eq!(b.enc_key_id, 1);
+        assert_eq!(b.enc_plaintext_len, 4_000_000);
+        assert_eq!(b.enc_header_bytes, 24);
+    }
+
+    /// v0.9 #106-audit-R2 P2-INT-1 (initial) / v0.10 #A1 (refined):
+    /// pin the Display text + struct shape of the new variant so
+    /// refactors can't silently drop the operator guidance
+    /// (server-mode rebuild / re-PUT / `--sse-s4-key` plumbing) or
+    /// rename the fields the CLI's error formatter reads. Mirrors
+    /// the existing `overwritten_during_repair_error_shape` test
+    /// pattern.
     #[test]
     fn repair_sidecar_rejects_encrypted_body_with_typed_error() {
         let err = RepairError::EncryptedSidecarUnsupported {

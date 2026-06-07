@@ -156,29 +156,36 @@ See [docker-compose.gpu.yml](docker-compose.gpu.yml) for details.
 
 ### Kubernetes (Helm)
 
-⚠️ **Build the image yourself first** (#108) — no `abyosoftware/s4` image is
-published to Docker Hub or ghcr.io yet (roadmap; expected after the first
-public production user is onboarded so we have something concrete to tag).
-For now, the chart expects you to build + push to your own registry:
+Official container images are published to GitHub Container Registry on every
+`v*.*.*` release tag — `ghcr.io/abyo-software/s4:<version>` (CPU, multi-arch
+amd64 + arm64) and `ghcr.io/abyo-software/s4:<version>-gpu` (nvCOMP GPU build,
+amd64). The package is public; no `imagePullSecrets` needed.
 
 ```bash
-# 1. Build and push to your registry (substitute MY_REGISTRY)
-docker build -t MY_REGISTRY/s4:0.8.9 .
-docker push MY_REGISTRY/s4:0.8.9
-
-# 2. Install pointing at your image
 helm install s4 ./charts/s4 \
-  --set image.repository=MY_REGISTRY/s4 \
-  --set image.tag=0.8.9 \
+  --set image.tag=0.9.0 \
   --set backend.endpointUrl=https://s3.us-east-1.amazonaws.com \
   --set backend.region=us-east-1
 kubectl port-forward svc/s4 8014:8014
 ```
 
+For the GPU image, override `image.tag` with the `-gpu` suffix and turn on
+GPU scheduling:
+
+```bash
+helm install s4 ./charts/s4 \
+  --set image.tag=0.9.0-gpu \
+  --set codec=nvcomp-zstd \
+  --set gpu.enabled=true \
+  --set backend.endpointUrl=https://s3.us-east-1.amazonaws.com
+```
+
 The chart in [`charts/s4/`](charts/s4/) ships a stateless Deployment + Service
 (ClusterIP, port 8014), optional GPU node selector (`gpu.enabled=true` for
 nvCOMP), inline or cert-manager TLS, and bucket-policy ConfigMap. See
-[charts/s4/README.md](charts/s4/README.md) for the full values table.
+[charts/s4/README.md](charts/s4/README.md) for the full values table and
+[.github/workflows/docker.yml](.github/workflows/docker.yml) for the image
+build / publish pipeline.
 
 ### Python (pip)
 
@@ -782,6 +789,58 @@ with backend (no network RTT to amortise). TTFB excludes TLS handshake
 - **Byte-range aware `upload_part_copy`** (v0.2): when the source is S4-framed,
   the user-visible byte range is what gets copied (decompressed and re-framed),
   not raw compressed bytes
+
+### Server-side encryption — Range GET fast-path matrix
+
+S4 supports four SSE modes (table below). The **Range GET fast-path**
+introduced in v0.9 #106 partial-fetches only the enclosing encrypted
+chunks for a given byte range instead of pulling the full body — but it
+only works for **SSE-S4 chunked** (`--sse-chunk-size > 0`, `S4E6` wire
+envelope). The other three modes fall back to the v0.8.12 #120 buffered
+path (full decrypt → frame-parse → slice).
+
+| SSE mode | CLI flag | Wire envelope | Range GET fast-path? |
+|---|---|---|---|
+| SSE-S4 chunked (default since v0.8 #52) | `--sse-s4-key <path>` + `--sse-chunk-size 1048576` (default) | `S4E6` | ✅ partial-fetch via v3 sidecar |
+| SSE-S4 buffered (back-compat) | `--sse-s4-key <path>` + `--sse-chunk-size 0` | `S4E2` | ❌ buffered fallback |
+| SSE-C (customer-provided key) | per-request `x-amz-server-side-encryption-customer-*` headers | `S4E3` | ❌ buffered fallback |
+| SSE-KMS (envelope, per-object DEK) | `--kms-local-dir <dir>` (or `--features aws-kms`) | `S4E4` | ❌ buffered fallback |
+| Multipart with any SSE | (any of the above on a multipart PUT) | per-part `S4Ex` | ❌ no sidecar emitted (v0.8.16 #151) |
+
+**Why only chunked SSE-S4?** Non-chunked envelopes (`S4E2` / `S4E3` /
+`S4E4`) wrap the entire body under one AES-256-GCM authentication tag.
+AEAD decrypt is only defined over the full ciphertext + AAD + tag
+quadruple — there is no "verify just the prefix" mode — so partial
+plaintext cannot be exposed without fetching and tag-verifying the
+whole body. This is the AEAD security contract, not an optimization
+deferment. The `S4E6` chunked envelope (v0.8 #52, refined in
+v0.8.1 #57) explicitly slices the plaintext into fixed-size chunks
+and emits one tag per chunk with a nonce derived from a per-PUT
+salt + chunk index, which is what makes chunk-aligned partial
+decrypt well-defined. Full per-mode walkthrough lives in
+[`docs/security/sse-partial-fetch-constraint.md`](docs/security/sse-partial-fetch-constraint.md).
+
+**Operator recommendation**: for Range-GET-heavy workloads on large
+objects (parquet / ORC footer reads, video segment seeks, log-line
+slice reads) where SSE is required, scope your data to **SSE-S4
+chunked** to keep the fast-path. The 1 MiB default chunk size
+matches the typical parquet row-group read pattern; smaller chunks
+give finer-grained partial fetch at higher tag overhead, larger
+chunks reduce on-disk tag bytes but do more wasted decrypt per Range
+GET.
+
+```bash
+s4-server \
+  --sse-s4-key /etc/s4/sse.key \
+  --sse-chunk-size 1048576 \
+  ...
+```
+
+If SSE-KMS or SSE-C is required by your key-management posture,
+either accept the buffered Range GET cost or restructure the data
+into smaller objects so the buffered fetch is bounded. Chunked-KMS
+(provisional `S4E7`) and chunked-SSE-C (provisional `S4E8`)
+envelopes are v0.11+ roadmap candidates, not promised features.
 
 ### Observability
 - **`/health`** — liveness probe, always 200 OK

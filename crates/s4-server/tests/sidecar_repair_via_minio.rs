@@ -30,7 +30,7 @@ use s4_codec::{CodecKind, CodecRegistry};
 use s4_server::S4Service;
 use s4_server::repair::{
     DEFAULT_REPAIR_BODY_BYTES_CAP, DeletePolicy, OrphanReason, RepairError, SidecarStatus,
-    repair_sidecar, sweep_orphan_sidecars, verify_sidecar,
+    repair_sidecar, repair_sidecar_with_keyring, sweep_orphan_sidecars, verify_sidecar,
 };
 use testcontainers_modules::minio::MinIO;
 use testcontainers_modules::testcontainers::ContainerAsync;
@@ -925,6 +925,375 @@ async fn repair_sidecar_rejects_sse_s4_chunked_object_cleanly() {
     assert_eq!(
         post_sidecar_bytes, pre_sidecar_bytes,
         "failed repair must NOT mutate the pre-existing sidecar state"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// v0.10 #A1: with an operator-supplied SSE-S4 keyring,
+/// `repair_sidecar_with_keyring` MUST decrypt an S4E6-encrypted
+/// object in-process, frame-scan the plaintext, and write a v3
+/// sidecar carrying the `sse_v3` chunked binding. Asserts:
+///   - the call succeeds (no `EncryptedSidecarUnsupported`),
+///   - the report's `sse_v3_binding` reflects the on-disk envelope
+///     geometry (chunk_size / key_id from the PUT-time gateway,
+///     plaintext_len matches the post-compression body the encoder
+///     fed in),
+///   - the freshly-written sidecar decodes with `sse_v3 = Some(..)`
+///     so a subsequent Range GET would take the encryption-aware
+///     fast-path,
+///   - the rebuilt sidecar's salt matches what the on-disk S4E6
+///     header carries (load-bearing bit the GET path uses to derive
+///     per-chunk nonces),
+///   - the full-body GET through the gateway still round-trips
+///     cleanly (= the rebuilt sidecar isn't subtly wrong in a way
+///     that breaks decrypt-on-GET).
+///
+/// Uses multipart PUT to make the post-compression body multi-frame
+/// (the v0.9 sidecar-write gate requires `entries.len() > 1`). The
+/// v0.9 multipart-with-SSE Complete path intentionally does NOT
+/// write any sidecar (line 5480 `&& !mp_will_encrypt`), so the
+/// pre-repair sidecar is always absent — the test exercises the
+/// fresh-write branch (`rebuilt_from_existing == false`) end-to-end
+/// without depending on a PUT-time v3 sidecar that would only exist
+/// on the single-PUT codepath.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn repair_sidecar_rebuilds_sse_s4_chunked_object_with_keyring() {
+    let minio = start_minio().await;
+    let (s4_endpoint, shutdown) = spawn_s4_server_with_sse_s4_chunked(&minio.endpoint_url).await;
+    let backend = build_aws_client(&minio.endpoint_url);
+    let _ = backend
+        .create_bucket()
+        .bucket("enc-repair-key")
+        .send()
+        .await;
+    let s4_client = build_aws_client(&s4_endpoint);
+
+    let payload = put_multipart_object(&s4_client, "enc-repair-key", "enc-doc.bin").await;
+    let sidecar = sidecar_key("enc-doc.bin");
+
+    // Precondition 1: the backend body is an S4E6 envelope.
+    let on_disk = backend
+        .get_object()
+        .bucket("enc-repair-key")
+        .key("enc-doc.bin")
+        .send()
+        .await
+        .expect("backend GET object")
+        .body
+        .collect()
+        .await
+        .expect("body")
+        .into_bytes();
+    assert_eq!(
+        &on_disk[..4],
+        b"S4E6",
+        "precondition: backend body must be S4E6 (chunked SSE-S4)"
+    );
+
+    // Precondition 2: no sidecar exists pre-repair. v0.9
+    // `complete_multipart_upload` skips sidecar emission when the
+    // multipart upload was encrypted (see service.rs `mp_will_encrypt`
+    // gate), so the repair tool always starts from absent on this
+    // path. We assert NotFound here to make any future change to the
+    // multipart-SSE sidecar-emission flow surface as a test failure
+    // (which is the right place to revisit this test's pre-state).
+    let pre_repair_head = backend
+        .head_object()
+        .bucket("enc-repair-key")
+        .key(&sidecar)
+        .send()
+        .await;
+    assert!(
+        pre_repair_head.is_err(),
+        "v0.9 multipart-SSE Complete must not emit a sidecar; got {pre_repair_head:?}"
+    );
+
+    // Build the same keyring the gateway used at PUT time
+    // (`spawn_s4_server_with_sse_s4_chunked` uses 32 bytes of 0x9a at
+    // slot id=1). The repair tool's keyring composition MUST match
+    // the PUT-time composition — a different active slot would
+    // surface as `SseDecryptFailed`.
+    let key = Arc::new(s4_server::sse::SseKey::from_bytes(&[0x9au8; 32]).expect("32-byte raw key"));
+    let keyring: s4_server::sse::SharedSseKeyring =
+        Arc::new(s4_server::sse::SseKeyring::new(1, key));
+
+    let report = repair_sidecar_with_keyring(
+        &backend,
+        "enc-repair-key",
+        "enc-doc.bin",
+        DEFAULT_REPAIR_BODY_BYTES_CAP,
+        Some(&keyring),
+    )
+    .await
+    .expect("repair must decrypt + rebuild SSE-S4 chunked sidecar");
+
+    assert!(
+        !report.rebuilt_from_existing,
+        "fresh write expected (multipart-SSE Complete didn't emit a sidecar)"
+    );
+    assert!(
+        report.frame_count >= 2,
+        "expected multi-frame body, got frame_count={}",
+        report.frame_count
+    );
+
+    // Post-condition 1: the report carries the v3 binding the CLI
+    // surfaces in its OK line.
+    let report_binding = report
+        .sse_v3_binding
+        .expect("repair report must carry sse_v3_binding on S4E6 rebuild");
+    assert_eq!(
+        report_binding.enc_key_id, 1,
+        "binding key_id must round-trip the PUT-time slot"
+    );
+    assert_eq!(
+        report_binding.enc_chunk_size,
+        256 * 1024,
+        "binding chunk_size must match the gateway's --sse-chunk-size"
+    );
+    assert!(
+        report_binding.enc_chunk_count >= 1,
+        "binding chunk_count must be derived from the on-disk envelope, got {}",
+        report_binding.enc_chunk_count
+    );
+    assert!(
+        report_binding.enc_plaintext_len > 0,
+        "binding plaintext_len must be the post-compression body length"
+    );
+    assert_eq!(
+        report_binding.enc_header_bytes,
+        s4_server::sse::S4E6_HEADER_BYTES as u32,
+        "binding header_bytes must equal S4E6_HEADER_BYTES"
+    );
+
+    // Post-condition 2: the on-disk sidecar carries the same binding
+    // the report describes AND the salt the on-disk S4E6 header
+    // stamps (salt isn't in the report but it's the load-bearing bit
+    // the GET path uses to derive per-chunk nonces).
+    let rebuilt_sidecar = backend
+        .get_object()
+        .bucket("enc-repair-key")
+        .key(&sidecar)
+        .send()
+        .await
+        .expect("backend GET rebuilt sidecar")
+        .body
+        .collect()
+        .await
+        .expect("rebuilt sidecar body")
+        .into_bytes();
+    let rebuilt_idx = decode_index(rebuilt_sidecar).expect("decode rebuilt sidecar");
+    let rebuilt_sse = rebuilt_idx
+        .sse_v3
+        .expect("rebuilt sidecar must carry sse_v3 binding");
+    let envelope_hdr = s4_server::sse::parse_s4e6_header(&on_disk).expect("parse S4E6 envelope");
+    assert_eq!(
+        rebuilt_sse.enc_key_id, envelope_hdr.key_id,
+        "rebuilt key_id must match the on-disk envelope"
+    );
+    assert_eq!(
+        rebuilt_sse.enc_chunk_size, envelope_hdr.chunk_size,
+        "rebuilt chunk_size must match the on-disk envelope"
+    );
+    assert_eq!(
+        rebuilt_sse.enc_chunk_count, envelope_hdr.chunk_count,
+        "rebuilt chunk_count must match the on-disk envelope"
+    );
+    assert_eq!(
+        &rebuilt_sse.enc_salt, envelope_hdr.salt,
+        "rebuilt salt must match the on-disk S4E6 header (load-bearing for GET-path nonce derivation)"
+    );
+    assert_eq!(
+        rebuilt_sse.enc_header_bytes,
+        s4_server::sse::S4E6_HEADER_BYTES as u32,
+        "rebuilt header_bytes must equal S4E6_HEADER_BYTES"
+    );
+
+    // Sanity: GET through the gateway still round-trips the original
+    // payload (i.e. the rebuilt sidecar isn't subtly wrong in a way
+    // that breaks decrypt-on-GET).
+    let roundtrip = s4_client
+        .get_object()
+        .bucket("enc-repair-key")
+        .key("enc-doc.bin")
+        .send()
+        .await
+        .expect("GET through gateway")
+        .body
+        .collect()
+        .await
+        .expect("collect body")
+        .into_bytes();
+    assert_eq!(
+        roundtrip, payload,
+        "full-body GET must still decrypt cleanly after sidecar rebuild"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// v0.10 #A1 (Codex R1 fix): the body-cap relaxation
+/// `repair_sidecar_with_keyring` introduced to accommodate S4E6
+/// envelope overhead MUST NOT bypass the cap on plaintext bodies
+/// (which carry no envelope overhead). Specifically, a plaintext
+/// body whose size lies in
+/// `(body_bytes_cap, body_bytes_cap + SSE_S4_REPAIR_MAX_OVERHEAD_BYTES]`
+/// must still surface `BodyTooLarge` when the operator happens to
+/// have an SSE keyring loaded — the 4-byte magic peek must classify
+/// the body as not-S4E6 before the relaxation applies.
+///
+/// This is the regression guard for the Codex R2 finding on the
+/// initial "keyring supplied ⇒ relax cap" shortcut.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn repair_with_keyring_does_not_bypass_cap_for_plaintext_body() {
+    let minio = start_minio().await;
+    // Spawn a plain (non-SSE) gateway so the body lands plaintext on
+    // the backend. The keyring we pass to repair below is unused for
+    // decryption but is what previously triggered the silent cap
+    // bypass — that's the regression we're guarding against.
+    let (s4_endpoint, shutdown) = spawn_s4_server(&minio.endpoint_url).await;
+    let backend = build_aws_client(&minio.endpoint_url);
+    let _ = backend
+        .create_bucket()
+        .bucket("repair-cap-plain")
+        .send()
+        .await;
+    let s4_client = build_aws_client(&s4_endpoint);
+
+    // Use the standard multipart helper (≈ 12 MiB plaintext on
+    // disk via multipart Complete; well above any reasonable tight
+    // cap we'd test against).
+    let _ = put_multipart_object(&s4_client, "repair-cap-plain", "doc.bin").await;
+
+    // Tight cap: 1 MiB. The plaintext body on disk is ~12 MiB so it
+    // exceeds the cap by orders of magnitude, comfortably outside
+    // the 256 MiB SSE-overhead headroom. Without the magic-peek
+    // safeguard the relaxation would have accepted bodies up to
+    // `1 MiB + ~256 MiB` and STILL rejected this 12 MiB body — but
+    // we want the assertion to also cover small overshoots, so use
+    // a deliberately tight cap.
+    let cap = 1024 * 1024_u64;
+
+    let keyring: s4_server::sse::SharedSseKeyring = Arc::new(s4_server::sse::SseKeyring::new(
+        1,
+        Arc::new(s4_server::sse::SseKey::from_bytes(&[0x77u8; 32]).expect("32-byte raw key")),
+    ));
+
+    let err =
+        repair_sidecar_with_keyring(&backend, "repair-cap-plain", "doc.bin", cap, Some(&keyring))
+            .await
+            .expect_err("repair must reject oversized plaintext body even with keyring set");
+    match &err {
+        RepairError::BodyTooLarge {
+            size,
+            cap: reported_cap,
+        } => {
+            assert!(
+                *size > cap,
+                "size {size} must exceed cap {cap} for BodyTooLarge"
+            );
+            assert_eq!(
+                *reported_cap, cap,
+                "reported cap must be the operator-supplied value (not the silently-relaxed one)"
+            );
+        }
+        other => panic!(
+            "expected BodyTooLarge on plaintext-body cap overshoot, got {other:?}; \
+             keyring-set MUST NOT bypass the cap on plaintext bodies"
+        ),
+    }
+
+    let _ = shutdown.send(());
+}
+
+/// v0.10 #A1: passing the WRONG keyring (different key bytes) to
+/// `repair_sidecar_with_keyring` against an S4E6 object MUST surface
+/// the new `SseDecryptFailed` variant (not `EncryptedSidecarUnsupported`
+/// — the operator DID supply a keyring; not `Backend` — the failure is
+/// crypto, not transport). Pre-existing sidecar state must round-trip
+/// unchanged across the failed repair.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn repair_sidecar_wrong_keyring_surfaces_sse_decrypt_failed() {
+    let minio = start_minio().await;
+    let (s4_endpoint, shutdown) = spawn_s4_server_with_sse_s4_chunked(&minio.endpoint_url).await;
+    let backend = build_aws_client(&minio.endpoint_url);
+    let _ = backend
+        .create_bucket()
+        .bucket("enc-repair-wrong")
+        .send()
+        .await;
+    let s4_client = build_aws_client(&s4_endpoint);
+
+    let _payload = put_multipart_object(&s4_client, "enc-repair-wrong", "doc.bin").await;
+    let sidecar = sidecar_key("doc.bin");
+    let pre_sidecar_bytes: Option<bytes::Bytes> = match backend
+        .get_object()
+        .bucket("enc-repair-wrong")
+        .key(&sidecar)
+        .send()
+        .await
+    {
+        Ok(resp) => Some(resp.body.collect().await.expect("body").into_bytes()),
+        Err(_) => None,
+    };
+
+    // Operator passes a DIFFERENT 32-byte key — same active slot
+    // (id=1) but different bytes — so the S4E6 chunk auth-tag verify
+    // fails on chunk 0.
+    let wrong_key =
+        Arc::new(s4_server::sse::SseKey::from_bytes(&[0x33u8; 32]).expect("32-byte raw key"));
+    let wrong_keyring: s4_server::sse::SharedSseKeyring =
+        Arc::new(s4_server::sse::SseKeyring::new(1, wrong_key));
+
+    let err = repair_sidecar_with_keyring(
+        &backend,
+        "enc-repair-wrong",
+        "doc.bin",
+        DEFAULT_REPAIR_BODY_BYTES_CAP,
+        Some(&wrong_keyring),
+    )
+    .await
+    .expect_err("repair must fail under a wrong keyring");
+    match &err {
+        RepairError::SseDecryptFailed { bucket, key, cause } => {
+            assert_eq!(bucket, "enc-repair-wrong");
+            assert_eq!(key, "doc.bin");
+            assert!(
+                !cause.is_empty(),
+                "cause must carry the underlying SSE error string"
+            );
+        }
+        other => panic!(
+            "expected SseDecryptFailed, got {other:?} \
+             (wrong-keyring repair must NOT surface Backend / FrameScan / \
+             EncryptedSidecarUnsupported — those would mislead the operator)"
+        ),
+    }
+    let rendered = format!("{err}");
+    assert!(
+        rendered.contains("--sse-s4-key"),
+        "Display must point at the operator-actionable flag — got {rendered:?}"
+    );
+
+    // Post-condition: failed repair must NOT mutate the pre-existing
+    // sidecar state (same invariant the no-keyring reject path holds).
+    let post_sidecar_bytes: Option<bytes::Bytes> = match backend
+        .get_object()
+        .bucket("enc-repair-wrong")
+        .key(&sidecar)
+        .send()
+        .await
+    {
+        Ok(resp) => Some(resp.body.collect().await.expect("body").into_bytes()),
+        Err(_) => None,
+    };
+    assert_eq!(
+        post_sidecar_bytes, pre_sidecar_bytes,
+        "failed (wrong-keyring) repair must NOT mutate the pre-existing sidecar"
     );
 
     let _ = shutdown.send(());

@@ -3,9 +3,14 @@ name: s4
 description: Drop-in S3-compatible storage gateway with GPU-accelerated transparent compression.
 type: application
 # Chart version follows the chart itself; bump on chart-only changes.
-version: 0.1.0
+# 0.2.0: v0.10 #B1 — `image.repository` default flipped from the
+# never-published `docker.io/abyosoftware/s4` to the now-published
+# `ghcr.io/abyo-software/s4`. Minor bump per SemVer because a
+# `helm upgrade` with no override now points at a different image
+# repo (chart behavior change, not just appVersion drift).
+version: 0.2.0
 # appVersion tracks the s4-server release shipped on crates.io / Docker Hub.
-appVersion: "0.3.0"
+appVersion: "0.9.0"
 kubeVersion: ">=1.24.0-0"
 home: https://github.com/abyo-software/s4
 sources:

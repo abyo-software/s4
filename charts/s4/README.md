@@ -6,9 +6,9 @@ stateless `Deployment` + `Service` on any Kubernetes 1.24+ cluster.
 
 > **Status: MVP (chart 0.1.0).** The chart itself is intended to follow Helm
 > best practices (labels, helpers, NOTES, ingress hook, GPU node selector,
-> readOnlyRootFilesystem). The official `docker.io/abyosoftware/s4:0.3.0`
-> image is **not yet published** — see [Image](#image) below for how to
-> bootstrap with a locally built image.
+> readOnlyRootFilesystem). Official images are published to
+> [`ghcr.io/abyo-software/s4`](https://github.com/abyo-software/s4/pkgs/container/s4)
+> on every `v*.*.*` git tag — see [Image](#image) below.
 
 ## TL;DR
 
@@ -29,21 +29,36 @@ aws --endpoint-url http://localhost:8014 s3 cp some.log s3://demo/some.log
 
 ## Image
 
-As of chart 0.1.0 the official Docker Hub image is **not yet published**.
-For local testing, build and side-load:
+Official images are published to
+[`ghcr.io/abyo-software/s4`](https://github.com/abyo-software/s4/pkgs/container/s4)
+on every `v*.*.*` release tag by
+[`.github/workflows/docker.yml`](../../.github/workflows/docker.yml). The
+package is public — `helm install` works with no `imagePullSecrets`.
+
+Two flavors share the same repository under different tag suffixes:
+
+| Flavor | Tag                                          | Platforms                    |
+|--------|----------------------------------------------|------------------------------|
+| CPU    | `ghcr.io/abyo-software/s4:<version>`         | `linux/amd64`, `linux/arm64` |
+| GPU    | `ghcr.io/abyo-software/s4:<version>-gpu`     | `linux/amd64` only           |
+
+`<version>` is the bare semver (e.g. `0.9.0`); `v0.9.0` and the `latest`
+moving tag are also published.
+
+For local testing without ghcr.io, build and side-load:
 
 ```bash
 # from the repo root
-docker build -t abyosoftware/s4:0.3.0 .
+docker build -t ghcr.io/abyo-software/s4:0.9.0 .
 
 # kind:
-kind load docker-image abyosoftware/s4:0.3.0
+kind load docker-image ghcr.io/abyo-software/s4:0.9.0
 
 # minikube:
-minikube image load abyosoftware/s4:0.3.0
+minikube image load ghcr.io/abyo-software/s4:0.9.0
 
 # k3d:
-k3d image import abyosoftware/s4:0.3.0
+k3d image import ghcr.io/abyo-software/s4:0.9.0
 ```
 
 Or push to your own registry and override:
@@ -51,19 +66,19 @@ Or push to your own registry and override:
 ```bash
 helm install s4 ./charts/s4 \
   --set image.repository=ghcr.io/myorg/s4 \
-  --set image.tag=0.3.0 \
+  --set image.tag=0.9.0 \
   --set backend.endpointUrl=https://s3.us-east-1.amazonaws.com
 ```
 
 ## GPU (nvCOMP) deployments
 
-Build the GPU image (see `Dockerfile.gpu` in the repo root), then enable GPU
-scheduling and pick an nvCOMP codec:
+The GPU image (built from `Dockerfile.gpu`) ships as the `-gpu` tag on the
+same `ghcr.io/abyo-software/s4` repository. Enable GPU scheduling and pick
+an nvCOMP codec:
 
 ```bash
 helm install s4 ./charts/s4 \
-  --set image.repository=ghcr.io/myorg/s4-gpu \
-  --set image.tag=0.3.0 \
+  --set image.tag=0.9.0-gpu \
   --set codec=nvcomp-zstd \
   --set gpu.enabled=true \
   --set gpu.count=1 \
@@ -109,7 +124,7 @@ checksum annotations roll the deployment when the policy text changes.
 | Key | Default | Description |
 |---|---|---|
 | `replicas` | `2` | Number of gateway replicas (S4 is stateless). |
-| `image.repository` | `docker.io/abyosoftware/s4` | Image repo. **Not yet published — see Image above.** |
+| `image.repository` | `ghcr.io/abyo-software/s4` | Image repo. Published from `.github/workflows/docker.yml` on each `v*.*.*` tag (CPU multi-arch + `-gpu` amd64). |
 | `image.tag` | `""` (defaults to `.Chart.AppVersion`) | Image tag. |
 | `image.pullPolicy` | `IfNotPresent` | Standard Kubernetes image pull policy. |
 | `backend.endpointUrl` | `""` (**REQUIRED**) | Real S3 endpoint the gateway forwards to. |

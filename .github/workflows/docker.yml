@@ -1,0 +1,183 @@
+name: Docker images (ghcr.io)
+
+# v0.10 #B1 — publish S4 container images to GitHub Container Registry.
+#
+# Two flavors share one repository under different tag suffixes:
+#   ghcr.io/abyo-software/s4:<version>          (CPU build,  linux/amd64 + linux/arm64)
+#   ghcr.io/abyo-software/s4:<version>-gpu      (GPU/nvCOMP, linux/amd64 only)
+#
+# Triggers:
+#   - push of a `v*.*.*` semver tag (cuts the official image for that release)
+#   - workflow_dispatch (manual rebuild — used to back-fill images for tags
+#     that pre-date this workflow, e.g. `gh workflow run docker.yml --ref v0.9.0`)
+#
+# `latest` / `latest-gpu` are applied only when the trigger is an actual
+# semver tag (workflow_dispatch on a tag also qualifies via metadata-action's
+# semver pattern detection), and only for non-prerelease versions, so a
+# back-fill of an older tag won't silently move `latest` backward.
+#
+# The GPU image is amd64 only — nvCOMP redist tarballs at
+# developer.download.nvidia.com only ship a linux-x86_64 build (see
+# Dockerfile.gpu's NVCOMP download URL), and there are no arm64 CUDA
+# base images in the size class we want for redistribution.
+#
+# Caching: GHA-backed Buildx cache (`type=gha`, scoped per matrix flavor) —
+# fast incremental rebuilds within a release line without persisting
+# layers in any external registry.
+#
+# Provenance / SBOM: enabled (`provenance: true`, `sbom: true`) so the
+# image carries an SLSA build attestation + SPDX SBOM that anyone pulling
+# from ghcr.io can inspect via `docker buildx imagetools inspect`.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push to ghcr.io (false = build only, useful for smoke-testing the workflow itself)"
+        type: boolean
+        default: true
+        required: false
+
+permissions:
+  # `packages: write` is required for the GITHUB_TOKEN to push to
+  # ghcr.io/<owner>/<repo>. `contents: read` is the standard checkout
+  # permission. No other scopes — the workflow does not open issues,
+  # write to gh-pages, or touch PRs.
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  # Hard-coded to the canonical org so a fork that runs this workflow
+  # doesn't accidentally try to push under the upstream namespace
+  # (the push will simply fail with a permissions error for the fork's
+  # GITHUB_TOKEN — fine — but the metadata-action tags would still
+  # carry the upstream name in the build log, which is confusing).
+  # Override by setting `vars.GHCR_IMAGE_NAME` at the org / repo level
+  # if you fork and want to publish under your own namespace.
+  IMAGE_NAME: ${{ vars.GHCR_IMAGE_NAME || 'abyo-software/s4' }}
+
+jobs:
+  docker:
+    name: build & push (${{ matrix.flavor }})
+    runs-on: ubuntu-latest
+    # 60 min covers worst case: arm64 CPU build via QEMU emulation on a
+    # cold GHA cache (~10-15 min observed for Rust release builds of this
+    # size) + GPU build with the nvCOMP download + cargo release build
+    # against the CUDA SDK base image (~20-30 min cold).
+    timeout-minutes: 60
+
+    strategy:
+      # Don't cancel the other flavor when one fails — a transient
+      # arm64 emulation hiccup on the CPU job shouldn't waste the
+      # ~20 min GPU build that may already be in progress.
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: cpu
+            dockerfile: Dockerfile
+            platforms: linux/amd64,linux/arm64
+            tag_suffix: ""
+          - flavor: gpu
+            dockerfile: Dockerfile.gpu
+            platforms: linux/amd64
+            tag_suffix: "-gpu"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU is only needed for the multi-arch CPU build (arm64 emulation
+      # on an amd64 runner). Setting it up for the GPU job is a no-op
+      # cost-wise (~3s) but pointless; gate by flavor for clarity.
+      - name: Set up QEMU
+        if: matrix.flavor == 'cpu'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Log in to ghcr.io using the workflow's GITHUB_TOKEN. No PAT or
+      # external secret required — the `packages: write` permission at
+      # the job level is sufficient because GitHub auto-grants the
+      # token push access to ghcr.io packages owned by this repo.
+      #
+      # Skipped when the operator explicitly disabled push via the
+      # workflow_dispatch input (build-only smoke test mode).
+      - name: Log in to ghcr.io
+        if: github.event_name != 'workflow_dispatch' || inputs.push
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # metadata-action emits the tag / label set that build-push-action
+      # then writes onto the image. `flavor.suffix` adds `-gpu` for the
+      # GPU job.
+      #
+      # Mutable tags (`latest`, `<major>.<minor>`) are gated on
+      # `push` events only — never emitted from `workflow_dispatch`.
+      # Rationale: metadata-action's "latest" detection (`latest=auto`)
+      # compares only the inputs of the current run, not the registry
+      # state, so a manual back-fill like `gh workflow run docker.yml
+      # --ref v0.9.0` *after* v0.10.0 has shipped would otherwise
+      # silently overwrite `latest` / `latest-gpu` / `0.9` and make
+      # `docker pull ghcr.io/abyo-software/s4:latest` regress to the
+      # older release. With these tags push-only, back-fills publish
+      # exactly the immutable `0.9.0` / `v0.9.0` / `<sha>` tags and
+      # `latest` keeps pointing at whatever tag-push moved it last.
+      # If an operator deliberately wants to re-promote `latest` (e.g.
+      # to roll back a regressed `latest`), they can re-push the
+      # desired tag — that flows through the `push` path and the
+      # mutable tags update.
+      #
+      # On the push path, `latest=auto` keeps the standard semantics:
+      # `latest` only attaches when the highest semver among inputs is
+      # non-prerelease (so a `v0.9.0-rc1` tag push won't move it).
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=${{ github.event_name == 'push' && 'auto' || 'false' }}
+            suffix=${{ matrix.tag_suffix }},onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern=v{{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'push' }}
+            type=ref,event=branch
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.title=s4${{ matrix.tag_suffix }}
+            org.opencontainers.image.description=Drop-in S3-compatible storage gateway with GPU-accelerated transparent compression (${{ matrix.flavor }} build)
+            org.opencontainers.image.vendor=abyo-software
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.source=https://github.com/abyo-software/s4
+            org.opencontainers.image.documentation=https://github.com/abyo-software/s4#readme
+
+      - name: Build & push (${{ matrix.flavor }})
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platforms }}
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Scope the cache per flavor so the CPU and GPU jobs don't
+          # invalidate each other's layers (different base images, different
+          # build feature set). `mode=max` exports intermediate layers too,
+          # which matters for the cargo release build that dominates the
+          # build time.
+          cache-from: type=gha,scope=docker-${{ matrix.flavor }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.flavor }}
+          # SLSA build provenance + SPDX SBOM so the published image is
+          # supply-chain verifiable. `mode=max` provenance pulls in
+          # frontend invocation details (Dockerfile contents, build args)
+          # in addition to the basic builder identity.
+          provenance: mode=max
+          sbom: true

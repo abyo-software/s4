@@ -87,7 +87,7 @@ service / Elevation of privilege) for each attack surface.
 |---|---|---|
 | Tampering | Attacker with backend write access flips bits in a compressed object | Per-frame CRC32C verified on GET; SSE modes wrap with AES-256-GCM whose tag covers the framed bytes. Out-of-band overwrite without ETag change still possible — `s4index` sidecar's `source_etag` + `source_compressed_size` binding (v0.8.4 #73 H-2) trips the staleness check on Range GET. |
 | Tampering | Sidecar entry overflow / non-monotonic offsets to crash the range planner | v0.8.15 #130, v0.8.16 #146 — per-entry `checked_add` + inter-entry monotonicity check, typed errors. |
-| Info disclosure | Range GET on encrypted object slices ciphertext at pre-encrypt offsets | v0.8.12 #120 suppressed sidecar when any SSE mode was on; encrypted Range GET buffered + decrypted + frame-parsed + sliced. v0.9 #106 re-enables the sidecar fast-path for **SSE-S4 chunked (S4E6 / `--sse-chunk-size > 0`)** via a v3 sidecar that carries per-chunk salt + key_id + chunk geometry — Range GET partial-fetches just the enclosing S4E6 chunks, decrypts them independently, then frame-parses and slices. SSE-KMS / SSE-C / S4E2 buffered keep the v0.8.12 #120 buffered fallback (multi-mode plumbing is the v0.10+ roadmap). |
+| Info disclosure | Range GET on encrypted object slices ciphertext at pre-encrypt offsets | v0.8.12 #120 suppressed the sidecar when any SSE mode was on; encrypted Range GET buffered + decrypted + frame-parsed + sliced. v0.9 #106 re-enables the sidecar fast-path for **SSE-S4 chunked (`S4E6` / `--sse-chunk-size > 0`)** via a v3 sidecar (`INDEX_VERSION = 3`) that carries the per-PUT `enc_salt` + `enc_key_id` + `enc_chunk_size` + `enc_chunk_count` + `enc_plaintext_len` + `enc_header_bytes` binding — Range GET partial-fetches just the enclosing `S4E6` chunks, AEAD-verifies each independently, then frame-parses and slices. The remaining modes (`S4E2` buffered SSE-S4, `S4E3` SSE-C, `S4E4` SSE-KMS, and per-part multipart-with-SSE) wrap the **entire body under one AES-256-GCM tag**, so AEAD decrypt is defined only over the full `(IV, ciphertext, AAD, tag)` quadruple (NIST SP 800-38D §7.2) — partial decrypt is **algorithm-level impossible**, not deferred plumbing. v0.10 status: only `S4E6` is fast-path-eligible; the other four keep the v0.8.12 #120 buffered fallback. Chunked-KMS (provisional `S4E7`) and chunked-SSE-C (provisional `S4E8`) envelopes are v0.11+ roadmap candidates, not promised features. Full per-mode walkthrough in [`sse-partial-fetch-constraint.md`](sse-partial-fetch-constraint.md). |
 | DoS | Decompression bomb — small compressed manifest, huge decompressed output | v0.8.6 #89 — `Decoder::take(manifest.original_size + 1024)` cap. v0.8.16 #145 fixes the dead-code probe so log messages distinguish "truncated at cap" from "decoder hit EOF". v0.8.16 #136 caps aggregate multipart output at `--max-body-bytes`. |
 | DoS | 32-bit WASM client (`s4-codec-wasm`) tricked by forged `compressed_size = 4 GiB+` | v0.8.15 #131 — `usize::try_from` rejects with `PayloadTooLarge` instead of silent truncation. |
 
@@ -178,15 +178,28 @@ These items are acknowledged and tracked, not silently hidden:
    (#122 / #128), which covers all six AWS checksum
    algorithms.
 3. **Range GET on encrypted objects** — v0.9 #106 shipped
-   the SSE-S4 chunked (S4E6 / `--sse-chunk-size > 0`) path
-   via a v3 sidecar carrying per-chunk salt + key_id + chunk
-   geometry; Range GET partial-fetches just the enclosing
-   S4E6 chunks. SSE-KMS / SSE-C / S4E2 buffered
-   (`--sse-chunk-size 0`) and per-part multipart SSE still
-   use the buffered fallback (full decrypt → frame-parse →
-   slice); covering them needs separate plumbing (KMS DEK
-   envelope shape, customer-key per-request material,
-   multipart per-part SSE) and is the v0.10+ roadmap.
+   the SSE-S4 chunked (`S4E6` / `--sse-chunk-size > 0`)
+   fast-path via a v3 sidecar (`INDEX_VERSION = 3`) whose
+   `sse_v3` block binds `enc_salt` + `enc_key_id` +
+   `enc_chunk_size` + `enc_chunk_count` + `enc_plaintext_len`
+   + `enc_header_bytes` (= `S4E6_HEADER_BYTES` = 24 today).
+   Range GET partial-fetches just the enclosing `S4E6`
+   chunks, AEAD-verifies each independently, then frame-parses
+   and slices. The remaining modes (`S4E2` buffered SSE-S4,
+   `S4E3` SSE-C, `S4E4` SSE-KMS, and per-part
+   multipart-with-SSE) wrap the entire body under one
+   AES-256-GCM authentication tag and therefore **cannot**
+   support partial-fetch under the AEAD security contract
+   (NIST SP 800-38D §7.2: authenticated decrypt is defined
+   only over the full `(IV, ciphertext, AAD, tag)` quadruple
+   — there is no "verify just the prefix" mode). This is an
+   algorithm-level constraint, not "follow-up plumbing".
+   Lifting it requires designing new chunked envelopes
+   (provisional `S4E7` for KMS, `S4E8` for SSE-C) plus a
+   part-aligned sidecar variant for multipart — v0.11+
+   roadmap candidates, not promised features. Operator
+   guidance, per-mode wire layout, and the v0.11+ sketches
+   live in [`sse-partial-fetch-constraint.md`](sse-partial-fetch-constraint.md).
 4. **Versioned multipart Complete writes no sidecar** —
    v0.8.16 #151 skips sidecar emission entirely for those
    bucket states. Range GET falls back to full read. **Cost

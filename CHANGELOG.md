@@ -7,6 +7,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+v0.10 roadmap in progress — encryption-aware sidecar completion
++ Docker image distribution.
+
+### Added
+
+- **#A1 SSE-S4 keyring for `s4 repair-sidecar`** — the v0.9 repair
+  tool intentionally fell back to `EncryptedSidecarUnsupported` on
+  every SSE-S4 chunked (S4E6) object because reconstructing the v3
+  `sse_v3` binding (key_id / salt / chunk_size / chunk_count /
+  plaintext_len / header_bytes) requires the SSE keyring. v0.10
+  plumbs `--sse-s4-key <PATH>` and `--sse-s4-key-rotated id=N,key=PATH`
+  (same shape as the server flags) onto the `repair-sidecar`
+  subcommand, plus a new `s4_server::repair::repair_sidecar_with_keyring`
+  lib entry point. When the body is an S4E6 envelope AND a keyring
+  is supplied, the repair path now decrypts the body in-process via
+  `decrypt_chunked_buffered`, frame-scans the recovered plaintext,
+  and stamps a v3 sidecar so subsequent Range GETs take the
+  encryption-aware partial-fetch fast-path. Non-S4E6 envelopes
+  (S4E1/E2/E3/E4/E5) and missing-keyring cases keep returning
+  `EncryptedSidecarUnsupported`; decrypt failures (key mismatch,
+  chunk auth-tag verify) surface the new typed
+  `RepairError::SseDecryptFailed` so the CLI can point at
+  `--sse-s4-key` instead of bubbling a generic `Backend` error.
+  Back-compat: the existing `repair_sidecar` signature is preserved
+  as a `None`-keyring shim around `repair_sidecar_with_keyring`;
+  `RepairReport` gains a new `sse_v3_binding: Option<RepairSseBinding>`
+  field (`Some(..)` only on the SSE-S4 chunked rebuild path). E2E
+  coverage adds `repair_sidecar_rebuilds_sse_s4_chunked_object_with_keyring`
+  (success path — asserts the rebuilt binding matches the on-disk
+  S4E6 header byte-for-byte + the full-body GET round-trips cleanly)
+  and `repair_sidecar_wrong_keyring_surfaces_sse_decrypt_failed`
+  (wrong-key path — asserts the typed variant + pre-existing sidecar
+  state is preserved across the failed repair). Closes the v0.9
+  audit-R2 P2-INT-1 follow-up. SSE-S4 buffered (S4E2),
+  SSE-C, SSE-KMS, and per-part multipart SSE remain out of scope —
+  partial-fetch fundamentally needs a chunked envelope, KMS / SSE-C
+  need different key-material plumbing.
+
+- **v0.10 #B1 ghcr.io container image publishing** — new
+  `.github/workflows/docker.yml` builds and pushes
+  `ghcr.io/abyo-software/s4:<version>` (CPU, multi-arch
+  `linux/amd64` + `linux/arm64`) and
+  `ghcr.io/abyo-software/s4:<version>-gpu` (nvCOMP GPU build,
+  `linux/amd64` only — nvCOMP redist only ships an x86_64 tarball)
+  on every `v*.*.*` push, plus `workflow_dispatch` for back-filling
+  images for tags that pre-date the workflow (e.g. v0.9.0). Images
+  carry SLSA build provenance (`provenance: mode=max`) + SPDX SBOM
+  and OCI labels (`source`, `description`, `vendor=abyo-software`,
+  `licenses=Apache-2.0`). GHA-cache-backed Buildx layer reuse
+  (`cache-from/to: type=gha,scope=docker-<flavor>`) keeps
+  incremental rebuilds fast. Auth uses the workflow's `GITHUB_TOKEN`
+  with `packages: write` — no PAT. The ghcr.io package is public,
+  so `helm install` / `docker pull` work with no pull secrets.
+  `charts/s4/values.yaml` `image.repository` now defaults to
+  `ghcr.io/abyo-software/s4` (was the never-published
+  `docker.io/abyosoftware/s4`); `docker-compose.yml` /
+  `docker-compose.gpu.yml` gain an `image:` line alongside the
+  existing `build:` so `up` works without a local build once the
+  release image is cached. README §"Kubernetes (Helm)" + chart
+  README rewritten to show the official `helm install --set
+  image.tag=0.9.0` invocation (CPU and `-gpu` variants) instead of
+  "build it yourself"; legacy-image warning in `NOTES.txt` now
+  points at the new default instead of "not yet published". Chart
+  `appVersion` bumped `0.3.0` → `0.9.0` so the default
+  `image.tag` (which falls back to `.Chart.AppVersion`) resolves to
+  an image that actually exists in ghcr.io. CPU `Dockerfile`
+  runtime stage now installs `wget` alongside `ca-certificates` —
+  the existing `HEALTHCHECK CMD wget …` would otherwise exit 127
+  on every probe because `debian:bookworm-slim` ships neither
+  `wget` nor `curl` (the GPU `Dockerfile.gpu` already installed it;
+  CPU image had been silently unhealthy since v0.8.x but no one
+  pulled it because no image had been published — surfaces now
+  that publishing is real).
+
+### Documentation
+
+- **v0.10 #A2-doc SSE partial-fetch constraint clarification** —
+  documents why the v0.9 #106 encryption-aware Range GET fast-path
+  covers **only** SSE-S4 chunked (`S4E6` / `--sse-chunk-size > 0`)
+  and not SSE-KMS (`S4E4`) / SSE-C (`S4E3`) / SSE-S4 buffered
+  (`S4E2`) / multipart-with-SSE. The other modes wrap the entire
+  body under one AES-256-GCM authentication tag, so AEAD decrypt is
+  only defined over the full ciphertext + AAD + tag quadruple —
+  partial-fetch is **algorithm-level impossible**, not "follow-up
+  plumbing". Lifting it requires designing new chunked envelopes
+  (provisional `S4E7` for KMS, `S4E8` for SSE-C) plus a part-aligned
+  sidecar variant for multipart — v0.11+ roadmap candidates, not
+  promised features. New `docs/security/sse-partial-fetch-constraint.md`
+  walks through the per-mode constraint + operator guidance on when
+  the fast-path matters and how to scope a workload to SSE-S4
+  chunked to get it. `docs/security/threat-model.md` §2 row + the
+  Known-residual-risks #3 entry now cite the constraint explicitly
+  instead of reading as "we'll get to it"; new README §"Server-side
+  encryption — Range GET fast-path matrix" surfaces the same matrix
+  + recommendation at the top-of-funnel level. Doc-only — zero code
+  / config / wire change.
+
+### Fixed
+
 ## [0.9.0] — 2026-06-07
 
 First v0.9 cut. Six roadmap items shipped + 7-round integrated

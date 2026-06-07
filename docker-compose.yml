@@ -27,6 +27,12 @@ services:
       retries: 5
 
   s4:
+    # Pull the published CPU image by default; fall through to a local
+    # build of `Dockerfile` when the tag isn't cached locally (lets
+    # `docker compose up` work in a freshly cloned repo even before the
+    # release image lands, and lets contributors test local Dockerfile
+    # changes without editing this file).
+    image: ghcr.io/abyo-software/s4:latest
     build: .
     depends_on:
       minio:

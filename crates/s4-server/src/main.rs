@@ -776,6 +776,30 @@ struct RepairSidecarArgs {
     /// (and make sure you actually have the RAM).
     #[clap(long, value_name = "BYTES", default_value_t = DEFAULT_REPAIR_BODY_BYTES_CLI)]
     max_body_bytes: u64,
+
+    /// v0.10 #A1: path to the SSE-S4 active key (32-byte raw, 64-char
+    /// hex, or 44-char base64) that was passed to the gateway as
+    /// `--sse-s4-key` when the encrypted object was PUT. Required to
+    /// repair SSE-S4 chunked (S4E6) objects — the repair tool will
+    /// decrypt the body in-process, frame-scan the plaintext, and
+    /// stamp a v3 sidecar carrying the SSE binding so Range GETs
+    /// take the encryption-aware partial-fetch fast-path. Plaintext
+    /// (non-encrypted) repairs ignore this flag. Non-S4E6 envelopes
+    /// (buffered S4E2, SSE-C, SSE-KMS) are NOT supported here —
+    /// route those through a server-mode rebuild / re-PUT instead.
+    #[clap(long, value_name = "PATH")]
+    sse_s4_key: Option<std::path::PathBuf>,
+
+    /// v0.10 #A1: additional retired SSE-S4 keys for repairing
+    /// objects that were PUT under a previous active slot. Format
+    /// matches the server's `--sse-s4-key-rotated`: `id=N,key=PATH`,
+    /// repeatable, and requires `--sse-s4-key` (which becomes the
+    /// id=1 active slot). The repair tool needs the SAME keyring
+    /// composition the gateway carried at PUT time — a different
+    /// composition surfaces as `SseDecryptFailed` (chunk auth-tag
+    /// verify fails on the slot mismatch).
+    #[clap(long, value_name = "id=N,key=PATH", requires = "sse_s4_key")]
+    sse_s4_key_rotated: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -2281,24 +2305,109 @@ async fn run_repair_sidecar(
     let (bucket, key) = s4_server::repair::parse_bucket_key(&args.target)
         .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.into() })?;
     let client = build_sidecar_client(opt).await?;
-    let report = s4_server::repair::repair_sidecar(&client, bucket, key, args.max_body_bytes)
-        .await
-        .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.to_string().into() })?;
-    println!(
-        "OK {}/{}: {} sidecar — {} frames, wrote {} bytes ({}), ETag={}",
-        report.bucket,
-        report.key,
-        if report.rebuilt_from_existing {
-            "rebuilt"
-        } else {
-            "wrote new"
-        },
-        report.frame_count,
-        report.sidecar_bytes_written,
-        format_bytes(report.sidecar_bytes_written),
-        report.source_etag.as_deref().unwrap_or("(none)"),
-    );
+    // v0.10 #A1: assemble the SSE-S4 keyring from the per-subcommand
+    // flags. `--sse-s4-key` becomes id=1 (matches the server boot
+    // convention at `src/main.rs::start_server`), retired keys come
+    // in via `--sse-s4-key-rotated id=N,key=PATH`. The keyring is
+    // `Option<Arc<_>>` so the back-compat (None) path keeps the
+    // v0.9 plaintext-only behaviour intact.
+    let sse_keyring = build_repair_keyring(&args.sse_s4_key, &args.sse_s4_key_rotated)?;
+    let report = s4_server::repair::repair_sidecar_with_keyring(
+        &client,
+        bucket,
+        key,
+        args.max_body_bytes,
+        sse_keyring.as_ref(),
+    )
+    .await
+    .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.to_string().into() })?;
+    // v0.10 #A1: surface the v3 SSE binding in the OK line so the
+    // operator can confirm the encryption-aware fast-path was
+    // re-stamped (vs. a plaintext repair that prints the v2 line).
+    match report.sse_v3_binding.as_ref() {
+        Some(b) => {
+            println!(
+                "OK {}/{}: {} v3 sidecar (SSE-S4 chunked) — {} frames, wrote {} bytes ({}), \
+                 ETag={}, sse(key_id={}, chunk_size={}, chunk_count={}, plaintext_len={}, \
+                 header_bytes={})",
+                report.bucket,
+                report.key,
+                if report.rebuilt_from_existing {
+                    "rebuilt"
+                } else {
+                    "wrote new"
+                },
+                report.frame_count,
+                report.sidecar_bytes_written,
+                format_bytes(report.sidecar_bytes_written),
+                report.source_etag.as_deref().unwrap_or("(none)"),
+                b.enc_key_id,
+                b.enc_chunk_size,
+                b.enc_chunk_count,
+                b.enc_plaintext_len,
+                b.enc_header_bytes,
+            );
+        }
+        None => {
+            println!(
+                "OK {}/{}: {} sidecar — {} frames, wrote {} bytes ({}), ETag={}",
+                report.bucket,
+                report.key,
+                if report.rebuilt_from_existing {
+                    "rebuilt"
+                } else {
+                    "wrote new"
+                },
+                report.frame_count,
+                report.sidecar_bytes_written,
+                format_bytes(report.sidecar_bytes_written),
+                report.source_etag.as_deref().unwrap_or("(none)"),
+            );
+        }
+    }
     Ok(())
+}
+
+/// v0.10 #A1: assemble the `repair-sidecar` subcommand's SSE-S4
+/// keyring from `--sse-s4-key` (active id=1 slot) + repeated
+/// `--sse-s4-key-rotated id=N,key=PATH` (retired slots). Returns
+/// `None` when no key was passed (= v0.9 plaintext-only behaviour).
+/// Errors carry enough context that the operator can fix the typo
+/// without `--help` — mirrors the server-boot wiring in
+/// `start_server`. Lives here (and not in `repair.rs`) so the lib
+/// crate doesn't grow a CLI-specific helper.
+fn build_repair_keyring(
+    active: &Option<std::path::PathBuf>,
+    rotated: &[String],
+) -> Result<Option<s4_server::sse::SharedSseKeyring>, Box<dyn Error + Send + Sync + 'static>> {
+    let Some(active_path) = active else {
+        // clap's `requires = "sse_s4_key"` on the rotated flag makes
+        // a non-empty `rotated` here unreachable, but guard defensively.
+        if !rotated.is_empty() {
+            return Err(
+                "--sse-s4-key-rotated requires --sse-s4-key (active key) to also be set".into(),
+            );
+        }
+        return Ok(None);
+    };
+    let active_key = s4_server::sse::SseKey::from_path(active_path)
+        .map_err(|e| format!("--sse-s4-key {}: {e}", active_path.display()))?;
+    let mut keyring = s4_server::sse::SseKeyring::new(1, std::sync::Arc::new(active_key));
+    for spec in rotated {
+        let (id, path) = parse_rotated_key_spec(spec)
+            .map_err(|e| format!("--sse-s4-key-rotated {spec:?}: {e}"))?;
+        if id == 1 {
+            return Err(
+                "--sse-s4-key-rotated id=1 collides with active id=1 (use a different id; \
+                 --sse-s4-key supplies id=1)"
+                    .into(),
+            );
+        }
+        let k = s4_server::sse::SseKey::from_path(&path)
+            .map_err(|e| format!("--sse-s4-key-rotated id={id} key {}: {e}", path.display()))?;
+        keyring.add(id, std::sync::Arc::new(k));
+    }
+    Ok(Some(std::sync::Arc::new(keyring)))
 }
 
 async fn run_sweep_orphan_sidecars(

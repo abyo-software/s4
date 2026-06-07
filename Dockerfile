@@ -26,8 +26,14 @@ RUN cargo build --release -p s4-server --bin s4
 
 # ---- runtime ----
 FROM debian:bookworm-slim
+# `wget` is consumed by the HEALTHCHECK below — debian-slim does not ship
+# either wget or curl out of the box, so without this install the
+# healthcheck CMD would exit 127 and Docker / `compose` would mark the
+# container unhealthy on every probe even when the gateway is serving
+# `/health` happily. `ca-certificates` is needed by the s4 binary's
+# rustls HTTPS path when talking to the real S3 backend.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
+    ca-certificates wget \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/src/s4/target/release/s4 /usr/local/bin/s4

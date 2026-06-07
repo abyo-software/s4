@@ -8,16 +8,23 @@
 replicas: 2
 
 image:
-  # -- Container image registry + repository. Note: the `abyosoftware/s4`
-  # image on Docker Hub is NOT yet published as of chart 0.1.0 — build it
-  # locally (`docker build -t abyosoftware/s4:0.3.0 .`) and `kind load
-  # docker-image abyosoftware/s4:0.3.0` (or push to your own registry) until
-  # the official image lands.
-  repository: docker.io/abyosoftware/s4
-  # -- Image tag. Defaults to .Chart.appVersion when empty.
+  # -- Container image registry + repository. Official images are published
+  # to GitHub Container Registry (ghcr.io) on every `v*.*.*` tag by
+  # `.github/workflows/docker.yml`. ghcr.io packages owned by
+  # `abyo-software` are public, so no `pullSecrets` are required for the
+  # default value.
+  #
+  # For the GPU (nvCOMP) build, append `-gpu` to the tag — both flavors
+  # share this repository, e.g. `ghcr.io/abyo-software/s4:0.9.0-gpu`.
+  repository: ghcr.io/abyo-software/s4
+  # -- Image tag. Defaults to .Chart.appVersion when empty. For the GPU
+  # build, override with `--set image.tag=<version>-gpu` and also set
+  # `--set gpu.enabled=true`.
   tag: ""
   pullPolicy: IfNotPresent
-  # -- Image pull secrets, e.g. [{name: regcred}].
+  # -- Image pull secrets, e.g. [{name: regcred}]. Not needed for the
+  # default public ghcr.io repository; only required if you mirror the
+  # image to a private registry.
   pullSecrets: []
 
 # -- Override generated names.
