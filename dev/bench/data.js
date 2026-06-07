@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780842816860,
+  "lastUpdate": 1780843003108,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -2710,6 +2710,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "5aa5c391e95b7a7dd1233602730684ad5c034d16",
+          "message": "feat(v0.10-B2): #B2 — Docker / Helm distribution smoke CI\n\nCloses v0.10 wave-2 #B2. v0.10 #B1 (wave-1) added the\nghcr.io publish workflow + flipped the Helm chart default to the\nnew image repo, but no CI step actually exercised the published\noutput. New `.github/workflows/docker-smoke.yml` validates the\ndistribution surface on every push that touches it (path-filtered\nto `charts/**`, `Dockerfile*`, `docker-compose*.yml`, plus the\ndocker / docker-smoke workflow files themselves):\n\n  - `helm-lint-template`: `helm lint` + three `helm template`\n    runs (default, `image.tag=0.9.0` pinned, `0.9.0-gpu`\n    variant) against `./charts/s4` with a placeholder\n    `backend.endpointUrl`. Asserts the rendered manifest\n    references the expected ghcr repo / tag per variant.\n  - `docker-compose-config`: `docker compose config` on both\n    compose files + grep for the `ghcr.io/abyo-software/s4`\n    image refs the wave-1 #B1 work added (catches a regression\n    that silently drops `image:` and forces consumers back to\n    `build:`-only mode).\n  - `image-smoke`: pulls `ghcr.io/abyo-software/s4:latest`\n    (overrideable via `workflow_dispatch -f image_tag=...`),\n    runs `s4 --help` + `s4 --version`. `continue-on-error: true`\n    on pull tolerates the not-yet-published case (before v0.10.0\n    cut) — chart + compose jobs still gate.\n\nWorkflow is NOT in `notify-on-failure`'s `needs:` by design —\ndistribution regressions are advisory during the v0.10\ndistribution-ramp; they surface in the run UI without\nauto-filing issues that would be noisy.\n\nREADME §\"Kubernetes (Helm)\" gains a \"Verifying the image /\nchart locally\" subsection mirroring the CI checks for\noperators who want to reproduce them pre-deploy.\n\nLocal sanity (run on this commit before push):\n  - `helm lint ./charts/s4 --set backend.endpointUrl=...`: clean\n  - `helm template ... --set image.tag=0.9.0`: 1 match for\n    `ghcr.io/abyo-software/s4:0.9.0` (= deployment image ref)\n  - `docker compose config` on both compose files: no errors\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-07T23:28:36+09:00",
+          "tree_id": "325bb9ce28c406bc2ea33a57ff16640c96167342",
+          "url": "https://github.com/abyo-software/s4/commit/5aa5c391e95b7a7dd1233602730684ad5c034d16"
+        },
+        "date": 1780843002523,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 48305,
+            "range": "± 2099",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 57751,
+            "range": "± 883",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 428,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2225254,
+            "range": "± 84058",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50685545,
+            "range": "± 151528",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201411,
+            "range": "± 10544",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 49229018,
+            "range": "± 1241884",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 923613708,
+            "range": "± 6131192",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3215816,
+            "range": "± 15520",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 28269,
+            "range": "± 4234",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 32325,
+            "range": "± 982",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 419,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 575527,
+            "range": "± 2076",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1641750,
+            "range": "± 7199",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201341,
+            "range": "± 728",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12315314,
+            "range": "± 90760",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 28925438,
+            "range": "± 1899288",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3222364,
+            "range": "± 32566",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1477710,
+            "range": "± 39126",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2111604,
+            "range": "± 21997",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 328027130,
+            "range": "± 8841415",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 136,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 8756,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 910,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 14174,
+            "range": "± 293",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2750,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 21346,
+            "range": "± 115",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 85166,
+            "range": "± 146",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 631,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 5287,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 21140,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
             "range": "± 0",
             "unit": "ns/iter"
           }
