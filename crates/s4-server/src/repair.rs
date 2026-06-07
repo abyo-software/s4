@@ -701,6 +701,20 @@ async fn classify_missing_sidecar(
             });
         }
     };
+    // v0.9 #106-audit self-review (post-R2): mirror the encrypted-body
+    // guard from `repair_sidecar` here. Without it, running
+    // `verify-sidecar` against an SSE-S4 chunked object (whose sidecar
+    // is missing — e.g. PUT happened pre-v0.9 before v3 sidecars
+    // shipped) would surface as a confusing FrameScan error instead of
+    // the friendly EncryptedSidecarUnsupported the repair tool already
+    // returns. Same root cause as P2-INT-1; same surface error.
+    if let Some(magic) = detect_sse_magic(&body) {
+        return Err(RepairError::EncryptedSidecarUnsupported {
+            bucket: bucket.into(),
+            key: key.into(),
+            message: format!("body magic {magic} indicates SSE-S4 envelope"),
+        });
+    }
     let idx = build_index_from_body(&body).map_err(|e| RepairError::FrameScan {
         bucket: bucket.into(),
         key: key.into(),
