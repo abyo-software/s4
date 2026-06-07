@@ -705,16 +705,28 @@ gateway hides `.s4index` from listings and decompresses bodies on GET,
 both of which break this tooling:
 
 ```bash
-# Read-only check. Exits 0 on Ok/LegacyV1, 1 on any divergence.
+# Read-only check. Exits 0 on Ok / LegacyV1 / MissingHarmless
+# (single-frame object, no sidecar by design) / MissingUnknown (body
+# exceeds the deep-scan cap, can't classify); exits 1 on
+# MissingDivergent / StaleEtag / StaleSize / DecodeError /
+# EncryptedSidecarUnsupported (SSE-S4 chunked, see follow-up below).
 s4 verify-sidecar bucket/key --endpoint-url https://s3.example.com
 
 # Re-scan the main object and overwrite the sidecar. Default body cap
 # is 5 GiB (matches --max-body-bytes); pass --max-body-bytes to raise.
+# Does NOT yet support SSE-S4 chunked encrypted objects from the CLI
+# (operator needs the SSE keyring; v0.10 roadmap is to plumb
+# `--sse-s4-key <path>` through). Until then, re-PUT the object via
+# the v0.9+ gateway to regenerate the v3 sidecar.
 s4 repair-sidecar bucket/key --endpoint-url https://s3.example.com
 
 # Find dangling `.s4index` whose pair is missing or stale. Dry-run by
-# default; --delete actually removes them.
-s4 sweep-orphan-sidecars bucket --endpoint-url https://s3.example.com [--delete]
+# default; --delete actually removes them. The default --delete only
+# removes pair-bound orphans (PairedMissing / PairedEtagMismatch /
+# PairedSizeMismatch); SidecarUndecodable entries stay until you
+# escalate with --delete-undecodable (guards against deleting legacy
+# reserved-name user data under --allow-legacy-reserved-key-reads).
+s4 sweep-orphan-sidecars bucket --endpoint-url https://s3.example.com [--delete] [--delete-undecodable]
 ```
 
 The manual fallback (DELETE the sidecar — Range GET drops to the

@@ -7,7 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-v0.9 roadmap in progress.
+## [0.9.0] — 2026-06-07
+
+First v0.9 cut. Six roadmap items shipped + 7-round integrated
+audit converged (clean bill of health on round 7). Net diff
+vs v0.8.22: 26 files / +8,500 lines across `s4-codec` and
+`s4-server`, all behind opt-in flags or new subcommands — no
+behavioral change on existing CLI surface or default-config
+deployments.
+
+Headline additions:
+- Operator tooling — `s4 verify-sidecar` / `s4 repair-sidecar` /
+  `s4 sweep-orphan-sidecars` subcommands close the gap that
+  v0.8.x `orphan-sidecar-recovery.md` left as manual aws-cli.
+- Performance regression gate — criterion-based bench targets +
+  GitHub-Pages-backed trend chart via
+  `benchmark-action/github-action-benchmark`.
+- Encryption-aware sidecar (SSE-S4 chunked / S4E6) — Range GET
+  on `--sse-chunk-size > 0` objects now hits a partial-fetch
+  fast path via the new v3 sidecar; SSE-KMS / SSE-C / S4E2
+  / multipart remain on the v0.8.12 #120 buffered fallback
+  (deferred to v0.10+).
+- True streaming PUT checksum verify (tee-into-hasher) for
+  `cpu-zstd` / `nvcomp-zstd` single-PUT — closes the v0.8.13
+  #127 regression that v0.8.14 #129 reverted to a buffered
+  fallback. Multipart `upload_part` keeps the buffered
+  per-part verify (bytes are already in memory there for
+  framing).
+- Chaos infrastructure — 5 deterministic backend-fault
+  scenarios replace the v0.8.18 P7 scaffold.
+- 32-bit cross-compile (`i686-unknown-linux-gnu`) across
+  every workspace crate. Runtime is NOT claimed —
+  `cargo check --target` parity only.
+
+Audit posture: zero P1 findings across 6 per-feature audits
+(11 Codex rounds) + 7-round integrated audit (7 P2 + 1
+self-review fix). v0.9.0 publishes from a clean R7.
 
 ### Added
 

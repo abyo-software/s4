@@ -723,8 +723,12 @@ enum Cmd {
 
     /// v0.9 #106: report whether `<bucket>/<key>.s4index` is intact,
     /// missing, or stale relative to the live HEAD on the backend.
-    /// Read-only — never writes. Exit code 0 on Ok / LegacyV1, 1 on any
-    /// divergence so a CI / cron job can branch.
+    /// Read-only — never writes. Exit 0 on `Ok` / `LegacyV1` /
+    /// `MissingHarmless` (single-frame object, no sidecar by design) /
+    /// `MissingUnknown` (body > `--max-body-bytes`, ambiguous); exit
+    /// 1 on `MissingDivergent` / `StaleEtag` / `StaleSize` /
+    /// `DecodeError`. SSE-S4 chunked objects without a v3 sidecar
+    /// surface `EncryptedSidecarUnsupported` (exit 1).
     VerifySidecar(SidecarTargetArgs),
 
     /// v0.9 #106: rebuild `<bucket>/<key>.s4index` by re-scanning the
