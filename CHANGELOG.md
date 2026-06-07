@@ -139,6 +139,30 @@ v0.10 roadmap in progress — encryption-aware sidecar completion
 
 ### Documentation
 
+- **v0.10 wave-2 #A3-doc streaming PUT checksum coverage matrix** —
+  new [`docs/security/streaming-checksum-coverage.md`](docs/security/streaming-checksum-coverage.md)
+  walks the codec-API constraint that limits the v0.9 #streaming-checksum
+  tee-into-hasher fast-path to single-PUT `cpu-zstd` / `nvcomp-zstd`
+  (= `Codec::supports_streaming_compress() == true`). Same "fundamental
+  contract, not deferred plumbing" framing as #A2-doc on the SSE side.
+  Captures:
+    - Coverage matrix across PUT-shape × codec branch (5 rows × verify
+      mode + reason).
+    - Three preconditions a "streaming win" actually requires (streaming
+      codec + streaming downstream + no full-body framing dependency)
+      and why multipart `upload_part` only meets the first two
+      (`pad_to_minimum` needs the framed length).
+    - Where each path lives in `s4-server` (`put_object` streaming vs
+      buffered branch, `upload_part` buffered, `verify_client_body_checksums`
+      + `verify_client_trailer_checksums` shared helpers).
+    - v0.11+ candidates (`S4F3` streaming frame format, streaming
+      `nvcomp-bitcomp` / `gdeflate`, multipart streaming `upload_part`)
+      with the upstream API constraints that block each one — tracked
+      here, not in the README, to keep the README's "Streaming I/O"
+      section focused on what operators get today.
+  README §"Streaming I/O" `**Streaming PUT**` bullet gains a link to
+  the dedicated doc.
+
 - **v0.10 #A2-doc SSE partial-fetch constraint clarification** —
   documents why the v0.9 #106 encryption-aware Range GET fast-path
   covers **only** SSE-S4 chunked (`S4E6` / `--sse-chunk-size > 0`)

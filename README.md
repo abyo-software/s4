@@ -792,7 +792,10 @@ with backend (no network RTT to amortise). TTFB excludes TLS handshake
   are verified **in-stream** via a tee-into-hasher wrapper (v0.9 #106): mismatched
   bytes surface as `400 BadDigest` without buffering the body. GPU codecs and
   multipart `UploadPart` keep the buffered per-body / per-part verify path
-  (the bytes are already in memory there for framing / padding)
+  (the bytes are already in memory there for framing / padding) —
+  see [`docs/security/streaming-checksum-coverage.md`](docs/security/streaming-checksum-coverage.md)
+  for the full coverage matrix and the codec-API constraint that makes
+  this a fundamental property of those branches, not deferred plumbing
 - **GPU streaming compress** (v0.2): nvCOMP `zstd` / `gdeflate` PUTs run a
   per-chunk pipeline so a 10 GB highly-compressible upload peaks at ~210 MB
   host RAM instead of buffering the full input
