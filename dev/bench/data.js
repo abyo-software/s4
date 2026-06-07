@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780843635791,
+  "lastUpdate": 1780844292722,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -3614,6 +3614,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "5ec27e36df3908124cc5c763b0f3a205c5a78034",
+          "message": "chore(release): cut v0.10.0 — encryption-aware completion + Docker distribution + hardening\n\nWorkspace 0.9.0 → 0.10.0. Internal dep specs: s4-server (s4-codec /\ns4-config 0.9 → 0.10), s4-codec-py (0.9 → 0.10), s4-codec-wasm\n(0.9 → 0.10). Helm chart Chart.yaml: version 0.2.0 → 0.2.1\n(appVersion-only bump, no chart-shape change since 0.2.0),\nappVersion 0.9.0 → 0.10.0.\n\nWave-1 shipped (commit b052319):\n  - #A1  s4 repair-sidecar --sse-s4-key plumbing (closes the v0.9\n         EncryptedSidecarUnsupported reject path; CLI can now\n         decrypt SSE-S4 chunked bodies in-process via the keyring\n         and rebuild the v3 sidecar)\n  - #B1  ghcr.io/abyo-software/s4 image publishing (multi-arch CPU\n         + amd64 GPU, SLSA provenance + SPDX SBOM, Helm chart\n         repo flip)\n  - #A2-doc  SSE partial-fetch AEAD constraint walkthrough\n\nWave-2 shipped (commits f9853ad / 5aa5c39 / 3da7b7e):\n  - #A4  i686 runtime smoke CI (cargo test codec/config + s4\n         binary --help / --version)\n  - #B2  Docker / Helm distribution smoke CI (helm lint + template\n         + docker compose config + image pull-smoke)\n  - #A3-doc  streaming PUT checksum coverage matrix\n\nIntegrated audit closeout fixes:\n  - be1765e v0.10-W2-R1 P2 (docker-smoke `s4 s4 --help` arg dup)\n  - eddd732 v0.10-W2-R2 P2 (docker.yml back-fill mis-tags `:main`\n            + `:sha-<x>` from dispatcher ref instead of build_ref)\n\nAudit posture: per-feature audits (A1 5R + B1 4R + B2 1R + A2-doc\n1R + A3-doc 0R + A4 0R) + 4-round integrated audit on the full\nv0.9.0..main range. Zero P1. 2 P2 integrated-audit fixes (both\ncaught BEFORE the corresponding image actually shipped). v0.10.0\npublishes from R4 clean.\n\nPre-release verification:\n  - cargo fmt --check clean\n  - cargo clippy --workspace --all-targets -- -D warnings clean\n  - cargo test --workspace: 0 failed\n  - cargo publish --dry-run: s4-codec + s4-config pass (s4-server\n    + s4-codec-py hit expected dep-skew because s4-codec 0.10.0\n    not yet published; resolved at publish time by ordering\n    s4-codec → s4-config → s4-server → s4-codec-py)\n  - helm lint ./charts/s4: clean\n  - helm template (default + image.tag=0.10.0): renders cleanly\n  - docker compose config (both files): clean\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-07T23:50:08+09:00",
+          "tree_id": "592ad3b0f01d188b2c690fc276f371ae1dbd3711",
+          "url": "https://github.com/abyo-software/s4/commit/5ec27e36df3908124cc5c763b0f3a205c5a78034"
+        },
+        "date": 1780844291839,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 48104,
+            "range": "± 1815",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 58012,
+            "range": "± 1469",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 432,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2202744,
+            "range": "± 59982",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50516382,
+            "range": "± 158526",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201459,
+            "range": "± 721",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 49306197,
+            "range": "± 1098061",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 921841474,
+            "range": "± 1924078",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3217897,
+            "range": "± 9858",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 27247,
+            "range": "± 1339",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 32668,
+            "range": "± 2191",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 418,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 590569,
+            "range": "± 4499",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1640485,
+            "range": "± 16340",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201384,
+            "range": "± 205",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 11993680,
+            "range": "± 135478",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 28732600,
+            "range": "± 193254",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3225494,
+            "range": "± 18566",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1491195,
+            "range": "± 23958",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2077965,
+            "range": "± 15013",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 308631108,
+            "range": "± 5233277",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 136,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 8285,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 899,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13787,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2937,
+            "range": "± 102",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 22842,
+            "range": "± 101",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 91015,
+            "range": "± 212",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 597,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4722,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19468,
+            "range": "± 452",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
             "range": "± 0",
             "unit": "ns/iter"
           }
