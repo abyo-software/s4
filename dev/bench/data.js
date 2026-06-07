@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780827678971,
+  "lastUpdate": 1780829809583,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -659,6 +659,232 @@ window.BENCHMARK_DATA = {
             "name": "decode_index/4096f",
             "value": 19327,
             "range": "± 111",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "76f0c110e0fbf0a77ea95ca000e0d8c65ef03d2b",
+          "message": "fix(audit): #106-audit-R3 P2-R3 — reject NotFramed before writing sidecar\n\nCodex round 3 integrated audit caught: `s4 repair-sidecar` on an\nobject whose body has no S4F2 frames (passthrough / empty / very\nshort bodies) used to silently write an empty `<key>.s4index`\nbecause `build_index_from_body` returns `Ok(FrameIndex { entries: [],\n.. })` rather than an error for those bodies. The empty sidecar\nthen broke Range GET on that key: `FrameIndex::lookup_range` over\nzero entries returns `None`, and the GET path took the \"no plan\"\nbranch instead of the passthrough-range fallback that exists for\nsidecar-less objects.\n\nFix: add an `idx.entries.is_empty()` guard right after\n`build_index_from_body` returns in `repair_sidecar`. Rejects with\nnew `RepairError::NotFramed { bucket, key }` whose Display tells\nthe operator the object isn't a sidecar-repair candidate (and\n`verify-sidecar` separately classifies it as `MissingHarmless`\nwith `frame_count = 0`, which IS the correct verdict — passthrough\nobjects intentionally have no sidecar).\n\nTests:\n- Lib unit `not_framed_error_shape` pins the variant's wire shape\n  + Display (catches refactor renames at compile time)\n- MinIO E2E `repair_sidecar_rejects_zero_frame_body` plants an\n  empty body (the exact case `build_index_from_body` returns Ok\n  with zero entries) AND a non-trivial raw-bytes body (which trips\n  the inner BadMagic / FrameScan path); proves BOTH paths reject\n  cleanly without writing a sidecar\n\nCoverage: lib unit tests now 15 (was 14). Workspace 0 failed.\nfmt + clippy clean.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-07T19:48:43+09:00",
+          "tree_id": "275474102d07e996478fd2b19a35ebdc78221ddc",
+          "url": "https://github.com/abyo-software/s4/commit/76f0c110e0fbf0a77ea95ca000e0d8c65ef03d2b"
+        },
+        "date": 1780829809234,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 48276,
+            "range": "± 1694",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 57353,
+            "range": "± 1597",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 428,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2199801,
+            "range": "± 24739",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50710077,
+            "range": "± 126442",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201793,
+            "range": "± 2656",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 49046070,
+            "range": "± 504645",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 925168395,
+            "range": "± 5183646",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3218412,
+            "range": "± 10512",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 26996,
+            "range": "± 1045",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 31886,
+            "range": "± 975",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 422,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 575323,
+            "range": "± 3520",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1654277,
+            "range": "± 16453",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201090,
+            "range": "± 265",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12837047,
+            "range": "± 330745",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 29468087,
+            "range": "± 199047",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3337962,
+            "range": "± 70438",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1467992,
+            "range": "± 61350",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2104590,
+            "range": "± 73530",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 355185939,
+            "range": "± 5389871",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 136,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 9796,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 920,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 14280,
+            "range": "± 175",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2756,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 21422,
+            "range": "± 58",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 86320,
+            "range": "± 806",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 647,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 5363,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 20951,
+            "range": "± 261",
             "unit": "ns/iter"
           },
           {
