@@ -7,8 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-v0.10 roadmap in progress — encryption-aware sidecar completion
-+ Docker image distribution.
+## [0.10.0] — 2026-06-07
+
+Second v0.10-line cut (= first v0.10). Two-wave delivery of the
+encryption-aware sidecar completion + Docker image distribution
+theme + bench-driven hardening, converged by a 4-round integrated
+audit (2 P2 fixes, clean R3 + R4). Net diff vs v0.9.0:
+~12 files / ~1,800 lines across `s4-server`, the chart, the
+distribution workflows, and the docs.
+
+Headline additions (= wave-1):
+- **`s4 repair-sidecar` now supports `--sse-s4-key`** — the v0.9
+  encryption-aware sidecar (v3 SSE-S4 chunked) is now repairable
+  from the CLI by supplying the SSE keyring. Closes the
+  `EncryptedSidecarUnsupported` reject path v0.9 audit P2-INT-1
+  introduced as a placeholder. New
+  `s4_server::repair::repair_sidecar_with_keyring` lib entry +
+  `RepairReport::sse_v3_binding`.
+- **Official container images on ghcr.io** —
+  `ghcr.io/abyo-software/s4:<version>` (multi-arch CPU) +
+  `ghcr.io/abyo-software/s4:<version>-gpu` (nvCOMP GPU,
+  amd64). SLSA provenance + SPDX SBOM. Helm chart default
+  `image.repository` flipped to ghcr (chart `version` 0.1.0 →
+  0.2.0, `appVersion` 0.9.0).
+- **SSE partial-fetch AEAD constraint docs** — new
+  `docs/security/sse-partial-fetch-constraint.md` explains why
+  the v3 sidecar fast-path is SSE-S4 chunked (S4E6) only and
+  why SSE-KMS / SSE-C / S4E2 stay buffered (AEAD whole-body
+  tag).
+
+Wave-2 hardening:
+- **i686 runtime smoke in CI** — `s4-codec` / `s4-config` tests
+  + `s4-server --help` / `--version` on i686. README §"Supported
+  targets" cell flips from "⚠️ compiles, untested at runtime"
+  to "✅ compiles + smoke (CI)".
+- **Docker / Helm distribution smoke CI** — `helm lint` +
+  `helm template` + `docker compose config` + `docker pull +
+  --help` on every chart / Dockerfile / compose push. Catches
+  distribution-surface regressions before operators hit them.
+- **Streaming PUT checksum coverage matrix doc** — companion
+  to the AEAD constraint doc; explains why the v0.9 streaming
+  verify tee covers single-PUT cpu-zstd/nvcomp-zstd only (codec
+  trait takes `Bytes`, not `Stream<Bytes>`).
+
+Audit posture: per-feature audits (A1 5R + B1 4R + B2 1R + A2-doc
+1R + A3-doc 0R + A4 0R) + 4-round integrated audit on the full
+v0.9.0..main range. Zero P1 across all rounds. 2 P2 integrated-
+audit fixes (Dockerfile `s4 s4 --help` arg dup, back-fill
+`:main` mis-tag — both caught BEFORE the corresponding image
+actually shipped). v0.10.0 publishes from clean R4.
 
 ### Added
 

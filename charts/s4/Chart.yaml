@@ -8,9 +8,10 @@ type: application
 # `ghcr.io/abyo-software/s4`. Minor bump per SemVer because a
 # `helm upgrade` with no override now points at a different image
 # repo (chart behavior change, not just appVersion drift).
-version: 0.2.0
-# appVersion tracks the s4-server release shipped on crates.io / Docker Hub.
-appVersion: "0.9.0"
+# 0.2.1: v0.10.0 cut — appVersion bump only, no chart-shape change.
+version: 0.2.1
+# appVersion tracks the s4-server release shipped on crates.io / ghcr.io.
+appVersion: "0.10.0"
 kubeVersion: ">=1.24.0-0"
 home: https://github.com/abyo-software/s4
 sources:
