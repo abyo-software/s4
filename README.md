@@ -736,7 +736,12 @@ with backend (no network RTT to amortise). TTFB excludes TLS handshake
   TTFB **8–20 ms** under the conditions above, memory ≈ zstd window
   (8 MiB at level 3) + 64 KiB buffer
 - **Streaming PUT** for the same codecs: input never fully buffered, peak memory
-  ≈ compressed size (5 GB → ~50 MB at 100× ratio)
+  ≈ compressed size (5 GB → ~50 MB at 100× ratio). Client-supplied whole-body
+  checksums (`Content-MD5`, `x-amz-checksum-{crc32, crc32c, sha1, sha256, crc64nvme}`)
+  are verified **in-stream** via a tee-into-hasher wrapper (v0.9 #106): mismatched
+  bytes surface as `400 BadDigest` without buffering the body. GPU codecs and
+  multipart `UploadPart` keep the buffered per-body / per-part verify path
+  (the bytes are already in memory there for framing / padding)
 - **GPU streaming compress** (v0.2): nvCOMP `zstd` / `gdeflate` PUTs run a
   per-chunk pipeline so a 10 GB highly-compressible upload peaks at ~210 MB
   host RAM instead of buffering the full input

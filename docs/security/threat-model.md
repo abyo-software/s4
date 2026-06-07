@@ -158,12 +158,25 @@ These items are acknowledged and tracked, not silently hidden:
    operator-trusted backend endpoint. Mitigation: pin to a
    trusted backend; upgrade path follows the s3s + aws-sdk-s3
    release schedule. Tracked in issue #91.
-2. **Streaming PUT does not verify client checksums** — the
-   v0.8.13 #127 attempt regressed sidecar correctness
-   (v0.8.14 #129). True streaming verify (tee-into-hasher) is
-   a roadmap follow-up; the buffered PUT branch and
-   `UploadPart` verify all six AWS checksum algorithms (#122
-   / #128).
+2. **Streaming PUT now verifies client checksums (v0.9 #106)** —
+   the v0.8.13 #127 attempt regressed sidecar correctness
+   (v0.8.14 #129). v0.9 #106 lands true streaming verify
+   (tee-into-hasher) for single-PUT cpu-zstd / nvcomp-zstd
+   (the streaming-framed path). Mismatched bodies surface
+   as `400 BadDigest` without buffering. Both delivery
+   shapes are covered: client checksums carried as request
+   headers (`Content-MD5`, `x-amz-checksum-*`) are
+   compared eagerly at EOF inside the tee, and the
+   chunked / SigV4-streaming SDK case where the value
+   arrives in **request trailers** (announced via
+   `x-amz-trailer`) is compared after the body has been
+   consumed, against the digest stashed by the tee. GPU
+   codecs that fall into the bytes-buffered branch
+   (currently the GPU codecs that don't yet
+   `supports_streaming_compress`) and `UploadPart` still
+   use the existing buffered `verify_client_body_checksums`
+   (#122 / #128), which covers all six AWS checksum
+   algorithms.
 3. **Range GET on encrypted objects is buffered** — no
    sidecar fast-path until an encryption-aware sidecar format
    lands (post-launch roadmap).

@@ -3517,3 +3517,310 @@ async fn replication_put_object_replicates_to_destination_bucket() {
         "HEAD A/key-1 must surface COMPLETED on the source"
     );
 }
+
+// =============================================================================
+// v0.9 #106 — streaming PUT checksum verify (tee-into-hasher) E2E tests
+// =============================================================================
+//
+// These tests exercise the streaming-framed PUT path
+// (cpu-zstd single-PUT, the only branch that previously fail-opened on
+// client-supplied whole-body checksums) through the full
+// `S4Service::put_object` handler — including header parsing, the tee
+// wrapper, and the `BadDigest` mapping in the error path.
+//
+// We deliberately stay on cpu-zstd here so the test exercises the
+// `streaming-framed` branch (`supports_streaming_compress(kind) && kind !=
+// Passthrough`), not the buffered fallback the existing
+// `verify_client_body_checksums` test coverage already exercises.
+
+mod streaming_checksum_e2e {
+    use super::*;
+    use base64::Engine as _;
+    use md5::{Digest as _, Md5};
+    use sha2::Sha256;
+
+    fn b64(b: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(b)
+    }
+
+    /// Build a PUT request that goes through the streaming-framed path
+    /// (cpu-zstd, multi-chunk body so the tee wrapper is meaningfully
+    /// exercised — single-chunk bodies are also fine, just less
+    /// representative).
+    fn streaming_put(
+        bucket: &str,
+        key: &str,
+        body: Bytes,
+        checksum_crc32c: Option<String>,
+        checksum_sha256: Option<String>,
+        content_md5: Option<String>,
+    ) -> S3Request<PutObjectInput> {
+        let len = body.len() as i64;
+        let input = PutObjectInput {
+            bucket: bucket.into(),
+            key: key.into(),
+            body: Some(s4_server::blob::bytes_to_blob(body)),
+            content_length: Some(len),
+            checksum_crc32c,
+            checksum_sha256,
+            content_md5,
+            ..Default::default()
+        };
+        S3Request {
+            input,
+            method: http::Method::PUT,
+            uri: format!("/{bucket}/{key}").parse().unwrap(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn s4service() -> S4Service<MemoryBackend> {
+        let backend = MemoryBackend::new();
+        S4Service::new(
+            backend,
+            make_registry(CodecKind::CpuZstd),
+            make_dispatcher(CodecKind::CpuZstd),
+        )
+    }
+
+    /// 1 MiB body, matching crc32c → PUT succeeds AND the GET-side
+    /// roundtrip matches. The body length is chosen large enough to
+    /// span multiple read calls inside the codec pipeline (default
+    /// chunk size is 4 MiB, but ZstdEncoder reads in 64 KiB blocks),
+    /// so the tee wrapper's per-chunk `update()` path is hit.
+    #[tokio::test]
+    async fn streaming_checksum_crc32c_match_succeeds() {
+        let s4 = s4service();
+        let body = Bytes::from(vec![b'a'; 1024 * 1024]);
+        let crc = crc32c::crc32c(&body).to_be_bytes();
+        let req = streaming_put("bk", "k1", body.clone(), Some(b64(&crc)), None, None);
+        s4.put_object(req)
+            .await
+            .expect("streaming PUT with matching crc32c must succeed");
+
+        // Round-trip the body to confirm the tee did not corrupt the
+        // bytes on their way through.
+        let got = read_back(s4.get_object(get_request("bk", "k1")).await.expect("get")).await;
+        assert_eq!(got, body, "streaming-tee body must roundtrip byte-equal");
+    }
+
+    /// 1 MiB body, deliberately wrong crc32c → PUT must reject with
+    /// `BadDigest` and the backend must NOT receive the bytes (the
+    /// error fires before `streaming_compress_to_frames` returns, so
+    /// the backend's put_object handler is never invoked).
+    #[tokio::test]
+    async fn streaming_checksum_crc32c_mismatch_rejects() {
+        let s4 = s4service();
+        let body = Bytes::from(vec![b'b'; 1024 * 1024]);
+        // Flip every bit of the real CRC so the claim is unambiguously wrong.
+        let wrong = (crc32c::crc32c(&body) ^ 0xFFFF_FFFF).to_be_bytes();
+        let req = streaming_put("bk", "k1", body, Some(b64(&wrong)), None, None);
+        let err = s4.put_object(req).await.expect_err("must reject");
+        assert_eq!(
+            err.code().as_str(),
+            "BadDigest",
+            "streaming crc32c mismatch must surface as BadDigest, got code={}",
+            err.code().as_str()
+        );
+    }
+
+    /// SHA-256 streaming verify also works (different code path inside
+    /// the hasher set — the `sha2` crate's incremental `update` /
+    /// `finalize` rather than the CRC accumulator).
+    #[tokio::test]
+    async fn streaming_checksum_sha256_match_succeeds() {
+        let s4 = s4service();
+        let body = Bytes::from(vec![b'c'; 256 * 1024]);
+        let digest = {
+            let mut h = Sha256::new();
+            h.update(&body);
+            h.finalize()
+        };
+        let req = streaming_put("bk", "k2", body.clone(), None, Some(b64(&digest)), None);
+        s4.put_object(req).await.expect("sha256 match must succeed");
+        let got = read_back(s4.get_object(get_request("bk", "k2")).await.unwrap()).await;
+        assert_eq!(got, body);
+    }
+
+    /// Multiple algorithms claimed simultaneously: both verified, both
+    /// must match. Mirrors real AWS-SDK behaviour where a client may
+    /// supply both `Content-MD5` and an `x-amz-checksum-*` header.
+    #[tokio::test]
+    async fn streaming_checksum_multiple_algorithms_match_all_required() {
+        let s4 = s4service();
+        let body = Bytes::from(vec![b'd'; 64 * 1024]);
+        let crc = crc32c::crc32c(&body).to_be_bytes();
+        let md5_digest = {
+            let mut h = Md5::new();
+            h.update(&body);
+            h.finalize()
+        };
+        let req = streaming_put(
+            "bk",
+            "k3",
+            body.clone(),
+            Some(b64(&crc)),
+            None,
+            Some(b64(&md5_digest)),
+        );
+        s4.put_object(req)
+            .await
+            .expect("crc32c + md5 both matching must succeed");
+
+        // Negative-companion test: same body, but MD5 deliberately
+        // wrong → must reject. Validates that "all claims verified"
+        // really means *all*, not just the first one.
+        let s4b = s4service();
+        let mut bad_md5 = md5_digest.to_vec();
+        bad_md5[0] ^= 0xFF;
+        let req2 = streaming_put(
+            "bk",
+            "k3-bad",
+            body,
+            Some(b64(&crc)),
+            None,
+            Some(b64(&bad_md5)),
+        );
+        let err = s4b
+            .put_object(req2)
+            .await
+            .expect_err("one-of-many wrong must reject");
+        assert_eq!(err.code().as_str(), "BadDigest");
+    }
+
+    /// Large-body smoke test. 5 GiB is the AWS single-PUT ceiling and
+    /// well beyond CI memory; 8 MiB is the practical stand-in. The
+    /// real assertion is "the PUT succeeds without buffering the whole
+    /// body" — RSS measurement is unreliable in test harnesses, so we
+    /// settle for a green PUT + roundtrip on a body that exercises
+    /// multiple internal chunks (default streaming chunk = 4 MiB, so
+    /// 8 MiB spans two chunks → two FuturesOrdered slots → two
+    /// per-chunk tee updates).
+    #[tokio::test]
+    async fn streaming_checksum_5gib_class_no_memory_blowup() {
+        let s4 = s4service();
+        // 8 MiB of varied bytes (not all-same so zstd doesn't collapse
+        // the whole thing into a 100-byte output that would dodge the
+        // chunk-pipelining path).
+        let body: Vec<u8> = (0..(8 * 1024 * 1024u32))
+            .map(|i| (i ^ 0xa5) as u8)
+            .collect();
+        let body = Bytes::from(body);
+        let crc = crc32c::crc32c(&body).to_be_bytes();
+        let req = streaming_put("bk", "kbig", body.clone(), Some(b64(&crc)), None, None);
+        s4.put_object(req)
+            .await
+            .expect("8 MiB streaming PUT with matching crc32c must succeed");
+        let got = read_back(s4.get_object(get_request("bk", "kbig")).await.unwrap()).await;
+        assert_eq!(got, body, "large-body roundtrip must be byte-equal");
+    }
+
+    /// Regression-fence for the v0.8.13 #127 → v0.8.14 #129 issue:
+    /// an AWS-SDK-style PUT that auto-attaches `x-amz-checksum-crc32`
+    /// must still go through the streaming-framed path (= the body
+    /// starts with the `S4F2` magic, NOT raw zstd bytes, AND the
+    /// sidecar `<key>.s4index` is emitted for multi-chunk bodies).
+    /// Without #106 this PUT would have either failed verification
+    /// (#127 pre-revert: forced buffered, but lost sidecar) or
+    /// silently fail-opened on a wrong checksum (#129 post-revert).
+    /// Now: the streaming path runs *and* the checksum is verified.
+    #[tokio::test]
+    async fn streaming_checksum_keeps_framed_path_for_sdk_default() {
+        let backend = MemoryBackend::new();
+        let backend_view = backend.shared();
+        let s4 = S4Service::new(
+            backend,
+            make_registry(CodecKind::CpuZstd),
+            make_dispatcher(CodecKind::CpuZstd),
+        );
+
+        // Body large enough to span multiple S4F2 frames so the
+        // sidecar is meaningful (single-frame objects skip the
+        // sidecar by design).
+        let body = Bytes::from(vec![b'q'; 6 * 1024 * 1024]);
+        // CRC32 (IEEE) — the algorithm AWS-SDK attaches by default.
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&body);
+        let crc_be = crc.finalize().to_be_bytes();
+
+        let req = S3Request {
+            input: PutObjectInput {
+                bucket: "bk".into(),
+                key: "sdk-default".into(),
+                body: Some(s4_server::blob::bytes_to_blob(body.clone())),
+                content_length: Some(body.len() as i64),
+                checksum_crc32: Some(b64(&crc_be)),
+                ..Default::default()
+            },
+            method: http::Method::PUT,
+            uri: "/bk/sdk-default".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        s4.put_object(req)
+            .await
+            .expect("SDK-default crc32 + cpu-zstd must still take streaming path");
+
+        // Backend received a `S4F2`-magic body (streaming-framed
+        // path) rather than raw zstd (buffered path).
+        let stored = backend_view
+            .lock()
+            .unwrap()
+            .get(&("bk".to_string(), "sdk-default".to_string()))
+            .expect("backend has object")
+            .clone();
+        assert_eq!(
+            &stored.body[..4],
+            b"S4F2",
+            "v0.8.14 #129 regression fence: streaming PUT with client \
+             checksum must still produce an S4F2 framed body (not raw zstd)"
+        );
+
+        // Roundtrip GET reconstructs the original bytes.
+        let got = read_back(
+            s4.get_object(get_request("bk", "sdk-default"))
+                .await
+                .expect("get"),
+        )
+        .await;
+        assert_eq!(got, body);
+    }
+
+    /// v0.9 #106 round-3 P2 fix: a malformed `x-amz-checksum-*`
+    /// header must surface as `InvalidDigest` from the request entry
+    /// itself, before any body bytes are awaited. Verified here by
+    /// passing a deliberately malformed base64 value and asserting
+    /// the PUT rejects without ever touching the codec pipeline.
+    #[tokio::test]
+    async fn streaming_checksum_malformed_header_rejects_pre_stream() {
+        let s4 = s4service();
+        let body = Bytes::from(vec![b'z'; 8 * 1024]);
+        let req = streaming_put(
+            "bk",
+            "k-malformed",
+            body,
+            Some("this-is-not-valid-base64!!!".into()),
+            None,
+            None,
+        );
+        let err = s4
+            .put_object(req)
+            .await
+            .expect_err("malformed crc32c header must reject");
+        assert_eq!(
+            err.code(),
+            &S3ErrorCode::InvalidDigest,
+            "malformed checksum header must surface as InvalidDigest, got {}",
+            err.code().as_str()
+        );
+    }
+}

@@ -43,8 +43,15 @@ use tokio_util::io::{ReaderStream, StreamReader};
 /// なので、`tokio_util::io::StreamReader` を使うと `tokio::io::AsyncRead` に変換できる。
 /// ただし StreamReader は `std::io::Error` を期待するので、StdError → io::Error への
 /// 変換層を挟む必要がある。
+///
+/// v0.9 #106: 旧実装は `e.to_string()` で型情報を捨てていたため、ストリーム上流
+/// (= `streaming_checksum::tee_into_hashers` 等) が typed な `io::Error` を投げても
+/// 下流で downcast 不能だった。`io::Error::other(e)` は `Box<dyn Error + Send + Sync>`
+/// を source としてそのまま保持するので、tee 側が emit した io::Error は
+/// `e.source().downcast_ref()` で `StreamingChecksumError` に復元できる
+/// (PUT handler 側で `BadDigest` mapping するため必須)。
 pub fn blob_to_async_read(blob: StreamingBlob) -> impl AsyncRead + Unpin + Send + Sync + 'static {
-    let mapped = blob.map(|chunk| chunk.map_err(|e| io::Error::other(e.to_string())));
+    let mapped = blob.map(|chunk| chunk.map_err(io::Error::other));
     StreamReader::new(mapped)
 }
 

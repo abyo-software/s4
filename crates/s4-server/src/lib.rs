@@ -26,6 +26,7 @@ pub mod sigv4a;
 pub mod sse;
 pub mod state_loader;
 pub mod streaming;
+pub mod streaming_checksum;
 pub mod tagging;
 pub mod tls;
 pub mod versioning;

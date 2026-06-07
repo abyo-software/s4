@@ -327,6 +327,109 @@ v0.9 roadmap in progress.
   fixture already brings in. Production code (`crates/s4-server/src/`)
   is unchanged; the harness lives entirely in test scope.
 
+- **#106 streaming PUT checksum verify (tee-into-hasher)** —
+  closes the long-standing fail-open on the streaming-framed
+  PUT path documented in `docs/security/threat-model.md §
+  Limitations [2]`. The v0.8.13 #127 attempt to "force
+  buffered when a checksum is supplied" regressed sidecar
+  correctness for AWS-SDK PUTs (which auto-attach
+  `x-amz-checksum-crc32`) and had to be reverted in v0.8.14
+  #129; until #106 the streaming-framed path silently
+  passed client-supplied whole-body checksums through
+  without verifying them.
+
+  New module `crates/s4-server/src/streaming_checksum.rs`:
+
+  - `ClientChecksums::from_request_fields(...)` parses the
+    six AWS-spec headers (`Content-MD5`,
+    `x-amz-checksum-{crc32, crc32c, sha1, sha256, crc64nvme}`)
+    pre-stream and rejects malformed values with
+    `InvalidDigest` before any body bytes flow.
+  - `tee_into_hashers(blob, claims)` wraps the inbound
+    `StreamingBlob` in a `TeeStream` that feeds each chunk
+    into every active hasher (only hashers whose claim is
+    set incur per-byte cost). On EOF the wrapper finalises
+    and compares; mismatch synthesises a typed
+    `io::Error(InvalidData, StreamingChecksumError)`.
+  - `extract_streaming_checksum_error(...)` walks the
+    `io::Error` source chain so the PUT handler can recover
+    the failed algorithm name across the
+    `blob_to_async_read` → `StreamReader` → `CodecError::Io`
+    wrap layers.
+
+  Wired into `service.rs::put_object`'s streaming-framed
+  branch (single-PUT cpu-zstd / nvcomp-zstd). Bodies that
+  fail verify surface as `400 BadDigest` with the same
+  message shape the buffered path uses. Sidecar emission is
+  unaffected — the tee sits **upstream** of
+  `streaming_compress_to_frames`, so a verify failure short-
+  circuits the call before any backend write or sidecar
+  build. Non-checksummed PUTs skip the wrapper entirely
+  (`ClientChecksums::any() == false` AND no
+  `x-amz-trailer` checksum) so the pre-#106 throughput is
+  preserved.
+
+  **Trailer-deferred verify** for the chunked /
+  SigV4-streaming SDK case: AWS SDKs that send the body
+  via `aws-chunked` encoding attach the checksum value in
+  the request **trailers** (post-body) rather than as a
+  request header, and announce which algorithm will follow
+  via `x-amz-trailer`. The PUT handler reads
+  `x-amz-trailer` at body-start (`WhichHashers::
+  from_trailer_header`) to spin up the matching hasher,
+  then — after `streaming_compress_to_frames` returns —
+  reads the actual value out of `req.trailing_headers` and
+  compares via `ComputedDigests::compare_b64`. A trailer
+  claim against an algorithm the tee did NOT hash returns
+  `BadDigest` (we cannot verify what the client promised,
+  so we must refuse the PUT). Without this branch a bad
+  trailer checksum on the streaming-framed path would
+  silently pass — the same fail-open #106 is closing,
+  just via the other delivery mechanism.
+
+  `blob_to_async_read` (`streaming.rs`) was updated to
+  preserve typed error sources via `io::Error::other(e)`
+  instead of `io::Error::other(e.to_string())` — the
+  string-cast dropped the `Box<dyn Error>` chain and made
+  downcast-recovery impossible. The
+  `extract_streaming_checksum_error` helper handles both
+  the direct and the one-deep-via-StreamReader chain shapes.
+
+  Multipart `UploadPart` keeps the buffered per-part verify
+  it already had (#122 / #128 still active there — the part
+  body is already in memory for framing / padding so
+  streaming verify wouldn't save anything). GPU codecs that
+  fall into the bytes-buffered single-PUT branch
+  (`!supports_streaming_compress(kind)`) continue to use
+  `verify_client_body_checksums` directly. Encrypted-object
+  PUTs are unaffected — the tee runs on plaintext upstream
+  of the encrypt step.
+
+  Six new E2E tests in
+  `crates/s4-server/tests/roundtrip.rs::streaming_checksum_e2e`
+  pin the behaviour:
+  `streaming_checksum_crc32c_match_succeeds`,
+  `streaming_checksum_crc32c_mismatch_rejects` (asserts the
+  failure surface is `BadDigest`, not `InternalError`),
+  `streaming_checksum_sha256_match_succeeds`,
+  `streaming_checksum_multiple_algorithms_match_all_required`
+  (both correct → pass; one wrong → reject),
+  `streaming_checksum_5gib_class_no_memory_blowup` (8 MiB
+  CI-budget stand-in for the 5 GiB class), and
+  `streaming_checksum_keeps_framed_path_for_sdk_default`
+  (regression fence for v0.8.13 #127 → v0.8.14 #129:
+  AWS-SDK-style `x-amz-checksum-crc32` PUT must still
+  produce an `S4F2` framed body, not raw zstd). Plus 10
+  unit tests in the new module covering header parsing,
+  multi-algorithm tee, mismatch / mid-stream error paths,
+  and the CRC-64/NVME accumulator cross-check against the
+  buffered helper. All ignored MinIO E2E tests for the
+  touched code paths (`minio_roundtrip_through_s4_with_cpu_zstd`,
+  `range_get_falls_back_to_full_when_sidecar_etag_stale`,
+  `upload_part_copy_propagates_source_version_id`,
+  `streaming_compress_truncated_input_returns_400`)
+  continue to pass.
+
 ## [0.8.22] — 2026-06-07
 
 Seventh-round review caught that R6-6 introduced a fresh

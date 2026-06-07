@@ -2489,6 +2489,25 @@ impl<B: S3> S3 for S4Service<B> {
             .as_ref()
             .map(|s| s.as_str().eq_ignore_ascii_case("ON"));
         if let Some(blob) = req.input.body.take() {
+            // v0.9 #106: parse client-supplied checksum headers
+            // **before** awaiting any body bytes. A malformed
+            // `Content-MD5` / `x-amz-checksum-*` value must surface
+            // as `InvalidDigest` immediately so a slow / non-
+            // delivering body cannot tie up the handler waiting on
+            // bytes only to reject the request on a header-level
+            // problem. The parsed `ClientChecksums` value is reused
+            // by the streaming-framed branch below; the
+            // bytes-buffered branch keeps its own
+            // `verify_client_body_checksums` call which is idempotent
+            // with this parse.
+            let client_checksums = crate::streaming_checksum::ClientChecksums::from_request_fields(
+                req.input.content_md5.as_deref(),
+                req.input.checksum_crc32.as_deref(),
+                req.input.checksum_crc32c.as_deref(),
+                req.input.checksum_sha1.as_deref(),
+                req.input.checksum_sha256.as_deref(),
+                req.input.checksum_crc64nvme.as_deref(),
+            )?;
             // Sample 4 KiB から codec を決定。streaming-aware codec なら streaming
             // compress fast path、そうでなければ従来の collect-then-compress。
             let (sample, rest_stream) = peek_sample(blob, SAMPLE_BYTES)
@@ -2510,33 +2529,84 @@ impl<B: S3> S3 for S4Service<B> {
             // pass-through. So passthrough always uses the legacy raw-blob
             // path; only compressing codecs go through the framed path.
             //
-            // v0.8.14 follow-up to #127 MED-B: the previous attempt
-            // forced the buffered path whenever the client supplied
-            // any whole-body checksum so `verify_client_body_checksums`
-            // could run. Modern AWS SDKs auto-add an
-            // `x-amz-checksum-crc32` trailer by default, which made
-            // every SDK PUT lose the streaming-framed path and
-            // therefore lose its sidecar — silent data path
-            // regression caught by
-            // `range_get_falls_back_to_full_when_sidecar_etag_stale`
-            // and `upload_part_copy_propagates_source_version_id`
-            // on the MinIO E2E job. The streaming PUT path now
-            // passes through unchanged; client-supplied checksums on
-            // streaming PUTs are NOT verified (same fail-open as
-            // pre-v0.8.12). The buffered PUT branch and UploadPart
-            // do verify, which covers the buffered upload case the
-            // HIGH-12 audit was scoped to. True streaming verify
-            // (tee-into-hasher on the chained input) remains the
-            // tracked follow-up.
+            // v0.9 #106 — true streaming PUT checksum verify. The
+            // streaming-framed path used to fail-open on client-supplied
+            // whole-body checksums (`x-amz-checksum-{crc32, crc32c, sha1,
+            // sha256, crc64nvme}` and `Content-MD5`): the v0.8.13 #127
+            // attempt to "force buffered when any checksum header is
+            // present" had to be reverted in v0.8.14 #129 because modern
+            // AWS SDKs auto-attach `x-amz-checksum-crc32`, which made
+            // every SDK PUT lose the streaming-framed path and therefore
+            // its sidecar (range_get_falls_back_to_full_when_sidecar_etag_stale
+            // + upload_part_copy_propagates_source_version_id failed on
+            // CI). v0.9 #106 keeps the streaming-framed path and tees
+            // each chunk into a multi-hasher (`streaming_checksum`
+            // module) as it flows through the compressor. On EOF the
+            // hashers are finalised and compared; a mismatch surfaces
+            // as a synthetic `io::Error` carrying
+            // `StreamingChecksumError` which we downcast back below and
+            // map to a typed 400 BadDigest. Sidecar emission is
+            // unaffected — the verifier sits **upstream** of
+            // `streaming_compress_to_frames`, so on mismatch the call
+            // returns Err and we never reach the backend write or
+            // sidecar build, preserving the post-revert invariant.
+            //
+            // Scope: single-PUT cpu-zstd / passthrough only. Multipart
+            // `upload_part` keeps its buffered per-part verify (the
+            // part body is already in memory there for framing /
+            // padding, so streaming verify wouldn't save anything).
+            // GPU codecs (nvcomp-*) fall through to the buffered
+            // branch below — they are bytes-buffered today and use the
+            // existing `verify_client_body_checksums`.
+            // (`client_checksums` was parsed before `peek_sample`
+            // above so malformed values fail pre-stream.)
+            //
+            // v0.9 #106 trailer support: the chunked / SigV4-streaming
+            // SDK case attaches the actual checksum value in the
+            // request **trailers** (post-body). The `x-amz-trailer`
+            // request header announces which algorithm(s) will follow;
+            // we use it to decide which hashers to spin up at body
+            // start so the digest is ready to compare once trailers
+            // arrive. After the codec consumes the body we read
+            // `req.trailing_headers` and run a deferred comparison
+            // against the finalised digests via
+            // `ComputedDigests::compare_b64` (see post-stream block
+            // below). Without this, a bad trailer checksum on the
+            // streaming-framed path would silently pass — same
+            // fail-open shape this issue is closing, different
+            // delivery mechanism.
+            let trailer_hashers: crate::streaming_checksum::WhichHashers = req
+                .headers
+                .get("x-amz-trailer")
+                .and_then(|v| v.to_str().ok())
+                .map(crate::streaming_checksum::WhichHashers::from_trailer_header)
+                .unwrap_or_default();
+            let which_hashers = client_checksums.which_hashers().or(trailer_hashers);
             let use_framed = supports_streaming_compress(kind) && kind != CodecKind::Passthrough;
             let (compressed, manifest, is_framed) = if use_framed {
                 // streaming fast path: input は memory に collect しない
                 let chained = chain_sample_with_rest(sample, rest_stream);
+                // v0.9 #106: tee the chained input through a multi-hasher
+                // when ANY client checksum claim is present (header or
+                // trailer). The wrapper is a no-op (and skipped
+                // entirely) when neither side has work, so non-
+                // checksummed PUTs keep their pre-#106 throughput.
+                let (chained, digest_handle) = if which_hashers.any() {
+                    let (b, h) = crate::streaming_checksum::tee_into_hashers_with_handle(
+                        chained,
+                        client_checksums.clone(),
+                        which_hashers,
+                    );
+                    (b, Some(h))
+                } else {
+                    (chained, None)
+                };
                 debug!(
                     bucket = ?req.input.bucket,
                     key = ?req.input.key,
                     codec = kind.as_str(),
                     path = "streaming-framed",
+                    client_checksum_verify = client_checksums.any(),
                     "S4 put_object: compressing (streaming, S4F2 multi-frame)"
                 );
                 // v0.4 #16: pick the chunk size based on the request's
@@ -2591,8 +2661,119 @@ impl<B: S3> S3 for S4Service<B> {
                             ),
                         )
                     }
+                    // v0.9 #106: streaming checksum mismatch — the tee
+                    // wrapper emitted a synthetic io::Error carrying
+                    // StreamingChecksumError. Downcast and remap to
+                    // BadDigest so the client sees the same response
+                    // the buffered path would have produced.
+                    s4_codec::CodecError::Io(ref io_err) => {
+                        if let Some(alg) =
+                            crate::streaming_checksum::extract_streaming_checksum_error(io_err)
+                        {
+                            let code = S3ErrorCode::from_bytes(b"BadDigest")
+                                .unwrap_or(S3ErrorCode::InvalidArgument);
+                            S3Error::with_message(
+                                code,
+                                format!("client-supplied {alg} did not match the received body"),
+                            )
+                        } else {
+                            internal("streaming framed compress")(e)
+                        }
+                    }
                     other => internal("streaming framed compress")(other),
                 })?;
+                // v0.9 #106 trailer-deferred verify. Header claims
+                // have already been compared eagerly inside the tee
+                // at EOF (mismatch surfaces as `BadDigest` through
+                // the `CodecError::Io` branch above). Now that the
+                // body has been fully consumed, request trailers are
+                // available — check any checksum trailers the
+                // client promised via `x-amz-trailer`.
+                //
+                // **Fail-closed when announced trailers are
+                // missing**: if the client announced
+                // `x-amz-trailer: x-amz-checksum-*` but did NOT
+                // deliver the trailer value (or the trailers block
+                // never arrived), we refuse the PUT with
+                // `BadDigest`. Skipping the comparison in that case
+                // would silently re-open the streaming fail-open
+                // this issue closes — a client could declare an
+                // integrity check and then omit the value to bypass
+                // verification.
+                if let Some(handle) = digest_handle.as_ref()
+                    && let Some(announced) = req
+                        .headers
+                        .get("x-amz-trailer")
+                        .and_then(|v| v.to_str().ok())
+                {
+                    let promised_checksum_trailers: Vec<String> = announced
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|n| {
+                            // RFC 9110 §5.1: HTTP header names are
+                            // case-insensitive — match accordingly.
+                            n.to_ascii_lowercase().starts_with("x-amz-checksum-")
+                        })
+                        .collect();
+                    if !promised_checksum_trailers.is_empty() {
+                        let computed = handle.lock().expect("digest handle lock poisoned").clone();
+                        let trailers_handle = req.trailing_headers.as_ref();
+                        let bad_digest = |msg: String| -> S3Error {
+                            let code = S3ErrorCode::from_bytes(b"BadDigest")
+                                .unwrap_or(S3ErrorCode::InvalidArgument);
+                            S3Error::with_message(code, msg)
+                        };
+                        // If the tee never finalised (computed is
+                        // None) the body was incomplete; the
+                        // CodecError path would have already
+                        // surfaced — defensive belt for any future
+                        // refactor.
+                        let Some(computed) = computed else {
+                            return Err(bad_digest(
+                                "client announced checksum trailer(s) but the streaming body \
+                                 did not produce a finalised digest"
+                                    .into(),
+                            ));
+                        };
+                        let Some(th) = trailers_handle else {
+                            return Err(bad_digest(
+                                "client announced checksum trailer(s) via x-amz-trailer but \
+                                 no trailing-headers handle was attached to the request"
+                                    .into(),
+                            ));
+                        };
+                        // `TrailingHeaders::read` returns None when
+                        // the trailers block has not been delivered.
+                        let result = th.read(|hmap| {
+                            for name in &promised_checksum_trailers {
+                                match hmap.get(name.as_str()).and_then(|v| v.to_str().ok()) {
+                                    Some(val) => {
+                                        computed.compare_b64(name, val)?;
+                                    }
+                                    None => {
+                                        return Err(bad_digest(format!(
+                                            "client announced trailer {name} via \
+                                             x-amz-trailer but the trailer value was \
+                                             missing or unparseable"
+                                        )));
+                                    }
+                                }
+                            }
+                            Ok::<(), S3Error>(())
+                        });
+                        match result {
+                            Some(Ok(())) => {} // verified
+                            Some(Err(e)) => return Err(e),
+                            None => {
+                                return Err(bad_digest(
+                                    "client announced checksum trailer(s) via x-amz-trailer \
+                                     but no trailing-headers block was delivered with the body"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
+                }
                 (body, manifest, true)
             } else {
                 // GPU codec 等で streaming-aware でないものは bytes-buffered path
