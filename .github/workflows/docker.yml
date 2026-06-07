@@ -40,6 +40,16 @@ on:
         type: boolean
         default: true
         required: false
+      build_ref:
+        description: "Git ref (tag / branch / sha) to check out for the Dockerfile + binary context. Leave empty to use the current ref. Set to e.g. 'v0.9.0' from `--ref main` to back-fill an image for a tag that pre-dates this workflow."
+        type: string
+        default: ""
+        required: false
+      image_tag_override:
+        description: "Override the image tag(s) emitted by metadata-action. Required when `build_ref` is set to a tag (otherwise the image would carry the dispatching branch's ref, not the build_ref's tag). Example: `0.9.0` produces `:0.9.0` + `:v0.9.0`."
+        type: string
+        default: ""
+        required: false
 
 permissions:
   # `packages: write` is required for the GITHUB_TOKEN to push to
@@ -87,7 +97,16 @@ jobs:
             tag_suffix: "-gpu"
 
     steps:
+      # When `build_ref` input is set (workflow_dispatch back-fill use
+      # case), check out that ref for the Dockerfile + binary context.
+      # Otherwise the default ref (= the branch / tag the workflow is
+      # dispatched against) is used. This lets `gh workflow run
+      # docker.yml --ref main -f build_ref=v0.9.0 -f
+      # image_tag_override=0.9.0 -f push=true` back-fill an image for
+      # a tag whose source predates this workflow file.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.build_ref || github.ref }}
 
       # QEMU is only needed for the multi-arch CPU build (arm64 emulation
       # on an amd64 runner). Setting it up for the GPU job is a no-op
@@ -148,9 +167,23 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern=v{{version}}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'push' }}
+            # v0.10 #B1-audit R4: the `{{major}}.{{minor}}` floating
+            # tag must also exclude prereleases — a `v0.10.0-rc1` tag
+            # push would otherwise move `0.10` to point at an unstable
+            # build. `!contains(github.ref, '-')` filters SemVer
+            # prerelease tags.
+            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'push' && !contains(github.ref, '-') }}
             type=ref,event=branch
             type=sha,format=short
+            # v0.10 back-fill: when `image_tag_override` is set on a
+            # workflow_dispatch (typical use case: back-fill an image
+            # for a tag whose source predates this workflow), emit
+            # `<override>` AND `v<override>` raw tags so the immutable
+            # tag pair lands on ghcr.io. The semver patterns above
+            # produce nothing because the dispatcher `github.ref` is
+            # the branch we dispatched from, not the tag we built.
+            type=raw,value=${{ inputs.image_tag_override }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.image_tag_override != '' }}
+            type=raw,value=v${{ inputs.image_tag_override }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.image_tag_override != '' }}
           labels: |
             org.opencontainers.image.title=s4${{ matrix.tag_suffix }}
             org.opencontainers.image.description=Drop-in S3-compatible storage gateway with GPU-accelerated transparent compression (${{ matrix.flavor }} build)
