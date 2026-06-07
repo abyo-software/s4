@@ -263,7 +263,8 @@ small instance or just front the bucket with nginx + gzip.
 **Failure modes documented** in the README (the "Durability, corruption
 recovery, and the repair tool" section): client mid-PUT disconnect, sidecar
 divergence, backend corruption (per-frame crc32c catches it, returns 500
-rather than corrupted bytes). `s4-tool repair-sidecar` lands in v0.9.
+rather than corrupted bytes). v0.9 adds `s4 verify-sidecar` /
+`s4 repair-sidecar` / `s4 sweep-orphan-sidecars` for operator recovery.
 
 Repo: https://github.com/abyo-software/s4
 

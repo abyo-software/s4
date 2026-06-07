@@ -616,11 +616,12 @@ main object (next section).
 | Failure | Visible symptom | Recovery |
 |---|---|---|
 | Client disconnects mid-PUT | Backend returns `IncompleteBody` or 5xx, S4 maps to `TruncatedStream` (v0.8.4 #73). Main object NOT created; sidecar NOT created. No partial state. | None needed — retry the PUT |
-| Main object PUT succeeds, sidecar PUT fails | GETs work (full object decode, no range optimisation); Range GETs fall back to "read whole object, decode, slice". | `s4-tool repair-sidecar <key>` rebuilds the sidecar by re-scanning frames in the main object |
+| Main object PUT succeeds, sidecar PUT fails | GETs work (full object decode, no range optimisation); Range GETs fall back to "read whole object, decode, slice". | `s4 repair-sidecar <bucket>/<key> --endpoint-url <BACKEND>` rebuilds the sidecar by re-scanning frames in the main object |
 | Multipart UploadPart succeeds, CompleteMultipartUpload fails | Backend cleans up uncommitted parts on lifecycle-driven `AbortIncompleteMultipartUpload` (S3 default 7 days, or operator policy). | Retry the upload; orphan parts charged but auto-deleted |
 | S3 returns a corrupted object body (rare, but happens on hardware faults) | Per-frame `crc32c` mismatch on decode → `CodecError::CrcMismatch` → S4 returns 500 to client with diagnostic. | None within S4 — fix at the backend storage layer; S4 won't return corrupted bytes |
-| Sidecar diverges from main object (manual `aws-cli` edit, etc.) | First Range GET that hits the diverged region returns 500 with `IndexFrameMismatch`. | `s4-tool verify <key>` flags it; `s4-tool repair-sidecar <key>` rebuilds |
-| Backend object exists, sidecar missing entirely | GETs work; Range GETs degrade to fallback path. | `s4-tool repair-sidecar <key>` |
+| Sidecar diverges from main object (manual `aws-cli` edit, etc.) | First Range GET that hits the diverged region returns 500 with `IndexFrameMismatch`. | `s4 verify-sidecar <bucket>/<key> --endpoint-url <BACKEND>` flags it; `s4 repair-sidecar` rebuilds |
+| Backend object exists, sidecar missing entirely | GETs work; Range GETs degrade to fallback path. | `s4 repair-sidecar <bucket>/<key> --endpoint-url <BACKEND>` |
+| Bucket has accumulated orphan `.s4index` from the v0.8.15 H-g window | Storage bill grows but reads still work (orphans never reach the GET path). | `s4 sweep-orphan-sidecars <bucket> --endpoint-url <BACKEND> --delete` (run without `--delete` first to inspect). See `docs/orphan-sidecar-recovery.md`. |
 
 ### CRC scope
 
@@ -641,11 +642,28 @@ It does **not** catch:
 
 ### Repair tool status
 
-`s4-tool repair-sidecar <bucket>/<key>` and `s4-tool verify <bucket>/<key>`
-are listed in the v0.9 roadmap (#106). Until they ship, the manual
-recovery for divergence cases is to `DELETE` the sidecar and the next
-non-range GET will work fine; Range GETs degrade silently to the fallback
-"read full, decode, slice" path that already exists.
+v0.9 #106 shipped three sidecar-maintenance subcommands on the `s4`
+binary. All three point at the **backend** (not the S4 gateway) — the
+gateway hides `.s4index` from listings and decompresses bodies on GET,
+both of which break this tooling:
+
+```bash
+# Read-only check. Exits 0 on Ok/LegacyV1, 1 on any divergence.
+s4 verify-sidecar bucket/key --endpoint-url https://s3.example.com
+
+# Re-scan the main object and overwrite the sidecar. Default body cap
+# is 5 GiB (matches --max-body-bytes); pass --max-body-bytes to raise.
+s4 repair-sidecar bucket/key --endpoint-url https://s3.example.com
+
+# Find dangling `.s4index` whose pair is missing or stale. Dry-run by
+# default; --delete actually removes them.
+s4 sweep-orphan-sidecars bucket --endpoint-url https://s3.example.com [--delete]
+```
+
+The manual fallback (DELETE the sidecar — Range GET drops to the
+full-read path) still works for one-offs without the CLI handy. See
+`docs/orphan-sidecar-recovery.md` for the v0.8.15 H-g cleanup recipe
+using `s4 sweep-orphan-sidecars`.
 
 ## Production Features
 

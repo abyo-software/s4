@@ -7,6 +7,184 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+v0.9 roadmap in progress.
+
+### Added
+
+- **#106 sidecar repair / verify / sweep CLI** — three new
+  subcommands on the `s4` binary cover the orphan-sidecar /
+  stale-sidecar / missing-sidecar operator stories that were
+  previously manual-aws-cli recipes:
+
+  - `s4 verify-sidecar <bucket>/<key> --endpoint-url <BACKEND>` —
+    read-only check. Reports `Ok` / `LegacyV1` / `Missing` /
+    `StaleEtag` / `StaleSize` / `DecodeError`. Exits 0 on
+    Ok / LegacyV1, 1 on any divergence so CI / cron jobs can
+    branch on "needs action".
+  - `s4 repair-sidecar <bucket>/<key> --endpoint-url <BACKEND>
+    [--max-body-bytes BYTES]` — rebuild the sidecar by
+    re-scanning the main object's frame layout. Overwrites any
+    existing sidecar (including stale or corrupt). Body cap
+    default 5 GiB matches the server's `--max-body-bytes`.
+  - `s4 sweep-orphan-sidecars <bucket> --endpoint-url <BACKEND>
+    [--delete]` — walk every `*.s4index` in the bucket and
+    report (and optionally delete) sidecars whose paired key
+    is missing or whose recorded ETag / size disagrees with
+    the live HEAD. Dry-run by default.
+
+  All three point at the **backend** (not the S4 gateway) — the
+  gateway hides `.s4index` from listings by design and
+  decompresses bodies on GET, both of which would break this
+  tooling. Replaces the manual aws-cli recipe in
+  `docs/orphan-sidecar-recovery.md` (the manual recipe is kept
+  as a "Pre-v0.9 fallback" appendix). README §"Repair tool
+  status" updated to drop the "v0.9 roadmap" qualifier.
+
+  Library API: `s4_server::repair::{verify_sidecar,
+  repair_sidecar, sweep_orphan_sidecars}` for programmatic use
+  alongside the CLI.
+
+  Two review rounds caught four correctness / safety issues that
+  landed in the initial cut.
+
+  Self-review:
+
+  - **TOCTOU race in `repair-sidecar`** — HEAD → GET could
+    straddle an overwrite, stamping the sidecar with E1 while
+    the body is actually at E2 (silently produces an
+    immediately-stale sidecar). Fixed by adding `If-Match` to
+    the GET, with a typed `OverwrittenDuringRepair` error so
+    the operator re-runs instead of trusting the write.
+  - **`SidecarUndecodable` auto-delete data-loss** — a
+    legitimate user-PUT object whose key happens to end in
+    `.s4index` (the v0.8.17 `--allow-legacy-reserved-key-reads`
+    migration scenario) would also fail to decode and would be
+    silently deleted by `--delete`. Split the deletion policy
+    into `DryRun` / `PairBoundOnly` / `IncludeUndecodable`; CLI
+    `--delete` is the safe pair-bound subset, and operators
+    must opt in with `--delete-undecodable` to escalate.
+
+  Defensive: `HEAD` with no `Content-Length` now returns
+  `MissingContentLength` instead of treating absence as zero
+  (would have silently bypassed `--max-body-bytes`).
+
+  Codex review (P1):
+
+  - **P1-A: `PairedMissing` data-loss for legacy reserved-name
+    user data** — the self-review fix above only protected
+    `SidecarUndecodable`, but the classifier checked the paired
+    HEAD before reading the candidate. A legacy user object at
+    `legacy.s4index` whose stripped pair `legacy` doesn't exist
+    would be classified as `PairedMissing` and the default
+    `--delete` would silently destroy it. Restructured
+    `classify_one` to **decode first**: bytes that don't parse
+    as S4IX magic are always classified as `SidecarUndecodable`
+    regardless of pair status, so the safe `PairBoundOnly`
+    policy can never delete non-sidecar bytes. New E2E asserts
+    the worst case (legacy data with no pair) classifies
+    correctly.
+  - **P1-B: `If-Match` must send the quoted entity-tag form
+    (RFC 7232)** — `head_main` was passing the normalized
+    (unquoted) ETag to the conditional GET; strict
+    S3-compatible backends reject `If-Match: abc-2` with 412
+    and repair never succeeds. Split `head_main` to return
+    both `raw_etag` (for `If-Match` headers) and
+    `normalized_etag` (for stamping into
+    `FrameIndex::source_etag`, matching the server-side
+    `s3s::ETag::value()` stripped form).
+
+  Codex review round 2 (P2):
+
+  - **P2-A: `s4 verify-sidecar bucket/key --endpoint-url ...`
+    fails to parse** — `--endpoint-url` was defined only on
+    the root `Opt`, so clap rejected it when supplied after a
+    subcommand even though every doc example uses that form.
+    Marked the flag `global = true` so post-subcommand
+    placement parses (matches docs without breaking the
+    existing pre-subcommand server-mode usage).
+  - **P2-B: `If-Match` doesn't cover the post-GET / pre-PUT
+    window** — the GET conditional only proves the body
+    matched at GET time; the main object can still be
+    overwritten during `build_index_from_body` or the sidecar
+    PUT itself, leaving a freshly-written sidecar stamped with
+    the OLD ETag (server's `sidecar_version_binding_ok` would
+    silently reject it on every subsequent Range GET). Added a
+    final HEAD after the sidecar PUT; if the live ETag / size
+    diverges from the initial HEAD, delete the just-written
+    sidecar and surface `OverwrittenDuringRepair` so the
+    operator re-runs under quieter conditions.
+
+  Codex review round 3 (P2):
+
+  - **P2-C: `verify-sidecar` false-alerts on healthy small
+    objects** — the server intentionally skips sidecar
+    emission for `entries.len() <= 1` (single-PUTs / single-
+    chunk multiparts have no Range GET fast-path to lose), so
+    a missing `.s4index` on a small object is normal. The
+    initial `Missing` verdict + exit 1 broke the documented
+    CI / cron use case for those objects. Split `Missing`
+    into three variants resolved by a body scan:
+    `MissingHarmless` (1 frame, no-op, exit 0),
+    `MissingDivergent` (2+ frames, real bug, exit 1), and
+    `MissingUnknown` (body > `--max-body-bytes`, ambiguous,
+    exit 0 with hint). The CLI's `--max-body-bytes` flag now
+    also controls the verify-time deep-scan cap so operators
+    can tune one knob.
+
+  Codex review round 4 (P2):
+
+  - **P2-D: rebuilt sidecar is always stale on ETag-less
+    backends** — `head_main` was coercing a missing `ETag`
+    response header to `""`, so `repair-sidecar` would stamp
+    `idx.source_etag = Some("")`. The server-side
+    `sidecar_version_binding_ok` treats `None` as the
+    back-compat "no binding" path (best-effort, Range GET
+    fast-path engages); `Some("")` falls into the strict
+    compare branch and always trips stale, leaving the
+    sidecar useless. Refactored `HeadInfo` to
+    `Option<String>` for both `raw_etag` and `normalized_etag`,
+    skip `If-Match` when the backend has no ETag, stamp
+    `source_etag = None` in that case, and made the verify /
+    sweep classifiers compare `Option<&str>` so `None == None`
+    holds. Matches the server PUT path's
+    `resp.e_tag.as_ref().map(...)` shape exactly.
+
+  Codex review round 5 (P3):
+
+  - **P3-A: repaired ETag-less v2 sidecar misclassified as
+    `LegacyV1`** — the verify match required `(Some, Some)`
+    for `Ok`, so `(None, Some(size))` (the shape `repair-
+    sidecar` writes on an ETag-less backend, P2-D fallout)
+    fell through to the `LegacyV1` wildcard arm. CLI then
+    told the operator the sidecar was "legacy v1, run
+    repair-sidecar to upgrade" — except repair already wrote
+    the highest-binding-level sidecar the backend supports.
+    Loosened the `Ok` arm to `(_, Some(_))` (any present size
+    binding = v2 enough) and narrowed `LegacyV1` to `(_, None)`
+    (no size binding at all = true legacy). Also reworded
+    the CLI "OK" message to drop the "ETag + size" claim
+    (would mis-advertise on ETag-less backends).
+
+  Coverage: 11 lib unit tests (parsing, ETag quote
+  normalization, `Option<&str>` etag-equality semantics for
+  the P2-D None-vs-Some-empty guard, P3-A status truth table
+  pinning the `(_, Some(_)) → Ok` arm so a regression here
+  can't quietly mis-route ETag-less v2 sidecars back to
+  `LegacyV1`, `DeletePolicy::allows` truth table, expanded
+  status truth table including `MissingHarmless` /
+  `MissingDivergent` / `MissingUnknown`, body-cap constant
+  guard) + 7 MinIO E2E tests (`tests/sidecar_repair_via_minio.rs`)
+  covering verify-clean, repair-after-backend-delete,
+  repair-after-clobber, sweep-finds-and-deletes-orphan, the
+  P1-A regression (legacy reserved-name user data with no
+  pair classifies as `SidecarUndecodable`, not
+  `PairedMissing`), the P2-B post-GET race detector (spawns a
+  parallel overwrite to drive `OverwrittenDuringRepair` and
+  confirms the stale sidecar is cleaned up), and the P2-C
+  small-object verdict (PUT a 512 B single-frame object,
+  verify it reports `MissingHarmless` exit 0, plus a `cap=0`
+  edge case asserting `MissingUnknown`).
+
 ## [0.8.22] — 2026-06-07
 
 Seventh-round review caught that R6-6 introduced a fresh

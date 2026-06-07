@@ -102,9 +102,17 @@ struct Opt {
     domain: Option<String>,
 
     /// バックエンド S3 endpoint (例: https://s3.us-east-1.amazonaws.com)。
-    /// 通常 (server mode) は必須。`verify-audit-log` 等の non-server
-    /// subcommand では指定不要 (server 起動時に runtime 検証する)。
-    #[clap(long)]
+    /// server mode + sidecar subcommand (verify-sidecar / repair-sidecar /
+    /// sweep-orphan-sidecars) で必須。`verify-audit-log` 等の pure-local
+    /// subcommand では指定不要。sidecar subcommand では**必ず backend を
+    /// 指す** ── S4 gateway を指すと `.s4index` が list で見えず、GET も
+    /// 解凍を掛けるため tool が誤動作する。
+    ///
+    /// v0.9 #106 P2-A (Codex review): `global = true` so the documented
+    /// form `s4 verify-sidecar bucket/key --endpoint-url ...` parses.
+    /// Without it clap would reject the flag because it isn't attached
+    /// to the subcommand directly.
+    #[clap(long, global = true)]
     endpoint_url: Option<String>,
 
     /// 既定の圧縮 codec (PUT 時に dispatcher が選ぶ default)
@@ -686,6 +694,82 @@ enum Cmd {
     /// `--audit-log-hmac-key`, recompute each line's HMAC, and report
     /// the first chain break (or "OK" if the chain is intact).
     VerifyAuditLog(VerifyAuditLogArgs),
+
+    /// v0.9 #106: report whether `<bucket>/<key>.s4index` is intact,
+    /// missing, or stale relative to the live HEAD on the backend.
+    /// Read-only — never writes. Exit code 0 on Ok / LegacyV1, 1 on any
+    /// divergence so a CI / cron job can branch.
+    VerifySidecar(SidecarTargetArgs),
+
+    /// v0.9 #106: rebuild `<bucket>/<key>.s4index` by re-scanning the
+    /// main object's frame layout. Overwrites any existing sidecar
+    /// (including stale or corrupt ones). The main object is loaded
+    /// fully into RAM — capped by `--max-body-bytes` (default 5 GiB) so
+    /// a runaway repair on a 50 GiB object fails fast.
+    RepairSidecar(RepairSidecarArgs),
+
+    /// v0.9 #106: scan every `*.s4index` in a bucket and report
+    /// sidecars whose paired key is missing or whose embedded
+    /// ETag / size disagrees with the live HEAD. Dry-run by default;
+    /// pass `--delete` to actually remove the orphans. The endpoint
+    /// MUST point at the backend (not the S4 gateway) because the
+    /// gateway hides `.s4index` from listings by design.
+    SweepOrphanSidecars(SweepOrphanSidecarsArgs),
+}
+
+#[derive(Debug, Args)]
+struct SidecarTargetArgs {
+    /// Sidecar target as `<bucket>/<key>`. Slashes after the first
+    /// belong to the key, so `mybucket/prefix/sub/file.bin` parses as
+    /// bucket=`mybucket`, key=`prefix/sub/file.bin`.
+    target: String,
+
+    /// Cap on the main-object body bytes loaded into RAM when the
+    /// sidecar is absent — verify-sidecar fetches the body to count
+    /// frames and distinguish a healthy single-frame "MissingHarmless"
+    /// from a real "MissingDivergent" (P2-C). Default 5 GiB matches
+    /// `repair-sidecar --max-body-bytes`; objects above the cap
+    /// surface as `MissingUnknown` rather than false-alerting.
+    #[clap(long, value_name = "BYTES", default_value_t = 5 * 1024 * 1024 * 1024)]
+    max_body_bytes: u64,
+}
+
+#[derive(Debug, Args)]
+struct RepairSidecarArgs {
+    /// Sidecar target as `<bucket>/<key>`. See `verify-sidecar` for the
+    /// parsing rule.
+    target: String,
+
+    /// Cap on the main-object body bytes loaded into RAM for the
+    /// single-pass frame scan. Default 5 GiB matches the server's
+    /// `--max-body-bytes`. Raise this when repairing larger objects
+    /// (and make sure you actually have the RAM).
+    #[clap(long, value_name = "BYTES", default_value_t = 5 * 1024 * 1024 * 1024)]
+    max_body_bytes: u64,
+}
+
+#[derive(Debug, Args)]
+struct SweepOrphanSidecarsArgs {
+    /// Bucket to scan.
+    bucket: String,
+
+    /// Delete orphans whose paired key is missing or whose ETag / size
+    /// disagrees with the live HEAD. `SidecarUndecodable` orphans are
+    /// NOT removed by this flag alone — see `--delete-undecodable`
+    /// below for why. Default is dry-run; always run the dry-run first.
+    #[clap(long, default_value_t = false)]
+    delete: bool,
+
+    /// Also delete sidecars whose bytes failed to parse as a valid
+    /// S4IX index. Off by default because operators on the v0.8.17
+    /// `--allow-legacy-reserved-key-reads` migration hatch may have
+    /// legitimate user-PUT objects whose key happens to end in
+    /// `.s4index` — those would also fail to decode, and removing them
+    /// would silently destroy user data. Only flip this on after
+    /// confirming there's no such legacy user data in the bucket.
+    /// Requires `--delete`.
+    #[clap(long, default_value_t = false, requires = "delete")]
+    delete_undecodable: bool,
 }
 
 #[derive(Debug, Args)]
@@ -902,8 +986,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // v0.5 #31: dispatch non-server subcommands before booting the
     // gateway (no tracing init, no AWS SDK config required — the
     // verifier is a pure file-walk).
+    //
+    // v0.9 #106: the sidecar subcommands need an aws-sdk-s3 client, so
+    // dispatch is async and takes &Opt to reach `--endpoint-url`.
     if let Some(cmd) = opt.command.as_ref() {
-        return run_subcommand(cmd);
+        return run_subcommand(&opt, cmd).await;
     }
 
     // v0.5 #32: enforce compliance-mode prereqs *before* anything
@@ -1955,11 +2042,19 @@ fn validate_compliance_mode(
     }
 }
 
-/// v0.5 #31: dispatch a non-server subcommand. Currently the only one
-/// is `verify-audit-log`, which walks an audit-log file and prints a
-/// short report (and exits non-zero on chain break).
-fn run_subcommand(cmd: &Cmd) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+/// v0.5 #31: dispatch a non-server subcommand. Started life as just
+/// `verify-audit-log` (pure file walk, no network). v0.9 #106 added the
+/// sidecar verify / repair / sweep commands, which need an aws-sdk-s3
+/// client — hence the `&Opt` parameter (to reach `--endpoint-url`) and
+/// the async signature.
+async fn run_subcommand(
+    opt: &Opt,
+    cmd: &Cmd,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     match cmd {
+        Cmd::VerifySidecar(args) => run_verify_sidecar(opt, args).await,
+        Cmd::RepairSidecar(args) => run_repair_sidecar(opt, args).await,
+        Cmd::SweepOrphanSidecars(args) => run_sweep_orphan_sidecars(opt, args).await,
         Cmd::VerifyAuditLog(args) => {
             let key = s4_server::audit_log::AuditHmacKey::from_str(&args.hmac_key)
                 .map_err(|e| format!("--hmac-key: {e}"))?;
@@ -2028,6 +2123,238 @@ fn run_subcommand(cmd: &Cmd) -> Result<(), Box<dyn Error + Send + Sync + 'static
                 }
             }
         }
+    }
+}
+
+/// v0.9 #106: shared aws-sdk-s3 client construction for the sidecar
+/// subcommands. Mirrors the server boot path (path-style + env creds)
+/// so the same `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / profile
+/// flow works. The `--endpoint-url` MUST point at the backend (real S3,
+/// MinIO, Garage, etc.) — not the S4 gateway — because the gateway
+/// hides `.s4index` from listings and decompresses bodies on GET, both
+/// of which break sidecar tooling.
+async fn build_sidecar_client(
+    opt: &Opt,
+) -> Result<aws_sdk_s3::Client, Box<dyn Error + Send + Sync + 'static>> {
+    let endpoint_url = opt.endpoint_url.as_deref().ok_or(
+        "--endpoint-url is required for sidecar subcommands (point it at the \
+         backend, not the S4 gateway)",
+    )?;
+    let sdk_conf = aws_config::from_env()
+        .endpoint_url(endpoint_url)
+        .load()
+        .await;
+    Ok(aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::config::Builder::from(&sdk_conf)
+            .force_path_style(true)
+            .build(),
+    ))
+}
+
+async fn run_verify_sidecar(
+    opt: &Opt,
+    args: &SidecarTargetArgs,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    let (bucket, key) = s4_server::repair::parse_bucket_key(&args.target)
+        .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.into() })?;
+    let client = build_sidecar_client(opt).await?;
+    let report = s4_server::repair::verify_sidecar(&client, bucket, key, args.max_body_bytes)
+        .await
+        .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.to_string().into() })?;
+    use s4_server::repair::SidecarStatus;
+    match &report.status {
+        SidecarStatus::Ok {
+            frame_count,
+            sidecar_size,
+        } => {
+            // v0.9 #106 P3-A (Codex R5): don't claim "ETag + size" —
+            // on ETag-less backends the binding is size-only and the
+            // sidecar is still fully v2.
+            println!(
+                "OK {}/{}: sidecar present, {} frames, {} bytes, version binding intact",
+                report.bucket, report.key, frame_count, sidecar_size,
+            );
+            Ok(())
+        }
+        SidecarStatus::LegacyV1 { frame_count } => {
+            println!(
+                "OK {}/{}: legacy v1 sidecar ({} frames, no ETag binding) — read-only \
+                 fast-path still works, but `repair-sidecar` upgrades to v2",
+                report.bucket, report.key, frame_count,
+            );
+            Ok(())
+        }
+        SidecarStatus::MissingHarmless { frame_count } => {
+            println!(
+                "OK {}/{}: no sidecar but main object has {} frame(s) — server skips \
+                 sidecar emission for single-frame objects by design (no Range GET \
+                 fast-path is lost)",
+                report.bucket, report.key, frame_count,
+            );
+            Ok(())
+        }
+        SidecarStatus::MissingDivergent { frame_count } => {
+            println!(
+                "MISSING {}/{}: no `<key>.s4index` but main object has {} frames — \
+                 Range GET falls back to full read. Run `repair-sidecar` to restore \
+                 the partial-fetch fast path.",
+                report.bucket, report.key, frame_count,
+            );
+            Err("sidecar missing (multi-frame divergence)".into())
+        }
+        SidecarStatus::MissingUnknown { size, cap } => {
+            println!(
+                "UNKNOWN {}/{}: no sidecar; main object body is {} bytes (> --max-body-bytes \
+                 cap {}), can't confirm whether this is a healthy single-frame skip or a \
+                 real divergence. Raise the cap or just run `repair-sidecar` to settle it.",
+                report.bucket, report.key, size, cap,
+            );
+            Ok(())
+        }
+        SidecarStatus::StaleEtag {
+            sidecar_etag,
+            live_etag,
+        } => {
+            println!(
+                "STALE_ETAG {}/{}: sidecar ETag {} != live {} — sidecar is from a different \
+                 commit point. Run `repair-sidecar`.",
+                report.bucket, report.key, sidecar_etag, live_etag,
+            );
+            Err("sidecar stale (etag mismatch)".into())
+        }
+        SidecarStatus::StaleSize {
+            sidecar_size,
+            live_size,
+        } => {
+            println!(
+                "STALE_SIZE {}/{}: sidecar recorded {} bytes != live {} — body changed without \
+                 ETag bump (lifecycle move?). Run `repair-sidecar`.",
+                report.bucket, report.key, sidecar_size, live_size,
+            );
+            Err("sidecar stale (size mismatch)".into())
+        }
+        SidecarStatus::DecodeError { message } => {
+            println!(
+                "DECODE_ERROR {}/{}: sidecar bytes failed to parse ({}). Run `repair-sidecar` \
+                 to overwrite cleanly.",
+                report.bucket, report.key, message,
+            );
+            Err("sidecar bytes corrupt".into())
+        }
+    }
+}
+
+async fn run_repair_sidecar(
+    opt: &Opt,
+    args: &RepairSidecarArgs,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    let (bucket, key) = s4_server::repair::parse_bucket_key(&args.target)
+        .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.into() })?;
+    let client = build_sidecar_client(opt).await?;
+    let report = s4_server::repair::repair_sidecar(&client, bucket, key, args.max_body_bytes)
+        .await
+        .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.to_string().into() })?;
+    println!(
+        "OK {}/{}: {} sidecar — {} frames, wrote {} bytes ({}), ETag={}",
+        report.bucket,
+        report.key,
+        if report.rebuilt_from_existing {
+            "rebuilt"
+        } else {
+            "wrote new"
+        },
+        report.frame_count,
+        report.sidecar_bytes_written,
+        format_bytes(report.sidecar_bytes_written),
+        report.source_etag.as_deref().unwrap_or("(none)"),
+    );
+    Ok(())
+}
+
+async fn run_sweep_orphan_sidecars(
+    opt: &Opt,
+    args: &SweepOrphanSidecarsArgs,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    let client = build_sidecar_client(opt).await?;
+    let policy = match (args.delete, args.delete_undecodable) {
+        (false, false) => s4_server::repair::DeletePolicy::DryRun,
+        (true, false) => s4_server::repair::DeletePolicy::PairBoundOnly,
+        (true, true) => s4_server::repair::DeletePolicy::IncludeUndecodable,
+        // clap's `requires = "delete"` makes the (false, true) state
+        // unreachable from the CLI parser — guard defensively.
+        (false, true) => unreachable!("clap requires --delete with --delete-undecodable"),
+    };
+    let report = s4_server::repair::sweep_orphan_sidecars(&client, &args.bucket, policy)
+        .await
+        .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.to_string().into() })?;
+    use s4_server::repair::OrphanReason;
+    if report.orphans.is_empty() {
+        println!(
+            "OK {}: {} sidecars scanned, 0 orphans",
+            report.bucket, report.sidecars_scanned,
+        );
+        return Ok(());
+    }
+    println!(
+        "{} orphan(s) found in {} ({} sidecars scanned):",
+        report.orphans.len(),
+        report.bucket,
+        report.sidecars_scanned,
+    );
+    let mut undecodable_count = 0u64;
+    for orph in &report.orphans {
+        let reason = match &orph.reason {
+            OrphanReason::PairedMissing => "paired key MISSING".into(),
+            OrphanReason::PairedEtagMismatch {
+                sidecar_etag,
+                live_etag,
+            } => format!("ETag mismatch (sidecar={sidecar_etag}, live={live_etag})"),
+            OrphanReason::PairedSizeMismatch {
+                sidecar_size,
+                live_size,
+            } => format!("size mismatch (sidecar={sidecar_size}, live={live_size})"),
+            OrphanReason::SidecarUndecodable { message } => {
+                undecodable_count += 1;
+                format!("sidecar UNDECODABLE: {message}")
+            }
+        };
+        println!("  {}  ({})", orph.sidecar_key, reason);
+    }
+    if args.delete {
+        println!("DELETED {} sidecar(s).", report.deleted);
+        if !args.delete_undecodable && undecodable_count > 0 {
+            println!(
+                "Skipped {} UNDECODABLE sidecar(s) — inspect manually and re-run \
+                 with --delete-undecodable if they are not legacy reserved-name user data.",
+                undecodable_count,
+            );
+        }
+        Ok(())
+    } else {
+        println!(
+            "Dry-run — re-run with --delete (and optionally --delete-undecodable) \
+             to remove the {} orphan(s).",
+            report.orphans.len(),
+        );
+        // Non-zero exit so a cron / CI loop can branch on "needs action".
+        Err("orphan sidecars detected (dry-run)".into())
+    }
+}
+
+/// One-line human-readable byte size for repair-report output. Keeps the
+/// dependency tree minimal — no `humansize` crate just for this string.
+fn format_bytes(n: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if n >= GIB {
+        format!("{:.2} GiB", n as f64 / GIB as f64)
+    } else if n >= MIB {
+        format!("{:.2} MiB", n as f64 / MIB as f64)
+    } else if n >= KIB {
+        format!("{:.2} KiB", n as f64 / KIB as f64)
+    } else {
+        format!("{n} B")
     }
 }
 
