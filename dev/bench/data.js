@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780830787430,
+  "lastUpdate": 1780831173256,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -1354,6 +1354,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "472b28ecf378f5f8ca731ddb4266e0fddb4e20f1",
+          "message": "fix(audit): #106-audit-R6 P2-R6 — bound sidecar GET (HEAD→GET TOCTOU)\n\nCodex round 6 integrated audit caught: the R5 P2-R5 cap fix\nHEADed first and GETed second, leaving a TOCTOU window where a\nsidecar swap between the two could bypass the cap. Race shape:\nHEAD(small) → swap-in(massive) → GET would still let `collect()`\npull the full new body into memory before the post-decode reject\ncould fire.\n\nFix: pin the GET to the HEAD ETag via `If-Match` so any swap\nsurfaces as 412 PreconditionFailed before any bytes are read.\nPlus a defense-in-depth post-GET length check that catches\nraces on ETag-less backends OR If-Match-non-honouring backends.\n\nRace detection paths:\n  - 412 → typed `SidecarFetchOutcome::Other` with a re-run hint\n  - Post-GET length > cap → `SidecarTooLarge` (same surface as\n    the HEAD-time rejection so callers branch uniformly)\n\nZero new tests — the existing `sweep_classifies_oversized_*` E2E\nexercises the happy capped path; the race itself is hard to\ndeterministically reproduce in a MinIO E2E (would require an\ninterposing proxy that mutates the body between HEAD and GET).\nThe lib unit `sidecar_too_large_error_shape` already pins the\ntyped error surface that the defense-in-depth post-GET branch\nemits, so any refactor that silently drops either guard fails\nloud either at the cap-value test or at the Display assertion.\n\nCoverage: workspace 0 failed. fmt + clippy clean.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-07T20:11:37+09:00",
+          "tree_id": "3794eef48fc145158c864cc582c519455c1da537",
+          "url": "https://github.com/abyo-software/s4/commit/472b28ecf378f5f8ca731ddb4266e0fddb4e20f1"
+        },
+        "date": 1780831172329,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 57356,
+            "range": "± 4054",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 54083,
+            "range": "± 3846",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 373,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2631434,
+            "range": "± 56743",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 41911550,
+            "range": "± 147440",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192743,
+            "range": "± 351",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 53850312,
+            "range": "± 996966",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 755877498,
+            "range": "± 1669375",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3073923,
+            "range": "± 13796",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 32045,
+            "range": "± 2292",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 38960,
+            "range": "± 3275",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 376,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 573778,
+            "range": "± 12410",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1545271,
+            "range": "± 27157",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192501,
+            "range": "± 1602",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12386614,
+            "range": "± 180956",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27374161,
+            "range": "± 130682",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3084784,
+            "range": "± 15530",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1606064,
+            "range": "± 15982",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2548915,
+            "range": "± 23361",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 350797519,
+            "range": "± 3564581",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 140,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 8389,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 818,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13155,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2910,
+            "range": "± 58",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 22706,
+            "range": "± 97",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 90911,
+            "range": "± 1075",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 597,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4606,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 18086,
+            "range": "± 52",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 28,
             "range": "± 0",
             "unit": "ns/iter"
           }
