@@ -173,8 +173,16 @@ jobs:
             # build. `!contains(github.ref, '-')` filters SemVer
             # prerelease tags.
             type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'push' && !contains(github.ref, '-') }}
-            type=ref,event=branch
-            type=sha,format=short
+            # v0.10 #B1-audit R2 (Codex): branch + sha tags MUST NOT
+            # fire during back-fill (workflow_dispatch with
+            # build_ref). Otherwise `gh workflow run docker.yml --ref
+            # main -f build_ref=v0.9.0` would publish the v0.9.0
+            # binary under `:main` + `:sha-<current-main-sha>`,
+            # which consumers of those mutable tags would interpret
+            # as the latest main tip — a silent regression-by-tag.
+            # Gate on `build_ref == ''` (= no back-fill in effect).
+            type=ref,event=branch,enable=${{ inputs.build_ref == '' }}
+            type=sha,format=short,enable=${{ inputs.build_ref == '' }}
             # v0.10 back-fill: when `image_tag_override` is set on a
             # workflow_dispatch (typical use case: back-fill an image
             # for a tag whose source predates this workflow), emit
