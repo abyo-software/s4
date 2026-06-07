@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780840820837,
+  "lastUpdate": 1780842816860,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -2484,6 +2484,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "f9853ada6e86efbdf8b1b8cff4143e8b899b5fb3",
+          "message": "feat(v0.10-A4): #A4 — i686 runtime smoke CI job\n\nCloses v0.10 wave-2 #A4. The v0.9 #106-32bit work proved\n`cargo check --target i686-unknown-linux-gnu` passes across the\nworkspace, but README qualified it as \"compiles, untested at\nruntime\" because no CI step actually exercised the i686 binary.\n\nNew per-push `i686-runtime-smoke` job in `.github/workflows/ci.yml`:\n\n  1. Installs `gcc-multilib` + `libc6-dev-i386` + `libc6:i386`\n     so a stock ubuntu-latest runner can produce + execute\n     i686 ELF binaries.\n  2. Runs `cargo test --target i686-unknown-linux-gnu -p s4-codec\n     -p s4-config --release` (full codec/config test suite —\n     regression gate for the v0.9 const-overflow + `usize::try_from`\n     hardening work).\n  3. Builds `s4-server` for i686 with `continue-on-error: true`\n     (the aws-sdk-rust / rustls / ring stack pulls C-source\n     crypto crates that may not link cleanly under stock i386\n     multilib; a build failure surfaces in the log without\n     going red because it doesn't invalidate the codec/config\n     test results in step 2).\n  4. When step 3 succeeded, invokes `s4 --help` + `s4 --version`\n     against the i686 binary to confirm it loads + initialises\n     CLI parsing on a 32-bit ELF.\n\n`notify-on-failure` job now depends on `i686-runtime-smoke` too,\nso an actual regression on the always-required steps (codec/config\ntests) auto-files a `ci-failure` issue like the other CI gates.\n\nREADME §\"Supported targets\" upgraded: `s4-server` cell flips from\n\"⚠️ compiles, untested at runtime\" to \"✅ compiles + `--help` /\n`--version` smoke (CI)\". Caveat preserved: full end-to-end\nPUT/GET on 32-bit is still not exercised; operators on i686\nshould treat `--max-body-bytes` carefully (auto-clamps to\n`isize::MAX as usize` ≈ 2 GiB per the v0.9 #106-32bit fix).\n\nContext: 3 wave-2 sub-agents (A3 / A4 / B2) hit Anthropic\nsession limit before producing any working-tree changes. This\ncommit picks up A4 in the main session so wave-2 progresses\nwhile the agent-quota resets at 00:30 JST. A3 + B2 to follow.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-07T23:25:42+09:00",
+          "tree_id": "f619adda769b390474e94ff05772101e32b5386b",
+          "url": "https://github.com/abyo-software/s4/commit/f9853ada6e86efbdf8b1b8cff4143e8b899b5fb3"
+        },
+        "date": 1780842815976,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 56179,
+            "range": "± 3653",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 57615,
+            "range": "± 3350",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 371,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2674435,
+            "range": "± 44862",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 41758697,
+            "range": "± 112604",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192244,
+            "range": "± 395",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 52082222,
+            "range": "± 1006535",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 755460485,
+            "range": "± 1761224",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3110172,
+            "range": "± 21269",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 32528,
+            "range": "± 2589",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 38983,
+            "range": "± 2454",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 378,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 574134,
+            "range": "± 12211",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1555965,
+            "range": "± 31128",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192296,
+            "range": "± 432",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 13211108,
+            "range": "± 339590",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27218796,
+            "range": "± 161780",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3075544,
+            "range": "± 11277",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1600265,
+            "range": "± 23016",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2545148,
+            "range": "± 39211",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 345631394,
+            "range": "± 4065724",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 140,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 9247,
+            "range": "± 43",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 815,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13098,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2798,
+            "range": "± 87",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 21866,
+            "range": "± 214",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 87301,
+            "range": "± 2632",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 595,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4955,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19743,
+            "range": "± 68",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
             "range": "± 0",
             "unit": "ns/iter"
           }
