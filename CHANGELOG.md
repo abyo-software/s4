@@ -45,6 +45,41 @@ v0.10 roadmap in progress — encryption-aware sidecar completion
   partial-fetch fundamentally needs a chunked envelope, KMS / SSE-C
   need different key-material plumbing.
 
+- **v0.10 wave-2 #B2 Docker image + Helm chart smoke CI** —
+  new per-push `.github/workflows/docker-smoke.yml` (path-
+  filtered to `charts/**`, `Dockerfile*`, `docker-compose*.yml`,
+  and the docker / docker-smoke workflow files) validates the
+  distribution surface added by wave-1 #B1. Three independent
+  jobs:
+
+  - `helm-lint-template`: `helm lint` + three `helm template`
+    invocations (default values, `image.tag=0.9.0` pinned, and
+    the `image.tag=0.9.0-gpu` `-gpu` suffix variant) against
+    `./charts/s4` with a placeholder `backend.endpointUrl`.
+    Asserts the rendered manifest references the expected ghcr
+    repo / tag for each variant.
+  - `docker-compose-config`: `docker compose config` on both
+    `docker-compose.yml` + `docker-compose.gpu.yml` plus a
+    grep for the `ghcr.io/abyo-software/s4` image refs the
+    wave-1 #B1 work added (catches a regression that silently
+    drops the `image:` line and forces consumers back into
+    `build:`-only mode).
+  - `image-smoke`: pulls `ghcr.io/abyo-software/s4:latest`
+    (overrideable via `workflow_dispatch -f image_tag=...`)
+    and runs `s4 --help` + `s4 --version` against it.
+    `continue-on-error: true` on the pull tolerates the
+    not-yet-published case (= before v0.10.0 cut) by skipping
+    the rest of the job — the chart + compose jobs above
+    still gate.
+
+  The workflow is NOT wired into `notify-on-failure` (`ci.yml`)
+  by design: distribution-surface regressions surface in the
+  workflow run UI without auto-filing issues that may be noisy
+  during the v0.10 distribution-ramp phase. README §"Kubernetes
+  (Helm)" gains a "Verifying the image / chart locally"
+  subsection that mirrors the CI checks for operators who want
+  to reproduce them pre-deploy.
+
 - **v0.10 #B1 ghcr.io container image publishing** — new
   `.github/workflows/docker.yml` builds and pushes
   `ghcr.io/abyo-software/s4:<version>` (CPU, multi-arch

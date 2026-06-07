@@ -187,6 +187,35 @@ nvCOMP), inline or cert-manager TLS, and bucket-policy ConfigMap. See
 [.github/workflows/docker.yml](.github/workflows/docker.yml) for the image
 build / publish pipeline.
 
+### Verifying the image / chart locally
+
+The published image + chart pair is exercised in CI on every push that
+touches the distribution surface
+([.github/workflows/docker-smoke.yml](.github/workflows/docker-smoke.yml) —
+v0.10 wave-2 #B2): `helm lint` + `helm template` against `charts/s4`
+with a placeholder backend URL (catches values-schema / template
+regressions), `docker compose config` against both compose files
+(catches reference / image-tag drift), and `docker pull` +
+`s4 --help` / `s4 --version` against the latest published ghcr.io tag
+(tolerates the not-yet-published case via `continue-on-error`).
+Operators can reproduce the same checks locally before deploying:
+
+```bash
+# Helm chart sanity (with placeholder so backend.endpointUrl is satisfied)
+helm lint ./charts/s4 --set backend.endpointUrl=https://s3.example.com
+helm template s4 ./charts/s4 --set backend.endpointUrl=https://s3.example.com \
+  | kubectl apply --dry-run=client -f -
+
+# Compose file syntax + image-ref validation
+docker compose -f docker-compose.yml config > /dev/null
+docker compose -f docker-compose.gpu.yml config > /dev/null
+
+# Image smoke (run this after a release lands on ghcr.io)
+docker pull ghcr.io/abyo-software/s4:0.9.0
+docker run --rm ghcr.io/abyo-software/s4:0.9.0 s4 --help
+docker run --rm ghcr.io/abyo-software/s4:0.9.0 s4 --version
+```
+
 ### Python (pip)
 
 For ML / ETL pipelines that just want the codec without the gateway:

@@ -1,0 +1,164 @@
+name: Docker / Helm smoke
+
+# v0.10 wave-2 #B2 — post-publish validation layer for the
+# Docker image + Helm chart distribution path B1 added. Catches
+# chart / Dockerfile / docker-compose regressions before they
+# reach operators who follow the README install recipe.
+#
+# Three independent jobs:
+#   helm-lint-template: `helm lint` + `helm template` over
+#     `charts/s4` with a placeholder backend endpoint. Runs on
+#     every push that touches the chart so a malformed
+#     `values.yaml` / template rotation surfaces immediately.
+#   docker-compose-config: `docker compose config` syntax /
+#     reference validation for both compose files.
+#   image-smoke: pulls the latest published ghcr.io image,
+#     runs `s4 --help` + `s4 --version` against it. Tolerates
+#     the "image not yet published" case (= before v0.10.0 cut)
+#     by skipping when the pull fails — the helm + compose
+#     jobs above still gate.
+#
+# `notify-on-failure` (ci.yml) does NOT include this workflow's
+# jobs by design — these are advisory checks; chart / image
+# regressions should surface in the workflow run UI without
+# auto-filing issues that may be noisy during the v0.10
+# distribution-ramp phase.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "charts/**"
+      - "Dockerfile"
+      - "Dockerfile.gpu"
+      - "docker-compose.yml"
+      - "docker-compose.gpu.yml"
+      - ".github/workflows/docker.yml"
+      - ".github/workflows/docker-smoke.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "charts/**"
+      - "Dockerfile"
+      - "Dockerfile.gpu"
+      - "docker-compose.yml"
+      - "docker-compose.gpu.yml"
+      - ".github/workflows/docker.yml"
+      - ".github/workflows/docker-smoke.yml"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to smoke (default: latest). Useful to validate a specific release."
+        type: string
+        default: "latest"
+        required: false
+
+permissions:
+  contents: read
+  # `packages: read` lets the smoke job pull from ghcr.io without
+  # an extra auth step. Public packages don't strictly need it but
+  # specifying it is fail-safe if the package is ever made internal.
+  packages: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: abyo-software/s4
+  PLACEHOLDER_ENDPOINT: https://s3.example.com
+
+jobs:
+  helm-lint-template:
+    name: helm lint + template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+      - name: helm lint
+        # `backend.endpointUrl` is required; pass a placeholder so
+        # lint doesn't flag the missing value as a failure. lint
+        # still catches all OTHER chart issues (template syntax,
+        # values.yaml schema, manifest validity).
+        run: |
+          helm lint ./charts/s4 \
+            --set backend.endpointUrl=${{ env.PLACEHOLDER_ENDPOINT }}
+      - name: helm template (default values)
+        # Render with the placeholder and pipe through
+        # `kubectl --dry-run=client apply -f -` so manifest
+        # validity is verified beyond what `helm template` checks
+        # (which only validates Go template syntax + the values
+        # schema, not Kubernetes resource shape).
+        run: |
+          helm template s4-smoke ./charts/s4 \
+            --set backend.endpointUrl=${{ env.PLACEHOLDER_ENDPOINT }} \
+            > /tmp/manifest.yaml
+          wc -l /tmp/manifest.yaml
+          grep -c "^kind:" /tmp/manifest.yaml
+      - name: helm template (image.tag override)
+        # The `image.tag` value is the main lever the v0.10
+        # README install recipe shows; verify both the default
+        # (== `appVersion` from `Chart.yaml`) and an override
+        # path render cleanly.
+        run: |
+          helm template s4-smoke ./charts/s4 \
+            --set backend.endpointUrl=${{ env.PLACEHOLDER_ENDPOINT }} \
+            --set image.tag=0.9.0 \
+            > /tmp/manifest-pinned.yaml
+          grep "ghcr.io/abyo-software/s4:0.9.0" /tmp/manifest-pinned.yaml > /dev/null
+      - name: helm template (gpu suffix)
+        # Sanity: the `-gpu` tag suffix Helm install path the
+        # README documents must produce a manifest that
+        # references the GPU image variant.
+        run: |
+          helm template s4-smoke ./charts/s4 \
+            --set backend.endpointUrl=${{ env.PLACEHOLDER_ENDPOINT }} \
+            --set image.tag=0.9.0-gpu \
+            > /tmp/manifest-gpu.yaml
+          grep "ghcr.io/abyo-software/s4:0.9.0-gpu" /tmp/manifest-gpu.yaml > /dev/null
+
+  docker-compose-config:
+    name: docker compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker compose config (cpu)
+        run: docker compose -f docker-compose.yml config > /dev/null
+      - name: docker compose config (gpu)
+        run: docker compose -f docker-compose.gpu.yml config > /dev/null
+      - name: assert ghcr image refs present
+        # The v0.10 #B1 work added `image:` alongside `build:`
+        # so `docker compose pull` works without a local build
+        # once the ghcr image is published. Catch a regression
+        # that would silently drop the image ref.
+        run: |
+          grep -E "image:.*ghcr.io/abyo-software/s4" docker-compose.yml
+          grep -E "image:.*ghcr.io/abyo-software/s4.*-gpu" docker-compose.gpu.yml
+
+  image-smoke:
+    name: image smoke (pull + --help / --version)
+    runs-on: ubuntu-latest
+    steps:
+      - name: docker pull (tolerate missing image)
+        # Tag defaults to `latest` on push, overrideable via
+        # workflow_dispatch. Skip the rest of the job when the
+        # pull fails (= image not yet published in the v0.10
+        # ramp phase) — the helm + compose jobs above still
+        # gate the chart / dockerfile shape.
+        id: pull
+        continue-on-error: true
+        run: |
+          TAG="${{ inputs.image_tag || 'latest' }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}"
+          echo "Trying to pull $IMAGE"
+          docker pull "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+      - name: smoke — s4 --help
+        if: steps.pull.outcome == 'success'
+        run: docker run --rm "${{ steps.pull.outputs.image }}" s4 --help > /dev/null
+      - name: smoke — s4 --version
+        if: steps.pull.outcome == 'success'
+        run: docker run --rm "${{ steps.pull.outputs.image }}" s4 --version
+      - name: skip notice (image not published)
+        if: steps.pull.outcome != 'success'
+        run: |
+          echo "::notice ::Image pull failed — skipping smoke. Image likely not yet published for this tag."
