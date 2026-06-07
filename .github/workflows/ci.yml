@@ -131,9 +131,10 @@ jobs:
   # probes (frame overhead, full pipeline, SSE throughput). We run
   # them in `release` profile with a short input so the CI signal
   # is "build + execute cleanly" — not a regression baseline.
-  # A criterion-based regression-tracking bench is roadmap (would
-  # need a baseline-storage backend like
-  # `benchmark-action/github-action-benchmark`).
+  # The per-commit regression-tracking baseline lives in the
+  # sibling `bench.yml` workflow (criterion + benchmark-action,
+  # gh-pages branch); this smoke job stays as the "build cleanly"
+  # gate for the example binaries themselves.
   bench-smoke:
     name: bench smoke (examples)
     runs-on: ubuntu-latest

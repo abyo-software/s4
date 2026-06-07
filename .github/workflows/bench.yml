@@ -1,0 +1,106 @@
+name: Bench
+
+# v0.9 — criterion regression-tracking bench. Runs on push to main
+# (PR runs would double the cost without giving a stable baseline),
+# stores the result in the `gh-pages` branch via
+# `benchmark-action/github-action-benchmark`, alerts in PR comments
+# when a commit makes a target ≥110% of the previous best.
+#
+# Linux x86_64 only (the `s4-codec` benches target CPU codecs that
+# work everywhere; the `nvcomp-gpu` GPU codecs are not benched here
+# because GitHub-hosted runners have no CUDA-capable GPU).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  # `contents: write` is needed for the action to push the criterion
+  # JSON into the `gh-pages` branch where the regression history
+  # lives. `pull-requests: write` lets the action drop a comment when
+  # a commit exceeds the alert threshold.
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: criterion benches (s4-codec)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Same cache configuration the `ci.yml` `test` job uses, so the
+      # bench workflow doesn't re-download / re-build every dep on
+      # every push.
+      - uses: Swatinem/rust-cache@v2
+
+      # `--output-format bencher` emits the libtest-style format
+      # benchmark-action understands directly under `tool: cargo`.
+      # `--quick` would skew the regression history; we run the full
+      # criterion sampling so the alert threshold has signal.
+      #
+      # `tee` keeps the human-readable output in the run log for
+      # debugging while the bencher-format lines go to the file the
+      # action parses. `set -o pipefail` is mandatory — GitHub
+      # Actions' default shell for plain `run:` is `bash -e`
+      # **without** `pipefail`, so a `cargo bench` failure on a
+      # later target would be hidden by `tee`'s successful exit
+      # and the action would publish a partial bencher file as if
+      # the run had been clean. With pipefail on, the workflow
+      # fails loud and the regression history is not corrupted.
+      - name: cargo bench (s4-codec, all targets)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo bench -p s4-codec \
+            --bench codec_roundtrip \
+            --bench frame_codec \
+            --bench index_codec \
+            -- --output-format bencher \
+            | tee bench-output.txt
+        timeout-minutes: 20
+
+      # Store the result in gh-pages (auto-creates the branch on the
+      # first successful run; if `gh-pages` does not yet exist the
+      # action initialises it). `alert-threshold: 110%` means a
+      # regression of 1.1× over the previous best fires an alert;
+      # `fail-on-alert: false` keeps CI green so the alert is
+      # advisory (a hard fail-the-PR knob is roadmap once we have
+      # enough history to know the natural noise floor of each
+      # benchmark).
+      - name: Store benchmark result + regression alert
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: s4-codec criterion benches
+          tool: cargo
+          output-file-path: bench-output.txt
+          # Push history into the dedicated `gh-pages` branch so
+          # `https://abyo-software.github.io/s4/dev/bench/` renders
+          # the trend chart. `auto-push: true` requires the workflow
+          # to have `contents: write` (granted above).
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          alert-threshold: "110%"
+          comment-on-alert: true
+          fail-on-alert: false
+          # Keep the last 200 data points in the history so the
+          # gh-pages JSON does not grow without bound. 200 commits
+          # ≈ 1-2 months at the current release cadence.
+          max-items-in-chart: 200
+
+      - name: Upload raw bench output as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-output-${{ github.run_id }}
+          path: bench-output.txt
+          if-no-files-found: ignore

@@ -185,6 +185,37 @@ v0.9 roadmap in progress.
   verify it reports `MissingHarmless` exit 0, plus a `cap=0`
   edge case asserting `MissingUnknown`).
 
+- **v0.9 criterion regression-tracking benches** — new
+  `crates/s4-codec/benches/` directory carries three criterion
+  suites driven by a `.github/workflows/bench.yml` push-to-main
+  job. Results are published per-commit to the `gh-pages`
+  branch via
+  [`benchmark-action/github-action-benchmark`](https://github.com/benchmark-action/github-action-benchmark);
+  any tracked target that goes ≥ 110% of its previous best
+  drops a comment on the offending commit. The trend chart
+  surfaces at `https://abyo-software.github.io/s4/dev/bench/`
+  once the first successful main run initialises the
+  `gh-pages` branch.
+
+  Suites:
+
+  - `codec_roundtrip` — `cpu-zstd` (levels 1 / 3 / 22) /
+    `cpu-gzip` / `passthrough` compress + decompress at
+    1 KiB / 1 MiB / 16 MiB inputs.
+  - `frame_codec` — `multipart::write_frame` and `FrameIter`
+    with the `S4P1` padding-skip branch exercised across
+    16 × 64 KiB and 256 × 4 KiB frame shapes.
+  - `index_codec` — `index::encode_index` / `decode_index`
+    plus `FrameIndex::lookup_range` at 128 / 1024 / 4096
+    sidecar entry counts.
+
+  GPU codecs (`nvcomp-*`, `dietgpu-*`) are deliberately not
+  in the suite because GitHub-hosted runners have no
+  CUDA-capable GPU; the manual `examples/bench_codecs.rs`
+  table in README §Benchmarks remains canonical for those
+  numbers. README §"Performance regression tracking
+  (criterion + GitHub Pages)" describes the workflow.
+
 ## [0.8.22] — 2026-06-07
 
 Seventh-round review caught that R6-6 introduced a fresh

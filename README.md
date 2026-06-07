@@ -476,6 +476,35 @@ configure larger multipart chunk sizes via the AWS SDK
 Range-GET granularity). The CSV captures end-to-end PUT/GET wall-clock
 including framing overhead.
 
+### Performance regression tracking (criterion + GitHub Pages)
+
+The single-pass numbers above are captured manually on the maintainer's
+workstation; for **per-commit regression detection** S4 also runs a
+criterion bench suite on every push to `main`
+([`.github/workflows/bench.yml`](.github/workflows/bench.yml)), stores
+the timing history in the `gh-pages` branch via
+[`benchmark-action/github-action-benchmark`](https://github.com/benchmark-action/github-action-benchmark),
+and comments on a commit when any tracked target gets ≥ 1.1× slower
+than its previous best. The targets cover the CPU hot paths every
+default-build deployment runs through:
+
+- `crates/s4-codec/benches/codec_roundtrip.rs` — `cpu-zstd` (levels
+  1 / 3 / 22) / `cpu-gzip` / `passthrough` compress + decompress at
+  1 KiB / 1 MiB / 16 MiB.
+- `crates/s4-codec/benches/frame_codec.rs` — `write_frame` and the
+  `FrameIter` walker, with the padding-skip branch exercised.
+- `crates/s4-codec/benches/index_codec.rs` — S4IX sidecar
+  `encode_index` / `decode_index` / `lookup_range` across 128 /
+  1024 / 4096 frame counts.
+
+GPU codecs (`nvcomp-*`) are intentionally not in the regression suite
+because GitHub-hosted runners have no CUDA-capable GPU; the manual
+table above remains the canonical source for those numbers.
+
+The rendered trend chart lives at
+`https://abyo-software.github.io/s4/dev/bench/` after the first
+successful CI run on `main` initialises the `gh-pages` branch.
+
 ### SSE throughput (AES-NI vs software fallback)
 
 S4's server-side encryption (`--sse-s4-key`) goes through the `aes-gcm`
