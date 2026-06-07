@@ -74,11 +74,14 @@ jobs:
   docker:
     name: build & push (${{ matrix.flavor }})
     runs-on: ubuntu-latest
-    # 60 min covers worst case: arm64 CPU build via QEMU emulation on a
-    # cold GHA cache (~10-15 min observed for Rust release builds of this
-    # size) + GPU build with the nvCOMP download + cargo release build
-    # against the CUDA SDK base image (~20-30 min cold).
-    timeout-minutes: 60
+    # v0.10.0 #B1 post-cut: bumped 60→90 min. The v0.9.0 back-fill
+    # CPU build (multi-arch including arm64 via QEMU) timed out at
+    # 1h0m17s on a cold GHA cache. arm64-via-QEMU for a Rust release
+    # build of this size is genuinely 40-60 min on a cold cache; the
+    # GPU build (amd64 only) is comfortably under 30 min. 90 min
+    # gives headroom for both flavors + occasional GHA hiccups
+    # without breaching the daily Actions budget.
+    timeout-minutes: 90
 
     strategy:
       # Don't cancel the other flavor when one fails — a transient
