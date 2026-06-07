@@ -815,6 +815,7 @@ with backend (no network RTT to amortise). TTFB excludes TLS handshake
 | Tier | What runs | Where | Pass count |
 |---|---|---|---|
 | **Unit + integration** | parsers, registry, blob helpers, S3 trait, policy, TLS | every push (CI) | 70+ |
+| **Chaos / fault-injection** | mid-stream GET error, HEAD timeout fail-close, concurrent overwrite, SSE keyring rotation, MPU complete failure (deterministic, in-memory) | every push (CI) | 6 |
 | **proptest fuzz** | 39 properties × 256–10K cases (push), × 1M (nightly) | every push + nightly | 39 |
 | **bolero coverage-guided** | 7 targets, libfuzzer engine | nightly (matrix, 30 min × 5) | 7 |
 | **fuzz canary** | proves fuzz framework is alive | every push | 3 |

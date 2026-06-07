@@ -279,6 +279,54 @@ v0.9 roadmap in progress.
   numbers. README §"Performance regression tracking
   (criterion + GitHub Pages)" describes the workflow.
 
+- **#106 chaos / fault-injection infrastructure** —
+  `crates/s4-server/tests/chaos.rs` graduates from the v0.8.18
+  P7 scaffold (`chaos_scaffold_smoke`, 45 LOC) into a full
+  fault-injection harness with a reusable `ChaosBackend` mock
+  (`ChaosHandle` + `ChaosConfig`) and five concrete scenarios
+  that pin gateway invariants which would otherwise only
+  surface in production under hostile backend conditions:
+
+  - **Scenario 1** (`chaos_get_5xx_mid_stream`): a backend
+    GET whose body stream errors after the first chunk must
+    surface to the client as a 5xx, never as a truncated
+    200. A regression here would silently hand clients half
+    a file labelled "complete".
+  - **Scenario 2** (`chaos_head_latency_timeout_fails_close`):
+    a backend HEAD that blocks indefinitely must not be able
+    to pin a gateway handler — `tokio::time::timeout` must
+    fire and cancellation must propagate through the await
+    chain. Validates the fail-close discipline the production
+    AWS-SDK read-timeout knob relies on.
+  - **Scenario 3** (`chaos_concurrent_put_same_key_no_mix`):
+    two PUTs at the same key sequenced through a
+    `tokio::sync::Notify` (deterministic, NOT random) leave
+    the backend with one of the two bodies byte-for-byte,
+    never a spliced mix; the second PUT wins under serial
+    ordering.
+  - **Scenario 4** (`chaos_keyring_rotation_mid_put`): an
+    SSE-S4 keyring rotated between two PUTs (active=1 →
+    active=2, id=1 retained for read) must let both objects
+    round-trip — the per-object S4E2 key_id embed picks the
+    right keyring entry on read-back.
+  - **Scenario 5** (`chaos_complete_mpu_fails_state_unchanged`):
+    a backend CompleteMultipartUpload that returns 500 must
+    leave the gateway-side multipart state intact (retry-able)
+    and must not materialise a partial object at the
+    destination key.
+
+  All faults are armed deterministically (ordinal counters
+  + `Notify` hand-off, no wall-clock racing or random
+  scheduling), so the suite reproduces under
+  `--test-threads=1` and `cargo nextest`. Confirmed flake-
+  free across 5 consecutive `cargo test -p s4-server
+  --test chaos -- --test-threads=1` runs. No new
+  `dev-dependencies` were added — the mock layer reuses the
+  same `s3s` / `async-trait` / `bytes` / `futures` /
+  `tokio` versions the existing `tests/multipart_audit_71.rs`
+  fixture already brings in. Production code (`crates/s4-server/src/`)
+  is unchanged; the harness lives entirely in test scope.
+
 ## [0.8.22] — 2026-06-07
 
 Seventh-round review caught that R6-6 introduced a fresh
