@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780843003108,
+  "lastUpdate": 1780843160921,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -2919,6 +2919,232 @@ window.BENCHMARK_DATA = {
             "name": "decode_index/4096f",
             "value": 21140,
             "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "3da7b7ec71d97602866e869aa51bd364cf7a2ee5",
+          "message": "docs(v0.10-A3): #A3-doc — streaming PUT checksum coverage matrix\n\nCloses v0.10 wave-2 #A3. Evaluation outcome:\n\nQ1: multipart upload_part streaming verify?\n  → NO. `Codec::compress_with_telemetry(bytes, codec_kind)` in\n  `service.rs::upload_part` takes `bytes: Bytes` by value because\n  (a) the dispatcher needs a sample for codec selection, (b) the\n  codec needs the full body for encode, (c) `pad_to_minimum`\n  needs the framed length to decide padding-skip. Teeing the\n  body through a hasher first doesn't change memory peak.\n\nQ2: non-streaming GPU codec branch streaming verify?\n  → NO. `nvcomp-bitcomp` / `nvcomp-gdeflate` need the full body\n  in one buffer to copy to GPU HBM. Same shape as the multipart\n  case — tee doesn't help.\n\nBoth gaps are codec-API constraints (codec trait takes `Bytes`,\nnot `Stream<Bytes>`), not implementation oversights. Closing\nthem requires new wire format + codec re-architecture, which\nis v0.11+ scope, not v0.10.\n\nApproach: same \"doc-only with explicit constraint walkthrough\"\npattern as wave-1 #A2-doc on the SSE side. New\n`docs/security/streaming-checksum-coverage.md` (~80 lines)\ndocuments:\n\n  - 5-row coverage matrix (single-PUT cpu-zstd/nvcomp-zstd\n    streaming, single-PUT passthrough buffered, single-PUT\n    non-streaming GPU codec buffered, multipart upload_part\n    buffered).\n  - Three preconditions for streaming win + which paths meet how\n    many (only single-PUT streaming-codec meets all three).\n  - Where each path lives in `s4-server` (link to\n    streaming_checksum.rs + service.rs anchors).\n  - v0.11+ roadmap candidates (`S4F3` streaming frame, streaming\n    nvCOMP wrappers, multipart streaming upload_part) with the\n    upstream API constraints that block each.\n\nREADME §\"Streaming I/O\" `**Streaming PUT**` bullet gains a link\nto the dedicated doc. CHANGELOG entry under `### Documentation`.\n\nNo code changes. No test additions (existing v0.9\n#streaming-checksum tests already cover the streaming path;\nbuffered paths are exercised by the existing checksum E2E suite).\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-07T23:31:19+09:00",
+          "tree_id": "e862e423d1ba70cd385ed548507a02db95e8bbe6",
+          "url": "https://github.com/abyo-software/s4/commit/3da7b7ec71d97602866e869aa51bd364cf7a2ee5"
+        },
+        "date": 1780843160530,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 48887,
+            "range": "± 1715",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 57835,
+            "range": "± 2604",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 426,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2217414,
+            "range": "± 87110",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50540225,
+            "range": "± 121109",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201580,
+            "range": "± 1489",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 49073287,
+            "range": "± 236357",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 921742545,
+            "range": "± 2827021",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3218339,
+            "range": "± 48482",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 27996,
+            "range": "± 1531",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 32843,
+            "range": "± 862",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 411,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 575186,
+            "range": "± 4416",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1650280,
+            "range": "± 16995",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201065,
+            "range": "± 2731",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12507549,
+            "range": "± 74319",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 28859779,
+            "range": "± 100633",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3221896,
+            "range": "± 36388",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1474586,
+            "range": "± 32290",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2093994,
+            "range": "± 11911",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 319582406,
+            "range": "± 5032417",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 136,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 10683,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 909,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 14156,
+            "range": "± 42",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2756,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 21408,
+            "range": "± 41",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 85498,
+            "range": "± 4147",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 658,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4731,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 18948,
+            "range": "± 314",
             "unit": "ns/iter"
           },
           {
