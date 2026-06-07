@@ -547,6 +547,22 @@ v0.9 roadmap in progress.
 
 ### Fixed
 
+- **#106-audit-R4 P2-R4** — `s4 verify-sidecar` on a passthrough /
+  raw-bytes object (no `S4F2` magic, body ≥ 28 bytes so the inner
+  frame parser reaches `BadMagic`) used to exit 1 with a confusing
+  `FrameScan` error. The server never sidecars those objects by
+  design, so absence of a sidecar is the correct steady state —
+  CI / cron jobs would false-alert on healthy passthrough
+  workloads. Closed in `classify_missing_sidecar` by catching the
+  `FrameError::BadMagic` variant from `build_index_from_body` and
+  surfacing `MissingHarmless { frame_count: 0 }` (exit 0) instead.
+  Twin of R3 P2-R3 on the verify-side. New MinIO E2E
+  `verify_sidecar_reports_missing_harmless_for_non_framed_body`
+  plants raw bytes directly via the backend (long enough to clear
+  the 28-byte FRAME_HEADER_BYTES probe) and proves the verdict.
+  Non-`BadMagic` `FrameScan` errors still propagate so genuine
+  corruption surfaces loud.
+
 - **#106-audit-R3 P2-R3** — `s4 repair-sidecar` against a
   passthrough / raw-bytes object (no `S4F2` frame magic in the
   body) used to silently write an empty `<key>.s4index`

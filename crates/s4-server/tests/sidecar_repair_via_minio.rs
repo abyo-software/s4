@@ -930,6 +930,58 @@ async fn repair_sidecar_rejects_sse_s4_chunked_object_cleanly() {
     let _ = shutdown.send(());
 }
 
+/// v0.9 #106-audit-R4 P2-R4 (Codex): `verify-sidecar` against a
+/// passthrough / raw-bytes object whose backend body has no `S4F2`
+/// magic must classify as `MissingHarmless`, NOT bubble up the
+/// inner `BadMagic` `FrameScan` error. The server intentionally
+/// never sidecars passthrough objects, so absence of a sidecar is
+/// the correct steady state — CI / cron should see exit 0, not
+/// a repair error.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn verify_sidecar_reports_missing_harmless_for_non_framed_body() {
+    let minio = start_minio().await;
+    let backend = build_aws_client(&minio.endpoint_url);
+    let _ = backend.create_bucket().bucket("verify-raw").send().await;
+
+    // Plant a raw passthrough-shape body directly via the backend
+    // (no S4 gateway in the loop). Bytes long enough to clear the
+    // FRAME_HEADER_BYTES (28) probe so we hit the `BadMagic` path,
+    // not the `Ok(empty entries)` short-body path the R3 fix
+    // already covers.
+    let raw =
+        Bytes::from_static(b"not an s4f2 frame body, just raw bytes, more than 28 bytes long");
+    backend
+        .put_object()
+        .bucket("verify-raw")
+        .key("raw.bin")
+        .body(raw.clone().into())
+        .send()
+        .await
+        .expect("PUT raw body");
+
+    let report = verify_sidecar(
+        &backend,
+        "verify-raw",
+        "raw.bin",
+        DEFAULT_REPAIR_BODY_BYTES_CAP,
+    )
+    .await
+    .expect("verify must classify non-framed body, not error");
+    assert!(
+        matches!(
+            report.status,
+            SidecarStatus::MissingHarmless { frame_count: 0 }
+        ),
+        "non-framed body must classify as MissingHarmless{{frame_count:0}}, got {:?}",
+        report.status
+    );
+    assert!(
+        report.is_clean(),
+        "MissingHarmless must be clean (exit 0 for CI / cron)"
+    );
+}
+
 /// v0.9 #106-audit-R3 P2-R3 (Codex): `repair-sidecar` on an object
 /// whose body `build_index_from_body` parses to **zero frames** must
 /// reject with `NotFramed` instead of writing an empty sidecar that

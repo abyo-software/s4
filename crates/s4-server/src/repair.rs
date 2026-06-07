@@ -747,11 +747,28 @@ async fn classify_missing_sidecar(
             message: format!("body magic {magic} indicates SSE-S4 envelope"),
         });
     }
-    let idx = build_index_from_body(&body).map_err(|e| RepairError::FrameScan {
-        bucket: bucket.into(),
-        key: key.into(),
-        cause: e.to_string(),
-    })?;
+    // v0.9 #106-audit-R4 P2-R4 (Codex): a passthrough / raw-bytes
+    // body (no S4F2 magic) trips `build_index_from_body` with a
+    // `BadMagic` `FrameError`. From the verify-sidecar perspective
+    // that's the same outcome as a single-frame body: server never
+    // sidecared it, Range GET takes the full-read path, no operator
+    // action needed. Surface `MissingHarmless { frame_count: 0 }`
+    // (clean, exit 0) instead of a FrameScan repair error (exit 1)
+    // so CI / cron jobs don't false-alert on healthy passthrough
+    // objects. Twin of R3 P2-R3 on the repair-side.
+    let idx = match build_index_from_body(&body) {
+        Ok(i) => i,
+        Err(crate::codec::multipart::FrameError::BadMagic { .. }) => {
+            return Ok(SidecarStatus::MissingHarmless { frame_count: 0 });
+        }
+        Err(e) => {
+            return Err(RepairError::FrameScan {
+                bucket: bucket.into(),
+                key: key.into(),
+                cause: e.to_string(),
+            });
+        }
+    };
     let frame_count = idx.entries.len() as u64;
     if frame_count <= 1 {
         Ok(SidecarStatus::MissingHarmless { frame_count })
