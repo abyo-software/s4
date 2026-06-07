@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780844830709,
+  "lastUpdate": 1780851403107,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -4066,6 +4066,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "63aa85f9d709435100a40d23071737ae9bb6bcc2",
+          "message": "feat(docker): native arm64 runner + per-digest build → manifest merge\n\nReplaces the v0.10 #B1 single-job QEMU-emulated multi-arch CPU\nbuild with a per-arch native-runner shape. Closes the 60+ min\nQEMU bottleneck that timed out the v0.9.0 + v0.10.0 back-fills\non the previous 60-min cap (and would have still been painfully\nslow at the bumped 90-min cap).\n\nNew pipeline:\n\n  build (matrix: cpu-amd64 ubuntu-latest, cpu-arm64 ubuntu-24.04-arm,\n         gpu-amd64 ubuntu-latest)\n    - native runner per arch, no QEMU emulation\n    - docker/build-push-action with\n      `outputs: type=image,push-by-digest=true,name-canonical=true,push=true`\n    - upload the resulting digest as a 0-byte file artifact named\n      `digests-<flavor>-<arch>` (filename = digest hex)\n\n  merge (matrix: cpu, gpu)\n    - needs: build\n    - download digests-<flavor>-* artifacts\n    - docker/metadata-action emits the FINAL tags (semver, latest,\n      raw-override, branch/sha) — same gating rules as before\n      (push-only mutable tags, prerelease guard, back-fill aware)\n    - `docker buildx imagetools create --tag <each> <digest-refs>`\n      assembles the multi-arch manifest server-side and pushes\n    - `imagetools inspect` first tag for verification\n\nWhy native arm64 is dramatically faster:\n  - Old: arm64 cargo release build via QEMU emulation on amd64\n    runner → 40-60 min per push (often timed out at 60 min)\n  - New: arm64 cargo release build on `ubuntu-24.04-arm` native\n    runner → 10-15 min per push (parallel with amd64)\n  - GPU build unchanged (already amd64-only native)\n\n`ubuntu-24.04-arm` is GitHub's free native arm64 runner for OSS\npublic repos (rolled out 2024-25). No emulation, no perf penalty.\n\nBuild-only smoke mode (workflow_dispatch with push=false) still\nworks — the build-push-action skips the by-digest export + the\ndigest-upload steps are gated on `inputs.push`, and the merge\njob is gated identically so the build flow exits cleanly without\nneeding digests.\n\nCache scoping: `docker-<flavor>-<arch>` (was `docker-<flavor>`)\nso per-arch runners don't poison each other's layer reuse.\n\nSLSA provenance + SPDX SBOM moved to the merge step — the\nmulti-arch manifest is the artifact end-users actually pull, so\nthe attestation rides on the manifest, not the per-arch digests.\n\nIn-flight `v0.10.0` back-fill (workflow_dispatch run 27097353124)\nwas cancelled before this rewrite — re-trigger from main after\npush to publish `:0.10.0` (now CPU multi-arch via native arm64).\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-08T01:48:57+09:00",
+          "tree_id": "8f2b3ff5c289452cbdd9ecec7fbb4bb9bf047b07",
+          "url": "https://github.com/abyo-software/s4/commit/63aa85f9d709435100a40d23071737ae9bb6bcc2"
+        },
+        "date": 1780851402191,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 56307,
+            "range": "± 2929",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 55463,
+            "range": "± 3596",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 364,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2685919,
+            "range": "± 69299",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 41630792,
+            "range": "± 105789",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192714,
+            "range": "± 906",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 52368468,
+            "range": "± 1051679",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 754433682,
+            "range": "± 719685",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3077040,
+            "range": "± 58992",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 33072,
+            "range": "± 3137",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 40562,
+            "range": "± 2842",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 377,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 570866,
+            "range": "± 7626",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1551785,
+            "range": "± 38776",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192645,
+            "range": "± 1492",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 13825311,
+            "range": "± 191650",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27169218,
+            "range": "± 240681",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3084959,
+            "range": "± 11285",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1619921,
+            "range": "± 32597",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2582040,
+            "range": "± 32256",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 347218409,
+            "range": "± 1795556",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 140,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 8280,
+            "range": "± 68",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 815,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13113,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 3238,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 25515,
+            "range": "± 210",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 101128,
+            "range": "± 1221",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 592,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4531,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 18124,
+            "range": "± 66",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
             "range": "± 0",
             "unit": "ns/iter"
           }
