@@ -288,9 +288,25 @@ jobs:
 
       - name: Verify digests present
         id: have_digests
+        # v0.11-audit-R4 P1 (Codex): CPU's multi-arch contract
+        # requires BOTH amd64 + arm64 digests. If one CPU build
+        # leg failed, publishing the surviving single-arch digest
+        # under `:<version>` would silently degrade the
+        # advertised multi-arch image. Set expected count per
+        # flavor; skip if actual < expected (no partial publish).
+        # GPU is single-arch by design (nvCOMP redist amd64-only),
+        # so 1 digest is correct for that flavor.
         run: |
-          if [ -z "$(ls -A /tmp/digests 2>/dev/null)" ]; then
-            echo "::warning ::no digests for flavor=${{ matrix.flavor }} (build leg failed or skipped); skipping merge"
+          flavor="${{ matrix.flavor }}"
+          case "$flavor" in
+            cpu) expected=2 ;;   # amd64 + arm64
+            gpu) expected=1 ;;   # amd64 only
+            *)   expected=0 ;;
+          esac
+          actual=$(ls -A /tmp/digests 2>/dev/null | wc -l)
+          echo "flavor=$flavor expected=$expected actual=$actual"
+          if [ "$actual" -lt "$expected" ]; then
+            echo "::warning ::flavor=$flavor has $actual digest(s), expected $expected (build leg(s) failed); skipping merge — refusing partial multi-arch publish"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
