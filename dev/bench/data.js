@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780939125046,
+  "lastUpdate": 1780939567828,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -8134,6 +8134,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "1f2944df1908d33fbab5e783beffcbaf5fc1cb74",
+          "message": "docs(post-v1.0): refresh image-tag examples 0.9.0 → 1.0.0\n\nRound-8 Opus review caught that helm install + docker pull snippets\nin §\"Install via Docker / Helm\" still cited image.tag=0.9.0 +\nghcr.io/abyo-software/s4:0.9.0. After the v1.0 cut, copy-pasting\nthese would pull a 2-version-old image and confuse first-time\nv1.0 users.\n\nFixed 4 references:\n- Line 256: `--set image.tag=0.9.0` → `1.0.0` + added a note\n  pointing at the §Stability tag policy and `image.tag=1` as the\n  floating major-line option.\n- Line 267: `--set image.tag=0.9.0-gpu` → `1.0.0-gpu`.\n- Lines 304-306: `docker pull/run ghcr.io/abyo-software/s4:0.9.0`\n  → `:1.0.0`.\n\nThe 3 per-crate READMEs (crates/{s4-codec,s4-server,s4-config}/\nREADME.md) are symlinks to this file so they inherit the fix\nautomatically; no separate edit needed.\n\nNet: doc lag closed, image-tag examples match the v1.0 cut.\nThis is a post-cut docs commit on main; the v1.0.0-tagged\nsnapshot at af3c69b has the old tag examples, which is symmetric\nwith the rest of the v1.0 publish payload (crate READMEs uploaded\nto crates.io are the v1.0.0 snapshot). Future post-v1.0 doc\nrefreshes can land on main without re-tagging.",
+          "timestamp": "2026-06-09T02:18:00+09:00",
+          "tree_id": "865a63f364ed8928792992d9a4c5520e8a0a40b5",
+          "url": "https://github.com/abyo-software/s4/commit/1f2944df1908d33fbab5e783beffcbaf5fc1cb74"
+        },
+        "date": 1780939566893,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 49255,
+            "range": "± 1857",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 58216,
+            "range": "± 877",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 426,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2251712,
+            "range": "± 63317",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50540976,
+            "range": "± 107098",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201285,
+            "range": "± 321",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 50730164,
+            "range": "± 1264616",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 922355530,
+            "range": "± 2230800",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3221759,
+            "range": "± 7688",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 27641,
+            "range": "± 2182",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 33039,
+            "range": "± 988",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 419,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 577043,
+            "range": "± 15011",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1636045,
+            "range": "± 8270",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201336,
+            "range": "± 912",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12079992,
+            "range": "± 76517",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 28559356,
+            "range": "± 103382",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3220043,
+            "range": "± 23468",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1438401,
+            "range": "± 17474",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2144222,
+            "range": "± 24943",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 313181537,
+            "range": "± 6341176",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 136,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 7417,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 890,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13829,
+            "range": "± 69",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2749,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 21345,
+            "range": "± 338",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 85173,
+            "range": "± 344",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 646,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 5234,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 20768,
+            "range": "± 43",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
             "range": "± 0",
             "unit": "ns/iter"
           }
