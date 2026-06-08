@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780937729273,
+  "lastUpdate": 1780938300587,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -7230,6 +7230,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "e6b356f5dd3bab60aac2f0c37fd43644dee8d9f1",
+          "message": "docs(v1.0): round-5 fix wave — scope-explicit freeze + 4 doc closures\n\nRound 5 (Opus + Codex dual cross-review) returned verdict B with ~8\nnew findings. Root cause across them: the freeze-table model that\ntries to enumerate every pub item exhaustively keeps surfacing \"you\nmissed X\" findings, even though X is internal-helper material that\nshould NOT be frozen anyway.\n\n## Structural fix — scope-explicit freeze (closes 4 findings)\n\nAdded new \"How to read the freeze table — scope of 'frozen'\"\nsub-section right before \"Modules NOT in the freeze list\", stating:\n\n- Items named in the freeze table ARE the v1.0 contract.\n- Other pub items in the same modules are NOT part of the contract\n  (they exist for binary + test needs).\n- Consumers depending on an unlisted item should pin =1.x.y and treat\n  each minor bump as a manual integration step.\n- Filing an issue is the path to promoting an unlisted item into the\n  named freeze list.\n\nIncludes a representative (not exhaustive) list of currently-existing\nunlisted items in the frozen modules: parse_bucket_key + 4 constants\nin repair; SSE_MAGIC_V1..V6, CustomerKeyMaterial, parse_customer_key_\nheaders, encrypt_with_source, S4E4Header, parse_s4e4_header,\ndecrypt_with_kms, and chunked helpers in sse; INDEX_MAGIC,\nSSE_BLOCK_V3, INDEX_HEADER_BYTES, build_index_from_body, sidecar_key,\nis_reserved_sidecar_key, FRAME_MAGIC, PADDING_MAGIC, FRAME_HEADER_BYTES\nin s4-codec. Closes Codex round-5 P2#1 (repair) + P2#2 (sse) + P3#3\n(s4-codec format constants).\n\nWhy this scope shape (paragraph in the same sub-section): exhaustive\n\"freeze every pub item\" over-promises on transitive internal-helper\nchurn; \"freeze nothing\" under-promises on items library consumers\nactually integrate against; naming the items keeps the contract\nexplicit on both ends.\n\n## Other closures\n\nOpus NF-NEW-4 (P2) — README enumerated Python exception classes as\n\"S4Error, S4CrcMismatchError, S4SizeMismatchError, plus the\ncodec-error / format-error / backend-error / I/O-error wrappers\".\n\"format-error wrapper\" was a fabricated category — no class with that\nlabel exists. Replaced the hand-wave with the actual 9 class names\n(S4Error, S4CrcMismatchError, S4SizeMismatchError,\nS4CodecMismatchError, S4UnregisteredCodecError,\nS4ManifestSizeExceedsLimitError, S4ManifestSizeMismatchError,\nS4BackendError, S4IoError) per\ncrates/s4-codec-py/src/lib.rs:52-60.\n\nOpus NF-NEW-5 (P3) — README \"field sets + inherent method signatures\nfrozen\" clause for index inner types grammatically applied only to\n\"the latter four\" (FrameIndexEntry / SseChunkBinding / RangePlan /\nEncryptedRangePlan); FrameIndex itself wasn't covered. Reworded to\nexplicitly include FrameIndex.\n\nOpus NF-NEW-6 (P3) — \"every public enum that may grow new variants\ngets #[non_exhaustive]\" was an overstatement: 6 AWS-spec-bound enums\nin unfrozen modules (IncludedVersions / LifecycleStatus / LockMode /\nEffect / ReplicationStatus / VersioningState) are intentionally not\nannotated. Scoped the claim to \"every public enum on the frozen\nsurface\" + added a parenthetical explaining the AWS-spec rationale.\n\nOpus NF-NEW-7 (P3) — crates/s4-codec-py/README.md listed\nNvcompZstd / NvcompBitcomp / NvcompGDeflate as Python classes\n\"Requires --features nvcomp-gpu\". Those classes don't exist in\nany build — the Rust feature forwards to s4-codec-rs but does NOT\nadd Python classes. README's Supported codecs table now lists only\nthe two actual classes (CpuZstd + CpuGzip) with a paragraph\nexplaining the v1.0 decision to keep Python CPU-only + the v1.x\nroadmap candidate for GPU exposure. Same correction in\ncrates/s4-codec-py/src/lib.rs doc comment.\n\nCodex P3#4 / Opus NF-NEW-8 — crates/s4-codec-wasm/README.md \"Status\"\nsection still said \"v0.4 #24 — initial cut\" + \"v0.9+ follow-up\" +\n\"as of v0.8.5\". Updated to v1.0-aligned wording with link to main\nREADME's stability section + \"v1.x roadmap\" phrasing for the\nstreaming-decoder + npm-publish-automation items.\n\nRound 6 follows per user instruction \"Finding 0 になるまで\".",
+          "timestamp": "2026-06-09T01:56:52+09:00",
+          "tree_id": "cb23fa10d8ea73708fba35b0df843987291c9960",
+          "url": "https://github.com/abyo-software/s4/commit/e6b356f5dd3bab60aac2f0c37fd43644dee8d9f1"
+        },
+        "date": 1780938299679,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 49135,
+            "range": "± 2701",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 59161,
+            "range": "± 1929",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 426,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2211493,
+            "range": "± 29437",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50708559,
+            "range": "± 851434",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201216,
+            "range": "± 2815",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 49371517,
+            "range": "± 1336620",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 923878239,
+            "range": "± 5400417",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3219632,
+            "range": "± 13284",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 27620,
+            "range": "± 1126",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 32325,
+            "range": "± 1017",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 422,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 598756,
+            "range": "± 7685",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1639986,
+            "range": "± 16074",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201511,
+            "range": "± 4130",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12823791,
+            "range": "± 112174",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 29056503,
+            "range": "± 215990",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3223970,
+            "range": "± 6861",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1460212,
+            "range": "± 19733",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2114948,
+            "range": "± 28534",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 331384241,
+            "range": "± 8167647",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 136,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 7879,
+            "range": "± 339",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 919,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 14254,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2752,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 21372,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 85336,
+            "range": "± 222",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 635,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 5242,
+            "range": "± 41",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 20943,
+            "range": "± 37",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
             "range": "± 0",
             "unit": "ns/iter"
           }
