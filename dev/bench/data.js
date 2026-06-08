@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780888223353,
+  "lastUpdate": 1780888373505,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -5648,6 +5648,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 28,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "50d728bc3d61f4c66d4aa81c75e18ed02df9b916",
+          "message": "chore(release): cut v0.11.0 — polish + maintenance (32-bit + Node24 + compat matrix)\n\nWorkspace 0.10.0 → 0.11.0. Internal dep specs: s4-server +\ns4-codec-py + s4-codec-wasm 0.10 → 0.11. Helm chart 0.2.1 →\n0.2.2 (appVersion bump only, no chart shape change since 0.2.1).\n\nWave-1 shipped (commit 3332f3e):\n  - #A4 — i686 runtime PUT/GET round-trip in CI (MinIO docker\n    backed). README \"compiles + smoke\" → \"compiles + full\n    PUT/GET (advisory)\".\n  - #A5 — 11 GHA JavaScript actions bumped to Node.js 24-ready\n    majors. actionlint clean. 2026-09 deprecation gate closed.\n  - #A7 — backend compat matrix workflow (weekly cron +\n    dispatch). MinIO/Garage/Ceph docker tier + B2/R2/Wasabi\n    real-cloud tier (silent skip when secrets absent).\n    Composite local action `.github/actions/compat-roundtrip`\n    factors out the per-backend PUT/GET + sidecar HEAD step.\n\nAudit closeout fixes:\n  - 3fceddd  R1 P2  SLSA + SBOM restored on per-arch builds\n                    (`imagetools create` can't retroactively patch)\n  - c29d69f  R2 P2  OCI image labels restored on per-arch builds\n                    + compat-matrix key scoped to ${{ github.run_id }}\n  - 08545ba  R3 P2  test-key propagation into composite action +\n                    flavor-independent merge (CPU arm64 failure\n                    no longer blocks GPU publish)\n  - 157d7e7  R4 P1  expected-digest-count guard: refuse\n                    partial multi-arch publish (CPU arm64 fail\n                    must not overwrite `:0.10.0` as amd64-only)\n  - eebc7e2  R5/R6  doc-only — action-version policy comment\n                    documents false-positive Codex sandbox\n                    hallucination + verification evidence\n\nAudit posture: per-feature 6 Codex rounds (A4=3, A5=1, A7=2)\n+ 6-round integrated audit (4 P2 + 1 P1 real fixes, 2\nfalse-positive rounds with inline doc note). Zero unresolved.\nv0.11.0 publishes from R6 (effective convergence).\n\nPre-release verification:\n  - cargo fmt --check clean\n  - cargo clippy --workspace --all-targets -- -D warnings clean\n  - cargo test --workspace: 0 failed\n  - helm lint ./charts/s4: clean\n  - docker compose config: both files clean\n  - actionlint: all 9 workflows clean\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-08T12:04:47+09:00",
+          "tree_id": "c6c7a40516c1488c66b3613bd86cc0fb785f8bd9",
+          "url": "https://github.com/abyo-software/s4/commit/50d728bc3d61f4c66d4aa81c75e18ed02df9b916"
+        },
+        "date": 1780888372495,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 47997,
+            "range": "± 1712",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 58059,
+            "range": "± 6407",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 428,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2245284,
+            "range": "± 32808",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50583286,
+            "range": "± 120061",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201639,
+            "range": "± 545",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 48903815,
+            "range": "± 839124",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 924049292,
+            "range": "± 2193044",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3228354,
+            "range": "± 20173",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 27739,
+            "range": "± 1183",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 32438,
+            "range": "± 1036",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 419,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 575834,
+            "range": "± 4228",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1648288,
+            "range": "± 19036",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201541,
+            "range": "± 276",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12221651,
+            "range": "± 76725",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 29033387,
+            "range": "± 180801",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3220922,
+            "range": "± 55095",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1454768,
+            "range": "± 20054",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2086641,
+            "range": "± 22791",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 315320698,
+            "range": "± 1693877",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 137,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 7416,
+            "range": "± 43",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 910,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 14164,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2937,
+            "range": "± 92",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 22787,
+            "range": "± 54",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 90939,
+            "range": "± 211",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 632,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 5259,
+            "range": "± 170",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 20831,
+            "range": "± 287",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 32,
             "range": "± 0",
             "unit": "ns/iter"
           }
