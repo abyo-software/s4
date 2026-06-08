@@ -82,9 +82,14 @@ jobs:
   # ignores are tracked in #91 — they live in the aws-sdk-rust TLS stack
   # (hyper-rustls 0.24 → rustls 0.21 → rustls-webpki 0.101) which is pinned
   # transitively by the upstream AWS SDK; we cannot bump them in isolation
-  # without forking aws-smithy-http-client. The dev-only rustls-pemfile
-  # unmaintained warning (RUSTSEC-2025-0134) is tracked in #92 (just a
-  # caretaker advisory; no exploit path).
+  # without forking aws-smithy-http-client. The rustls-pemfile unmaintained
+  # warning (RUSTSEC-2025-0134) is tracked in #92 — this is a *runtime*
+  # dependency (rustls-pemfile 2.x, used at production HTTPS startup in
+  # crates/s4-server/src/tls.rs to load the operator-supplied cert/key
+  # PEM files), not dev-only as the comment previously claimed. Risk
+  # acceptance is documented in detail in
+  # docs/security/cargo-audit-ignores.md (operator-controlled PEM input
+  # = no adversary-reachable parser path).
   security-audit:
     name: cargo audit
     runs-on: ubuntu-latest
