@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780887783023,
+  "lastUpdate": 1780888223353,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -5422,6 +5422,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 41,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "eebc7e25bdecdbaac7248b775de61acbd161efce",
+          "message": "docs(audit): v0.11-R5/R6 — action-version policy comment (false-positive guard)\n\nCodex integrated audit R5 + R6 both raised P1 \"action versions\nunpublished\" findings against the v0.11 #A5 Node.js 24 bumps.\nBoth were false positives: Codex's review sandbox couldn't reach\ngithub.com to verify tag existence (its `git ls-remote --tags\nhttps://github.com/actions/upload-artifact.git refs/tags/v6` came\nback empty), so it assumed the tags don't exist.\n\nReality, verified via `gh api /repos/<owner>/<repo>/releases/latest`:\n\n  actions/checkout            latest v6.0.3 → @v5 valid\n  actions/upload-artifact     latest v7.0.1 → @v6 valid\n  actions/download-artifact   latest v8.0.1 → @v7 valid\n  actions/github-script       latest v9.0.0 → @v8 valid\n  docker/build-push-action    latest v7.2.0 → @v7 valid\n  docker/login-action         latest v4.2.0 → @v4 valid\n  aws-actions/configure-...   latest v6.2.0 → @v6 valid\n\nAND every CI run since commit 3332f3e (the v0.11 wave-1 push)\nhas resolved these cleanly — workflow_dispatch + push triggers\nboth succeed.\n\nAdds top-of-file comment to ci.yml + compat-matrix.yml\ndocumenting the policy + verification + the audit false-positive\nhistory, so future audits / human reviewers see the evidence\ninline before re-raising the same claim. No code change.\n\nAfter this commit the v0.11 integrated audit is treated as\n2-round converged (R5 + R6 both no-real-finding) and v0.11.0\ncut can proceed.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-08T12:02:38+09:00",
+          "tree_id": "a1461487dcedf1463737a37a9e0208e8332f0a3d",
+          "url": "https://github.com/abyo-software/s4/commit/eebc7e25bdecdbaac7248b775de61acbd161efce"
+        },
+        "date": 1780888222839,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 54223,
+            "range": "± 3899",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 54211,
+            "range": "± 4100",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 366,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2667526,
+            "range": "± 40971",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 41636815,
+            "range": "± 486143",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192559,
+            "range": "± 1273",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 52825170,
+            "range": "± 1055898",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 754528865,
+            "range": "± 2858694",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3085611,
+            "range": "± 89080",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 32695,
+            "range": "± 2439",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 38599,
+            "range": "± 2795",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 377,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 580408,
+            "range": "± 19132",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1668320,
+            "range": "± 49993",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192429,
+            "range": "± 1247",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12603337,
+            "range": "± 144479",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 28535439,
+            "range": "± 904025",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3094607,
+            "range": "± 19903",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1568249,
+            "range": "± 27719",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2615479,
+            "range": "± 26018",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 353399384,
+            "range": "± 4304492",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 174,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 7828,
+            "range": "± 48",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 815,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13112,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 3237,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 25670,
+            "range": "± 506",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 101216,
+            "range": "± 819",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 594,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4708,
+            "range": "± 101",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 17869,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 28,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 28,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 28,
             "range": "± 0",
             "unit": "ns/iter"
           }
