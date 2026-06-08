@@ -1,0 +1,466 @@
+name: Backend Compatibility Matrix
+
+# v0.11 #A7 — explicit E2E verification across every S3-compatible
+# backend S4 claims support for. Until now the only backends with
+# CI-verified compat evidence were MinIO (via the testcontainers-
+# driven http_e2e / multipart_e2e suites in `crates/s4-server/tests/`)
+# and real AWS S3 (via `aws-e2e.yml`). README §"How it Compares"
+# and §"Quick Start" list MinIO / Garage / Ceph RGW / Wasabi / B2 /
+# R2 as backends S4 is intended to front, but Garage / Ceph RGW /
+# B2 / R2 / Wasabi had no automated coverage — the "should work"
+# claim rested on wire-shape similarity alone.
+#
+# This workflow closes that gap with a 1 PUT + 1 GET + sidecar HEAD
+# round-trip per backend through a live s4-server. Two tiers:
+#
+#   Docker-based jobs (no secrets, runs every cron firing):
+#     - MinIO        — quay.io/minio/minio:latest
+#     - Garage       — dxflrs/garage:v1.1.0
+#     - Ceph RGW     — quay.io/ceph/demo:latest-quincy (best-effort:
+#                      the demo image is no longer actively maintained
+#                      upstream, so a startup / pull failure is
+#                      reported as a warning and does NOT fail the
+#                      workflow — this lets MinIO + Garage continue
+#                      to gate while operators decide whether to
+#                      pin a newer ceph image)
+#
+#   Real-cloud jobs (each gated on operator-provided vars/secrets;
+#     skips silently when the backend isn't configured):
+#     - Backblaze B2     — vars: B2_BUCKET / B2_ENDPOINT / B2_REGION
+#                          secrets: B2_KEY_ID / B2_APPLICATION_KEY
+#     - Cloudflare R2    — vars: R2_BUCKET / R2_ENDPOINT / R2_REGION
+#                          secrets: R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY
+#     - Wasabi           — vars: WASABI_BUCKET / WASABI_ENDPOINT / WASABI_REGION
+#                          secrets: WASABI_ACCESS_KEY_ID / WASABI_SECRET_ACCESS_KEY
+#
+# Why a separate workflow vs adding to ci.yml:
+#   - cost: real-cloud backends bill per request + egress, so we
+#     keep these off PR runs and on a weekly schedule instead
+#   - blast radius: a Garage / Ceph regression should not block PR
+#     merges (these backends are best-effort compat); ci.yml stays
+#     the merge-gate workflow
+#   - independence: each real-cloud backend's vars/secrets can be
+#     enabled per-operator without touching ci.yml
+#
+# Why weekly (not nightly) cron:
+#   - real-cloud egress / request costs scale with frequency; weekly
+#     is the lightest cadence that still catches wire breaks within
+#     one release cycle
+#   - aligned with `fuzz-nightly.yml` cadence philosophy: nightly
+#     for things that touch only repo resources, weekly for things
+#     that touch external paid resources or that take >30min
+#
+# Triggers:
+#   - weekly Sunday 06:00 UTC (cron)
+#   - manual via workflow_dispatch (operators iterating on a new
+#     backend's vars/secrets config want a sub-week feedback loop)
+
+on:
+  schedule:
+    - cron: "0 6 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Bucket + key reused by every backend job. Random body of
+  # TEST_SIZE_BYTES is generated per-job so concurrent runs against
+  # the same bucket name (only matters on real-cloud backends with a
+  # shared operator-provided bucket) don't collide on content even
+  # if they share the key.
+  TEST_BUCKET: s4-compat-test
+  TEST_KEY: compat/large.bin
+  # 8 MiB body — the server only writes `<key>.s4index` when the
+  # frame index has > 1 entry (see service.rs gate), and
+  # `pick_chunk_size` picks a 4 MiB chunk for any body in the
+  # (1 MiB, 100 MiB] band (see streaming.rs), so 8 MiB yields 2
+  # frames → sidecar emitted. The per-backend sidecar HEAD step
+  # below treats sidecar absence as a hard failure (it's the
+  # load-bearing compat assertion: the second backend PUT is where
+  # most S3-API-shape divergences would surface — PutObject with
+  # no Content-MD5, aws-chunked encoding, etc.) — under-sizing the
+  # body would silent-pass on the single-frame elide path.
+  TEST_SIZE_BYTES: "8388608"
+  S4_PORT: "8014"
+
+jobs:
+  # ───────────────────────── shared build ─────────────────────────
+  build-s4:
+    name: Build s4 binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: compat-matrix
+
+      - name: cargo build --release -p s4-server --bin s4
+        run: cargo build --release -p s4-server --bin s4
+
+      - name: Upload s4 binary artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: s4-binary
+          path: target/release/s4
+          retention-days: 1
+          if-no-files-found: error
+
+  # ───────────────────────── docker backends ─────────────────────────
+  minio-compat:
+    name: MinIO compat (docker)
+    needs: build-s4
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download s4 binary
+        uses: actions/download-artifact@v7
+        with:
+          name: s4-binary
+          path: ./bin
+
+      - name: chmod +x s4
+        run: chmod +x ./bin/s4
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name backend \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            quay.io/minio/minio:latest \
+            server /data --address :9000
+          {
+            echo "BACKEND_ENDPOINT=http://127.0.0.1:9000"
+            echo "BACKEND_ACCESS_KEY=minioadmin"
+            echo "BACKEND_SECRET_KEY=minioadmin"
+            echo "BACKEND_REGION=us-east-1"
+          } >> "$GITHUB_ENV"
+
+      - name: Wait for backend + create bucket
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+        run: |
+          for _ in $(seq 1 60); do
+            if aws --endpoint-url "$BACKEND_ENDPOINT" --region "$BACKEND_REGION" \
+                s3api list-buckets >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          aws --endpoint-url "$BACKEND_ENDPOINT" --region "$BACKEND_REGION" \
+            s3api create-bucket --bucket "$TEST_BUCKET"
+
+      - name: Round-trip + sidecar check
+        uses: ./.github/actions/compat-roundtrip
+        with:
+          s4-binary: ./bin/s4
+          backend-endpoint: ${{ env.BACKEND_ENDPOINT }}
+          backend-access-key: ${{ env.BACKEND_ACCESS_KEY }}
+          backend-secret-key: ${{ env.BACKEND_SECRET_KEY }}
+          backend-region: ${{ env.BACKEND_REGION }}
+
+      - name: Dump backend log on failure
+        if: failure()
+        run: docker logs --tail 200 backend 2>&1 || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f backend 2>/dev/null || true
+
+  garage-compat:
+    name: Garage compat (docker)
+    needs: build-s4
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download s4 binary
+        uses: actions/download-artifact@v7
+        with:
+          name: s4-binary
+          path: ./bin
+
+      - name: chmod +x s4
+        run: chmod +x ./bin/s4
+
+      - name: Start Garage
+        run: |
+          # Garage requires a TOML config + post-startup cluster
+          # layout assignment. Single-node "none" replication is
+          # the minimal viable config for compat-smoke purposes.
+          # rpc_secret is a deterministic 32-byte hex throwaway —
+          # the container is destroyed at end of job.
+          cat > /tmp/garage.toml <<'EOF'
+          metadata_dir = "/var/lib/garage/meta"
+          data_dir = "/var/lib/garage/data"
+          db_engine = "sqlite"
+          replication_mode = "none"
+          rpc_bind_addr = "[::]:3901"
+          rpc_public_addr = "127.0.0.1:3901"
+          rpc_secret = "1799bccfd7411eddcf9ebd1e0d8d4d4eb4f9b9aaa1f1f0f1e2d3c4b5a6978685"
+          [s3_api]
+          api_bind_addr = "[::]:3900"
+          s3_region = "garage"
+          root_domain = ".s3.garage.local"
+          [s3_web]
+          bind_addr = "[::]:3902"
+          root_domain = ".web.garage.local"
+          index = "index.html"
+          [admin]
+          api_bind_addr = "[::]:3903"
+          admin_token = "admintoken"
+          metrics_token = "metricstoken"
+          EOF
+          docker run -d --name backend \
+            -v /tmp/garage.toml:/etc/garage.toml:ro \
+            -p 3900:3900 -p 3901:3901 -p 3902:3902 -p 3903:3903 \
+            dxflrs/garage:v1.1.0
+          # Wait for garage process to come up
+          for _ in $(seq 1 60); do
+            if docker exec backend /garage status >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          # Single-node layout
+          NODE_ID=$(docker exec backend /garage status | awk '/HEALTHY|UNHEALTHY|NO ROLE/{print $1; exit}' | cut -d@ -f1)
+          if [ -z "$NODE_ID" ]; then
+            # Fallback: `node id` returns the local node id directly
+            NODE_ID=$(docker exec backend /garage node id -q | cut -d@ -f1)
+          fi
+          docker exec backend /garage layout assign -z dc1 -c 1G "$NODE_ID"
+          docker exec backend /garage layout apply --version 1
+          # Wait for layout to settle
+          for _ in $(seq 1 30); do
+            if docker exec backend /garage status | grep -q HEALTHY; then
+              break
+            fi
+            sleep 2
+          done
+          # Pre-create the test bucket + access key (garage doesn't
+          # support arbitrary client-side CreateBucket on a fresh
+          # layout — bucket has to be declared via the garage CLI
+          # and bound to a key)
+          docker exec backend /garage bucket create "$TEST_BUCKET"
+          docker exec backend /garage key create test-key
+          docker exec backend /garage bucket allow \
+            --read --write --owner "$TEST_BUCKET" --key test-key
+          ACCESS=$(docker exec backend /garage key info --show-secret test-key | awk '/Key ID:/ {print $3}')
+          SECRET=$(docker exec backend /garage key info --show-secret test-key | awk '/Secret key:/ {print $3}')
+          if [ -z "$ACCESS" ] || [ -z "$SECRET" ]; then
+            echo "::error::Failed to parse garage key info output"
+            docker exec backend /garage key info --show-secret test-key
+            exit 1
+          fi
+          {
+            echo "BACKEND_ENDPOINT=http://127.0.0.1:3900"
+            echo "BACKEND_ACCESS_KEY=$ACCESS"
+            echo "BACKEND_SECRET_KEY=$SECRET"
+            echo "BACKEND_REGION=garage"
+          } >> "$GITHUB_ENV"
+
+      - name: Round-trip + sidecar check
+        uses: ./.github/actions/compat-roundtrip
+        with:
+          s4-binary: ./bin/s4
+          backend-endpoint: ${{ env.BACKEND_ENDPOINT }}
+          backend-access-key: ${{ env.BACKEND_ACCESS_KEY }}
+          backend-secret-key: ${{ env.BACKEND_SECRET_KEY }}
+          backend-region: ${{ env.BACKEND_REGION }}
+          # garage pre-creates the bucket via CLI above
+          skip-bucket-create: "true"
+
+      - name: Dump backend log on failure
+        if: failure()
+        run: docker logs --tail 200 backend 2>&1 || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f backend 2>/dev/null || true
+
+  ceph-rgw-compat:
+    name: Ceph RGW compat (docker, best-effort)
+    needs: build-s4
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # NOTE: quay.io/ceph/demo is no longer actively maintained
+    # upstream (the project moved to cephadm for orchestration).
+    # We keep the job in the matrix because Ceph RGW is a major
+    # backend in the README compat table, but mark the launch step
+    # `continue-on-error: true` so an image-pull or container-init
+    # failure doesn't fail the workflow as a whole. When this job
+    # starts failing consistently, the fix is to either (a) pin a
+    # known-working image digest, (b) switch to a community-built
+    # alternative, or (c) drop ceph from the docker tier and move
+    # it to the operator-CI ("claimed") row in the README compat
+    # table.
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download s4 binary
+        uses: actions/download-artifact@v7
+        with:
+          name: s4-binary
+          path: ./bin
+
+      - name: chmod +x s4
+        run: chmod +x ./bin/s4
+
+      - name: Start Ceph demo (RGW on :8080)
+        id: start
+        continue-on-error: true
+        run: |
+          docker run -d --name backend --network host \
+            -e MON_IP=127.0.0.1 \
+            -e CEPH_PUBLIC_NETWORK=0.0.0.0/0 \
+            -e CEPH_DEMO_UID=demo \
+            -e CEPH_DEMO_ACCESS_KEY=demoaccesskey \
+            -e CEPH_DEMO_SECRET_KEY=demosecretkey \
+            -e CEPH_DEMO_BUCKET="$TEST_BUCKET" \
+            -e RGW_NAME=localhost \
+            quay.io/ceph/demo:latest-quincy
+          # Wait for RGW HTTP listener (demo image binds RGW on 8080
+          # by default). 5 min cap — Ceph demo is heavy and can take
+          # 90-180s on a cold runner.
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/ >/dev/null 2>&1; then
+              echo "RGW ready"
+              break
+            fi
+            sleep 5
+          done
+          curl -fsS http://127.0.0.1:8080/ >/dev/null
+          {
+            echo "BACKEND_ENDPOINT=http://127.0.0.1:8080"
+            echo "BACKEND_ACCESS_KEY=demoaccesskey"
+            echo "BACKEND_SECRET_KEY=demosecretkey"
+            echo "BACKEND_REGION=us-east-1"
+          } >> "$GITHUB_ENV"
+
+      - name: Skip notice (Ceph startup failed)
+        if: steps.start.outcome != 'success'
+        run: |
+          echo "::warning ::Ceph RGW demo container failed to start — skipping the round-trip step. The quay.io/ceph/demo:latest-quincy image is no longer actively maintained upstream; see compat-matrix.yml header comment for the fix paths."
+
+      - name: Round-trip + sidecar check
+        if: steps.start.outcome == 'success'
+        uses: ./.github/actions/compat-roundtrip
+        with:
+          s4-binary: ./bin/s4
+          backend-endpoint: ${{ env.BACKEND_ENDPOINT }}
+          backend-access-key: ${{ env.BACKEND_ACCESS_KEY }}
+          backend-secret-key: ${{ env.BACKEND_SECRET_KEY }}
+          backend-region: ${{ env.BACKEND_REGION }}
+          # CEPH_DEMO_BUCKET pre-creates it at container init
+          skip-bucket-create: "true"
+
+      - name: Dump backend log on failure
+        if: failure() && steps.start.outcome == 'success'
+        run: docker logs --tail 200 backend 2>&1 || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f backend 2>/dev/null || true
+
+  # ───────────────────────── real-cloud backends ─────────────────────────
+  realcloud-compat:
+    name: ${{ matrix.label }} compat (real cloud)
+    needs: build-s4
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: backblaze-b2
+            label: Backblaze B2
+            bucket_var: B2_BUCKET
+            endpoint_var: B2_ENDPOINT
+            region_var: B2_REGION
+            access_key_secret: B2_KEY_ID
+            secret_key_secret: B2_APPLICATION_KEY
+          - backend: cloudflare-r2
+            label: Cloudflare R2
+            bucket_var: R2_BUCKET
+            endpoint_var: R2_ENDPOINT
+            region_var: R2_REGION
+            access_key_secret: R2_ACCESS_KEY_ID
+            secret_key_secret: R2_SECRET_ACCESS_KEY
+          - backend: wasabi
+            label: Wasabi
+            bucket_var: WASABI_BUCKET
+            endpoint_var: WASABI_ENDPOINT
+            region_var: WASABI_REGION
+            access_key_secret: WASABI_ACCESS_KEY_ID
+            secret_key_secret: WASABI_SECRET_ACCESS_KEY
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Pre-flight — opt-in vars + secrets check (no-op skip if missing)
+        id: check
+        env:
+          BUCKET: ${{ vars[matrix.bucket_var] }}
+          ENDPOINT: ${{ vars[matrix.endpoint_var] }}
+          REGION: ${{ vars[matrix.region_var] }}
+          # Codex review-R1 P2: pull the secrets in here too so the
+          # opt-in gate considers a partially-configured backend
+          # (vars set but secrets missing) as "not opted in" → skip,
+          # not "configured" → fail-with-empty-credentials. Without
+          # this, scheduling-tier failures would surface as ugly
+          # AccessDenied / SignatureDoesNotMatch errors deep in the
+          # round-trip step instead of the documented opt-in skip.
+          ACCESS_KEY: ${{ secrets[matrix.access_key_secret] }}
+          SECRET_KEY: ${{ secrets[matrix.secret_key_secret] }}
+        run: |
+          set -eu
+          missing=""
+          [ -n "${BUCKET:-}" ]     || missing="$missing ${{ matrix.bucket_var }}(vars)"
+          [ -n "${ENDPOINT:-}" ]   || missing="$missing ${{ matrix.endpoint_var }}(vars)"
+          [ -n "${REGION:-}" ]     || missing="$missing ${{ matrix.region_var }}(vars)"
+          [ -n "${ACCESS_KEY:-}" ] || missing="$missing ${{ matrix.access_key_secret }}(secrets)"
+          [ -n "${SECRET_KEY:-}" ] || missing="$missing ${{ matrix.secret_key_secret }}(secrets)"
+          if [ -n "$missing" ]; then
+            echo "::notice::${{ matrix.label }} compat is opt-in; skipping (missing$missing — set the vars in Settings → Variables and the secrets in Settings → Secrets to enable)."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download s4 binary
+        if: steps.check.outputs.configured == 'true'
+        uses: actions/download-artifact@v7
+        with:
+          name: s4-binary
+          path: ./bin
+
+      - name: chmod +x s4
+        if: steps.check.outputs.configured == 'true'
+        run: chmod +x ./bin/s4
+
+      - name: Round-trip + sidecar check
+        if: steps.check.outputs.configured == 'true'
+        uses: ./.github/actions/compat-roundtrip
+        with:
+          s4-binary: ./bin/s4
+          backend-endpoint: ${{ vars[matrix.endpoint_var] }}
+          backend-access-key: ${{ secrets[matrix.access_key_secret] }}
+          backend-secret-key: ${{ secrets[matrix.secret_key_secret] }}
+          backend-region: ${{ vars[matrix.region_var] }}
+          # Real-cloud bucket must be pre-provisioned by the operator
+          # (we can't CreateBucket against a bucket name that's
+          # globally claimed; nor do we want CI to provision real
+          # paid storage)
+          skip-bucket-create: "true"
+          # Operator-provided bucket name overrides the default to
+          # avoid clashing with whatever naming convention the
+          # operator's cloud account already uses
+          test-bucket: ${{ vars[matrix.bucket_var] }}

@@ -132,12 +132,12 @@ jobs:
       # case), check out that ref for the Dockerfile + binary context.
       # Otherwise the default ref (= the branch / tag the workflow is
       # dispatched against) is used.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.build_ref || github.ref }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # Log in to ghcr.io using the workflow's GITHUB_TOKEN. No PAT or
       # external secret required — the `packages: write` permission at
@@ -149,7 +149,7 @@ jobs:
       # not pushing we also skip the by-digest export below.
       - name: Log in to ghcr.io
         if: github.event_name != 'workflow_dispatch' || inputs.push
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -167,7 +167,7 @@ jobs:
       - name: Build (${{ matrix.flavor }} ${{ matrix.arch }})
         id: build
         if: github.event_name != 'workflow_dispatch' || inputs.push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -185,7 +185,7 @@ jobs:
       # syntax / dependency drift without writing anywhere.
       - name: Build only (no push, smoke mode)
         if: github.event_name == 'workflow_dispatch' && !inputs.push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -207,7 +207,7 @@ jobs:
           touch "/tmp/digests/${digest#sha256:}"
       - name: Upload digest artifact
         if: github.event_name != 'workflow_dispatch' || inputs.push
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: digests-${{ matrix.flavor }}-${{ matrix.arch }}
           path: /tmp/digests/*
@@ -232,7 +232,7 @@ jobs:
 
     steps:
       - name: Download per-arch digests (${{ matrix.flavor }})
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: /tmp/digests
           # Wildcard so we pick up cpu-amd64 + cpu-arm64 for the CPU
@@ -241,10 +241,10 @@ jobs:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -256,7 +256,7 @@ jobs:
       # here, after the per-arch build is already done.
       - name: Extract Docker metadata (${{ matrix.flavor }})
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: |

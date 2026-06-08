@@ -24,7 +24,7 @@ jobs:
     name: cargo test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -45,7 +45,7 @@ jobs:
             --test fuzz_parsers --test fuzz_server --test fuzz_advanced
       - name: Upload proptest-regressions artifact (on failure)
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: proptest-regressions-${{ github.run_id }}
           path: "**/*.proptest-regressions"
@@ -71,7 +71,7 @@ jobs:
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-audit
@@ -91,7 +91,7 @@ jobs:
     name: E2E (MinIO Docker)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --ignored (MinIO E2E)
@@ -108,7 +108,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -120,7 +120,7 @@ jobs:
           cargo llvm-cov --workspace --lcov --output-path lcov.info \
             --ignore-filename-regex '(tests?/__fuzz__|tests/fuzz_)'
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           files: ./lcov.info
           fail_ci_if_error: false   # Codecov flakes shouldn't fail CI
@@ -140,7 +140,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: build bench examples
@@ -156,18 +156,20 @@ jobs:
         continue-on-error: true
       - name: upload bench log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: bench-${{ github.run_id }}
           path: bench.log
           if-no-files-found: ignore
 
-  # v0.10 wave-2 #A4: 32-bit (i686-unknown-linux-gnu) runtime smoke.
-  # Builds + executes the `s4-codec` test suite on i686 (already
+  # v0.10 wave-2 #A4 + v0.11 #A4: 32-bit (i686-unknown-linux-gnu) runtime
+  # smoke. Builds + executes the `s4-codec` test suite on i686 (already
   # passed since v0.9 #106-32bit but now gated in CI so a regression
   # surfaces immediately), then builds + runs the `s4` binary's
-  # `--help` / `--version` for runtime parity evidence beyond the
-  # `cargo check --target` claim README §"Supported targets" makes.
+  # `--help` / `--version`, then v0.11 #A4 adds an end-to-end PUT/GET
+  # round-trip through the i686 `s4` binary fronting an amd64 MinIO
+  # container so the README §"Supported targets" 32-bit row can claim
+  # actual wire-level parity (not just "process boots, prints --help").
   #
   # If the `s4-server` build step fails (= one of its deps —
   # aws-sdk-rust / rustls / ring — doesn't link cleanly on i686
@@ -175,11 +177,22 @@ jobs:
   # skipped and the job records "compiles only, runtime untested"
   # rather than going red — the codec/config test step still gates
   # on the regression-detection use case.
+  #
+  # The PUT/GET step itself runs `continue-on-error: true` until a
+  # green push is observed on `main`. Rationale: the i686 toolchain
+  # exercises a code path (32-bit pointer-width, alternative `Arc`
+  # atomics, isize-clamped buffer allocations) that has historically
+  # tripped on bugs we did not anticipate; landing the job in
+  # advisory mode lets us see the first failure in CI without
+  # immediately turning the whole pipeline red while a fix lands in
+  # a follow-up (v0.11.x) commit. Promote to required once observed
+  # green for a stretch of main pushes.
   i686-runtime-smoke:
     name: i686 runtime smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: i686-unknown-linux-gnu
@@ -218,6 +231,117 @@ jobs:
       - name: smoke — s4 --version (i686 binary)
         if: steps.build-s4.outcome == 'success'
         run: ./target/i686-unknown-linux-gnu/release/s4 --version
+      # v0.11 #A4: full PUT/GET round-trip — i686 `s4` binary in front
+      # of a stock amd64 MinIO container, using AWS CLI as the client.
+      # MinIO runs as host docker (not a service container) so we can
+      # control `--rm` + name-based cleanup and so the i686 process talks
+      # to it over plain TCP on the host. The single PUT + single GET +
+      # body equality check exercises:
+      #   - i686 hyper / rustls TLS-off listener (S4 → client)
+      #   - i686 aws-sdk-rust SigV4 signer (S4 → MinIO backend)
+      #   - i686 `Bytes` / `Vec<u8>` paths through the CPU-zstd codec
+      # which together are everything an operator would hit on a 32-bit
+      # deployment beyond the `--help` smoke.
+      - name: start MinIO (amd64 backend for the i686 s4 process)
+        if: steps.build-s4.outcome == 'success'
+        id: minio
+        # MinIO setup runs on the same advisory path as the PUT/GET
+        # step that follows: a Docker Hub / MinIO startup flake would
+        # otherwise red the i686 job even though the documented
+        # rollout posture is "non-blocking until a stretch of green
+        # main pushes is observed". Promote alongside the PUT/GET
+        # step once both have been stable.
+        continue-on-error: true
+        run: |
+          docker run -d --rm --name s4-i686-minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          # wait for MinIO /minio/health/live (max 60s)
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
+              echo "MinIO is live (after ${i}s)"
+              break
+            fi
+            if [ "$i" = "60" ]; then
+              echo "MinIO failed to come up in 60s" >&2
+              docker logs s4-i686-minio || true
+              exit 1
+            fi
+            sleep 1
+          done
+      - name: PUT/GET round-trip through i686 s4 binary
+        if: steps.build-s4.outcome == 'success' && steps.minio.outcome == 'success'
+        id: i686-smoke
+        # continue-on-error keeps a first-time 32-bit runtime bug from
+        # turning the CI badge red while the fix lands in v0.11.x; once
+        # we observe a stretch of green pushes on main this guard can
+        # be dropped. See the job header comment.
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          # v0.11 #A7 cross-agent audit: set both `AWS_REGION` and
+          # `AWS_DEFAULT_REGION` — SDK v2 prefers `AWS_REGION` while
+          # CLI v2 reads either; defensive for variations across the
+          # AWS SDK callers in s4-server's startup path.
+          AWS_REGION: us-east-1
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -eux
+          # 1. start i686 s4 server in the background, pointing at MinIO
+          ./target/i686-unknown-linux-gnu/release/s4 \
+            --host 127.0.0.1 --port 8014 \
+            --endpoint-url http://127.0.0.1:9000 \
+            --codec cpu-zstd \
+            --log-format json \
+            > s4-i686.log 2>&1 &
+          S4_PID=$!
+          echo "s4 PID=${S4_PID}"
+          trap 'kill ${S4_PID} 2>/dev/null || true; wait ${S4_PID} 2>/dev/null || true' EXIT
+          # 2. wait for S4 /ready (max 30s); /ready returns 200 only once
+          #    the backend ListBuckets call succeeds, so this also doubles
+          #    as a backend-reachability gate.
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8014/ready >/dev/null 2>&1; then
+              echo "S4 is ready (after ${i}s)"
+              break
+            fi
+            if ! kill -0 "${S4_PID}" 2>/dev/null; then
+              echo "S4 process exited during readiness wait" >&2
+              cat s4-i686.log >&2 || true
+              exit 1
+            fi
+            if [ "$i" = "30" ]; then
+              echo "S4 /ready did not return 200 in 30s" >&2
+              cat s4-i686.log >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+          # 3. PUT a small object through S4 (= it lands in MinIO compressed)
+          aws --endpoint-url http://127.0.0.1:8014 \
+            s3 mb s3://i686-smoke
+          echo 'hello-from-i686-s4' > /tmp/i686-payload.txt
+          aws --endpoint-url http://127.0.0.1:8014 \
+            s3 cp /tmp/i686-payload.txt s3://i686-smoke/k
+          # 4. GET it back through S4 (= S4 transparently decompresses)
+          aws --endpoint-url http://127.0.0.1:8014 \
+            s3 cp s3://i686-smoke/k /tmp/i686-roundtrip.txt
+          # 5. byte-equality vs the original
+          diff /tmp/i686-payload.txt /tmp/i686-roundtrip.txt
+          echo "i686 s4 PUT/GET round-trip succeeded"
+      - name: upload s4-i686 server log (always)
+        if: always() && steps.build-s4.outcome == 'success'
+        uses: actions/upload-artifact@v6
+        with:
+          name: s4-i686-server-log-${{ github.run_id }}
+          path: s4-i686.log
+          if-no-files-found: ignore
+      - name: stop MinIO (cleanup)
+        if: always() && steps.minio.outcome == 'success'
+        run: docker rm -f s4-i686-minio || true
 
   # Auto-open a GitHub issue when CI fails on a push to main (only on
   # push, not PR — PR failures are visible inline; main failures are
@@ -234,7 +358,7 @@ jobs:
     needs: [test, e2e, security-audit, i686-runtime-smoke]
     if: failure() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/github-script@v7
+      - uses: actions/github-script@v8
         with:
           script: |
             const shortSha = context.sha.slice(0, 7);

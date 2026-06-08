@@ -1,0 +1,234 @@
+name: S4 backend compat round-trip
+description: |
+  Starts an s4-server pointed at a pre-provisioned S3-compatible
+  backend, performs a single PUT + GET round-trip via aws-cli, and
+  asserts the `<key>.s4index` sidecar lands on the backend.
+
+  Shared across every job in `compat-matrix.yml` — each job is
+  responsible for provisioning its backend (docker container or
+  real-cloud credentials), populating BACKEND_* env, and optionally
+  pre-creating the bucket; this action then does the s4-specific
+  round-trip in a backend-agnostic way.
+
+  v0.11 #A7.
+
+inputs:
+  s4-binary:
+    description: Path to the s4 binary (artifact extracted somewhere on the runner).
+    required: true
+  backend-endpoint:
+    description: Backend S3 endpoint URL (e.g. http://127.0.0.1:9000).
+    required: true
+  backend-access-key:
+    description: AWS_ACCESS_KEY_ID equivalent for the backend.
+    required: true
+  backend-secret-key:
+    description: AWS_SECRET_ACCESS_KEY equivalent for the backend.
+    required: true
+  backend-region:
+    description: AWS_REGION equivalent for the backend.
+    required: true
+  test-bucket:
+    description: |
+      Bucket name to PUT/GET against. Defaults to `s4-compat-test`.
+      Real-cloud backends override this to the operator-provisioned
+      bucket so naming conventions in the cloud account stay intact.
+    required: false
+    default: s4-compat-test
+  test-key:
+    description: Object key for the PUT/GET round-trip.
+    required: false
+    default: compat/large.bin
+  test-size-bytes:
+    description: |
+      Random body size. Default 8 MiB — must exceed `pick_chunk_size`
+      for the chosen content-length so the resulting S4F2 frame index
+      has more than one entry, which is the gate the server uses to
+      actually emit `<key>.s4index` (see
+      `crates/s4-server/src/service.rs::idx.entries.len() > 1`).
+      `pick_chunk_size` returns 4 MiB for any body in the
+      (1 MiB, 100 MiB] range (see
+      `crates/s4-server/src/streaming.rs::pick_chunk_size`), so 8 MiB
+      yields exactly 2 frames → sidecar emitted. The sidecar HEAD
+      step below treats sidecar absence as a hard compat failure,
+      so under-sizing this value would silent-pass on a single-frame
+      body that the server intentionally elided the sidecar for.
+    required: false
+    default: "8388608"
+  s4-port:
+    description: TCP port s4-server listens on (loopback).
+    required: false
+    default: "8014"
+  skip-bucket-create:
+    description: |
+      Set "true" when the bucket has already been provisioned (garage
+      CLI / ceph demo init / operator-managed cloud bucket). When
+      "false" the action does a `s3api create-bucket` against the
+      backend before starting s4.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Pre-flight — backend reachable + create bucket (if needed)
+      shell: bash
+      env:
+        AWS_ACCESS_KEY_ID: ${{ inputs.backend-access-key }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.backend-secret-key }}
+        AWS_REGION: ${{ inputs.backend-region }}
+        BACKEND_ENDPOINT: ${{ inputs.backend-endpoint }}
+        BACKEND_REGION: ${{ inputs.backend-region }}
+        TEST_BUCKET: ${{ inputs.test-bucket }}
+        SKIP_BUCKET_CREATE: ${{ inputs.skip-bucket-create }}
+      run: |
+        set -euo pipefail
+        # Wait for the backend to respond to a ListBuckets — this is a
+        # cheap S3-spec sanity check that doesn't require the bucket
+        # to exist yet (works on MinIO / Garage / Ceph / B2 / R2 /
+        # Wasabi alike).
+        for _ in $(seq 1 60); do
+          if aws --endpoint-url "$BACKEND_ENDPOINT" --region "$BACKEND_REGION" \
+              s3api list-buckets >/dev/null 2>&1; then
+            echo "backend ready"
+            break
+          fi
+          sleep 2
+        done
+        aws --endpoint-url "$BACKEND_ENDPOINT" --region "$BACKEND_REGION" \
+          s3api list-buckets >/dev/null
+
+        if [ "$SKIP_BUCKET_CREATE" != "true" ]; then
+          # Tolerate BucketAlreadyOwnedByYou (re-running locally /
+          # workflow_dispatch after a previous successful run leaves
+          # the bucket on the backend; we don't tear it down between
+          # runs because doing so requires DeleteObjects which is
+          # surface we're explicitly NOT exercising here).
+          aws --endpoint-url "$BACKEND_ENDPOINT" --region "$BACKEND_REGION" \
+            s3api create-bucket --bucket "$TEST_BUCKET" || true
+        fi
+
+    - name: Start s4-server pointing at backend
+      shell: bash
+      env:
+        AWS_ACCESS_KEY_ID: ${{ inputs.backend-access-key }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.backend-secret-key }}
+        AWS_REGION: ${{ inputs.backend-region }}
+        S4_BINARY: ${{ inputs.s4-binary }}
+        BACKEND_ENDPOINT: ${{ inputs.backend-endpoint }}
+        S4_PORT: ${{ inputs.s4-port }}
+        RUST_LOG: info,aws_smithy_runtime=warn,aws_config=warn
+      run: |
+        set -euo pipefail
+        # `--dispatcher always` + `--codec cpu-zstd` forces compression
+        # on every PUT regardless of body shape, which guarantees the
+        # `<key>.s4index` sidecar is emitted (the sampling dispatcher
+        # would skip compression on uncompressible random payloads,
+        # which would silently make the sidecar HEAD step below false-
+        # positive when the codec was actually passthrough).
+        "$S4_BINARY" \
+          --endpoint-url "$BACKEND_ENDPOINT" \
+          --host 127.0.0.1 \
+          --port "$S4_PORT" \
+          --codec cpu-zstd \
+          --dispatcher always \
+          > /tmp/s4-server.log 2>&1 &
+        echo $! > /tmp/s4-server.pid
+        # Wait for /ready (which exercises ListBuckets against the
+        # backend so we know the SDK chain + creds are wired right
+        # before exercising the data plane).
+        for _ in $(seq 1 60); do
+          if curl -fsS "http://127.0.0.1:${S4_PORT}/ready" >/dev/null 2>&1; then
+            echo "s4-server ready"
+            break
+          fi
+          sleep 1
+        done
+        if ! curl -fsS "http://127.0.0.1:${S4_PORT}/health" >/dev/null; then
+          echo "::error::s4-server did not come up — log follows:"
+          cat /tmp/s4-server.log
+          exit 1
+        fi
+
+    - name: PUT + GET round-trip via s4
+      shell: bash
+      env:
+        AWS_ACCESS_KEY_ID: ${{ inputs.backend-access-key }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.backend-secret-key }}
+        AWS_REGION: ${{ inputs.backend-region }}
+        S4_PORT: ${{ inputs.s4-port }}
+        TEST_BUCKET: ${{ inputs.test-bucket }}
+        TEST_KEY: ${{ inputs.test-key }}
+        TEST_SIZE_BYTES: ${{ inputs.test-size-bytes }}
+      run: |
+        set -euo pipefail
+        # Random body so we know the GET output truly equals the PUT
+        # input (a constant body would round-trip even if s4 silently
+        # served the same canned response on every GET).
+        dd if=/dev/urandom of=/tmp/put.bin bs=1 count=0 status=none
+        dd if=/dev/urandom of=/tmp/put.bin bs=4096 count=$((TEST_SIZE_BYTES / 4096)) status=none
+        BEFORE_SHA=$(sha256sum /tmp/put.bin | awk '{print $1}')
+        echo "PUT body sha256: $BEFORE_SHA"
+
+        aws --endpoint-url "http://127.0.0.1:${S4_PORT}" \
+            s3api put-object \
+            --bucket "$TEST_BUCKET" \
+            --key "$TEST_KEY" \
+            --body /tmp/put.bin >/dev/null
+
+        aws --endpoint-url "http://127.0.0.1:${S4_PORT}" \
+            s3api get-object \
+            --bucket "$TEST_BUCKET" \
+            --key "$TEST_KEY" \
+            /tmp/get.bin >/dev/null
+        AFTER_SHA=$(sha256sum /tmp/get.bin | awk '{print $1}')
+        echo "GET body sha256: $AFTER_SHA"
+
+        if [ "$BEFORE_SHA" != "$AFTER_SHA" ]; then
+          echo "::error::round-trip mismatch: before=$BEFORE_SHA after=$AFTER_SHA"
+          exit 1
+        fi
+        echo "round-trip OK"
+
+    - name: Assert sidecar landed on backend
+      shell: bash
+      env:
+        AWS_ACCESS_KEY_ID: ${{ inputs.backend-access-key }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.backend-secret-key }}
+        AWS_REGION: ${{ inputs.backend-region }}
+        BACKEND_ENDPOINT: ${{ inputs.backend-endpoint }}
+        BACKEND_REGION: ${{ inputs.backend-region }}
+        TEST_BUCKET: ${{ inputs.test-bucket }}
+        TEST_KEY: ${{ inputs.test-key }}
+      run: |
+        set -euo pipefail
+        # HEAD the sidecar directly against the *backend* endpoint
+        # (not s4 — the sidecar is internal to s4 and s4 hides it
+        # from ListObjects, so the only way to verify it actually
+        # landed is to query the backend directly). This is the
+        # compat-load-bearing assertion: the backend not only
+        # accepted the body PUT, it also accepted the second PUT
+        # of the sidecar with the s4-emitted Content-Type +
+        # `*.s4index` key shape.
+        aws --endpoint-url "$BACKEND_ENDPOINT" --region "$BACKEND_REGION" \
+          s3api head-object \
+          --bucket "$TEST_BUCKET" \
+          --key "${TEST_KEY}.s4index" \
+          > /tmp/sidecar-head.json
+        cat /tmp/sidecar-head.json
+        echo "sidecar verified on backend"
+
+    - name: Dump s4-server log on failure
+      if: failure()
+      shell: bash
+      run: |
+        echo "--- s4-server.log ---"
+        cat /tmp/s4-server.log || true
+
+    - name: Stop s4-server
+      if: always()
+      shell: bash
+      run: |
+        if [ -f /tmp/s4-server.pid ]; then
+          kill "$(cat /tmp/s4-server.pid)" 2>/dev/null || true
+        fi

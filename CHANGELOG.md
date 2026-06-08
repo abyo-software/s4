@@ -7,6 +7,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+v0.11 roadmap in progress — polish + maintenance: 32-bit
+runtime end-to-end smoke + GHA Node.js 24 migration + backend
+compatibility matrix expansion.
+
+### Added
+
+- **v0.11 #A4 — 32-bit end-to-end PUT/GET smoke in CI.** The
+  existing `i686-runtime-smoke` job (added in v0.10 wave-2 #A4 to
+  cover `cargo test` on the codec / config crates + `--help` /
+  `--version` runtime of the `s4` binary) now also runs a stock
+  MinIO container on the host, starts the **i686 `s4` binary** in
+  front of it, and exercises a full `aws s3 mb` + `aws s3 cp` PUT
+  + `aws s3 cp` GET round-trip with byte-equality check on the
+  body. The PUT/GET step lands as advisory (`continue-on-error: true`)
+  so a first-time 32-bit runtime bug surfaces in the job log
+  without turning CI red while a fix follows in a v0.11.x commit;
+  the README §"Supported targets" 32-bit row is updated to reflect
+  the new claim and the advisory caveat. Job timeout bumped from
+  the implicit default to **40 min** to absorb MinIO pull + start
+  + the round-trip itself. Server log is uploaded as a CI artifact
+  (`s4-i686-server-log-${{ github.run_id }}`) for post-mortem.
+
+- **v0.11 #A7 — backend compatibility matrix CI.** New
+  [`compat-matrix.yml`](.github/workflows/compat-matrix.yml) workflow
+  closes the long-standing "should work" gap on the README's S3-
+  compatible backend list. Prior to this, only MinIO (via per-PR
+  testcontainers) and real AWS S3 (via nightly `aws-e2e.yml`) had
+  CI-verified compat evidence; Garage / Ceph RGW / Backblaze B2 /
+  Cloudflare R2 / Wasabi rested on wire-shape similarity alone.
+  Two tiers, weekly cron (Sunday 06:00 UTC) + `workflow_dispatch`:
+  (1) docker tier with no secrets — MinIO
+  (`quay.io/minio/minio:latest`), Garage (`dxflrs/garage:v1.1.0`,
+  CLI-provisioned single-node `replication_mode = "none"` cluster),
+  and Ceph RGW (`quay.io/ceph/demo:latest-quincy`, best-effort with
+  `continue-on-error` because the upstream demo image is no longer
+  actively maintained — pull / startup failures surface as warnings
+  rather than blocking the matrix); (2) real-cloud tier for B2 / R2
+  / Wasabi, each gated on operator-provided `vars.*_BUCKET` /
+  `*_ENDPOINT` / `*_REGION` + `secrets.*_ACCESS_KEY_ID` /
+  `*_SECRET_ACCESS_KEY` (silent skip when the backend isn't
+  configured — same opt-in pattern aws-e2e.yml uses). Each job
+  builds `s4` once via a shared `build-s4` job + artifact, then
+  runs a 1 PUT + 1 GET + sidecar HEAD round-trip through `s4
+  --codec cpu-zstd --dispatcher always` against the live backend;
+  the sidecar HEAD on the **backend** (not s4) is the load-bearing
+  assertion that the second backend PUT — where most S3-API-shape
+  divergences would surface — landed cleanly. Shared step logic
+  factored into a new `./.github/actions/compat-roundtrip`
+  composite action so adding a 7th / 8th backend in the future
+  doesn't require copy-pasting bash. README §"How it Compares"
+  gains a new "Backend compatibility matrix" subsection enumerating
+  each backend's verification posture (✅ verified / ⚠️ best-effort
+  / 🔧 configurable in operator CI).
+
+### Changed
+
+- **v0.11 #A5 — GitHub Actions Node.js 24 migration.** GitHub is
+  forcing all JavaScript actions to run on Node.js 24 by default
+  on 2026-06-16, and removing the Node.js 20 runtime from runners
+  on 2026-09-16 (deprecation announced 2026 spring). Every action
+  reference across all nine workflows (`ci.yml`, `ci-close-resolved.yml`,
+  `bench.yml`, `docker.yml`, `docker-smoke.yml`, `aws-e2e.yml`,
+  `aws-kms-e2e.yml`, `fuzz-nightly.yml`, `compat-matrix.yml`) has
+  been bumped to the first major release that runs natively on
+  Node.js 24, so the deprecation warning is silenced and the
+  workflows continue working past the September runtime removal.
+  Concretely: `actions/checkout` @v4 → @v5, `actions/upload-artifact`
+  @v4 → @v6 (v5 still ran on Node.js 20), `actions/download-artifact`
+  @v4 → @v7 (v5 + v6 still ran on Node.js 20),
+  `actions/github-script` @v7 → @v8, `codecov/codecov-action`
+  @v4 → @v5, `docker/build-push-action` @v5 → @v7 (v6 still ran
+  on Node.js 20), `docker/login-action` @v3 → @v4,
+  `docker/setup-buildx-action` @v3 → @v4, `docker/metadata-action`
+  @v5 → @v6, `aws-actions/configure-aws-credentials` @v4 → @v6
+  (v5 still ran on Node.js 20), `azure/setup-helm` @v4 → @v5.
+  Three actions already serve Node.js 24 under their existing
+  floating major tag and were left untouched: `Swatinem/rust-cache@v2`
+  (resolves to v2.9.1 = Node.js 24), `benchmark-action/github-action-benchmark@v1`
+  (the `v1` branch is Node.js 24), and `dtolnay/rust-toolchain@stable`
+  (composite action, no Node.js runtime). Action input / output
+  contracts at the bumped majors are call-compat with the prior
+  usage in this repo (verified per action's release notes — the
+  most invasive jump, `aws-actions/configure-aws-credentials` @v4
+  → @v6, only changed invalid-boolean handling we don't trip; the
+  `codecov-action` v5 `file` → `files` rename was already adopted).
+
+### Documentation
+
 ## [0.10.0] — 2026-06-07
 
 Second v0.10-line cut (= first v0.10). Two-wave delivery of the

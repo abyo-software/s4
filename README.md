@@ -262,7 +262,7 @@ target/release/s4 --endpoint-url https://s3.us-east-1.amazonaws.com \
 | `s4-codec` (library)           | ✅ tier 1                           | ✅ compiles + tests   | ✅ via `s4-codec-wasm`             |
 | `s4-codec-wasm` (browser)      | n/a                                 | n/a                   | ✅ tier 1                          |
 | `s4-config`                    | ✅ tier 1                           | ✅                    | ✅                                 |
-| `s4-server` (gateway binary)   | ✅ tier 1                           | ✅ compiles + `--help` / `--version` smoke (CI) | ❌ not applicable           |
+| `s4-server` (gateway binary)   | ✅ tier 1                           | ✅ compiles + `--help` / `--version` + advisory PUT/GET round-trip (CI) | ❌ not applicable           |
 | `nvcomp-gpu` feature (any crate above) | ✅ x86_64 only (NVIDIA driver) | ❌ (no 32-bit nvCOMP) | ❌                            |
 
 Runtime-tested platform is **`x86_64-unknown-linux-gnu`** and
@@ -273,13 +273,19 @@ so the 5 GiB AWS S3 single-PUT ceiling no longer const-overflows `usize` on
 32-bit). v0.10 wave-2 #A4 adds a per-push CI job that (a) executes the
 `s4-codec` + `s4-config` test suites under `--target i686-unknown-linux-gnu`
 and (b) builds the `s4` binary itself for i686 + invokes
-`s4 --help` / `s4 --version` as a runtime smoke. Full end-to-end
-PUT/GET on 32-bit is still not exercised in CI; operators running it
-on i686 should treat `--max-body-bytes` carefully (auto-clamps to
-`isize::MAX as usize` ≈ 2 GiB on 32-bit — Rust caps any single `Vec` /
-`Bytes` allocation at `isize::MAX`, so a higher gateway guard would
-let oversized requests panic inside the SSE buffered-decrypt pre-alloc
-path).
+`s4 --help` / `s4 --version` as a runtime smoke. v0.11 #A4 extends the
+same job with an **end-to-end PUT/GET round-trip** — the i686 `s4` binary
+runs in front of a stock MinIO container and the AWS CLI puts then gets
+a small object back through it, byte-equality-checked. The round-trip
+step lands in CI as **advisory (`continue-on-error: true`)** so a
+first-time 32-bit runtime bug surfaces in the job log without turning
+the badge red while a fix lands in a follow-up v0.11.x commit; promotion
+to a required gate happens once a stretch of green main pushes is
+observed. Operators running on i686 should still treat
+`--max-body-bytes` carefully (auto-clamps to `isize::MAX as usize`
+≈ 2 GiB on 32-bit — Rust caps any single `Vec` / `Bytes` allocation
+at `isize::MAX`, so a higher gateway guard would let oversized requests
+panic inside the SSE buffered-decrypt pre-alloc path).
 
 The `wasm32-unknown-unknown` target is the public release channel for the
 browser decoder (`s4-codec-wasm`); the criterion regression-tracking suite
@@ -378,6 +384,33 @@ relevant issue.
 client uses whatever the operator's `--endpoint-url` configuration
 specifies. If your client is fussy about this, set `--path-style` on
 the s4 server side or `--force-path-style` on the AWS SDK side.
+
+### Backend compatibility matrix
+
+S4 is a transparent compression proxy in front of an S3-compatible
+backend. Each row below is the **verification posture** S4 holds for
+that backend — what CI actually exercises, not "should work" claims.
+v0.11 #A7 added the weekly
+[`compat-matrix.yml`](.github/workflows/compat-matrix.yml) workflow
+that drives the docker-tier verifications (and the real-cloud rows
+when operators provide credentials).
+
+| Backend | Verification | Notes |
+|---|---|---|
+| [AWS S3](https://aws.amazon.com/s3/) | ✅ Verified via nightly CI ([`aws-e2e.yml`](.github/workflows/aws-e2e.yml)) | real bucket, OIDC-assumed IAM role; the reference implementation |
+| [MinIO](https://github.com/minio/minio) | ✅ Verified via per-PR CI (`http_e2e` / `multipart_e2e` testcontainers) + weekly compat-matrix | `quay.io/minio/minio:latest` |
+| [Garage](https://git.deuxfleurs.fr/Deuxfleurs/garage) | ✅ Verified via weekly compat-matrix CI (docker `dxflrs/garage:v1.1.0`) | single-node `replication_mode = "none"`, CLI-provisioned bucket + key |
+| [Ceph RGW](https://docs.ceph.com/en/latest/radosgw/) | ⚠️ Best-effort weekly compat-matrix CI (`quay.io/ceph/demo:latest-quincy`) | the upstream `ceph/demo` image is no longer actively maintained; the job is gated `continue-on-error` so a pull / startup failure surfaces as a warning rather than blocking the matrix |
+| [Backblaze B2](https://www.backblaze.com/b2/cloud-storage.html) | 🔧 Configurable in operator CI (real backend; requires `vars.B2_BUCKET` / `B2_ENDPOINT` / `B2_REGION` + `secrets.B2_KEY_ID` / `B2_APPLICATION_KEY`) | weekly when configured, silent skip otherwise |
+| [Cloudflare R2](https://www.cloudflare.com/products/r2/) | 🔧 Configurable in operator CI (real backend; requires `vars.R2_BUCKET` / `R2_ENDPOINT` / `R2_REGION` + `secrets.R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY`) | weekly when configured, silent skip otherwise |
+| [Wasabi](https://wasabi.com/) | 🔧 Configurable in operator CI (real backend; requires `vars.WASABI_BUCKET` / `WASABI_ENDPOINT` / `WASABI_REGION` + `secrets.WASABI_ACCESS_KEY_ID` / `WASABI_SECRET_ACCESS_KEY`) | weekly when configured, silent skip otherwise |
+
+Each compat-matrix job runs a 1 PUT + 1 GET + sidecar HEAD against
+the live backend through an `s4 --codec cpu-zstd --dispatcher always`
+server — sidecar HEAD on the backend asserts the second backend round-
+trip (sidecar PUT) lands the way s4 expects, which is where most
+S3-API-shape divergences would surface (PutObject without
+`Content-MD5`, aws-chunked encoding, etc.).
 
 ## Security & threat model
 
