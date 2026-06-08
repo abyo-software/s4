@@ -67,7 +67,11 @@ pub struct FrameHeader {
     pub crc32c: u32,
 }
 
+/// v1.0 stability: `#[non_exhaustive]` — new framing-level validation
+/// errors may be added in minor releases. Downstream callers must
+/// include a `_ =>` arm when matching on this enum.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum FrameError {
     #[error("frame too short: need at least {FRAME_HEADER_BYTES} bytes, have {0}")]
     TooShort(usize),

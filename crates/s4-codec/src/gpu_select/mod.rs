@@ -56,7 +56,11 @@ use cudarc::nvrtc::compile_ptx;
 /// AST down to one of these — anything else (function calls, AND/OR
 /// composition, multi-column refs) means "no GPU path, fall back to
 /// CPU".
+/// v1.0 stability: `#[non_exhaustive]` — new comparison operators
+/// (e.g. `LIKE` suffix / contains, `BETWEEN`) may be added in minor
+/// releases. Downstream callers must include a `_ =>` arm when matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CompareOp {
     /// `col = 'literal'` — byte-wise equality.
     Equal,
@@ -76,7 +80,11 @@ pub enum CompareOp {
 /// at the caller (route to CPU); the `select` module wraps this in
 /// `Option` so the call site doesn't need to distinguish them, but the
 /// rich variants exist for diagnostics / metrics.
+/// v1.0 stability: `#[non_exhaustive]` — new GPU-path failure modes
+/// may be added in minor releases. Downstream callers must include a
+/// `_ =>` arm when matching on this enum.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum GpuSelectError {
     #[error("CUDA driver error: {0}")]
     Cuda(String),

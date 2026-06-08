@@ -35,8 +35,13 @@ pub mod registry;
 pub use registry::CodecRegistry;
 
 /// 圧縮 codec の種類 (manifest に記録、後段の decompress で codec を確定するために使う)
+///
+/// v1.0 stability: `#[non_exhaustive]` — future codecs (e.g. LZ4, Brotli)
+/// may be added in minor releases without bumping major. Downstream
+/// callers must include a `_ =>` arm when matching on this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum CodecKind {
     Passthrough,
     NvcompBitcomp,
@@ -212,7 +217,12 @@ pub fn looks_like_oom(err: &CodecError) -> bool {
 
 /// codec 操作のエラー型。`anyhow::Error` ではなく専用型にすることで、上位 (S4Service) が
 /// HTTP エラーコードを意味的に出し分けやすくする。
+///
+/// v1.0 stability: `#[non_exhaustive]` — new error variants (e.g. for
+/// future codecs or validation guards) may be added in minor releases.
+/// Downstream callers must include a `_ =>` arm when matching.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CodecError {
     #[error("codec mismatch: expected {expected:?}, got {got:?}")]
     CodecMismatch { expected: CodecKind, got: CodecKind },

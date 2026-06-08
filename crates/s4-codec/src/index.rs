@@ -450,7 +450,11 @@ impl FrameIndex {
     }
 }
 
+/// v1.0 stability: `#[non_exhaustive]` — new validation guards may be
+/// added in minor releases. Downstream callers must include a `_ =>`
+/// arm when matching on this enum.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum IndexError {
     #[error("index too short: {0} bytes")]
     TooShort(usize),

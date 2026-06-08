@@ -108,6 +108,12 @@ fn codec_err_to_py(e: CodecError) -> PyErr {
         // panics — surface as backend so retries hit the same class as
         // anyhow-wrapped backend faults.
         Join(e) => S4BackendError::new_err(format!("backend (worker join): {e}")),
+        // v1.0 F1: `CodecError` is `#[non_exhaustive]`, so newly-added
+        // variants in a future minor release must have a fallback here.
+        // Map to the generic `S4Error` carrying the upstream Display
+        // text — Python callers see the message but cannot pattern-
+        // match on the specific subclass until this wrapper is updated.
+        other => S4Error::new_err(format!("codec error: {other}")),
     }
 }
 
