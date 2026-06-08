@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780888373505,
+  "lastUpdate": 1780929507628,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -5875,6 +5875,232 @@ window.BENCHMARK_DATA = {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 32,
             "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "b950b0c1d9212d69df746e95af2661583871e38e",
+          "message": "fix(v1.0): F14 — compat-matrix Garage NODE_ID parse + Ceph best-effort\n\nTwo bugs surfaced by the first manual compat-matrix runs (in support\nof the v1.0 HTTP API surface freeze evidence):\n\n1. Garage job died with `Internal error: 0 nodes match '===='`.\n   The awk pattern `/HEALTHY|UNHEALTHY|NO ROLE/` matched the\n   `==== HEALTHY NODES ====` table header line in dxflrs/garage:v1.1.0\n   output and printed `====` as the node id. Replaced with\n   `garage node id -q`, which returns `<hex>@<addr>` directly.\n\n2. Ceph RGW round-trip failed with XAmzContentSHA256Mismatch on the\n   PutObject through s4-server. quay.io/ceph/demo:latest-quincy is\n   unmaintained upstream and drifts against the current\n   aws-sdk-rust streaming-checksum wire shape. The job already had\n   continue-on-error on the start step (per the existing header\n   comment's intent), but the round-trip step did not, so the wire\n   drift gated the workflow. Made round-trip continue-on-error too\n   and added a separate Warn step + downgraded the README compat\n   claim from \"CI-verified\" to \"claimed but not CI-verified\" until\n   a successor demo image lands (Cluster B will reflect this in\n   the README v1.0 rewrite).\n\nAfter this commit the matrix should show success on MinIO + Garage\n(docker tier) and on B2 / R2 / Wasabi (real-cloud tier), with Ceph\nRGW emitting a clear warning. This is the evidence backing the\nREADME v1.0 stability section's HTTP API surface freeze.",
+          "timestamp": "2026-06-08T23:30:23+09:00",
+          "tree_id": "4e5b3360cba9e8bc75fdc556a4cbbd8024defded",
+          "url": "https://github.com/abyo-software/s4/commit/b950b0c1d9212d69df746e95af2661583871e38e"
+        },
+        "date": 1780929507015,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 55686,
+            "range": "± 3433",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 55770,
+            "range": "± 6047",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 364,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2666444,
+            "range": "± 84564",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 41885496,
+            "range": "± 1036680",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192160,
+            "range": "± 3939",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 53145034,
+            "range": "± 1305139",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 757811127,
+            "range": "± 5565646",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3077001,
+            "range": "± 19514",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 31868,
+            "range": "± 2640",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 38898,
+            "range": "± 3226",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 376,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 568436,
+            "range": "± 21481",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1582744,
+            "range": "± 50069",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192452,
+            "range": "± 2022",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12451542,
+            "range": "± 475091",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27821493,
+            "range": "± 155316",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3158622,
+            "range": "± 20587",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1521366,
+            "range": "± 13743",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2458654,
+            "range": "± 39828",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 356907754,
+            "range": "± 7902021",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 172,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 7099,
+            "range": "± 450",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 814,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13096,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2910,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 22704,
+            "range": "± 970",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 90761,
+            "range": "± 3104",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 636,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4956,
+            "range": "± 73",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19686,
+            "range": "± 50",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
+            "range": "± 1",
             "unit": "ns/iter"
           }
         ]
