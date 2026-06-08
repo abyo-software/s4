@@ -252,7 +252,17 @@ jobs:
     name: merge manifest (${{ matrix.flavor }})
     runs-on: ubuntu-latest
     needs: build
-    if: github.event_name != 'workflow_dispatch' || inputs.push
+    # v0.11-audit-R3 P2 (Codex): `if: always()` so a failure in
+    # an unrelated build-matrix leg (e.g. CPU arm64 transient
+    # GHA runner hiccup) doesn't skip BOTH CPU and GPU merges.
+    # Each merge then checks for its own flavor's digest
+    # artifacts and skips itself if absent — gives per-flavor
+    # publication independence. The push-gate keeps build-only
+    # smoke runs from accidentally publishing.
+    if: |
+      always()
+      && needs.build.result != 'cancelled'
+      && (github.event_name != 'workflow_dispatch' || inputs.push)
     timeout-minutes: 15
 
     strategy:
@@ -262,6 +272,12 @@ jobs:
 
     steps:
       - name: Download per-arch digests (${{ matrix.flavor }})
+        id: download
+        # v0.11-audit-R3 P2: continue-on-error so a flavor whose
+        # build leg failed (= no artifacts for this flavor exist)
+        # doesn't error here; the next step gates publication on
+        # this step's outcome.
+        continue-on-error: true
         uses: actions/download-artifact@v7
         with:
           path: /tmp/digests
@@ -270,10 +286,24 @@ jobs:
           pattern: digests-${{ matrix.flavor }}-*
           merge-multiple: true
 
+      - name: Verify digests present
+        id: have_digests
+        run: |
+          if [ -z "$(ls -A /tmp/digests 2>/dev/null)" ]; then
+            echo "::warning ::no digests for flavor=${{ matrix.flavor }} (build leg failed or skipped); skipping merge"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "digests found:"
+            ls /tmp/digests
+          fi
+
       - name: Set up Docker Buildx
+        if: steps.have_digests.outputs.skip != 'true'
         uses: docker/setup-buildx-action@v4
 
       - name: Log in to ghcr.io
+        if: steps.have_digests.outputs.skip != 'true'
         uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
@@ -285,6 +315,7 @@ jobs:
       # (push-only, non-prerelease-only, back-fill-aware) all live
       # here, after the per-arch build is already done.
       - name: Extract Docker metadata (${{ matrix.flavor }})
+        if: steps.have_digests.outputs.skip != 'true'
         id: meta
         uses: docker/metadata-action@v6
         with:
@@ -332,6 +363,7 @@ jobs:
       # 2 for CPU); manifest creation needs the digest list as
       # `image@sha256:<digest>` references.
       - name: Combine digests into multi-arch manifest (${{ matrix.flavor }})
+        if: steps.have_digests.outputs.skip != 'true'
         working-directory: /tmp/digests
         run: |
           # Each downloaded artifact is a 0-byte file whose NAME is
@@ -362,6 +394,7 @@ jobs:
       # reports the manifest contents (per-arch image refs, SLSA
       # provenance, SBOM) without pulling anything to the runner.
       - name: Inspect merged manifest (${{ matrix.flavor }})
+        if: steps.have_digests.outputs.skip != 'true'
         run: |
           first_tag=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
           if [ -z "$first_tag" ]; then

@@ -175,6 +175,7 @@ jobs:
           backend-access-key: ${{ env.BACKEND_ACCESS_KEY }}
           backend-secret-key: ${{ env.BACKEND_SECRET_KEY }}
           backend-region: ${{ env.BACKEND_REGION }}
+          test-key: ${{ env.TEST_KEY }}
 
       - name: Dump backend log on failure
         if: failure()
@@ -285,6 +286,7 @@ jobs:
           backend-access-key: ${{ env.BACKEND_ACCESS_KEY }}
           backend-secret-key: ${{ env.BACKEND_SECRET_KEY }}
           backend-region: ${{ env.BACKEND_REGION }}
+          test-key: ${{ env.TEST_KEY }}
           # garage pre-creates the bucket via CLI above
           skip-bucket-create: "true"
 
@@ -369,6 +371,7 @@ jobs:
           backend-access-key: ${{ env.BACKEND_ACCESS_KEY }}
           backend-secret-key: ${{ env.BACKEND_SECRET_KEY }}
           backend-region: ${{ env.BACKEND_REGION }}
+          test-key: ${{ env.TEST_KEY }}
           # CEPH_DEMO_BUCKET pre-creates it at container init
           skip-bucket-create: "true"
 
@@ -464,6 +467,7 @@ jobs:
           backend-access-key: ${{ secrets[matrix.access_key_secret] }}
           backend-secret-key: ${{ secrets[matrix.secret_key_secret] }}
           backend-region: ${{ vars[matrix.region_var] }}
+          test-key: ${{ env.TEST_KEY }}
           # Real-cloud bucket must be pre-provisioned by the operator
           # (we can't CreateBucket against a bucket name that's
           # globally claimed; nor do we want CI to provision real
