@@ -8143,7 +8143,12 @@ impl SigV4aGate {
 /// HTTP 403 with one of the two AWS-standard error codes
 /// (`InvalidAccessKeyId` / `SignatureDoesNotMatch` / `RequestTimeTooSkewed`)
 /// — see [`SigV4aGateError::s3_error_code`].
+///
+/// v1.0 stability: `#[non_exhaustive]` — new gate-level failures may
+/// be added in minor releases. Downstream callers must include a
+/// `_ =>` arm when matching on this enum.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SigV4aGateError {
     #[error("missing Authorization header")]
     MissingAuthorization,

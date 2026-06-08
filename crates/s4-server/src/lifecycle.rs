@@ -254,7 +254,13 @@ pub struct LifecycleConfig {
 
 /// The action a single rule wants to take **right now** for a candidate
 /// object.
+///
+/// v1.0 stability: `#[non_exhaustive]` — additional lifecycle action
+/// types (e.g. `RestoreFromArchive`) may be added in minor releases.
+/// Downstream callers must include a `_ =>` arm when matching on
+/// this enum.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LifecycleAction {
     /// Delete the object (`Expiration` / `NoncurrentVersionExpiration`).
     Expire,

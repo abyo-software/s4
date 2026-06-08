@@ -183,7 +183,12 @@ const KEY_MD5_LEN: usize = 16;
 /// match that exact spelling for parity with real S3 clients.
 pub const SSE_C_ALGORITHM: &str = "AES256";
 
+/// v1.0 stability: `#[non_exhaustive]` — new SSE failure modes
+/// (e.g. for future S4Ex frames or new KMS error classes) may be added
+/// in minor releases. Downstream callers must include a `_ =>` arm
+/// when matching on this enum.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SseError {
     #[error("SSE key file {path:?}: {source}")]
     KeyFileIo {
@@ -631,7 +636,12 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// Borrowed (not owned) so the caller can hold a long-lived
 /// `CustomerKeyMaterial` next to the request and just lend it for the
 /// duration of one PUT/GET.
+/// v1.0 stability: `#[non_exhaustive]` — new SSE source variants
+/// (e.g. SSE-S3 for AWS managed keys, or other KMS providers) may be
+/// added in minor releases. Downstream callers must include a `_ =>`
+/// arm when matching on this enum.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum SseSource<'a> {
     /// Server-managed keyring path → produces / consumes S4E1 (legacy)
     /// or S4E2 (rotation-aware) frames.

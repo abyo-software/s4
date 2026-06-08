@@ -68,7 +68,11 @@ impl ByteStream for SingleChunkBlob {
     }
 }
 
+/// v1.0 stability: `#[non_exhaustive]` — new streaming-body failure
+/// modes may be added in minor releases. Downstream callers must
+/// include a `_ =>` arm when matching on this enum.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BlobError {
     #[error("body exceeded configured limit ({limit} bytes); saw at least {seen_at_least}")]
     Oversized { limit: usize, seen_at_least: usize },

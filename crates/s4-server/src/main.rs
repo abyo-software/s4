@@ -2295,6 +2295,18 @@ async fn run_verify_sidecar(
             );
             Err("sidecar bytes corrupt".into())
         }
+        // v1.0 F1: `SidecarStatus` is `#[non_exhaustive]`, so a future
+        // minor release may add new categories. Surface the Debug form
+        // and exit non-zero so an operator notices the unrecognised
+        // state and the CLI can be updated.
+        other => {
+            println!(
+                "UNKNOWN_STATUS {}/{}: {:?} — this build is older than the server / sidecar \
+                 producer (forward-compat). Update the s4 CLI to interpret this status.",
+                report.bucket, report.key, other,
+            );
+            Err("sidecar status unknown to this CLI build".into())
+        }
     }
 }
 
@@ -2456,6 +2468,13 @@ async fn run_sweep_orphan_sidecars(
                 undecodable_count += 1;
                 format!("sidecar UNDECODABLE: {message}")
             }
+            // v1.0 F1: `OrphanReason` is `#[non_exhaustive]`; a future
+            // minor release may add categories. Show the Debug form so
+            // the operator can still inspect the reason; do NOT
+            // increment `undecodable_count` (that counter governs the
+            // `--delete-undecodable` gate, and we must not auto-delete
+            // a category this CLI build doesn't recognise).
+            other => format!("UNKNOWN reason (forward-compat): {other:?}"),
         };
         println!("  {}  ({})", orph.sidecar_key, reason);
     }

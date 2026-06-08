@@ -57,7 +57,12 @@ use tracing::warn;
 
 /// Output format. Only `Csv` is implemented today; Parquet is reserved for a
 /// future feature-gated build.
+///
+/// v1.0 stability: `#[non_exhaustive]` — Parquet (and possibly ORC)
+/// will land in a future minor release. Downstream callers must
+/// include a `_ =>` arm when matching on this enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum InventoryFormat {
     Csv,
 }
@@ -530,7 +535,12 @@ fn hex_char(n: u8) -> char {
 /// Errors surfaced by [`InventoryManager::run_once_for_test`]. Kept narrow so
 /// the caller (test or scheduler) can pattern-match without depending on the
 /// underlying writer's error type.
+///
+/// v1.0 stability: `#[non_exhaustive]` — new inventory-run failure
+/// modes may be added in minor releases. Downstream callers must
+/// include a `_ =>` arm when matching on this enum.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RunError {
     #[error("no inventory configuration for bucket={0} id={1}")]
     UnknownConfig(String, String),

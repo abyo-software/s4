@@ -58,7 +58,13 @@ use serde::{Deserialize, Serialize};
 /// the full ~30-event matrix because v0.6 #35 only fires PUT and DELETE
 /// hooks; more events can be added when the corresponding handlers grow
 /// notification fire-points.
+///
+/// v1.0 stability: `#[non_exhaustive]` — the additional event types
+/// (`ObjectCreated:CompleteMultipartUpload`, restore events,
+/// replication events, etc.) will land in future minor releases.
+/// Downstream callers must include a `_ =>` arm when matching.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum EventType {
     /// `s3:ObjectCreated:Put`
     ObjectCreatedPut,
@@ -113,7 +119,13 @@ impl EventType {
 /// path: `Webhook` is always built; `Sqs` / `Sns` are accepted at config
 /// time regardless of the build feature, but the runtime dispatcher will
 /// log + drop them when the `aws-events` feature isn't compiled in.
+///
+/// v1.0 stability: `#[non_exhaustive]` — additional destination
+/// variants (Lambda, EventBridge, NATS, Kafka) may be added in minor
+/// releases. Downstream callers must include a `_ =>` arm when
+/// matching on this enum.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Destination {
     /// HTTP POST to the URL with the event JSON as body. Always available
     /// (no extra cargo features required).

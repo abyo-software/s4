@@ -91,7 +91,11 @@ pub const SSE_S4_REPAIR_MAX_OVERHEAD_BYTES: u64 = (crate::sse::S4E6_HEADER_BYTES
 /// `chunk_size` to compensate.
 pub const SSE_S4_REPAIR_MAX_CHUNK_SLACK_BYTES: u64 = 16 * 1024 * 1024;
 
+/// v1.0 stability: `#[non_exhaustive]` — new repair-time failure
+/// modes may be added in minor releases. Downstream callers must
+/// include a `_ =>` arm when matching on this enum.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum RepairError {
     #[error("S3 backend error on {op} {bucket}/{key}: {cause}")]
     Backend {
@@ -230,7 +234,11 @@ pub enum RepairError {
 /// intentionally have no sidecar (server only writes when
 /// `entries.len() > 1`), so a blanket `Missing` = exit-1 would false-
 /// alert on healthy objects.
+/// v1.0 stability: `#[non_exhaustive]` — new sidecar-status categories
+/// (e.g. forward-compat sidecar version markers) may be added in minor
+/// releases. Downstream callers must include a `_ =>` arm when matching.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SidecarStatus {
     /// Sidecar present, parses cleanly, and its v2 etag + size binding
     /// matches the live HEAD.
@@ -329,7 +337,11 @@ pub struct RepairSseBinding {
     pub enc_header_bytes: u32,
 }
 
+/// v1.0 stability: `#[non_exhaustive]` — new orphan-classification
+/// reasons may be added in minor releases. Downstream callers must
+/// include a `_ =>` arm when matching on this enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OrphanReason {
     /// The paired logical key has no HEAD — sidecar is dangling.
     PairedMissing,
@@ -970,7 +982,12 @@ fn decrypt_s4e6_for_repair(
 /// those would fail to decode and `--delete` would nuke real user data.
 /// Escalation to `DeletePolicy::IncludeUndecodable` is an explicit
 /// operator opt-in (`--delete-undecodable` on the CLI).
+/// v1.0 stability: `#[non_exhaustive]` — new orphan-delete policies
+/// may be added in minor releases (e.g. policy variants that combine
+/// undecodable handling with stricter age windows). Downstream callers
+/// must include a `_ =>` arm when matching on this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DeletePolicy {
     /// Pure dry-run: classify only, never write to the backend.
     DryRun,

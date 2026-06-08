@@ -144,7 +144,11 @@ impl TagSet {
 /// v0.8.4 #79: `EmptyKey` / `DuplicateKey` added, and the size-bound
 /// variants now carry the configured `max` (and the offending key for
 /// `ValueTooLong`) so the error surface is self-describing on the wire.
+/// v1.0 stability: `#[non_exhaustive]` — new tag-validation guards
+/// may be added in minor releases. Downstream callers must include a
+/// `_ =>` arm when matching on this enum.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TagError {
     #[error("too many tags: {got} (max {max} per object/bucket)")]
     TooManyTags { got: usize, max: usize },

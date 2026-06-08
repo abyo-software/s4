@@ -173,7 +173,12 @@ impl MfaDeleteManager {
 }
 
 /// Errors surfaced by [`check_mfa`] / [`parse_mfa_header`].
+///
+/// v1.0 stability: `#[non_exhaustive]` — new MFA validation errors
+/// may be added in minor releases. Downstream callers must include a
+/// `_ =>` arm when matching on this enum.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MfaError {
     #[error("missing x-amz-mfa header (MFA Delete is Enabled on this bucket)")]
     Missing,

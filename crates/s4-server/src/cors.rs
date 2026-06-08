@@ -48,7 +48,12 @@ use std::sync::RwLock;
 use serde::{Deserialize, Serialize};
 
 /// v0.8.15 M-3: validation errors surfaced by [`CorsManager::validate`].
+///
+/// v1.0 stability: `#[non_exhaustive]` — new CORS validation guards
+/// may be added in minor releases. Downstream callers must include a
+/// `_ =>` arm when matching on this enum.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CorsValidationError {
     #[error(
         "AllowedMethod {0:?} is not a valid AWS S3 CORS verb (must be one of GET / PUT / POST / DELETE / HEAD; `*` is rejected)"

@@ -55,7 +55,11 @@ use sqlparser::parser::Parser;
 // Errors
 // =====================================================================
 
+/// v1.0 stability: `#[non_exhaustive]` — new SELECT failure modes
+/// may be added in minor releases. Downstream callers must include a
+/// `_ =>` arm when matching on this enum.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SelectError {
     #[error("SQL parse error: {0}")]
     Parse(String),
@@ -71,13 +75,21 @@ pub enum SelectError {
 // Input / output formats
 // =====================================================================
 
+/// v1.0 stability: `#[non_exhaustive]` — Parquet input is a planned
+/// addition in a future minor release. Downstream callers must include
+/// a `_ =>` arm when matching on this enum.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum SelectInputFormat {
     Csv { has_header: bool, delimiter: char },
     JsonLines,
 }
 
+/// v1.0 stability: `#[non_exhaustive]` — additional output formats
+/// (e.g. Parquet) may be added in minor releases. Downstream callers
+/// must include a `_ =>` arm when matching on this enum.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum SelectOutputFormat {
     Csv,
     Json,

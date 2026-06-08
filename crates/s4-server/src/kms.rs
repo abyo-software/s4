@@ -58,7 +58,11 @@ const WRAP_TAG_LEN: usize = 16;
 /// overflow).
 const LOCAL_WRAP_MIN_LEN: usize = WRAP_NONCE_LEN + WRAP_TAG_LEN;
 
+/// v1.0 stability: `#[non_exhaustive]` — new KMS backend failure
+/// modes may be added in minor releases. Downstream callers must
+/// include a `_ =>` arm when matching on this enum.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum KmsError {
     #[error("KMS key id {key_id:?} not found in backend")]
     KeyNotFound { key_id: String },

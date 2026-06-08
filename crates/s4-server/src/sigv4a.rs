@@ -52,7 +52,12 @@ pub const SIGV4A_ALGORITHM: &str = "AWS4-ECDSA-P256-SHA256";
 pub const REGION_SET_HEADER: &str = "x-amz-region-set";
 
 /// Errors surfaced by [`verify`] / [`SigV4aCredentialStore::load_dir`].
+///
+/// v1.0 stability: `#[non_exhaustive]` — new SigV4a validation errors
+/// may be added in minor releases. Downstream callers must include a
+/// `_ =>` arm when matching on this enum.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SigV4aError {
     /// The DER-encoded ECDSA signature failed to parse.
     #[error("malformed ECDSA-P256 signature: {0}")]

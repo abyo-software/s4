@@ -90,7 +90,12 @@ impl StringOrVec {
 /// bare string that isn't `"*"`, an empty `{"AWS": []}` list, or any
 /// `Service` / `Federated` / `CanonicalUser` Principal type that we
 /// don't support).
+///
+/// v1.0 stability: `#[non_exhaustive]` — `Service` / `Federated` /
+/// `CanonicalUser` support may be added in a future minor release.
+/// Downstream callers must include a `_ =>` arm when matching.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PrincipalSet {
     /// `"Principal": "*"` — match any caller (incl. anonymous / unauth).
     /// The bare string must be exactly `"*"`; any other string form is a
@@ -186,7 +191,13 @@ struct PolicyJson {
 /// object-form). Built once at policy-parse time so statement evaluation
 /// can route bucket-only / object-only actions to the right ARN shape
 /// without re-parsing on every request.
+///
+/// v1.0 stability: `#[non_exhaustive]` — future ARN shapes (e.g.
+/// access-point ARNs, lifecycle-rule-scoped ARNs) may be added in
+/// minor releases. Downstream callers must include a `_ =>` arm when
+/// matching on this enum.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResourceArn {
     /// `arn:aws:s3:::<bucket>` — matches bucket-level actions only.
     Bucket(String),
@@ -210,7 +221,12 @@ enum ResourceKind {
 /// v0.8.4 #75: structured parse / validation errors. Surfaced via
 /// [`Display`] for the public `Result<_, String>` boundary so existing
 /// CLI / test call sites that string-match on the message keep working.
+///
+/// v1.0 stability: `#[non_exhaustive]` — new policy parse / validation
+/// errors may be added in minor releases. Downstream callers must
+/// include a `_ =>` arm when matching on this enum.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PolicyParseError {
     #[error("policy JSON parse error: {0}")]
     Json(#[from] serde_json::Error),

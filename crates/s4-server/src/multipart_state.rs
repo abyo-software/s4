@@ -57,7 +57,12 @@ use crate::tagging::TagSet;
 /// fingerprint (S3 puts it on the wire on every PUT/GET response) and
 /// requires no zeroization. Custom `PartialEq` ignores the `Zeroizing`
 /// wrapper so existing tests that match on the variant keep compiling.
+/// v1.0 stability: `#[non_exhaustive]` — new SSE modes (e.g. SSE-S3 /
+/// AWS-managed keys, or additional KMS providers) may be added in
+/// minor releases. Downstream callers must include a `_ =>` arm when
+/// matching on this enum.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum MultipartSseMode {
     /// Plaintext multipart. Backend stores raw framed bytes.
     None,
