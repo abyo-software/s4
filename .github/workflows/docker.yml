@@ -175,6 +175,21 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: ${{ matrix.platform }}
+          # v0.11-audit-R2 P2 (Codex): OCI image-config labels
+          # MUST attach at per-arch build time. The merge step's
+          # `docker buildx imagetools create` only assembles
+          # existing manifests; it can't retroactively patch
+          # image-config labels. Hard-code the static labels here
+          # (only `title` + `description` vary by flavor —
+          # parameterised on `matrix.flavor`).
+          labels: |
+            org.opencontainers.image.title=s4${{ matrix.flavor == 'gpu' && '-gpu' || '' }}
+            org.opencontainers.image.description=Drop-in S3-compatible storage gateway with GPU-accelerated transparent compression (${{ matrix.flavor }} build)
+            org.opencontainers.image.vendor=abyo-software
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.source=https://github.com/abyo-software/s4
+            org.opencontainers.image.documentation=https://github.com/abyo-software/s4#readme
+            org.opencontainers.image.revision=${{ github.sha }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           # Scope the cache per arch + flavor so each runner builds
           # on a hot cache for its own arch without poisoning other
@@ -302,13 +317,10 @@ jobs:
             # tag pair lands on ghcr.io.
             type=raw,value=${{ inputs.image_tag_override }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.image_tag_override != '' }}
             type=raw,value=v${{ inputs.image_tag_override }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.image_tag_override != '' }}
-          labels: |
-            org.opencontainers.image.title=s4${{ matrix.flavor == 'gpu' && '-gpu' || '' }}
-            org.opencontainers.image.description=Drop-in S3-compatible storage gateway with GPU-accelerated transparent compression (${{ matrix.flavor }} build)
-            org.opencontainers.image.vendor=abyo-software
-            org.opencontainers.image.licenses=Apache-2.0
-            org.opencontainers.image.source=https://github.com/abyo-software/s4
-            org.opencontainers.image.documentation=https://github.com/abyo-software/s4#readme
+          # v0.11-audit-R2 P2: OCI labels removed from merge-step
+          # metadata-action — `imagetools create` cannot retroactively
+          # patch image-config labels. Labels now attach at per-arch
+          # build time in the `build` job above.
 
       # Combine per-arch digests into a multi-arch manifest and push
       # under each computed tag. `imagetools create` builds the

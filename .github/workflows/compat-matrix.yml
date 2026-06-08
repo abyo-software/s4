@@ -70,7 +70,16 @@ env:
   # shared operator-provided bucket) don't collide on content even
   # if they share the key.
   TEST_BUCKET: s4-compat-test
-  TEST_KEY: compat/large.bin
+  # v0.11-audit-R2 P2 (Codex): run-scoped key. Was a fixed
+  # `compat/large.bin` — on real-cloud rows the bucket is
+  # operator-pre-provisioned and reused across weekly runs, so a
+  # previous run's sidecar at `compat/large.bin.s4index` could
+  # satisfy the post-PUT HEAD check (write_sidecar is fail-open)
+  # even when the current run failed to write a fresh sidecar.
+  # `${{ github.run_id }}` makes the key unique per execution so
+  # the sidecar HEAD provably exercises the current run's write
+  # path.
+  TEST_KEY: compat/run-${{ github.run_id }}/large.bin
   # 8 MiB body — the server only writes `<key>.s4index` when the
   # frame index has > 1 entry (see service.rs gate), and
   # `pick_chunk_size` picks a 4 MiB chunk for any body in the
