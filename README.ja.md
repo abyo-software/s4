@@ -1,8 +1,12 @@
 # S4 — Squished S3
 
+> ⚠️ **このファイルは v0.2.0 時点で停止しており、 内容は v1.0 と大きく乖離しています。**
+> 最新かつ正確な情報は英語版 [README.md](README.md) を参照してください。
+> 翻訳の更新は v1.x の roadmap item です — issue tag `i18n-ja` で進捗を追跡できます。
+
 GPU 透過圧縮の AWS S3 互換ストレージゲートウェイ。
 
-## Status
+## Status (OUTDATED — see README.md for v1.0 status)
 
 **v0.2.0 release 済** (2026-05-12)。crates.io publish: `s4-server` /
 `s4-codec` / `s4-config` 全 0.2.0、`cargo install s4-server` で `s4`
