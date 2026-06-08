@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780930147897,
+  "lastUpdate": 1780931032491,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -6326,6 +6326,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "f9c14a3b89bb4b60359444180b6fd82c17446781",
+          "message": "docs(v1.0): re-audit fix wave — 2×P1 + 7×P2 closure\n\nAdversarial re-audit on the v1.0 readiness work returned verdict C\nwith two P1 + seven P2 findings. This commit closes all 9.\n\n## P1 fixes (blocking)\n\nP1-1 — Fabricated `with_backend` in S4Service freeze table.\n`with_backend` does not exist anywhere in the workspace; the freeze\ntable at README.md§Stability claimed it as part of the constructor\nsignature. Rewrote the S4Service row to enumerate the actual builder\nAPI (every `pub fn with_*` visible on S4Service — 23 builders, each\nlocked at its `fn(self, …) -> Self` signature). Adding a new\n`with_*` builder remains additive (minor); rename or signature\nchange is v2.0. Also added the `DEFAULT_MAX_BODY_BYTES` +\n`DEFAULT_REPLICATION_MAX_CONCURRENT` constants which the binary\nrelies on.\n\nP1-2 — cargo-audit-ignores.md had 3 fabricated advisory titles + a\n4th with wrong version and scope. Rewrote the doc against the\nactual `cargo audit --json` output and `cargo tree -i` dep paths:\n\n- RUSTSEC-2026-0098: real title \"Name constraints for URI names\n  were incorrectly accepted\" (was: \"rustls-webpki Time constructor\n  panic\"). Dep path verified via cargo tree against\n  rustls-webpki@0.101.7 ← rustls 0.21 ← aws-smithy-http-client.\n- RUSTSEC-2026-0099: real title \"Name constraints were accepted\n  for certificates asserting a wildcard name\" (was: \"PKCS#7 cert\n  chain validation\").\n- RUSTSEC-2026-0104: real title \"Reachable panic in certificate\n  revocation list parsing\" (was: \"name-constraint validation\",\n  which is actually 0098/0099). Updated mitigation: S4 does not\n  opt-in to rustls CRL checking, so the panic path is unreachable.\n- RUSTSEC-2025-0134: scope was wrong. Doc had claimed \"1.x, dev-\n  only test fixtures\"; actual is `rustls-pemfile = \"2\"` (2.2.0 in\n  Cargo.lock), used at runtime in `crates/s4-server/src/tls.rs`\n  to load the production HTTPS listener cert/key. Risk acceptance\n  still holds (operator-controlled PEM files, not adversary-\n  controlled) but the rationale needed grounding in reality.\n\nAdded a \"Verification\" section at the bottom with the exact\ncommands to re-verify every fact in the doc.\n\n## P2 fixes\n\nP2-1 — S3 API matrix said \"Bucket replication ✅ Full\" while the\nstability section explicitly excludes replication from v1.0 freeze.\nUpdated the matrix row to \"⚠ experimental\" with the same scaffold-\nonly qualifier.\n\nP2-2 — F6 cross-major caveat (b) said \"v0.8.x readers do not\nrecognize S4E6\". S4E6 was introduced in v0.8.1 (commit a7333f2),\nso only v0.8.0 is missing it. Updated to \"v0.8.1+ recognizes\nS4E6; only the v0.8.0 hot-fix line lacks support\".\n\nP2-3 — F6 cross-major caveat (a) inverted wording about\n--sse-chunk-size. The default is 1_048_576 (chunked is on by\ndefault whenever SSE-S4 is active), so the previous wording\n\"deployments that have not enabled --sse-chunk-size > 0\" was\ninverted. Rephrased to \"deployments without an SSE-S4 keyring\nconfigured never emit v3 sidecars; SSE-S4 deployments DO emit v3\nby default\".\n\nP2-4 — Freeze surprise on 23 unfrozen `pub mod`. Added a new\nsub-section \"Modules NOT in the freeze list\" right after the\nfreeze table, enumerating every other `pub mod` in s4-server\nand stating explicitly: they exist for binary-and-tests' needs,\nare not part of the v1.0 contract, and may break in any minor.\nConsumers who depend on them should pin `=1.x.y`. Path to\npromotion is opening an issue with the use case.\n\nP2-5 — README.ja.md was stuck at v0.2.0 (2026-05-12), wildly\ncontradicting the v1.0 claim. Added an outdated-banner at top\nof the JP file pointing readers to README.md for current\ninformation, and dropped the two cross-link references to JP\nfrom README.md until the translation is updated (tracked as\n`i18n-ja` for v1.x).\n\nP2-6 — `VerifyReport` (return type of frozen `verify_sidecar`)\nwas missing from the s4_server::repair freeze list. Added.\nAlso added an explicit \"public structs are NOT\n`#[non_exhaustive]`; field additions are v2.0 territory\" clause\nto the repair row so the asymmetry vs the public enums is\ndocumented rather than implicit.\n\nP2-7 — `SharedSseKey` (= `Arc<SseKey>`, parameter type of\nfrozen `S4Service::with_sse_key`) and `S4E6Header<'a>` (return\ntype of frozen `parse_s4e6_header`) were missing from the\ns4_server::sse freeze list. Added both, with explicit hints\npointing to the frozen signatures that reach them.\n\n## Out of scope this commit\n\n- P3 (post-cut nice-to-have) items deferred: ferro_compress::Error\n  + s4-config::CompressionMode non_exhaustive hygiene; additional\n  repair constants in freeze; #[non_exhaustive] on the public\n  structs noted above (left as documented-asymmetry per P2-6\n  treatment); S4F3 / S4E7 / S4E8 forward-compat clarification.\n- F9 (workspace version bump) still deferred to the cut commit per\n  the F9 rule of atomic version-bump-with-cut.\n\nAfter re-audit signs off, cut commit follows.",
+          "timestamp": "2026-06-08T23:56:13+09:00",
+          "tree_id": "6b37fe2bb0baa9fcc260fd7e24b8cb4e3fb7967f",
+          "url": "https://github.com/abyo-software/s4/commit/f9c14a3b89bb4b60359444180b6fd82c17446781"
+        },
+        "date": 1780931031951,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 58380,
+            "range": "± 5541",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 46241,
+            "range": "± 1662",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 385,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2153995,
+            "range": "± 30663",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 28678485,
+            "range": "± 93641",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 152131,
+            "range": "± 386",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 52124508,
+            "range": "± 2032960",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 507126173,
+            "range": "± 1510895",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 2500065,
+            "range": "± 22275",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 26778,
+            "range": "± 1760",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 31486,
+            "range": "± 1477",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 398,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 536506,
+            "range": "± 4904",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1414545,
+            "range": "± 27203",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 152168,
+            "range": "± 235",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 14104214,
+            "range": "± 962535",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 26442095,
+            "range": "± 138075",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 2529899,
+            "range": "± 14406",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1356395,
+            "range": "± 13089",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2168039,
+            "range": "± 42656",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 423034353,
+            "range": "± 4137477",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 118,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 5852,
+            "range": "± 140",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 788,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 12309,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2232,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 17203,
+            "range": "± 205",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 68575,
+            "range": "± 468",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 561,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4943,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19610,
+            "range": "± 75",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 30,
             "range": "± 0",
             "unit": "ns/iter"
           }
