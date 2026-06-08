@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780937159685,
+  "lastUpdate": 1780937729273,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -7004,6 +7004,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 24,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "945c583ca3a9d79eb88e7b35b91e70f737d7c26a",
+          "message": "docs(v1.0): round-4 fix wave — 4 P2 closures (Python names, enum list, SECURITY policy, FrameIndex fields)\n\nRound 4 (Opus + Codex dual cross-review) confirmed all 11 round-3 fixes\nlanded correctly and surfaced 4 P2 doc-accuracy findings:\n\n- Opus NF-NEW-1 (P2): README s4-codec freeze row claimed Python public\n  APIs as `PyCpuZstd` / `PyCpuGzip`, which are the Rust struct names.\n  Actual Python-importable names are `CpuZstd` / `CpuGzip` (per\n  `#[pyclass(name = \"...\")]` at crates/s4-codec-py/src/lib.rs:147,211).\n  README's own usage example uses the correct names; the freeze table\n  was self-contradicting. Fixed by spelling out: Python-side names\n  `CpuZstd` + `CpuGzip` are the contract, with a parenthetical\n  noting the underlying Rust types. Also added `__version__` to the\n  enumerated Python public surface (was omitted).\n\n- Opus NF-NEW-2 (P2): The new \"v0.x → v1.0 source compatibility note\"\n  enumerated 29 enums but omitted 4 that ALSO received non_exhaustive\n  in commits ce30dde / db06912: CompareOp, GpuSelectError,\n  SelectInputFormat, SelectOutputFormat. The commit message promised\n  \"enumerating every affected enum\" — promise was unmet. Updated the\n  list to 33 total enums (6 s4-codec + 27 s4-server), grouped by\n  crate for clarity.\n\n- Codex P2 (SECURITY.md:27): \"S4 is currently pre-1.0\" contradicted\n  the README v1.0 stability claim. Rewrote the Supported Versions\n  section to match the v1.0 contract: rolling window of latest\n  minor + previous minor, patch releases on the affected minor's\n  release branch.\n\n- Codex P3 (FrameIndex inner-type field freeze): the newly-added\n  FrameIndexEntry / SseChunkBinding / RangePlan / EncryptedRangePlan\n  entries didn't explicitly say their public field sets were frozen\n  (unlike the s4_server::repair row which does). Added the same\n  \"field sets + inherent method signatures frozen; additions /\n  removals / renames are v2.0\" rule explicitly.\n\n## Cut-commit reminders (deferred; not in this commit)\n\n- Opus NF-NEW-3 (P3): CHANGELOG.md needs a v1.0.0 entry. Will be\n  added in the cut commit itself (atomic with the version bump,\n  per F9). Drafted topics for that entry: 33 enums received\n  non_exhaustive, freeze table introduced in Stability section,\n  test-only helpers gated (F3), service_arc/SharedService path\n  correction, source-break migration note, backend compat matrix\n  table, cargo-audit-ignores doc, Garage + Ceph best-effort,\n  binding-specific Python/WASM API freeze.\n\nAfter this wave, round 5 follows per user instruction\n\"Finding 0 になるまでレビュー回して\".",
+          "timestamp": "2026-06-09T01:47:25+09:00",
+          "tree_id": "62e2279145304ba2df0f4703e08d2cb616502489",
+          "url": "https://github.com/abyo-software/s4/commit/945c583ca3a9d79eb88e7b35b91e70f737d7c26a"
+        },
+        "date": 1780937728881,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 56196,
+            "range": "± 4152",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 55378,
+            "range": "± 3797",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 368,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2750808,
+            "range": "± 43076",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 41749382,
+            "range": "± 102226",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192348,
+            "range": "± 1813",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 52519848,
+            "range": "± 1195930",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 754466047,
+            "range": "± 2469943",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3069863,
+            "range": "± 16765",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 32269,
+            "range": "± 2692",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 41969,
+            "range": "± 2972",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 379,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 574922,
+            "range": "± 8604",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1555436,
+            "range": "± 42241",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192358,
+            "range": "± 1791",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12324503,
+            "range": "± 80214",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27066259,
+            "range": "± 482517",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3074983,
+            "range": "± 21529",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1596102,
+            "range": "± 19037",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2546675,
+            "range": "± 31634",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 355802334,
+            "range": "± 5557070",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 139,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 7988,
+            "range": "± 37",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 954,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 14802,
+            "range": "± 128",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2565,
+            "range": "± 162",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 22696,
+            "range": "± 415",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 91083,
+            "range": "± 157",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 591,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4577,
+            "range": "± 140",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 18321,
+            "range": "± 81",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
             "range": "± 0",
             "unit": "ns/iter"
           }
