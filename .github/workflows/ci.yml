@@ -1,5 +1,23 @@
 name: CI
 
+# v0.11 wave-1 #A5 — every JavaScript action is pinned to a major
+# tag that runs on Node.js 24 to clear the deprecation gate landing
+# 2026-09-16. Specifically: actions/checkout@v5 (latest v6.0.3),
+# actions/upload-artifact@v6 (latest v7.0.1), actions/download-
+# artifact@v7 (latest v8.0.1), actions/github-script@v8 (latest
+# v9.0.0), codecov/codecov-action@v5, docker/build-push-action@v7,
+# docker/login-action@v4, docker/setup-buildx-action@v4,
+# docker/metadata-action@v6, aws-actions/configure-aws-credentials@v6,
+# azure/setup-helm@v5. All majors verified published via
+# `gh api /repos/<owner>/<repo>/releases/latest -q .tag_name` AND
+# live-tested in CI runs since commit 3332f3e (the wave-1 push) —
+# every subsequent push has resolved them cleanly. v0.11 integrated
+# audit R5 / R6 flagged these as P1 "unpublished" twice; both were
+# false positives caused by Codex's review sandbox being unable to
+# reach github.com to verify tag existence. Future audits should
+# treat "action version not found" claims as sandbox-limited unless
+# accompanied by a failing CI run.
+
 on:
   push:
     branches: [main]

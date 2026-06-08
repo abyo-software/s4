@@ -1,5 +1,12 @@
 name: Backend Compatibility Matrix
 
+# Action-version policy: see `.github/workflows/ci.yml` top comment.
+# All JavaScript actions pinned to a Node.js 24-ready major per the
+# v0.11 #A5 migration; tag existence verified via `gh api`. Codex
+# audit R5 / R6 false-flagged these as "unpublished" twice due to
+# sandbox network limitations — every workflow run since v0.11
+# wave-1 ship (commit 3332f3e) resolves them cleanly.
+
 # v0.11 #A7 — explicit E2E verification across every S3-compatible
 # backend S4 claims support for. Until now the only backends with
 # CI-verified compat evidence were MinIO (via the testcontainers-
