@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780886896710,
+  "lastUpdate": 1780887127661,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -4518,6 +4518,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "3fceddd517f6c082945b9ab40af6f2a8152f3c10",
+          "message": "fix(audit): v0.11-R1 P2 — restore SLSA + SBOM on per-arch builds\n\nCodex R1 integrated audit caught: the v0.10.0 docker.yml\nnative-runner rewrite dropped `provenance: mode=max` + `sbom: true`\nfrom the per-arch build step. `docker buildx imagetools create`\nin the merge step assembles existing manifests but cannot\nretroactively add attestations — every v0.10.0 release image\nwould have lost the supply-chain metadata the README + workflow\ncomments still promised.\n\nFix: attach `provenance: mode=max` + `sbom: true` to the\nper-arch `docker/build-push-action@v7` step. Each digest now\ncarries its own SLSA build attestation + SPDX SBOM, and the\nmerged multi-arch manifest references both transitively\n(visible via `docker buildx imagetools inspect`).\n\nComment block at the file top + merge-step header updated to\nreflect the per-arch-time attachment vs. the old \"applied on\nmerge step\" wording.\n\nCleanup recipe for shipped v0.10.0 image without attestations:\nre-trigger `gh workflow run docker.yml --ref main -f\nbuild_ref=v0.10.0 -f image_tag_override=0.10.0 -f push=true`\nfrom this commit forward — the per-arch rebuild attaches the\nattestations, the merged manifest under `:0.10.0` overwrites\nthe prior attestation-less manifest.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-08T11:44:25+09:00",
+          "tree_id": "9a007277b0fecf7e79f103bbccc3e4913a9d2bc6",
+          "url": "https://github.com/abyo-software/s4/commit/3fceddd517f6c082945b9ab40af6f2a8152f3c10"
+        },
+        "date": 1780887126810,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 54703,
+            "range": "± 3698",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 53507,
+            "range": "± 3081",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 366,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2653998,
+            "range": "± 22507",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 41767717,
+            "range": "± 536474",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192114,
+            "range": "± 230",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 51387636,
+            "range": "± 1087230",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 756137625,
+            "range": "± 2119769",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3072166,
+            "range": "± 41750",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 31521,
+            "range": "± 2708",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 37062,
+            "range": "± 2858",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 378,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 621113,
+            "range": "± 3612",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1553212,
+            "range": "± 28373",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192058,
+            "range": "± 375",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 13345098,
+            "range": "± 214807",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27013187,
+            "range": "± 83956",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3066242,
+            "range": "± 7148",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1503974,
+            "range": "± 23798",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2578123,
+            "range": "± 42969",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 340826798,
+            "range": "± 4285732",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 139,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 7207,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 791,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 12552,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 3121,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 24733,
+            "range": "± 550",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 100967,
+            "range": "± 1736",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 593,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4706,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 18894,
+            "range": "± 49",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
             "range": "± 0",
             "unit": "ns/iter"
           }
