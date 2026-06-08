@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780887660137,
+  "lastUpdate": 1780887783023,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -5196,6 +5196,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "157d7e7315b148ef1c5aaf2087414899e3286315",
+          "message": "fix(audit): v0.11-R4 P1 — refuse partial multi-arch CPU publish\n\nCodex R4 escalated the previous merge-job hardening from P2 to\nP1: my R3 fix (`have_digests.skip=true` only when ZERO artifacts\nexist) was too permissive for the CPU flavor. CPU's contract is\nmulti-arch (`linux/amd64` + `linux/arm64` per the README +\nDocker manifest); if CPU arm64 build legged-fails but CPU amd64\nsucceeds, my R3 code would have run `imagetools create` with\njust the amd64 digest, overwriting `:0.10.0` with an amd64-only\nmanifest — a silent degradation of the advertised multi-arch\nimage.\n\nFix: expected digest count per flavor:\n  - CPU expects 2 (amd64 + arm64)\n  - GPU expects 1 (amd64-only by design, nvCOMP redist constraint)\nSkip merge if `actual < expected`; emit a warning naming the\nflavor + count. Per-flavor independence preserved (GPU still\npublishes when CPU partially fails), but no flavor publishes\nwith a downgraded arch set.\n\nWhy P1: the bug would have silently shipped an amd64-only image\nunder the CPU `:<version>` tag on first CPU arm64 flake, and\nARM operators following the README install recipe would see\n\"unable to find image for linux/arm64\" with no warning that the\nrelease was incomplete.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-08T11:55:42+09:00",
+          "tree_id": "cb282071ee8b43d1e3e00af117d1c6c422b3b1a7",
+          "url": "https://github.com/abyo-software/s4/commit/157d7e7315b148ef1c5aaf2087414899e3286315"
+        },
+        "date": 1780887782154,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 58186,
+            "range": "± 5492",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 43723,
+            "range": "± 2387",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 392,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2145645,
+            "range": "± 24783",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 28559163,
+            "range": "± 579469",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 152194,
+            "range": "± 1037",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 52792058,
+            "range": "± 347950",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 504109835,
+            "range": "± 1202009",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 2454241,
+            "range": "± 13177",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 25911,
+            "range": "± 2438",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 31382,
+            "range": "± 1639",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 393,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 529251,
+            "range": "± 6015",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1382592,
+            "range": "± 26505",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 152284,
+            "range": "± 467",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12882423,
+            "range": "± 315830",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 25949205,
+            "range": "± 224365",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 2457146,
+            "range": "± 15992",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1348549,
+            "range": "± 14622",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2149025,
+            "range": "± 15915",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 395390138,
+            "range": "± 4329297",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 118,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 5856,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 784,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 12227,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2426,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 18697,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 74500,
+            "range": "± 136",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 596,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4579,
+            "range": "± 95",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19184,
+            "range": "± 84",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 41,
             "range": "± 0",
             "unit": "ns/iter"
           }
