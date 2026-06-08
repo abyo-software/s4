@@ -24,9 +24,7 @@ advisory unless requested otherwise.
 
 ## Supported versions
 
-S4 is currently pre-1.0. We provide security fixes for the **latest commit on
-`main`**. Once a stable release is cut (1.0+), the policy will expand to cover
-the latest minor release line.
+S4 is at **v1.0** with a SemVer-stable surface (see [README.md §Stability](README.md#stability--v10-guarantees)). We provide security fixes for the **latest minor release on the v1.x line** plus the previous minor (rolling window of two minors). Patch releases (e.g. v1.0.1) are cut from the affected minor's release branch. The `main` branch always carries the most recent fixes; if you need a fix that hasn't been backported yet, file an issue and we'll prioritize the backport.
 
 ## Known hardening
 
