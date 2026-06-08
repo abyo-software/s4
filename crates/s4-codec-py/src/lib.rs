@@ -2,14 +2,14 @@
 // for PyErr` is identity. The clippy warning is intrinsic to the binding
 // idiom; suppress at file scope.
 #![allow(clippy::useless_conversion)]
-//! Python bindings for `s4-codec` (v0.4 #23).
+//! Python bindings for `s4-codec`.
 //!
 //! Exposes the CPU codecs (`CpuZstd`, `CpuGzip`) and a `gpu_available()`
-//! helper. GPU codec classes (`NvcompZstd`, `NvcompBitcomp`,
-//! `NvcompGDeflate`) are gated behind the `nvcomp-gpu` cargo feature so
-//! the default `pip install s4-codec` wheel doesn't require a CUDA toolchain
-//! at build time. Build with `maturin build --release --features nvcomp-gpu`
-//! on a machine with `NVCOMP_HOME` set to opt in.
+//! helper. GPU codec classes are intentionally NOT exposed in v1.0 — the
+//! `nvcomp-gpu` cargo feature on this crate forwards to the underlying
+//! `s4-codec` GPU paths for the server build, but the Python module's
+//! runtime classes remain CPU-only. See `crates/s4-codec-py/README.md`
+//! for the rationale; GPU-Python exposure is a v1.x roadmap candidate.
 //!
 //! # Async bridge
 //!

@@ -148,18 +148,12 @@ doesn't make the call async-aware.
 
 ## Supported codecs
 
-| Codec | Default | Requires `--features nvcomp-gpu` |
-|---|---|---|
-| `CpuZstd` | ✓ | — |
-| `CpuGzip` | ✓ | — |
-| `NvcompZstd` | — | ✓ + CUDA 12.x at runtime |
-| `NvcompBitcomp` | — | ✓ + CUDA 12.x at runtime |
-| `NvcompGDeflate` | — | ✓ + CUDA 12.x at runtime |
+| Codec | Default |
+|---|---|
+| `CpuZstd` | ✓ |
+| `CpuGzip` | ✓ |
 
-Use `gpu_available() -> bool` at runtime to confirm a CUDA-capable GPU is present
-before constructing a GPU codec — building the wheel with `--features nvcomp-gpu`
-on a host with no GPU still produces a wheel that loads but raises at codec
-construction time.
+The GPU codecs (`nvcomp-zstd`, `nvcomp-bitcomp`, `nvcomp-gdeflate`) are intentionally **not** exposed as Python classes in v1.0 — they require a CUDA toolchain at build time and a GPU at runtime, which is a poor fit for the `pip install s4-codec` packaging story. The `nvcomp-gpu` feature on the underlying Rust crate exists for the server path; the Python module's runtime classes are the two CPU codecs above. `gpu_available() -> bool` is exposed for clients that want to gate their own logic on GPU presence (e.g. to decide whether to route a workload through the `s4` server gateway instead of the in-process Python decoder), but it does not enable any new Python class on its own. GPU codec exposure in Python is a v1.x roadmap candidate.
 
 ## Publishing status
 

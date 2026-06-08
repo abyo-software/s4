@@ -9,9 +9,11 @@ This crate is the WASM-target sibling of `s4-codec` and shares the same
 
 ## Status
 
-- v0.4 #24 — initial cut.
+- v1.0 — frozen public API (see [main README §Stability](../../README.md#stability--v10-guarantees)
+  for the cross-crate v1.0 contract).
 - API: `decompressFramed`, `decompressSingle`, `supportedCodecs`,
-  `supportedFrameMagic`.
+  `supportedFrameMagic`. These four names are the v1.0 contract for this
+  binding; additions ship in v1.x minors, renames / removals ship in v2.0.
 - Codec subset (CPU only — no GPU in the browser):
   `passthrough`, `cpu-zstd`, `cpu-gzip`. Encountering a GPU-only codec
   (`nvcomp-zstd`, `nvcomp-bitcomp`, …) returns a hard error — route those
@@ -115,7 +117,8 @@ sample text shows up in the `<pre>`.
 
   Workaround: pre-chunk via `Uint8Array.subarray()` in JS and decompress per-chunk
   (each S4F2 frame is independently decodable when you know the frame boundaries).
-  A streaming decoder API is tracked as a v0.9+ follow-up.
+  A streaming decoder API is tracked as a v1.x roadmap item (see main README's
+  v1.x roadmap candidates).
 
 - **Browser-safe codec subset**: only `Passthrough`, `CpuZstd`, `CpuGzip` are
   exported. Encountering a GPU-codec frame (NvcompZstd / NvcompBitcomp / etc) in
@@ -124,7 +127,7 @@ sample text shows up in the `<pre>`.
 
 ## Publishing status
 
-- npm publish is **manual** (no CI automation as of v0.8.5):
+- npm publish is **manual** (no CI automation; automation is a v1.x roadmap candidate):
   ```sh
   cd crates/s4-codec-wasm
   wasm-pack build --release --target web
