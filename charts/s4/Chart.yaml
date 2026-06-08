@@ -9,9 +9,10 @@ type: application
 # `helm upgrade` with no override now points at a different image
 # repo (chart behavior change, not just appVersion drift).
 # 0.2.1: v0.10.0 cut — appVersion bump only, no chart-shape change.
-version: 0.2.1
+# 0.2.2: v0.11.0 cut — appVersion bump only, no chart-shape change.
+version: 0.2.2
 # appVersion tracks the s4-server release shipped on crates.io / ghcr.io.
-appVersion: "0.10.0"
+appVersion: "0.11.0"
 kubeVersion: ">=1.24.0-0"
 home: https://github.com/abyo-software/s4
 sources:

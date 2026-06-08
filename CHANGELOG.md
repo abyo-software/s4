@@ -7,9 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-v0.11 roadmap in progress — polish + maintenance: 32-bit
-runtime end-to-end smoke + GHA Node.js 24 migration + backend
-compatibility matrix expansion.
+## [0.11.0] — 2026-06-08
+
+Polish + maintenance cut. Wave-1 three-theme delivery (32-bit
+end-to-end smoke, GHA Node.js 24 migration, backend compat
+matrix) converged by a 6-round integrated audit (4 P2 + 1 P1
+real fixes, 2 false-positive rounds caused by Codex sandbox
+network limits — documented inline). Net diff vs v0.10.0:
+~12 files / ~1,400 lines across the GHA workflows + docs +
+composite actions. No production code changes.
+
+Headline additions:
+- **32-bit `s4-server` runtime end-to-end PUT/GET smoke** —
+  the v0.10 #A4 `--help`/`--version` smoke is now a full
+  MinIO-backed PUT/GET round-trip exercising the i686
+  hyper/rustls listener, aws-sdk-rust SigV4 signer, and
+  CPU-zstd codec paths.
+- **GHA Node.js 24 migration** — 11 JavaScript actions
+  bumped to their Node 24-ready majors ahead of the 2026-09
+  deprecation deadline. actionlint clean.
+- **Backend compatibility matrix CI** — new weekly workflow
+  exercises a PUT/GET + sidecar HEAD round-trip across
+  MinIO, Garage, Ceph RGW, Backblaze B2, Cloudflare R2, and
+  Wasabi. Docker tier runs every cron; real-cloud tier
+  gates on operator-provided secrets and skips silently
+  otherwise.
+
+Audit posture: per-feature audits (A4=3R, A5=1R, A7=2R) +
+6-round integrated audit catching SLSA/SBOM regression,
+OCI label regression, run-key staleness, merge-job
+coupling, partial multi-arch publish (P1). v0.11.0
+publishes from R6 (effective convergence after two
+sandbox-limited false-positive rounds).
+
+Cleanup recipe for shipped v0.9.0 / v0.10.0 images missing
+the labels + attestations the docker.yml regressions
+dropped: re-trigger `docker.yml` from this commit (`gh
+workflow run docker.yml --ref main -f build_ref=v0.10.0 -f
+image_tag_override=0.10.0 -f push=true`) — per-arch
+rebuilds attach the labels + SLSA + SBOM, merged manifest
+overwrites the prior labels-less manifest.
 
 ### Added
 
