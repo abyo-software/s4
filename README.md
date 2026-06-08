@@ -253,18 +253,22 @@ amd64). The package is public; no `imagePullSecrets` needed.
 
 ```bash
 helm install s4 ./charts/s4 \
-  --set image.tag=0.9.0 \
+  --set image.tag=1.0.0 \
   --set backend.endpointUrl=https://s3.us-east-1.amazonaws.com \
   --set backend.region=us-east-1
 kubectl port-forward svc/s4 8014:8014
 ```
+
+(Use `image.tag=1` for the floating major-line tag that auto-rolls forward
+across v1.x minors; the per-version, per-minor, and floating-major tag
+rules are defined in §Stability.)
 
 For the GPU image, override `image.tag` with the `-gpu` suffix and turn on
 GPU scheduling:
 
 ```bash
 helm install s4 ./charts/s4 \
-  --set image.tag=0.9.0-gpu \
+  --set image.tag=1.0.0-gpu \
   --set codec=nvcomp-zstd \
   --set gpu.enabled=true \
   --set backend.endpointUrl=https://s3.us-east-1.amazonaws.com
@@ -301,9 +305,9 @@ docker compose -f docker-compose.yml config > /dev/null
 docker compose -f docker-compose.gpu.yml config > /dev/null
 
 # Image smoke (run this after a release lands on ghcr.io)
-docker pull ghcr.io/abyo-software/s4:0.9.0
-docker run --rm ghcr.io/abyo-software/s4:0.9.0 --help
-docker run --rm ghcr.io/abyo-software/s4:0.9.0 --version
+docker pull ghcr.io/abyo-software/s4:1.0.0
+docker run --rm ghcr.io/abyo-software/s4:1.0.0 --help
+docker run --rm ghcr.io/abyo-software/s4:1.0.0 --version
 ```
 
 ### Python (pip)
