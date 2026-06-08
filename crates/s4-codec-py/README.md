@@ -75,7 +75,11 @@ pip install -e ".[dev]"
 pytest tests/
 ```
 
-GPU codecs require a `--features nvcomp-gpu` build:
+The `--features nvcomp-gpu` build flag forwards to the underlying
+`s4-codec-rs` GPU paths at the Rust level. In v1.0 this only affects
+what `gpu_available()` reports; the Python module does NOT add GPU
+codec classes when built with this feature (see the §Status note at
+the top of this file).
 
 ```sh
 maturin develop --release --features nvcomp-gpu
