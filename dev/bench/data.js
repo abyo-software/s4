@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780931320031,
+  "lastUpdate": 1780937159685,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -6778,6 +6778,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "e69ab933e22d8e51ea3438a84b76b4f7b0ec8225",
+          "message": "docs(v1.0): round-3 dual-reviewer fix wave — 4×P1 + 7×P2 closure\n\nRound 3 (Opus + Codex CLI dual cross-review) caught 11 new findings\nthe prior 3 rounds missed. This commit closes all of them. Following\nthe user's instruction \"Finding 0 になるまでレビュー回して\" (loop\nreview until findings = 0), this is the third fix wave; a 4th\nreview round will follow.\n\n## P1 fixes (4)\n\nNF-2 — S4Service freeze claimed Default impl + S4Service::default()\nchain that don't exist in the source (verified by `grep \"Default for\nS4Service\" crates/` returning nothing). Same fabrication species as\nthe original P1-1 with_backend finding. Rewrote the freeze opening\nto use the actual constructor: `S4Service::new(backend, registry,\ndispatcher) -> Self` with the full signature spelled out.\n\nNF-10 — Backend compat matrix marked AWS / B2 / R2 / Wasabi all as\n\"✓ gating\" on this upstream repo. Verified via `gh run view` that\nall four jobs skip in 3-5 seconds with \"opt-in\" annotations because\nthe repo has no AWS_E2E_* / B2_* / R2_* / WASABI_* secrets\nconfigured. Only MinIO actually gates on this repo. Reworded the\nupper compat-matrix table to be honest: \"⚠ opt-in. Gates ONLY when\n<secrets> are configured on the fork; this upstream repo has them\nNOT configured.\" Added a closing paragraph distinguishing this\nupstream repo's intentional no-shared-credentials posture from\nwhat a fork can opt in to.\n\nNF-7 / Codex #2 — S4Service freeze claims every with_* builder\nsignature is frozen; 13 of the 23 builders take Arc<ManagerType>\nparameters from modules the README explicitly lists as unfrozen\n(tagging / inventory / lifecycle / notifications / replication /\nmfa / cors / object_lock / kms / versioning / access_log /\nrate_limit / policy). Internally contradictory. Added an \"Important\ncaveat on builder parameter types\" paragraph to the S4Service row\nexplaining: builder signatures are frozen, but the manager\nconstructors / fields are not — consumers should pin =1.x.y if\nthey inject these managers.\n\nCodex #5 — Lower compat table at README.md:475-478 had Garage as\n\"✅ Verified via weekly compat-matrix CI\" while the upper Stability\ntable now says \"claimed but not currently CI-verified\". Fixed both\nthe AWS row (added opt-in qualifier) and the Garage row\n(distinguished provisioning gate from round-trip continue-on-error)\nand the Ceph row (noted both start AND round-trip are best-effort).\n\n## P2 fixes (7)\n\nNF-3 — README claimed `StreamingBlob` was a stable type alias in\n`s4_server::streaming`. Actually it's a private `use s3s::dto::\nStreamingBlob;` at streaming.rs:32; no pub type. Rewrote the\nstreaming row to explicitly note the functions take s3s::dto::\nStreamingBlob and that the type is governed by the s3s 0.13 row\nabove.\n\nNF-4 / Codex #4 — `.github/workflows/ci.yml` security-audit job\ncomment still called rustls-pemfile \"dev-only\". Round-1 fix wave\ncorrected the cargo-audit-ignores.md doc but missed the CI comment.\nUpdated to \"runtime dependency (rustls-pemfile 2.x, used at\nproduction HTTPS startup in tls.rs)\" and linked to the audit doc.\n\nNF-5 — Stability section said \"compat-matrix job's start-step\nalways gates\" but Ceph's start step has continue-on-error: true.\nReworded to \"gates for every backend except Ceph RGW\".\n\nCodex #1 / NF-8 — `s4-codec` row said Py and WASM bindings \"export\nthe same surface\" as the Rust crate. They don't — Py exports\nPyCpuZstd / PyCpuGzip / gpu_available + exception classes; WASM\nexports decompressFramed / decompressSingle / supportedCodecs /\nsupportedFrameMagic. Rewrote to \"bindings are versioned in\nlockstep; their binding-specific public APIs are frozen, but the\nbindings do NOT re-export the full Rust surface — only the\ndocumented subset\".\n\nCodex #3 — FrameIndex is frozen but its public fields use\nFrameIndexEntry + Option<SseChunkBinding>, and the frozen\nencode_index / decode_index family returns RangePlan +\nEncryptedRangePlan. Added these four reachable types to the\ns4-codec freeze list explicitly.\n\nCodex #6 — Adding #[non_exhaustive] to 30+ existing public enums\nis source-API-breaking for v0.x → v1.0 consumers who used exhaustive\nmatch without `_ =>` arms. Stability section previously documented\nonly wire caveats. Added a new \"v0.x → v1.0 source compatibility\nnote\" sub-section enumerating every affected enum and the\nmechanical consumer-side fix (add `_ =>` arm); explained why this\nis intentional (alternative would be never adding a variant within\nv1.x = worse contract).\n\nNF-9 — `s4-config` is published on crates.io and re-exported as\n`s4_server::config::*` but had no row in the freeze table. Added\nan s4-config row: CompressionMode + BackendConfig + S4Config struct\nfield sets frozen; S4Config::from_toml stub explicitly NOT frozen\n(currently bails with \"toml loading not implemented yet\"; the\neventual real implementation may change its error shape).\n\n## Round-3 reviewer agreement\n\nOf the 11 new findings, both reviewers independently caught:\n- S4Service builder param type contradiction (Codex #2 / Opus NF-7)\n- ci.yml rustls-pemfile dev-only comment stale (Codex #4 / Opus NF-4)\n- Py + WASM \"same surface\" overclaim (Codex #1 / Opus NF-8)\n\nOpus uniquely caught: NF-2 (Default::default fabrication), NF-3\n(StreamingBlob), NF-5 (start-step gate), NF-9 (s4-config), NF-10\n(cloud opt-in misrep), and verified NF-1 still closed.\n\nCodex uniquely caught: #3 (FrameIndex inner types), #5 (lower\nREADME compat table contradicts upper), #6 (source-break enum\nmigration caveat).\n\nRound 4 follows.",
+          "timestamp": "2026-06-09T01:37:53+09:00",
+          "tree_id": "88cea5617e1bb4b6b7df564231cd13a391895331",
+          "url": "https://github.com/abyo-software/s4/commit/e69ab933e22d8e51ea3438a84b76b4f7b0ec8225"
+        },
+        "date": 1780937158808,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 37706,
+            "range": "± 1758",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 45220,
+            "range": "± 4713",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 334,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 1760887,
+            "range": "± 20937",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 39251599,
+            "range": "± 59928",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 156168,
+            "range": "± 575",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 39362301,
+            "range": "± 293524",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 715701649,
+            "range": "± 5114499",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 2497000,
+            "range": "± 3955",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 21800,
+            "range": "± 781",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 25637,
+            "range": "± 690",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 333,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 450527,
+            "range": "± 36320",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1296284,
+            "range": "± 3949",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 156113,
+            "range": "± 251",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 8571660,
+            "range": "± 66448",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 21525190,
+            "range": "± 67362",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 2496888,
+            "range": "± 1826",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1161344,
+            "range": "± 14618",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 1775824,
+            "range": "± 19293",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 250140030,
+            "range": "± 838085",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 144,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 6955,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 707,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 10979,
+            "range": "± 41",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2420,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 18831,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 75091,
+            "range": "± 161",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 491,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4108,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 16196,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 24,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 24,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 24,
             "range": "± 0",
             "unit": "ns/iter"
           }
