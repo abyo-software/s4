@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780887432339,
+  "lastUpdate": 1780887660137,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -4970,6 +4970,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 24,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "08545ba9117612189f6fa399276fd4ed4c34d1f3",
+          "message": "fix(audit): v0.11-R3 P2 — propagate test-key + flavor-independent merge\n\nCodex R3 caught two follow-on P2s from R2:\n\n1. **compat-matrix run-scoped key NOT propagated to composite\n   action** — the R2 fix changed `env.TEST_KEY` to\n   `compat/run-${{ github.run_id }}/large.bin`, but the\n   `compat-roundtrip` composite action has its own input\n   default `compat/large.bin`. All 4 invocations omitted\n   `test-key:` so the action fell back to the stale default.\n   Real-cloud rows running against operator-pre-provisioned\n   buckets still had the original stale-state failure mode.\n   Fix: explicitly pass `test-key: ${{ env.TEST_KEY }}` to all\n   4 call sites (minio/garage/ceph + the real-cloud matrix\n   row).\n\n2. **`needs: build` couples CPU + GPU merges to the entire\n   build matrix** — if any build leg fails (e.g. CPU arm64\n   runner hiccup), both CPU AND GPU merges are skipped, even\n   though the GPU build leg succeeded and its digest artifact\n   exists. Per-flavor publication independence is lost. Fix:\n   change merge job's `if:` to\n   `always() && needs.build.result != 'cancelled' && ...` so\n   the matrix runs regardless of build outcome; each merge\n   leg then `continue-on-error: true`s the artifact download\n   and gates all subsequent steps (Buildx setup, login,\n   metadata extraction, imagetools create, inspect) on a new\n   `have_digests.outputs.skip` flag. Result: a missing\n   per-flavor digest set emits a `::warning::` and exits\n   cleanly without taking down the other flavor's publish.\n\nNet effect: CPU arm64 transient failures no longer prevent\nGPU publication, and vice versa. Cancellations still\npropagate (intentional — workflow cancel means stop).\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-08T11:53:14+09:00",
+          "tree_id": "79792d0dfa0238a490474209625dce31be519904",
+          "url": "https://github.com/abyo-software/s4/commit/08545ba9117612189f6fa399276fd4ed4c34d1f3"
+        },
+        "date": 1780887659740,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 55657,
+            "range": "± 3786",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 58411,
+            "range": "± 3304",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 363,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2825563,
+            "range": "± 426199",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 41789047,
+            "range": "± 258020",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192586,
+            "range": "± 706",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 54034280,
+            "range": "± 1641382",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 757403142,
+            "range": "± 4152462",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3199276,
+            "range": "± 89811",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 33123,
+            "range": "± 2801",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 40073,
+            "range": "± 3172",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 376,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 576059,
+            "range": "± 16199",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1567311,
+            "range": "± 60908",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192385,
+            "range": "± 531",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 13068350,
+            "range": "± 1559696",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27929505,
+            "range": "± 1286293",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3095223,
+            "range": "± 73226",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1540043,
+            "range": "± 24799",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2595409,
+            "range": "± 37831",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 363695561,
+            "range": "± 35351883",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 139,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 7392,
+            "range": "± 160",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 814,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13088,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 3314,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 25349,
+            "range": "± 118",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 101403,
+            "range": "± 444",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 592,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4549,
+            "range": "± 53",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 18012,
+            "range": "± 101",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 28,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
             "range": "± 0",
             "unit": "ns/iter"
           }
