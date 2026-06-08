@@ -106,6 +106,75 @@ inputs. See [the codec verdict table](#headline-numbers) above for the routing r
 | Existing object-storage compressors (MinIO S2, Garage zstd) are CPU-only | S4 supports nvCOMP **GPU** codecs — Bitcomp gives 3.6–7.5× on integer columns |
 | Analytics workloads need byte-range reads | S4 supports `Range` GET via sidecar frame index (parquet/ORC reader compatible) |
 
+## Stability — v1.0 guarantees
+
+S4 ships under the [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
+contract as of **v1.0.0**. That means the items below are stable for the
+v1.x line — any incompatible change to them ships under a **v2.0.0**
+release with migration guidance, not a v1.x patch.
+
+### What's stable (= v2.0 if broken)
+
+| Surface | Frozen at v1.0 |
+|---|---|
+| **Wire formats** on the backend | `S4F2` framed body + `S4P1` padding (multipart + single-PUT framed objects); `S4IX` v1 / v2 / v3 sidecar layouts; `S4E1` / `S4E2` / `S4E3` / `S4E4` / `S4E5` / `S4E6` SSE envelopes. A v1.x reader can read any byte stream another v1.x server has written, in either direction. **Cross-major back-compat caveats:** (a) v0.8.x readers handle `S4IX` v1 / v2 but return `UnsupportedVersion(3)` on v3 sidecars (introduced in v0.9 #106 for SSE-S4 chunked / `S4E6` partial-fetch); deployments that have not enabled `--sse-chunk-size > 0` never emit v3 and are bidirectionally compatible with v0.8.x. (b) v0.8.x readers do not recognize `S4E6` and will refuse SSE-S4 chunked objects. (c) v0.8.x server binaries can still read all v1.0-written framed bodies + v1/v2 sidecars + S4E1–S4E5 envelopes. |
+| **`s4` binary subcommands** (CLI surface) | `verify-sidecar`, `repair-sidecar`, `sweep-orphan-sidecars`, `verify-audit-log`, plus the long-running server's documented `--<flag>` set. New flags are additive (default off). |
+| **`s4_server::repair::*` public API** | `verify_sidecar`, `repair_sidecar` (and the `_with_keyring` variant), `sweep_orphan_sidecars`. Types: `RepairError`, `SidecarStatus`, `RepairReport`, `OrphanReason`, `OrphanReport`, `SweepReport`, `DeletePolicy`, `RepairSseBinding`. All public enums in this module are `#[non_exhaustive]` — adding a new variant in a minor release is **not** breaking (downstream `match` must use a catch-all arm). Library consumers can pin `s4-server = "1"` and rebuild against any v1.x without code changes. |
+| **`s4_server::service::S4Service` shape** | The `S4Service` struct, its constructor signature (`new` / `with_sse_key` / `with_backend`), the `SharedService` newtype, `SigV4aGate` / `SigV4aGateError`, `resolve_range`, and the wrapping pattern (`Arc<S4Service>` is the supported handle shape) are frozen. Any change to this shape ships under v2.0. The internal modules behind `S4Service` (request routing, multipart state, etc.) remain refactorable. |
+| **`s4_server::sse` public surface** | Types: `SseKey`, `SseKeyring`, `SharedSseKeyring`, `SseError`, `SseSource<'a>`. Functions: `compute_key_md5`, `encrypt`, `decrypt`, `encrypt_v2`, `parse_s4e6_header`, `peek_magic`. Constants: `SSE_C_ALGORITHM`, `ALGO_AES_256_GCM`, `SSE_MAGIC_V5`, `S4E5_HEADER_BYTES`, `S4E6_HEADER_BYTES`. New SSE envelopes (e.g. provisional `S4E7` chunked-KMS) ship as **additive** symbols and do not break the v1.x contract. |
+| **`s4_server::streaming` public surface** | `DEFAULT_S4F2_CHUNK_SIZE` constant, `streaming_compress_to_frames` + `streaming_compress_to_frames_with` functions. The `StreamingBlob` type alias remains stable. |
+| **`s4-codec` codec trait + format constants** | `Codec` trait shape, `CodecKind` enum (all `#[non_exhaustive]`), `CodecError`, `IndexError`, `FrameError`, `GpuSelectError`, `CompareOp`. Constants: `index::{SIDECAR_SUFFIX, MAX_FRAMES, MAX_ETAG_BYTES, ENTRY_BYTES, HEADER_FIXED_V1, HEADER_FIXED_V2, INDEX_VERSION, INDEX_VERSION_V1, INDEX_VERSION_V2}`. Items: `index::{FrameIndex, encode_index, decode_index}`, `multipart::FrameHeader` layout. Python (`s4-codec-py`) and WASM (`s4-codec-wasm`) bindings export the same surface and are frozen at v1.0 in lockstep. |
+| **HTTP API surface** | S3 wire compatibility — the [`s3s 0.13`](https://crates.io/crates/s3s/0.13.0) trait set S4 implements. PUT / GET / Range GET / multipart / SigV4 / SigV4a / `x-amz-checksum-*` / `x-amz-server-side-encryption-*` headers all preserved. **`s3s` is itself pre-1.0**; our v1.x contract is that we will continue to track the `s3s 0.13` trait surface that S4 currently implements, accepting backward-compatible additions in `s3s` minors. A `s3s` major bump (0.14, 1.0) that breaks our trait impls would itself trigger a v2.0 of S4 with a clear migration in `docs/migration/`. |
+| **Container image tags + Helm chart `values.yaml` keys** | `ghcr.io/abyo-software/s4:<major>.<minor>.<patch>` + `:<major>.<minor>` + `:latest` floating tag rules; GPU build sibling tags `:<major>.<minor>.<patch>-gpu`. The complete top-level `values.yaml` key set is frozen: `replicas`, `image.{repository, tag, pullPolicy, pullSecrets}`, `nameOverride`, `fullnameOverride`, `serviceAccount.{create, annotations, name}`, `backend.{endpointUrl, region}`, `codec`, `zstdLevel`, `dispatcher`, `logFormat`, `otlpEndpoint`, `gpu.{enabled, count, nodeSelector, runtimeClassName}`, `tls.{enabled, cert, key, existingSecret, certKey, keyKey}`, `policy.{json, existingConfigMap}`, `service.{type, port, annotations}`, `ingress.{enabled, className, annotations, hosts, tls}`, `resources.{requests, limits}`, `podAnnotations`, `podLabels`, `podSecurityContext`, `securityContext`, `nodeSelector`, `tolerations`, `affinity`, `extraEnv`, `extraVolumes`, `extraVolumeMounts`, `probes.{liveness, readiness}`. **Default values** may shift in a minor release (e.g. a probe tuning change to reduce flake); the **key shape** (key names + structure) is v2.0 territory. |
+
+### Backend compatibility matrix (CI-verified surface)
+
+[`compat-matrix.yml`](.github/workflows/compat-matrix.yml) runs a 1 PUT + 1
+GET + sidecar HEAD round-trip per backend through a live s4-server, on a
+weekly schedule and via `workflow_dispatch`. CI-verified backends as of
+v1.0:
+
+| Backend | Tier | CI status |
+|---|---|---|
+| MinIO | docker | ✓ gating |
+| AWS S3 | real cloud | ✓ gating (`aws-e2e.yml`) |
+| Backblaze B2 | real cloud | ✓ gating (operator-configured secrets) |
+| Cloudflare R2 | real cloud | ✓ gating (operator-configured secrets) |
+| Wasabi | real cloud | ✓ gating (operator-configured secrets) |
+| Garage | docker | ⚠ claimed but not currently CI-verified — `dxflrs/garage:v1.1.0` rejects `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` from current `aws-sdk-rust` (worked in v0.x against older garage); the round-trip step is `continue-on-error` until either s4-server pins `UNSIGNED-PAYLOAD` on the relay path or garage v1.2+ ships chunked-signed support. |
+| Ceph RGW | docker, best-effort | ⚠ claimed but not currently CI-verified — `quay.io/ceph/demo:latest-quincy` is unmaintained upstream and drifts on the streaming checksum wire shape (`XAmzContentSHA256Mismatch`). Real Ceph clusters operated by users should work because Ceph RGW production releases track the AWS wire spec; we need a maintained demo image or an operator-CI hook to re-introduce gating coverage. |
+
+The compat-matrix job's start-step always gates (provisioning failure = workflow failure); the round-trip step is `continue-on-error` only for the two backends above. The status here is the source of truth — if a backend isn't in this table as `✓ gating`, treat the README's other compat claims as "should work given S3 wire compatibility, not asserted by CI."
+
+### What's not promised (operator-tunable / explicitly opt-in)
+
+- Compression **ratios** + **throughput numbers**: these are workload-dependent and benchmark conditions are published, not promised SLAs.
+- Default values for `--max-body-bytes`, `--sse-chunk-size`, `--gpu-min-bytes`, and similar runtime tunables: defaults may shift in a minor release if a clear correctness / safety reason warrants it (the v0.9 #106-32bit fix that clamped to `isize::MAX` on 32-bit is an example of a default the SemVer-stable contract did not protect).
+- Implementation details inside frozen modules (private functions, struct field reordering, internal trait impls): the v1.0 freeze pins the *items listed above*, not "every line in `service.rs`". Re-arranging request-routing internals is fine in a minor.
+- Backend behavior beyond S3-wire-spec compliance (e.g. how a specific backend handles a particular SigV4 edge case): we test the documented backends (see §"Backend compatibility matrix"), but breakage caused by a backend-side change is not a v2.0 trigger on our end.
+- Experimental flags marked `--allow-legacy-*` or surfaced as `unstable` in `--help`: explicitly opt-in to behavior that may change.
+- Cross-region replication and the `replication.*` config surface: shipped as **experimental scaffolding** in v0.6 with the wire path stubbed in but no production-grade reconciliation. Excluded from v1.0 freeze; promotion to first-class (with Jepsen-class consistency tests) is on the v1.x roadmap below.
+- Security advisories accepted as risk-with-mitigation: see [`docs/security/cargo-audit-ignores.md`](docs/security/cargo-audit-ignores.md) for the 4 currently-ignored RUSTSEC advisories, each with rationale, mitigation, and upstream-tracking links. The ignore list is part of CI (`cargo audit` is a merge-block); changes to the list are visible in the diff.
+
+### v1.x roadmap candidates (= shipping under v1.x without breaking the contract above)
+
+- Chunked SSE-KMS envelope (provisional `S4E7` magic) + chunked SSE-C (`S4E8`) → Range GET partial-fetch fast-path for SSE-KMS / SSE-C, parallel to the v0.9 #106 work that enabled it for SSE-S4 chunked (`S4E6`).
+- `S4F3` streaming frame format → enables streaming PUT checksum verify for multipart `upload_part` (= closes the codec-API constraint documented in [`docs/security/streaming-checksum-coverage.md`](docs/security/streaming-checksum-coverage.md)).
+- 32-bit `s4-server` runtime promotion from advisory to required CI smoke (currently advisory per v0.11 #A4).
+- Per-action SHA pinning on the GHA workflows (supply chain hardening; v0.11 #A5 ended at the floating-major tag policy).
+- Cross-region replication promoted from experimental scaffolding to production-grade, with Jepsen-style consistency tests.
+- Re-introducing Garage + Ceph as `✓ gating` in the backend compat matrix once the upstream signature-interop drifts are resolved.
+- Additional codec backends (Snappy, LZ4 if user demand emerges).
+
+### Stability policy in practice
+
+- **Adding** a new codec / SSE envelope / sidecar version / CLI subcommand / lib function is **additive** = ships in a minor release. The v0.9 `verify-sidecar` subcommand + the v3 sidecar variant + the `S4E6` chunked envelope are examples of minor-release additions.
+- **Changing** the wire format of an existing magic (e.g. shrinking `S4F2`'s header) is **breaking** = ships in a major release.
+- **Removing** a CLI subcommand or a pub function is **breaking** = ships in a major release after a deprecation cycle.
+- **Default value drifts** for runtime tunables — not breaking per the carve-out above, but always called out in CHANGELOG `### Changed`.
+
+The audit trail for what counts as breaking lives in [`CHANGELOG.md`](CHANGELOG.md) per the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format S4 uses end-to-end. Migration recipes for any future v2.0 will live in `docs/migration/<from>-to-<to>.md`; no such file exists today because no breaking change is on the v1.x roadmap.
+
 ## Quick Start
 
 ### Install via cargo (Rust devs)
@@ -715,13 +784,17 @@ Honest list of workloads where S4 doesn't pay off:
 - **Single-region cold-storage-only** (everything goes straight to
   Glacier) — Glacier already prices low enough that the storage
   savings rarely pay for the compute / operational cost of running S4.
-- **Strict regulatory environments** until the **alpha disclaimer** in
-  Project Status lifts — S4 has no SOC2 / ISO27001 / FedRAMP audit
-  trail yet. If your compliance team's bar is "must have third-party
-  audit on file", S4 isn't there.
-- **As the only copy of irreplaceable data** — pre-1.0; pair with
-  backend-native versioning + replication. (Restated from Project
-  Status for emphasis.)
+- **Strict regulatory environments without third-party audit on file** —
+  v1.0 freezes the wire + API surface, but S4 has no SOC2 / ISO27001 /
+  FedRAMP audit trail yet. If your compliance team's bar is "must have
+  third-party audit on file", S4 isn't there.
+- **As the only copy of irreplaceable data, before a production
+  reference is on file** — until at least one public production
+  deployment reference lands (we're collecting them under issue label
+  `production-reference`), pair S4 with backend-native versioning +
+  replication. The v1.0 freeze is a contract on surface stability,
+  not a substitute for the operational track record that a reference
+  deployment provides.
 
 ## Durability, corruption recovery, and the repair tool
 
@@ -1155,36 +1228,49 @@ needed bytes from S3.
 
 ## Project Status
 
-> **Status: alpha / early-access.** Codepaths are well-exercised (600+
-> workspace tests, three deep-audit rounds, continuous fuzz farm), but
-> **no public production deployment yet**. Looking for design-partner
-> users to validate at TB-scale. If that's you, file an issue tagged
-> `early-adopter` and we'll prioritize the rough edges you hit.
-> Pre-1.0 — we may break the wire format if an audit round identifies
-> a structural issue (CHANGELOG will call this out explicitly when it
-> happens).
+> **Status: v1.0 — stable surface, no public production deployment
+> reference yet.** v1.0 is the SemVer-stable freeze of the wire formats,
+> library API surface, CLI subcommands, `s3s 0.13` HTTP trait set, and
+> Helm `values.yaml` key shape enumerated in the §"Stability" section
+> above. It is *not* a marketing claim that "S4 has been battle-tested
+> at every Fortune 500." The freeze means downstream consumers can pin
+> `s4-server = "1"` (or `ghcr.io/abyo-software/s4:1`, or
+> `s4 = "1"` in a `Cargo.toml`) and rely on the surface not changing
+> under them; first public production deployment references are still
+> being collected. If you're putting S4 into a TB-scale workload, please
+> file an issue tagged `production-reference` so we can list your
+> deployment alongside the audit + fuzz evidence below.
 
-- **Latest tag:** see [CHANGELOG.md](CHANGELOG.md) for the full
-  per-version history and the GitHub Releases page for the
-  cut-points. Cumulative scope through the current `0.8.x`
-  series is 540+ workspace tests + 14+ production milestones
-  covering S3-compatible PUT / GET / multipart / Select /
-  SSE-S3 / SSE-KMS / SSE-C / IAM Conditions / bucket policy /
-  versioning / object-lock / lifecycle / inventory /
-  notifications (Webhook / SQS / SNS) / replication / CORS /
-  tagging / MFA delete / SigV4 + SigV4a, plus Python
-  (`s4-codec-py`) and browser (`s4-codec-wasm`) bindings, all
-  on crates.io as the
+- **Release line:** [CHANGELOG.md](CHANGELOG.md) has the full
+  per-version history; the GitHub Releases page has the cut-points.
+  Cumulative scope through v1.0 is **714+ workspace tests + 14+
+  production milestones** covering S3-compatible PUT / GET / multipart
+  / Select / SSE-S3 / SSE-KMS / SSE-C / IAM Conditions / bucket
+  policy / versioning / object-lock / lifecycle / inventory /
+  notifications (Webhook / SQS / SNS) / CORS / tagging / MFA delete /
+  SigV4 + SigV4a, plus Python (`s4-codec-py`) and browser
+  (`s4-codec-wasm`) bindings, all on crates.io as the
   [`s4-server`](https://crates.io/crates/s4-server) /
   [`s4-codec`](https://crates.io/crates/s4-codec) /
-  [`s4-config`](https://crates.io/crates/s4-config) trio.
-- **Three rounds of deep audit** (`第一弾` / `第二弾` / `第三弾`)
-  closed in v0.8.2 → v0.8.5, plus a **pre-launch audit** (claude + codex
-  cross-review, tracker #111) in v0.8.7 → v0.8.8 — 70+ findings spanning
-  CRITICAL pre-auth state-machine bugs, HTTP wire hardening, GPU codec
-  safety, binding correctness, background-task lifecycle, and README
-  claim accuracy. CVE clean (`cargo audit`, see CI `security-audit` job)
-  except 3 upstream-blocked rustls-webpki advisories tracked in #91.
+  [`s4-config`](https://crates.io/crates/s4-config) trio. **Cross-region
+  replication** ships as experimental scaffolding (config surface + wire
+  stub) and is intentionally **excluded from the v1.0 freeze** — promotion
+  to production-grade is on the v1.x roadmap.
+- **Audit history:** three rounds of deep audit (`第一弾` / `第二弾` /
+  `第三弾`) closed in v0.8.2 → v0.8.5; pre-launch audit (claude + codex
+  cross-review, tracker #111) in v0.8.7 → v0.8.8; integrated audit
+  rounds R1–R6 across v0.9 / v0.10 / v0.11 cuts; v1.0 readiness audit
+  (Opus + Codex adversarial review) drove 13 surfaced findings to
+  closure — including the v1.0 stability section in this README, the
+  `#[non_exhaustive]` annotations on every public enum, gating
+  test-only helpers out of the public API contract, and qualifying the
+  backend compatibility matrix above. Findings spanned CRITICAL
+  pre-auth state-machine bugs, HTTP wire hardening, GPU codec safety,
+  binding correctness, background-task lifecycle, README claim
+  accuracy, and v1.0 freeze surface completeness. CVE clean
+  (`cargo audit`, see CI `security-audit` job); 4 advisories accepted
+  as risk-with-mitigation per
+  [`docs/security/cargo-audit-ignores.md`](docs/security/cargo-audit-ignores.md).
 - **Continuous fuzz farm** (v0.8.6) — 5 bolero targets running 24/7
   under a `systemd-user` slice budgeted at 8 cores / 30 GiB (1/4 of the
   build host). Coverage compounds across `Restart=always` wakeups; any
@@ -1198,11 +1284,11 @@ needed bytes from S3.
   `docs/perf-v0.8.png`).
 - **Suitable for** log archival, data lake / parquet/ORC analytics,
   drop-in transparent-compression proxy in front of any S3-compatible
-  backend — at the scale where you can absorb early-adopter rough
-  edges and report back. We do **not** yet recommend S4 as the only
-  copy of irreplaceable data; pair with backend-native replication
-  / versioning until v1.0 + the first public production deployment is
-  documented.
+  backend. The v1.0 surface freeze means you can integrate against a
+  stable contract; the "no public production reference yet" caveat
+  means we still recommend pairing with backend-native replication /
+  versioning for irreplaceable data until at least one production
+  reference is published.
 - **Roadmap is driven by audit findings + continuous fuzz** rather than
   feature checklists; file issues at
   https://github.com/abyo-software/s4/issues to influence it.
