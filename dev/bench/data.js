@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780938836428,
+  "lastUpdate": 1780939125046,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -7891,6 +7891,232 @@ window.BENCHMARK_DATA = {
             "name": "decode_index/4096f",
             "value": 19686,
             "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "af3c69b6cd435eecfb92488fe9893ff26b808c4b",
+          "message": "chore(release): cut v1.0.0 — SemVer-stable surface freeze\n\nv1.0 — the surface enumerated in README.md §\"Stability — v1.0\nguarantees\" is frozen for the v1.x line. Downstream consumers can\npin s4-server = \"1\" (or s4-codec = \"1\", or s4-config = \"1\", or\nghcr.io/abyo-software/s4:1) and rely on the surface not changing.\n\nThis is the cut commit. Per the F9 atomic-bump rule, version bumps\nland in a single commit:\n\n- Cargo.toml: workspace.version 0.11.0 → 1.0.0\n- crates/s4-server/Cargo.toml: internal dep pins (s4-codec,\n  s4-config) \"0.11\" → \"1\"\n- crates/s4-codec-wasm/Cargo.toml: internal dep pin\n  (s4-codec) \"0.11\" → \"1\"\n- crates/s4-codec-py/Cargo.toml: internal dep pin (s4-codec-rs)\n  \"0.11\" → \"1\" (already landed in round-7 wave; included here\n  again for atomicity)\n- charts/s4/Chart.yaml: appVersion \"0.11.0\" → \"1.0.0\";\n  chart's own version 0.2.2 → 0.2.3 (Helm-SemVer convention —\n  appVersion bump only, no chart-shape change)\n- Cargo.lock: regenerated via `cargo update --workspace`\n- CHANGELOG.md: full v1.0.0 entry per Keep-a-Changelog,\n  documenting the freeze surface, the 7-round audit history,\n  the added/changed/fixed work, and the v1.x roadmap candidates\n- SOCIAL_POSTS.md: outdated-banner added (v0.8.10-era drafts;\n  the \"pre-1.0\" wording inside the drafts contradicts the v1.0\n  claim and needs rewrite before being posted)\n\n## Audit convergence\n\n7 rounds of dual-reviewer (Opus + Codex) drove ~30 findings to\nclosure. Final round-7 verdict: Codex C (only blocker = this\ncommit's version bump), Opus A (findings = 0, cut now). The\naudit-cycle-pattern memory (\"5-8 rounds normal for convergence\")\nheld: this is round-cut at #7, well inside the band.\n\nNet commit stack since v0.11.0 base (commit 50d728b):\n- 5889cab fix(v1.0): F2 — annotate service/sse/streaming as freeze candidates\n- 65f972b fix(v1.0): F3 — gate test-only helpers out of public API contract\n- ce30dde fix(v1.0): F1 — non_exhaustive on codec public enums\n- db06912 fix(v1.0): F1 — non_exhaustive on server public enums\n- b950b0c fix(v1.0): F14 — compat-matrix Garage NODE_ID parse + Ceph best-effort\n- 8c6b930 docs(v1.0): F5-F12 — README rewrite + audit ignores doc + Garage best-effort\n- f9c14a3 docs(v1.0): re-audit fix wave — 2×P1 + 7×P2 closure\n- 2dde5c9 docs(v1.0): NF-1 — service_arc / SharedService path correction\n- e69ab93 docs(v1.0): round-3 dual-reviewer fix wave — 4×P1 + 7×P2 closure\n- 945c583 docs(v1.0): round-4 fix wave — 4 P2 closures\n- e6b356f docs(v1.0): round-5 fix wave — scope-explicit freeze + 4 doc closures\n- fef44ad docs(v1.0): round-6 fix wave — 2×P2 + 1×P3 closure\n- d93c9eb docs(v1.0): round-7 fix wave — 2 P2 + 2 P3 closures\n- [this commit] chore(release): cut v1.0.0 — SemVer-stable surface freeze\n\nAfter this commit:\n- Tag v1.0.0 on this commit\n- Publish 4 crates: s4-codec, s4-config, s4-server, s4-codec-py\n  (s4-codec-wasm npm publish is manual + listed as v1.x roadmap)\n- GitHub Release notes from CHANGELOG.md v1.0.0 entry\n- ghcr.io image trigger (auto from tag via docker.yml workflow)",
+          "timestamp": "2026-06-09T02:10:45+09:00",
+          "tree_id": "e481a86a8678186d2df3e60cce2404661373aaf0",
+          "url": "https://github.com/abyo-software/s4/commit/af3c69b6cd435eecfb92488fe9893ff26b808c4b"
+        },
+        "date": 1780939123972,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 53819,
+            "range": "± 3546",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 56418,
+            "range": "± 7379",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 366,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2603990,
+            "range": "± 62734",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 41681571,
+            "range": "± 118720",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192297,
+            "range": "± 324",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 50684635,
+            "range": "± 1041265",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 753451585,
+            "range": "± 647793",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3068623,
+            "range": "± 7740",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 31339,
+            "range": "± 2712",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 37843,
+            "range": "± 3313",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 375,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 569152,
+            "range": "± 17338",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1546317,
+            "range": "± 22941",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192205,
+            "range": "± 2447",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 10987981,
+            "range": "± 82426",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 26068159,
+            "range": "± 77426",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3078051,
+            "range": "± 9180",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1599713,
+            "range": "± 17497",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2666158,
+            "range": "± 73605",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 339286383,
+            "range": "± 1699724",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 140,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 12335,
+            "range": "± 255",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 800,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 12686,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2997,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 22711,
+            "range": "± 366",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 90905,
+            "range": "± 1618",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 589,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 5053,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19694,
+            "range": "± 38",
             "unit": "ns/iter"
           },
           {
