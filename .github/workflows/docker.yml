@@ -44,10 +44,13 @@ name: Docker images (ghcr.io)
 # fast incremental rebuilds within a release line without persisting
 # layers in any external registry.
 #
-# Provenance / SBOM: enabled on the merge step (`provenance: true`,
-# `sbom: true`) so the resulting multi-arch manifest carries an SLSA
-# build attestation + SPDX SBOM that anyone pulling from ghcr.io can
-# inspect via `docker buildx imagetools inspect`.
+# Provenance / SBOM: applied at per-arch build time (`provenance:
+# mode=max`, `sbom: true`) — `docker buildx imagetools create` in
+# the merge step combines existing manifests but cannot
+# retroactively add attestations, so each per-arch digest carries
+# its own SLSA build attestation + SPDX SBOM and the merged
+# multi-arch manifest references both. Inspect via
+# `docker buildx imagetools inspect`.
 
 on:
   push:
@@ -178,6 +181,17 @@ jobs:
           # matrix entries' layer reuse.
           cache-from: type=gha,scope=docker-${{ matrix.flavor }}-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=docker-${{ matrix.flavor }}-${{ matrix.arch }}
+          # v0.11-audit-R1 P2 (Codex): SLSA build provenance + SPDX
+          # SBOM MUST attach at per-arch build time. `docker buildx
+          # imagetools create` in the merge step combines existing
+          # manifests but cannot retroactively add attestations —
+          # dropping these here in the v0.10.0 native-runner rewrite
+          # would have silently degraded the release-artifact
+          # supply-chain guarantees the comments + README still
+          # promise. Each per-arch digest now carries its own
+          # attestation, and the merged manifest references both.
+          provenance: mode=max
+          sbom: true
 
       # Build-only smoke (workflow_dispatch with push=false) skips
       # both the push-by-digest output above and the artifact upload
@@ -216,8 +230,9 @@ jobs:
 
   # Per-flavor merge: download all per-arch digests for the flavor,
   # assemble a multi-arch image manifest under the metadata-action
-  # tags, push to ghcr.io. SLSA provenance + SPDX SBOM ride along on
-  # the merged manifest.
+  # tags, push to ghcr.io. SLSA provenance + SPDX SBOM are attached
+  # to each per-arch digest at build time (v0.11-audit-R1 P2 fix);
+  # the merged manifest references both attestations transitively.
   merge:
     name: merge manifest (${{ matrix.flavor }})
     runs-on: ubuntu-latest
