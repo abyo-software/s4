@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780887127661,
+  "lastUpdate": 1780887432339,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -4744,6 +4744,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "c29d69ff8c848e83c44ba7803db12a99daab55c6",
+          "message": "fix(audit): v0.11-R2 P2 — restore OCI labels + per-run compat keys\n\nCodex R2 integrated audit caught two cross-feature P2s:\n\n1. **compat-matrix sidecar HEAD satisfied by stale state**\n   (`compat-matrix.yml:73`) — `TEST_KEY` was `compat/large.bin`\n   fixed. On real-cloud rows the bucket is operator-pre-provisioned\n   and reused across weekly runs, so a previous run's sidecar at\n   `compat/large.bin.s4index` could satisfy the post-PUT sidecar\n   HEAD assertion (`write_sidecar` is fail-open by design) even\n   when the current run failed to emit a fresh sidecar — the\n   weekly compat check would go green on stale evidence. Fix:\n   scope the key to `compat/run-${{ github.run_id }}/large.bin`\n   so the assertion provably covers the current run's write path.\n\n2. **OCI image-config labels dropped on published images**\n   (`docker.yml:272-275` + merge-step `metadata-action` `labels:`)\n   — the v0.10.0 native-runner rewrite moved labels into the\n   merge-step metadata-action, but `docker buildx imagetools\n   create` only assembles existing manifests and cannot\n   retroactively patch image-config labels. Same shape as the R1\n   SLSA / SBOM regression. Every published image since v0.10.0\n   has been missing `org.opencontainers.image.{source, vendor,\n   licenses, documentation, ...}`. Fix: hard-code the static\n   labels at the per-arch build step (only `title` +\n   `description` vary by `matrix.flavor`); remove the now-dead\n   `labels:` block from the merge-step `metadata-action`.\n\nCleanup recipe for already-shipped v0.9.0 / v0.10.0 images\nwithout labels: re-trigger `docker.yml` with `build_ref` +\n`image_tag_override` from this commit forward — per-arch\nrebuilds attach the labels, merged manifest under each tag\noverwrites the prior label-less manifest.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-08T11:49:12+09:00",
+          "tree_id": "5ca04ac237fccd5dcbcfc2aa49645d993fd6a24a",
+          "url": "https://github.com/abyo-software/s4/commit/c29d69ff8c848e83c44ba7803db12a99daab55c6"
+        },
+        "date": 1780887431474,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 37431,
+            "range": "± 1361",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 45528,
+            "range": "± 657",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 337,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 1657496,
+            "range": "± 41403",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 39335043,
+            "range": "± 580486",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 156030,
+            "range": "± 295",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 37061726,
+            "range": "± 175608",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 715102179,
+            "range": "± 2985198",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 2503039,
+            "range": "± 17479",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 22119,
+            "range": "± 1087",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 25487,
+            "range": "± 914",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 324,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 549844,
+            "range": "± 23801",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1368789,
+            "range": "± 47864",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 156063,
+            "range": "± 195",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 9909462,
+            "range": "± 190126",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 23023178,
+            "range": "± 62928",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 2509022,
+            "range": "± 114887",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1136468,
+            "range": "± 40944",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 1649425,
+            "range": "± 44278",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 262144001,
+            "range": "± 5380134",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 104,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 6083,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 708,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 10992,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2557,
+            "range": "± 48",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 19911,
+            "range": "± 332",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 74945,
+            "range": "± 108",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 490,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4106,
+            "range": "± 78",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 16314,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 24,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 24,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 24,
             "range": "± 0",
             "unit": "ns/iter"
           }
