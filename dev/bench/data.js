@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780929507628,
+  "lastUpdate": 1780930147897,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -6101,6 +6101,232 @@ window.BENCHMARK_DATA = {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
             "range": "± 1",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "8c6b93088bf7b4c1a9641cad7443527d8d56ef99",
+          "message": "docs(v1.0): F5-F12 — README rewrite + audit ignores doc + Garage best-effort\n\nCluster B of the v1.0 readiness work: aligns the README + companion\ndocs with the v1.0 stability section's actual contract.\n\nREADME.md\n- F5: removes \"alpha / early-access / pre-1.0 / may break the wire\n  format\" disclaimer block from Project Status; replaces with v1.0\n  GA narrative (surface freeze ≠ marketing claim; first public\n  production reference still being collected under issue label\n  `production-reference`).\n- F5 (sweep): \"When NOT to use S4\" bullets updated to drop \"alpha\n  disclaimer\" + \"pre-1.0\" phrasing.\n- F6: qualifies the \"v0.8.x backend can read v1.0 bytes\" claim with\n  three explicit cross-major caveats: v3 sidecar UnsupportedVersion,\n  S4E6 chunked-SSE unrecognized, and the deployments where bidirectional\n  compatibility still holds.\n- F7: drops \"replication\" from the cumulative scope claim; instead,\n  the \"What's not promised\" section explicitly excludes it from v1.0\n  freeze (experimental scaffolding from v0.6, promotion on v1.x\n  roadmap).\n- F8: adds explicit s3s 0.13 stability policy — we track 0.13 trait\n  surface through minor bumps, a s3s major would itself trigger our\n  v2.0 with migration in docs/migration/.\n- F10: expands freeze list with real public surface — added the\n  s4_server::service::S4Service row (hard-freeze per the v1.0\n  judgment call), s4_server::sse row (14 items), s4_server::streaming\n  row (3 items), and expanded the s4_server::repair row with the\n  RepairReport / OrphanReport / SweepReport / RepairSseBinding types\n  + #[non_exhaustive] policy. s4-codec row now enumerates the full\n  error enum set (CodecError / IndexError / FrameError /\n  GpuSelectError / CompareOp) and all the index version constants.\n- F11: expands the Helm row to enumerate every top-level values.yaml\n  key (replicas, image.*, serviceAccount.*, backend.*, gpu.*, tls.*,\n  policy.*, service.*, ingress.*, resources.*, podAnnotations,\n  podLabels, podSecurityContext, securityContext, nodeSelector,\n  tolerations, affinity, extraEnv, extraVolumes, extraVolumeMounts,\n  probes.*). Distinguishes \"default values may shift in minor\" from\n  \"key shape is v2.0 territory\".\n- F12: links the new docs/security/cargo-audit-ignores.md from the\n  \"What's not promised\" section.\n- Adds a new \"Backend compatibility matrix (CI-verified surface)\"\n  table inside Stability — calls out which of the 7 README-claimed\n  backends are currently CI-gating vs claimed-but-not-CI-verified,\n  and links to compat-matrix.yml for the source of truth. Garage +\n  Ceph RGW are flagged as claimed-but-not-CI-verified with the\n  specific drift symptom (signature interop for Garage, unmaintained\n  demo image for Ceph). Re-introducing both as gating is on the\n  v1.x roadmap.\n- Removes the contradictory \"service/sse/streaming are NOT public\n  API\" bullet (the F2 audit found all three have external callers;\n  they are now frozen at the externally-used surface and listed in\n  the freeze table).\n\ndocs/security/cargo-audit-ignores.md (new)\n- F12: per-advisory rationale + mitigation + upstream-tracking for\n  the four currently-ignored RUSTSEC advisories\n  (2026-0098/0099/0104 = rustls-webpki path-blocked by AWS SDK\n  transitive pin; 2025-0134 = rustls-pemfile unmaintained, dev-only).\n- Policy section for when to add a new ignore vs trigger a\n  release-blocker.\n- Procedure for removing an ignore when the upstream bump lands.\n\n.github/workflows/compat-matrix.yml\n- F14 follow-up: Garage round-trip step is now continue-on-error\n  with a warning (same pattern as Ceph). dxflrs/garage:v1.1.0\n  rejects STREAMING-AWS4-HMAC-SHA256-PAYLOAD from current\n  aws-sdk-rust, breaking the 8 MiB PUT round-trip. The\n  provisioning steps still gate (admin-API surface IS verified);\n  re-introducing the round-trip as gating is on the v1.x roadmap.\n\nCargo.toml + Chart.yaml version bumps + the v1.0.0 tag are\nintentionally NOT in this commit per F9 (version bumps must land\nin a single atomic commit with the cut). This commit just lands\nthe doc + workflow scaffolding; the cut commit follows after the\nintegrated re-audit closes any new findings the rewrite surfaced.",
+          "timestamp": "2026-06-08T23:41:04+09:00",
+          "tree_id": "2d8cffe9b9be9385b6da5d2c214a42af8ea17dbc",
+          "url": "https://github.com/abyo-software/s4/commit/8c6b93088bf7b4c1a9641cad7443527d8d56ef99"
+        },
+        "date": 1780930146774,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 53779,
+            "range": "± 3898",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 55539,
+            "range": "± 3410",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 365,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2722389,
+            "range": "± 66388",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 41939110,
+            "range": "± 160274",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192693,
+            "range": "± 567",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 53268667,
+            "range": "± 1303694",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 756451912,
+            "range": "± 936670",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3165020,
+            "range": "± 49726",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 32163,
+            "range": "± 3230",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 37422,
+            "range": "± 2834",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 376,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 581183,
+            "range": "± 16836",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1594847,
+            "range": "± 43714",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192696,
+            "range": "± 447",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12095719,
+            "range": "± 176295",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27002562,
+            "range": "± 161237",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3182620,
+            "range": "± 10873",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1599447,
+            "range": "± 16340",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2523892,
+            "range": "± 23611",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 391503590,
+            "range": "± 3219140",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 139,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 7661,
+            "range": "± 73",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 814,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13119,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2916,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 21770,
+            "range": "± 468",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 86407,
+            "range": "± 2122",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 588,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4468,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 18279,
+            "range": "± 600",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
+            "range": "± 0",
             "unit": "ns/iter"
           }
         ]
