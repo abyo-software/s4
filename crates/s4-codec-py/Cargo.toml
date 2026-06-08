@@ -16,7 +16,7 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 readme = "README.md"
-description = "Python (pyo3) bindings for s4-codec — in-process GPU/CPU compression for ML / ETL pipelines."
+description = "Python (pyo3) bindings for s4-codec — in-process CPU compression (zstd + gzip) for ML / ETL pipelines. GPU codecs are not exposed in Python in v1.0; route GPU workloads through the s4 server gateway."
 
 # NOTE: we deliberately do NOT inherit `[workspace.lints]` (which sets
 # `unsafe_code = "deny"`) — the `pyo3` proc-macros expand to `unsafe`

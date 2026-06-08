@@ -1,20 +1,20 @@
 # s4-codec (Python bindings)
 
-In-process GPU/CPU compression from Python — no S4 gateway required.
+In-process CPU compression (zstd + gzip) from Python — no S4 gateway required.
 Wraps the same Rust [`s4-codec`](../s4-codec) crate that powers the S4
 S3-compatible storage gateway, so a Python notebook / Airflow task / Spark
 UDF can compress and decompress with the exact same byte format as
-objects sitting in an S4 bucket.
+objects sitting in an S4 bucket. (GPU codecs are intentionally NOT exposed
+in Python in v1.0 — they require a CUDA toolchain + GPU at runtime, which
+is a poor fit for `pip install`. Workloads that need GPU compression
+should route through the `s4` server gateway instead. Python GPU exposure
+is a v1.x roadmap candidate.)
 
 ## Install
 
 ```bash
-pip install s4-codec        # CPU codecs only (zstd + gzip), no CUDA needed
+pip install s4-codec        # CPU codecs only (zstd + gzip)
 ```
-
-For GPU (nvCOMP) codecs you currently have to build from source, because
-the wheel needs to be linked against your CUDA toolchain. See
-**Build from source** below.
 
 ## Example
 
@@ -52,17 +52,17 @@ JSON sidecar fields).
 ## Build from source
 
 ```bash
-# CPU-only wheel
 pip install maturin
 cd crates/s4-codec-py
 maturin build --release
 ls target/wheels/                          # *.whl is here
-
-# GPU wheel — requires NVCOMP_HOME pointed at an extracted nvCOMP redist
-# tarball, plus a CUDA toolchain (nvcc) on the build host.
-export NVCOMP_HOME=/path/to/nvcomp-linux-x86_64-5.x.x.x_cuda12-archive
-maturin build --release --features nvcomp-gpu
 ```
+
+The `--features nvcomp-gpu` flag forwards to the underlying `s4-codec-rs`
+crate's GPU codecs at the Rust level, but the Python module does NOT
+expose Python classes for the GPU codecs in v1.0 (see the §Status note
+above). Building with `--features nvcomp-gpu` therefore only affects
+what `gpu_available()` reports, not which Python classes are importable.
 
 `maturin develop` installs the wheel into the current virtualenv for
 iterative development.

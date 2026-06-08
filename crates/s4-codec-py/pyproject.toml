@@ -9,7 +9,7 @@ name = "s4-codec"
 # "0.1.0" here would have desynced the wheel from the workspace semver and
 # shipped a misleading pre-release tag on PyPI.
 dynamic = ["version"]
-description = "Python bindings for s4-codec — in-process GPU/CPU compression (zstd / gzip / nvCOMP) for ML and ETL pipelines."
+description = "Python bindings for s4-codec — in-process CPU compression (zstd / gzip) for ML and ETL pipelines. GPU codecs are not exposed in Python in v1.0; route GPU workloads through the s4 server gateway."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
@@ -17,9 +17,9 @@ authors = [
     { name = "abyo software 合同会社" },
     { name = "masumi-ryugo", email = "abyo.software@gmail.com" },
 ]
-keywords = ["s3", "compression", "gpu", "nvcomp", "zstd", "gzip"]
+keywords = ["s3", "compression", "zstd", "gzip"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: POSIX :: Linux",

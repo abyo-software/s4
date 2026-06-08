@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 /// 圧縮戦略
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum CompressionMode {
     /// 透過 (圧縮なし、開発/比較用)
     Passthrough,
