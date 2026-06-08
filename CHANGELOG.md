@@ -7,6 +7,187 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-06-09
+
+**v1.0 — SemVer-stable surface freeze.** From v1.0 onward the items
+enumerated in [`README.md` §"Stability — v1.0 guarantees"](README.md#stability--v10-guarantees)
+are frozen for the v1.x line; any incompatible change to them ships
+in a v2.0.0 release with migration recipes under `docs/migration/`.
+**v1.0 is *not* a marketing claim that "S4 has been battle-tested at
+every Fortune 500."** It is a contract that downstream consumers can
+pin `s4-server = "1"` (or `s4-codec = "1"`, or `s4-config = "1"`, or
+`ghcr.io/abyo-software/s4:1`) and rely on the surface listed in
+`README.md`. First public production deployment reference is still
+being collected — file an issue tagged `production-reference` if
+you are running S4 at TB scale.
+
+### Surface freeze — what's in the v1.0 contract
+
+See `README.md` for the table. Briefly:
+- Wire formats: `S4F2` framed body, `S4P1` padding, `S4IX` v1/v2/v3
+  sidecars, `S4E1`/`S4E2`/`S4E3`/`S4E4`/`S4E5`/`S4E6` SSE envelopes
+- `s4` binary subcommands (`verify-sidecar`, `repair-sidecar`,
+  `sweep-orphan-sidecars`, `verify-audit-log`, plus the server's
+  documented `--<flag>` set)
+- `s4_server::repair::*` public API (verify/repair/sweep + all
+  related error / report / policy types)
+- `s4_server::service::S4Service` shape — `new(backend, registry,
+  dispatcher)` constructor + every `pub fn with_*` builder signature
+  (23 of them — exact list in README); + the `SharedService` newtype
+  at `s4_server::service_arc::SharedService`; + `SigV4aGate` /
+  `SigV4aGateError` / `resolve_range` / `DEFAULT_MAX_BODY_BYTES` /
+  `DEFAULT_REPLICATION_MAX_CONCURRENT`
+- `s4_server::sse` public surface (frozen types, functions, constants)
+- `s4_server::streaming` public surface (frozen constants + functions)
+- `s4-codec` codec trait + format constants (Codec trait shape;
+  CodecKind / CodecError / IndexError / FrameError / GpuSelectError /
+  CompareOp enums all `#[non_exhaustive]`; index module's pub structs
+  + functions + constants; multipart::FrameHeader layout)
+- `s4-config`: `CompressionMode` enum (`#[non_exhaustive]`) +
+  `BackendConfig` / `S4Config` struct field sets
+- HTTP API surface: `s3s 0.13` trait set (S3 wire compatibility)
+- Container image tags + Helm chart `values.yaml` key set (full
+  enumeration of 28 top-level keys in README)
+
+### Added
+
+- Stability section in `README.md` (§"Stability — v1.0 guarantees")
+  enumerating the v1.0 freeze surface with explicit scope rules.
+- `docs/security/cargo-audit-ignores.md` — per-advisory rationale +
+  mitigation + upstream-tracking for the 4 accepted RUSTSEC ignores
+  (2026-0098 / 2026-0099 / 2026-0104 / 2025-0134), with verification
+  commands to re-check each fact.
+- README "Backend compatibility matrix" sub-section inside §Stability
+  documenting CI-verified state honestly: ✓ gating for MinIO; ⚠ opt-in
+  for AWS/B2/R2/Wasabi (gate only when operator-configured secrets
+  are set); ⚠ claimed-but-not-CI-verified for Garage + Ceph RGW with
+  the specific drift symptoms documented.
+- README "Modules NOT in the freeze list" sub-section enumerating
+  the 25 `s4_server::*` modules that exist as `pub mod` for binary
+  + tests needs but are NOT part of the v1.0 contract.
+- README "How to read the freeze table — scope of 'frozen'"
+  sub-section: items named in the table ARE the v1.0 contract; other
+  `pub` items in those modules are NOT; pin `=1.x.y` if depending on
+  unlisted items.
+- README "v0.x → v1.0 source compatibility note" sub-section listing
+  all 34 enums annotated `#[non_exhaustive]` (6 s4-codec + 27
+  s4-server + 1 s4-config) + the mechanical consumer-side fix
+  (add `_ =>` arm) for exhaustive matches.
+
+### Changed
+
+- 34 public enums on the frozen surface gained `#[non_exhaustive]`
+  for forward-compat additive variants. **Source-level breaking
+  change** for downstream code with exhaustive `match` arms; fix is
+  mechanical (add `_ =>`). See README §"v0.x → v1.0 source
+  compatibility note" for the full enum list and rationale.
+- `pub fn encode_index_v1_for_test` (and other `_for_test` helpers)
+  gated out of the v1.0 public API via `#[cfg(test)] pub(crate)`
+  visibility + `#[doc(hidden)]`.
+- `crates/s4-codec-py/pyproject.toml` PyPI trove classifier bumped
+  from `Development Status :: 3 - Alpha` → `5 - Production/Stable`
+  to match the v1.0 frozen-API contract.
+- `SECURITY.md` Supported Versions section rewritten from "pre-1.0,
+  latest commit on main" → "v1.x rolling window of latest minor +
+  previous minor; patch releases on the affected minor's release
+  branch".
+- Backend compat matrix table in `compat-matrix.yml` now reflects
+  the round-trip-vs-provisioning gate distinction; Garage and Ceph
+  round-trips are `continue-on-error` with explicit warning steps
+  documenting the wire-shape drift symptoms.
+- README disclaimers updated from alpha / early-access / pre-1.0
+  framing to the v1.0 "surface freeze ≠ production track record"
+  narrative.
+- Helm chart `values.yaml` key set is now frozen at v1.0; key shape
+  changes are v2.0 territory. Chart's own `version` stays in 0.2.x
+  (Helm-side SemVer, independent of appVersion); `appVersion` bumps
+  to `1.0.0`.
+- `crates/s4-codec-py/README.md` + Cargo.toml + pyproject.toml
+  metadata updated from "GPU/CPU compression" to "CPU compression"
+  to match what the Python module actually exports in v1.0
+  (`CpuZstd` + `CpuGzip` only; GPU codec classes are intentionally
+  NOT exposed in v1.0).
+- `crates/s4-codec-wasm/README.md` status header updated from
+  "v0.4 #24 — initial cut" to "v1.0 — frozen public API".
+- `.github/workflows/ci.yml` `security-audit` job comment corrected:
+  `rustls-pemfile` is a runtime dep (used by the production HTTPS
+  listener in `tls.rs`), not "dev-only" as the prior comment claimed.
+
+### Fixed
+
+- `compat-matrix.yml` Garage start step: replaced over-broad
+  `awk '/HEALTHY|UNHEALTHY|NO ROLE/'` that matched the
+  `==== HEALTHY NODES ====` table header line in
+  `dxflrs/garage:v1.1.0` output (producing `NODE_ID="===="` and a
+  hard-fail at `layout assign`). Now uses `garage node id -q`
+  directly, which returns `<hex>@<addr>`.
+- `compat-matrix.yml` Ceph RGW + Garage round-trip steps: marked
+  `continue-on-error` because `quay.io/ceph/demo:latest-quincy` is
+  unmaintained upstream (XAmzContentSHA256Mismatch) and
+  `dxflrs/garage:v1.1.0` rejects current aws-sdk-rust's
+  STREAMING-AWS4-HMAC-SHA256-PAYLOAD (Invalid payload signature).
+  Provisioning steps still gate for both.
+
+### Roadmap candidates (v1.x, additive only)
+
+- Chunked SSE-KMS envelope (provisional `S4E7`) + chunked SSE-C
+  (provisional `S4E8`) for Range GET partial-fetch fast-path.
+- `S4F3` streaming frame format enabling streaming PUT checksum
+  verify for multipart `upload_part`.
+- 32-bit runtime smoke promoted from advisory to required CI gate.
+- Per-action SHA pinning on GHA workflows.
+- Cross-region replication promoted from experimental scaffolding
+  to production-grade with Jepsen-style consistency tests.
+- Re-introducing Garage + Ceph as `✓ gating` once upstream signature
+  / image issues resolve.
+- GPU codec exposure in the Python module.
+- Streaming decoder API in the WASM module.
+- npm publish automation for the WASM package.
+- Japanese README (`README.ja.md`) brought current to v1.0.
+
+### Audit history
+
+7 rounds of dual-reviewer (Opus + Codex) adversarial audit drove
+~30 individual findings to closure across this cycle:
+- R0 (pre-session, on v1.0 draft README): Opus + Codex, 13 findings
+  spanning enum non_exhaustive coverage, README freeze accuracy,
+  s3s 0.13 policy, cargo-audit ignores doc, compat-matrix evidence,
+  cross-major back-compat caveats.
+- R1: Cluster A (F1 + F2 + F3 sub-agent parallel fixes) + Cluster B
+  (main-session README + audit-ignores doc rewrite) + Cluster C
+  (compat-matrix manual triggers + Garage / Ceph best-effort wrap).
+- R2: NF-1 — `SharedService` path correction (`s4_server::service` →
+  `s4_server::service_arc`).
+- R3 (dual reviewer): 11 new findings → fix wave including
+  `S4Service::default` fabrication removal, cloud-backend opt-in
+  honest qualifiers, S4Service builder-param contradiction caveat,
+  FrameIndex inner-type freeze, v0.x→v1.0 source-break caveat.
+- R4: 4 P2 + 1 P3 — Python class name correction, enum list
+  completeness, SECURITY.md update, FrameIndex own-field freeze.
+- R5 (dual): scope-explicit freeze sub-section + Python exception
+  enumeration + binding README updates.
+- R6 (dual, split verdict): Codex P1/P2/P3 closures — Python pkg
+  GPU marketing removal, PyPI classifier bump, CompressionMode
+  non_exhaustive.
+- R7 (dual): `s4 = "1"` → `s4-server / s4-codec / s4-config = "1"`,
+  freeze-scope enum-list wording correction, Python README GPU
+  build-recipe v1.0 caveat, EOF whitespace, SOCIAL_POSTS.md
+  historical-artifact banner.
+
+### Cut-commit changes
+
+- `Cargo.toml`: workspace.version `0.11.0` → `1.0.0`
+- `crates/s4-server/Cargo.toml`: internal-dep pins
+  `s4-codec`, `s4-config` `"0.11"` → `"1"`
+- `crates/s4-codec-wasm/Cargo.toml`: internal-dep pin
+  `s4-codec` `"0.11"` → `"1"`
+- `crates/s4-codec-py/Cargo.toml`: internal-dep pin
+  `s4-codec-rs` `"0.11"` → `"1"` (already landed in round-7 wave;
+  noted here for completeness)
+- `charts/s4/Chart.yaml`: `appVersion` `0.11.0` → `1.0.0`;
+  chart's own `version` `0.2.2` → `0.2.3` (appVersion bump only,
+  no chart-shape change)
+
 ## [0.11.0] — 2026-06-08
 
 Polish + maintenance cut. Wave-1 three-theme delivery (32-bit
