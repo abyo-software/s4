@@ -248,11 +248,18 @@ jobs:
             fi
             sleep 2
           done
-          # Single-node layout
-          NODE_ID=$(docker exec backend /garage status | awk '/HEALTHY|UNHEALTHY|NO ROLE/{print $1; exit}' | cut -d@ -f1)
+          # Single-node layout. `garage node id -q` returns the local
+          # node id as `<hex>@<addr>` directly — avoid parsing the
+          # tabular `garage status` output, whose `==== HEALTHY NODES
+          # ====` header line was matched by an over-broad awk pattern
+          # in the v0.11 #A7 implementation, producing NODE_ID="===="
+          # and failing `layout assign` with
+          # `Internal error: 0 nodes match '===='`.
+          NODE_ID=$(docker exec backend /garage node id -q | cut -d@ -f1)
           if [ -z "$NODE_ID" ]; then
-            # Fallback: `node id` returns the local node id directly
-            NODE_ID=$(docker exec backend /garage node id -q | cut -d@ -f1)
+            echo "::error::Failed to read garage node id"
+            docker exec backend /garage status
+            exit 1
           fi
           docker exec backend /garage layout assign -z dc1 -c 1G "$NODE_ID"
           docker exec backend /garage layout apply --version 1
@@ -369,8 +376,18 @@ jobs:
         run: |
           echo "::warning ::Ceph RGW demo container failed to start — skipping the round-trip step. The quay.io/ceph/demo:latest-quincy image is no longer actively maintained upstream; see compat-matrix.yml header comment for the fix paths."
 
+      # Round-trip is also best-effort for Ceph: the demo image has
+      # known wire-compat drift against current aws-sdk-rust (e.g.
+      # XAmzContentSHA256Mismatch on PutObject with streaming
+      # checksums) that fails the round-trip even when the container
+      # starts cleanly. Marking continue-on-error so the failure is
+      # surfaced as a warning rather than gating the workflow — the
+      # whole job is "demo image known-broken; track upstream for a
+      # successor image" per the header comment.
       - name: Round-trip + sidecar check
+        id: roundtrip
         if: steps.start.outcome == 'success'
+        continue-on-error: true
         uses: ./.github/actions/compat-roundtrip
         with:
           s4-binary: ./bin/s4
@@ -382,8 +399,13 @@ jobs:
           # CEPH_DEMO_BUCKET pre-creates it at container init
           skip-bucket-create: "true"
 
+      - name: Warn if round-trip failed
+        if: steps.start.outcome == 'success' && steps.roundtrip.outcome != 'success'
+        run: |
+          echo "::warning ::Ceph RGW round-trip failed — quay.io/ceph/demo:latest-quincy is unmaintained and drifts against current aws-sdk-rust wire shape (the typical symptom is XAmzContentSHA256Mismatch on PutObject). README compat table treats Ceph RGW as 'claimed but not CI-verified' until a successor demo image lands; see compat-matrix.yml header comment for fix paths."
+
       - name: Dump backend log on failure
-        if: failure() && steps.start.outcome == 'success'
+        if: steps.start.outcome == 'success' && steps.roundtrip.outcome != 'success'
         run: docker logs --tail 200 backend 2>&1 || true
 
       - name: Cleanup
