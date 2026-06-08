@@ -340,7 +340,14 @@ impl InventoryManager {
     /// iterator means the inventory module never needs a back-reference to
     /// `S4Service`, which sidesteps the circular dependency between the
     /// service handler and a scheduler that lives outside `S4Service`.
-    pub fn run_once_for_test<I, F>(
+    ///
+    /// v1.0 F3: `#[cfg(test)]`-gated so it never enters the v1.0 public API
+    /// contract. Only the same-file `#[cfg(test)] mod tests` reaches this
+    /// helper today; if the scheduler wiring in `main.rs` eventually needs
+    /// a production-grade synchronous variant, it should be added as a
+    /// separate non-`_for_test` API rather than removing this gate.
+    #[cfg(test)]
+    pub(crate) fn run_once_for_test<I, F>(
         &self,
         bucket: &str,
         id: &str,

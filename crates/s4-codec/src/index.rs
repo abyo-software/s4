@@ -569,8 +569,12 @@ pub fn encode_index(idx: &FrameIndex) -> Bytes {
 /// (`sidecar_header_back_compat_old_format_no_source_etag`) which has to
 /// synthesize a v1 buffer to prove decode_index still parses it. Production
 /// callers should always go through [`encode_index`] which emits v2.
-#[doc(hidden)]
-pub fn encode_index_v1_for_test(idx: &FrameIndex) -> Bytes {
+///
+/// v1.0 F3: `#[cfg(test)]`-gated so it never appears in the v1.0 public API
+/// contract. Only the same-file `#[cfg(test)] mod tests` consumes it; no
+/// integration test, fuzz target, or bench reaches it.
+#[cfg(test)]
+pub(crate) fn encode_index_v1_for_test(idx: &FrameIndex) -> Bytes {
     let mut buf = BytesMut::with_capacity(HEADER_FIXED_V1 + idx.entries.len() * ENTRY_BYTES);
     buf.put_slice(INDEX_MAGIC);
     buf.put_u32_le(INDEX_VERSION_V1);

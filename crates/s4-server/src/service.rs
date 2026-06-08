@@ -869,6 +869,16 @@ impl<B: S3> S4Service<B> {
     /// evaluator without spawning the (deferred) background scanner.
     /// Returns an empty `Vec` when no lifecycle manager is attached or
     /// no rule matches.
+    ///
+    /// **v1.0 F3 — UNSTABLE, NOT part of the v1.0 public API contract.**
+    /// Marked `#[doc(hidden)]` so it does not appear in `cargo doc` output
+    /// and so external consumers don't grow a dependency on its existence
+    /// or signature. It stays `pub` only because the same-crate integration
+    /// test in `tests/roundtrip.rs` cannot reach `#[cfg(test)]`-gated items
+    /// (Rust builds the lib without `cfg(test)` when compiling integration
+    /// test targets). Signature, name, or existence may change in any 1.y
+    /// release without semver notice.
+    #[doc(hidden)]
     #[must_use]
     pub fn run_lifecycle_once_for_test(
         &self,
