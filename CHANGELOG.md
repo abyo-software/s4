@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`s4 estimate <bucket>[/prefix] --endpoint-url <BACKEND>`** — read-only
+  pre-deployment savings simulator. Lists the bucket (`.s4index` excluded,
+  capped at `--max-list-keys`), stratifies objects by extension, samples
+  `--samples-per-stratum` objects per stratum (size-weighted, deterministic
+  under `--seed`), compresses the sampled bytes with the same
+  `SamplingDispatcher` pick the gateway would make at PUT time (honoring
+  `--codec` / `--dispatcher` / `--zstd-level` / `--gpu-min-bytes` /
+  `--prefer-columnar-gpu`), and extrapolates projected storage bytes and
+  $/month (`--price-per-gb-month`, default 0.023). `--format table|json`.
+  Never executes GPU codecs: `nvcomp-*` picks are measured via a cpu-zstd
+  proxy with an explicit report note. New library module
+  `s4_server::estimate` (`run_estimate`, `EstimateParams`,
+  `EstimateReport`, `EstimateError` `#[non_exhaustive]`). Additive only —
+  no existing flag or default changed.
+
 ## [1.0.0] — 2026-06-09
 
 **v1.0 — SemVer-stable surface freeze.** From v1.0 onward the items

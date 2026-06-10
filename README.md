@@ -904,6 +904,63 @@ full-read path) still works for one-offs without the CLI handy. See
 `docs/orphan-sidecar-recovery.md` for the v0.8.15 H-g cleanup recipe
 using `s4 sweep-orphan-sidecars`.
 
+### Pre-deployment savings estimate (`s4 estimate`)
+
+`s4 estimate` answers "how many GB / dollars would S4 save on this
+existing bucket?" **before** you deploy the gateway. Fully read-only
+(`ListObjectsV2` + `GetObject` only, never writes); point it at the
+**backend**, not an S4 gateway:
+
+```bash
+s4 estimate <bucket>[/prefix] --endpoint-url https://s3.example.com [--format json]
+```
+
+It lists the bucket (`.s4index` sidecars excluded, capped at
+`--max-list-keys`, default 100000), stratifies objects by extension,
+samples up to `--samples-per-stratum` (default 8) objects per stratum
+(size-weighted, deterministic under `--seed`, default 42), runs the
+**same `SamplingDispatcher` decision the gateway would run at PUT
+time** (the server-side `--codec` / `--dispatcher` / `--zstd-level` /
+`--gpu-min-bytes` / `--prefer-columnar-gpu` flags are honored, passed
+*before* the subcommand), actually compresses the sampled bytes, and
+extrapolates. Objects larger than `--max-sample-bytes` (default 8 MiB)
+are measured on a Range-GET prefix. Cost lines use
+`--price-per-gb-month` (default 0.023, S3 Standard us-east-1 first-50TB
+tier). Example output (5-object MinIO demo bucket — your ratios depend
+entirely on your data):
+
+```
+S4 storage estimate for demo
+  objects: 5   total: 2.7 MiB (2808356 bytes)
+  sampled: 5 object(s), 2.7 MiB read (100.0% of listed bytes)
+
+  stratum       objects        bytes  sampled   ratio      projected  codecs
+  .bin                1      1.0 MiB        1   1.000        1.0 MiB  passthrough×1
+  .json               1    242.0 KiB        1   0.034        8.2 KiB  cpu-zstd×1
+  .log                3      1.4 MiB        3   0.000          438 B  cpu-zstd×3
+
+  projected total: 1.0 MiB (1057418 bytes, overall ratio 0.377)
+  storage cost: $0.00/month now -> $0.00/month projected (at $0.023/GB-month, storage bytes only)
+```
+
+Honesty notes (always printed with the report):
+
+- **Storage bytes only** — request, egress and (on GPU deployments)
+  compute costs are unchanged by S4.
+- It is a **sampling extrapolation**; the report states the sampled
+  fraction of listed bytes, and prefix-sampled large objects can
+  compress differently from their tails.
+- **No GPU is required or used.** When the dispatcher would pick an
+  `nvcomp-*` codec at runtime (GPU build, or `--prefer-columnar-gpu`
+  passed from a CPU-only host to model a planned GPU deployment), the
+  ratio is measured with a **cpu-zstd proxy** and the report says so
+  explicitly — e.g. `nvcomp-bitcomp would be chosen at runtime for 1
+  sample(s); ratio shown is cpu-zstd (level 3) proxy … (typically
+  conservative for integer columns)`.
+
+Exit code is 0 on any completed estimate, including an empty listing
+(`no objects found`).
+
 ## Production Features
 
 ### Streaming I/O

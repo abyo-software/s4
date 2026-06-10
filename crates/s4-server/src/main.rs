@@ -738,6 +738,23 @@ enum Cmd {
     /// a runaway repair on a 50 GiB object fails fast.
     RepairSidecar(RepairSidecarArgs),
 
+    /// v1.1: read-only pre-deployment savings simulator. Lists the
+    /// bucket (or prefix), stratifies objects by extension, samples a
+    /// few objects per stratum (size-weighted, seeded RNG), compresses
+    /// the sampled bytes with the same codec the gateway's dispatcher
+    /// would pick at PUT time, and extrapolates the storage-bytes /
+    /// $-per-month savings. Never writes — ListObjectsV2 + GetObject
+    /// only. The endpoint MUST point at the backend (not an S4
+    /// gateway, which would decompress bodies and skew the ratios).
+    /// Honors the server's codec-selection flags (`--codec`,
+    /// `--dispatcher`, `--zstd-level`, `--gpu-min-bytes`,
+    /// `--prefer-columnar-gpu`) so the simulated picks match the
+    /// planned deployment; GPU picks are measured via a cpu-zstd
+    /// proxy with an explicit note (this subcommand never requires a
+    /// GPU). Exit 0 on a completed estimate (including an empty
+    /// listing).
+    Estimate(EstimateArgs),
+
     /// v0.9 #106: scan every `*.s4index` in a bucket and report
     /// sidecars whose paired key is missing or whose embedded
     /// ETag / size disagrees with the live HEAD. Dry-run by default;
@@ -745,6 +762,68 @@ enum Cmd {
     /// MUST point at the backend (not the S4 gateway) because the
     /// gateway hides `.s4index` from listings by design.
     SweepOrphanSidecars(SweepOrphanSidecarsArgs),
+}
+
+/// v1.1: `s4 estimate` output format.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum EstimateFormat {
+    /// Human-readable table + notes (default).
+    Table,
+    /// Structured JSON (`s4_server::estimate::EstimateReport` serde shape).
+    Json,
+}
+
+#[derive(Debug, Args)]
+struct EstimateArgs {
+    /// Estimate target as `<bucket>` or `<bucket>/<prefix>`. Slashes
+    /// after the first belong to the prefix, so `mybucket/logs/2026`
+    /// estimates only the keys under `logs/2026`.
+    target: String,
+
+    /// Stop listing after this many objects (`.s4index` sidecars are
+    /// excluded before counting). When the bucket has more keys, the
+    /// report flags the truncation and the totals cover only the
+    /// listed subset.
+    #[clap(long, value_name = "N", default_value_t = s4_server::estimate::DEFAULT_MAX_LIST_KEYS)]
+    max_list_keys: usize,
+
+    /// Objects sampled (GET + compressed) per extension stratum,
+    /// drawn size-weighted without replacement from a seeded RNG.
+    #[clap(
+        long,
+        value_name = "N",
+        default_value_t = s4_server::estimate::DEFAULT_SAMPLES_PER_STRATUM
+    )]
+    samples_per_stratum: usize,
+
+    /// Per-sample byte cap. Objects larger than this are measured on a
+    /// `Range: bytes=0-…` prefix GET (the report notes that a prefix
+    /// ratio can differ from the whole-object ratio).
+    #[clap(
+        long,
+        value_name = "BYTES",
+        default_value_t = s4_server::estimate::DEFAULT_MAX_SAMPLE_BYTES
+    )]
+    max_sample_bytes: u64,
+
+    /// RNG seed for the deterministic sampler — two runs with the same
+    /// seed (and an unchanged bucket) sample the same objects.
+    #[clap(long, default_value_t = s4_server::estimate::DEFAULT_SEED)]
+    seed: u64,
+
+    /// Storage price in $/GB-month for the cost lines (binary GB =
+    /// GiB, matching AWS billing). Default is S3 Standard us-east-1
+    /// first-50TB ($0.023).
+    #[clap(
+        long,
+        value_name = "USD",
+        default_value_t = s4_server::estimate::DEFAULT_PRICE_PER_GB_MONTH
+    )]
+    price_per_gb_month: f64,
+
+    /// Output format.
+    #[clap(long, value_enum, default_value = "table")]
+    format: EstimateFormat,
 }
 
 #[derive(Debug, Args)]
@@ -2109,6 +2188,7 @@ async fn run_subcommand(
         Cmd::VerifySidecar(args) => run_verify_sidecar(opt, args).await,
         Cmd::RepairSidecar(args) => run_repair_sidecar(opt, args).await,
         Cmd::SweepOrphanSidecars(args) => run_sweep_orphan_sidecars(opt, args).await,
+        Cmd::Estimate(args) => run_estimate_cmd(opt, args).await,
         Cmd::VerifyAuditLog(args) => {
             let key = s4_server::audit_log::AuditHmacKey::from_str(&args.hmac_key)
                 .map_err(|e| format!("--hmac-key: {e}"))?;
@@ -2203,6 +2283,63 @@ async fn build_sidecar_client(
             .force_path_style(true)
             .build(),
     ))
+}
+
+/// v1.1: `s4 estimate <bucket>[/prefix] --endpoint-url <BACKEND>`.
+/// Read-only savings simulation — see `s4_server::estimate` for the
+/// methodology and the honesty constraints baked into the report notes.
+async fn run_estimate_cmd(
+    opt: &Opt,
+    args: &EstimateArgs,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    let (bucket, prefix) = s4_server::estimate::parse_bucket_prefix(&args.target)
+        .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.to_string().into() })?;
+    let client = build_sidecar_client(opt).await?;
+
+    // GPU probe, same shape as the server boot path: only a nvcomp-gpu
+    // build with a CUDA-capable device reports `true`.
+    #[cfg(feature = "nvcomp-gpu")]
+    let gpu_present = s4_codec::nvcomp::is_gpu_available();
+    #[cfg(not(feature = "nvcomp-gpu"))]
+    let gpu_present = false;
+    // Simulate GPU-promotion picks when the host actually has a GPU OR
+    // the operator passed `--prefer-columnar-gpu` (= "I am modelling a
+    // GPU deployment from a CPU-only host"). Either way the measurement
+    // itself stays CPU-only (cpu-zstd proxy + explicit report note) —
+    // this subcommand never requires a GPU.
+    let simulate_gpu = gpu_present || opt.prefer_columnar_gpu;
+
+    let params = s4_server::estimate::EstimateParams {
+        prefix,
+        max_list_keys: args.max_list_keys,
+        samples_per_stratum: args.samples_per_stratum,
+        max_sample_bytes: args.max_sample_bytes,
+        seed: args.seed,
+        price_per_gb_month: args.price_per_gb_month,
+        default_codec: opt.codec.as_kind(),
+        zstd_level: opt.zstd_level,
+        use_sampling_dispatcher: matches!(opt.dispatcher, DispatcherChoice::Sampling),
+        gpu_min_bytes: opt.gpu_min_bytes,
+        prefer_columnar_gpu: opt.prefer_columnar_gpu,
+        simulate_gpu,
+        gpu_present,
+    };
+    let report = s4_server::estimate::run_estimate(&client, &bucket, &params)
+        .await
+        .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.to_string().into() })?;
+    match args.format {
+        EstimateFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        EstimateFormat::Table => {
+            if report.total_objects == 0 {
+                println!("no objects found under {}", args.target);
+            } else {
+                print!("{}", s4_server::estimate::render_human(&report));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn run_verify_sidecar(

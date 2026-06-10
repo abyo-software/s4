@@ -5,6 +5,7 @@ pub mod acme;
 pub mod audit_log;
 pub mod blob;
 pub mod cors;
+pub mod estimate;
 pub mod inventory;
 pub mod kms;
 pub mod lifecycle;
