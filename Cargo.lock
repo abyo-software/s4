@@ -4332,6 +4332,7 @@ name = "s4-codec-py"
 version = "1.0.0"
 dependencies = [
  "bytes",
+ "crc32c",
  "pyo3",
  "s4-codec",
  "semver",

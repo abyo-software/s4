@@ -1,0 +1,7 @@
+{
+  "s4-codec": "cpu-zstd",
+  "s4-compressed-size": "26442",
+  "s4-crc32c": "597809835",
+  "s4-framed": "true",
+  "s4-original-size": "167190"
+}

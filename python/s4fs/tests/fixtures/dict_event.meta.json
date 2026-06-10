@@ -1,0 +1,8 @@
+{
+  "s4-codec": "cpu-zstd-dict",
+  "s4-compressed-size": "79",
+  "s4-crc32c": "1915663527",
+  "s4-dict-id": "9867d0e5cf974014",
+  "s4-framed": "true",
+  "s4-original-size": "204"
+}

@@ -45,3 +45,5 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+# editable install artifacts (pip install -e python/s4fs)
+*.egg-info/

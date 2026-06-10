@@ -69,6 +69,10 @@ pyo3 = { version = "0.24", features = ["extension-module", "abi3-py39"] }
 s4-codec-rs = { package = "s4-codec", path = "../s4-codec", version = "1" }
 bytes = { workspace = true }
 tokio = { workspace = true }
+# v1.1 s4fs: expose `crc32c(bytes) -> int` so the pure-Python fsspec
+# reader (python/s4fs) can verify `passthrough` frame payloads (the only
+# codec whose payload integrity isn't checked by a decompressor).
+crc32c = { workspace = true }
 
 [dev-dependencies]
 # v0.8.5 #82: parse `CARGO_PKG_VERSION` in `tests/version_matches_workspace.rs`

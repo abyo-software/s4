@@ -83,6 +83,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `s4-codec-py` / `s4-codec-wasm` native decode are out of scope
   (follow-ups). Without `--zstd-dict`, PUT/GET behavior is bit-for-bit
   unchanged.
+- **`s4fs` — fsspec filesystem for reading S4 objects without the gateway**
+  (new pure-Python package [`python/s4fs/`](python/s4fs/), protocol
+  `s4://`). pandas / pyarrow / DuckDB / Polars read gateway-written
+  objects straight off the backend: S4F2 frames are decoded transparently
+  (`passthrough` / `cpu-zstd` / `cpu-gzip` / `cpu-zstd-dict`, with
+  `.s4dict/<id>` fetch + SHA-256-fingerprint verify), unframed
+  metadata-manifest objects (`cpu-gzip`, legacy raw zstd) decode via the
+  `s4-codec` / `s4-original-size` / `s4-crc32c` stamps, and non-S4
+  objects pass through byte-for-byte. `ls` / `info` hide `.s4index` /
+  `.s4dict/` / `.__s4ver__/` internals and report **original**
+  (decompressed) sizes (sidecar → `s4-original-size` metadata →
+  compressed size with `s4_size_exact: False`). Range reads / seeks use
+  the `.s4index` sidecar (with source-ETag staleness check) to fetch only
+  the overlapping frames; verified by the MinIO e2e to transfer fewer
+  backend bytes than a full read. Read-only by design — every write API
+  raises `NotImplementedError("s4fs is read-only; write through the S4
+  gateway")`; GPU frames (`nvcomp-*` / `dietgpu-ans`) raise
+  `NotImplementedError` instead of decoding wrong. The underlying
+  filesystem defaults to s3fs (`[s3]` extra) and is injectable
+  (`S4FileSystem(fs=...)`). Unit fixtures are real gateway-written bytes
+  captured off MinIO (`tests/fixtures/generate_fixtures.py`); e2e
+  (`pytest -m e2e`) covers pandas / pyarrow / DuckDB round-trips against
+  MinIO + the real gateway.
+- **`s4-codec` Python binding: wire-format read helpers** (additive,
+  `crates/s4-codec-py`) — `read_frame(bytes)` / `frame_iter(bytes)`
+  (S4F2 frame parse, S4P1 padding skipped; header dicts carry
+  `codec` / `original_size` / `compressed_size` / `crc32c`),
+  `decode_index(bytes)` (`.s4index` sidecar v1/v2/v3 → dict with
+  `entries` / `total_original_size` / `source_etag` / `sse`),
+  `crc32c(bytes)`, the `CpuZstdDict(dict_bytes, level=3)` codec class
+  (same `compress` / `decompress` shape as `CpuZstd`), module constants
+  `FRAME_MAGIC` / `PADDING_MAGIC` / `FRAME_HEADER_BYTES` /
+  `SIDECAR_SUFFIX`, and exception classes `S4FrameError` / `S4IndexError`
+  (⊂ `S4Error`). Existing API unchanged.
 
 ## [1.0.0] — 2026-06-09
 

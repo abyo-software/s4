@@ -1,0 +1,1 @@
+{"timestamp":"2026-06-10T12:37:19Z","level":"info","service":"checkout-api","event":"order_created","order_id":"ord_00007777","customer_id":"cus_00241087","amount_cents":101201,"currency":"USD","items":1}

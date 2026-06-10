@@ -142,6 +142,185 @@ def test_module_version_matches_workspace():
     )
 
 
+# ---------------------------------------------------------------------------
+# v1.1 s4fs: wire-format read helpers (read_frame / frame_iter / decode_index
+# / crc32c) + CpuZstdDict. The synthesized frame/index bytes below restate the
+# frozen v1.0 S4F2 / S4IX layouts from `crates/s4-codec/src/multipart.rs` and
+# `index.rs` — an independent little-endian re-statement that cross-checks the
+# binding against the documented format (the Rust unit tests already pin
+# write↔read symmetry).
+# ---------------------------------------------------------------------------
+
+import struct
+
+from s4_codec import (
+    CpuZstdDict,
+    S4FrameError,
+    S4IndexError,
+    crc32c,
+    decode_index,
+    frame_iter,
+    read_frame,
+)
+
+# CodecKind::id() values (wire-frozen, see s4-codec/src/lib.rs)
+_CODEC_ID_PASSTHROUGH = 0
+_CODEC_ID_CPU_ZSTD = 1
+
+
+def _frame(codec_id: int, original_size: int, payload: bytes, crc: int) -> bytes:
+    """[S4F2][codec_id u32][orig u64][comp u64][crc u32] LE + payload."""
+    return (
+        struct.pack("<4sIQQI", b"S4F2", codec_id, original_size, len(payload), crc)
+        + payload
+    )
+
+
+def test_crc32c_known_vector():
+    # RFC 3720 CRC32C check value for "123456789".
+    assert crc32c(b"123456789") == 0xE3069283
+
+
+def test_read_frame_passthrough():
+    payload = b"hello frame payload"
+    buf = _frame(_CODEC_ID_PASSTHROUGH, len(payload), payload, crc32c(payload))
+    header, got_payload, rest = read_frame(buf + b"TRAILING")
+    assert header["codec"] == "passthrough"
+    assert header["original_size"] == len(payload)
+    assert header["compressed_size"] == len(payload)
+    assert header["crc32c"] == crc32c(payload)
+    assert got_payload == payload
+    assert rest == b"TRAILING"
+
+
+def test_read_frame_zstd_payload_roundtrips_through_cpu_zstd():
+    data = b"squish me " * 500
+    compressed, orig_size, crc = CpuZstd(level=3).compress(data)
+    buf = _frame(_CODEC_ID_CPU_ZSTD, orig_size, compressed, crc)
+    header, payload, rest = read_frame(buf)
+    assert header["codec"] == "cpu-zstd"
+    assert rest == b""
+    assert CpuZstd().decompress(payload, header["original_size"], header["crc32c"]) == data
+
+
+def test_read_frame_bad_magic_raises():
+    with pytest.raises(S4FrameError):
+        read_frame(b"BAD!" + b"\x00" * 64)
+
+
+def test_read_frame_truncated_raises():
+    with pytest.raises(S4FrameError):
+        read_frame(b"S4F2\x00")
+
+
+def test_frame_iter_skips_s4p1_padding():
+    p1 = b"first"
+    p2 = b"second"
+    pad_payload = b"\x00" * 100
+    padding = struct.pack("<4sQ", b"S4P1", len(pad_payload)) + pad_payload
+    buf = (
+        _frame(_CODEC_ID_PASSTHROUGH, len(p1), p1, crc32c(p1))
+        + padding
+        + _frame(_CODEC_ID_PASSTHROUGH, len(p2), p2, crc32c(p2))
+    )
+    frames = frame_iter(buf)
+    assert [payload for _h, payload in frames] == [p1, p2]
+
+
+def test_frame_iter_corrupt_tail_raises():
+    p1 = b"first"
+    buf = _frame(_CODEC_ID_PASSTHROUGH, len(p1), p1, crc32c(p1)) + b"GARBAGE!"
+    with pytest.raises(S4FrameError):
+        frame_iter(buf)
+
+
+def _index_v2(entries, total_padded, source_compressed=0, etag=b""):
+    """S4IX v2: [magic][version u32][n u64][total_orig u64][total_padded u64]
+    [source_compressed_size u64][etag_len u32][etag] + n × 4 u64 entries."""
+    total_orig = sum(e[1] for e in entries)
+    buf = struct.pack(
+        "<4sIQQQQI",
+        b"S4IX",
+        2,
+        len(entries),
+        total_orig,
+        total_padded,
+        source_compressed,
+        len(etag),
+    ) + etag
+    for ooff, osize, coff, csize in entries:
+        buf += struct.pack("<QQQQ", ooff, osize, coff, csize)
+    return buf
+
+
+def test_decode_index_v2():
+    entries = [(0, 100, 0, 50), (100, 80, 60, 40)]
+    raw = _index_v2(entries, total_padded=200, source_compressed=100, etag=b'"abc"')
+    idx = decode_index(raw)
+    assert idx["total_padded_size"] == 200
+    assert idx["total_original_size"] == 180
+    assert idx["source_etag"] == '"abc"'
+    assert idx["source_compressed_size"] == 100
+    assert idx["sse"] is None
+    assert idx["entries"] == [
+        {
+            "original_offset": 0,
+            "original_size": 100,
+            "compressed_offset": 0,
+            "compressed_size": 50,
+        },
+        {
+            "original_offset": 100,
+            "original_size": 80,
+            "compressed_offset": 60,
+            "compressed_size": 40,
+        },
+    ]
+
+
+def test_decode_index_bad_magic_raises():
+    with pytest.raises(S4IndexError):
+        decode_index(b"NOPE" + b"\x00" * 64)
+
+
+def test_decode_index_truncated_raises():
+    with pytest.raises(S4IndexError):
+        decode_index(b"S4IX\x02")
+
+
+def test_cpu_zstd_dict_roundtrip():
+    # Any non-empty byte string is a valid zstd "raw content" dictionary;
+    # compress/decompress must agree as long as both sides use the same one.
+    dictionary = b'{"timestamp":"2026-01-01T00:00:00Z","level":"info","service":"x"}' * 16
+    codec = CpuZstdDict(dictionary, level=3)
+    data = b'{"timestamp":"2026-06-10T13:01:02Z","level":"info","service":"x","n":1}'
+    compressed, orig_size, crc = codec.compress(data)
+    assert orig_size == len(data)
+    assert codec.decompress(compressed, orig_size, crc) == data
+
+
+def test_cpu_zstd_dict_wrong_dict_raises():
+    # Data is a verbatim slice of the dictionary with no internal redundancy,
+    # so the compressor must reference the dictionary content; decoding with
+    # a different dictionary then yields different bytes → typed error
+    # (zstd refuses the frame or the CRC check catches it), never silence.
+    import os
+
+    dictionary = os.urandom(4096)
+    right = CpuZstdDict(dictionary, level=19)
+    wrong = CpuZstdDict(os.urandom(4096), level=19)
+    data = dictionary[100:1100]
+    compressed, orig_size, crc = right.compress(data)
+    assert len(compressed) < len(data), "dict reference must actually compress"
+    with pytest.raises((S4Error, OSError, RuntimeError)):
+        wrong.decompress(compressed, orig_size, crc)
+
+
+def test_cpu_zstd_dict_empty_dict_rejected():
+    with pytest.raises((S4Error, RuntimeError)):
+        CpuZstdDict(b"")
+
+
 def test_exception_class_hierarchy():
     """v0.8.5 #85 M-5: validate the documented inheritance tree."""
     from s4_codec import (

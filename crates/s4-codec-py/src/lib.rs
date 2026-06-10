@@ -19,14 +19,16 @@
 //! GIL across the await so other Python threads can progress while the
 //! blocking compression worker churns.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
-use s4_codec_rs::{cpu_gzip, cpu_zstd, ChunkManifest, Codec, CodecError, CodecKind};
+use pyo3::types::{PyBytes, PyDict, PyList};
+use s4_codec_rs::index::{FrameIndex, IndexError};
+use s4_codec_rs::multipart::{FrameError, FrameHeader, FrameIter};
+use s4_codec_rs::{cpu_gzip, cpu_zstd, cpu_zstd_dict, ChunkManifest, Codec, CodecError, CodecKind};
 use tokio::runtime::{Builder, Runtime};
 
 // v0.8.5 #85 M-5: surface CodecError variants as discriminable Python
@@ -58,6 +60,13 @@ create_exception!(s4_codec, S4ManifestSizeExceedsLimitError, S4Error);
 create_exception!(s4_codec, S4ManifestSizeMismatchError, S4Error);
 create_exception!(s4_codec, S4BackendError, PyRuntimeError);
 create_exception!(s4_codec, S4IoError, PyIOError);
+// v1.1 s4fs: frame-parse / sidecar-decode failures. Both sit under the
+// S4Error base (⊂ ValueError) so existing `except S4Error:` handlers
+// catch them without changes. Messages carry the upstream Display text
+// (`FrameError` / `IndexError` are `#[non_exhaustive]`, so we map by
+// message rather than per-variant subclasses).
+create_exception!(s4_codec, S4FrameError, S4Error);
+create_exception!(s4_codec, S4IndexError, S4Error);
 
 fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
@@ -264,6 +273,80 @@ impl PyCpuGzip {
     }
 }
 
+/// CPU zstd codec bound to a shared trained dictionary (`cpu-zstd-dict`,
+/// v1.1 `--zstd-dict`). The dictionary is a stock zstd dictionary
+/// (`zstd --train` / `ZDICT_trainFromBuffer` output); the compressed
+/// payload is a stock zstd frame referencing it. Level clamped to 1..=22.
+#[pyclass(name = "CpuZstdDict", module = "s4_codec")]
+struct PyCpuZstdDict {
+    inner: cpu_zstd_dict::CpuZstdDict,
+    level: i32,
+}
+
+#[pymethods]
+impl PyCpuZstdDict {
+    #[new]
+    #[pyo3(signature = (dict_bytes, level = 3))]
+    fn new(dict_bytes: &Bound<'_, PyBytes>, level: i32) -> PyResult<Self> {
+        let dict: Arc<[u8]> = Arc::from(dict_bytes.as_bytes().to_vec().into_boxed_slice());
+        let inner = cpu_zstd_dict::CpuZstdDict::new(dict, level).map_err(codec_err_to_py)?;
+        Ok(Self {
+            inner,
+            level: level.clamp(1, 22),
+        })
+    }
+
+    /// Compress `data` against the bound dictionary. Returns
+    /// `(compressed: bytes, original_size: int, crc32c: int)` — same shape
+    /// as `CpuZstd.compress`.
+    fn compress<'py>(
+        &self,
+        py: Python<'py>,
+        data: &Bound<'py, PyBytes>,
+    ) -> PyResult<(Bound<'py, PyBytes>, u64, u32)> {
+        let input = Bytes::copy_from_slice(data.as_bytes());
+        let codec = self.inner.clone();
+        let (out, manifest) =
+            block_on(py, async move { codec.compress(input).await }).map_err(codec_err_to_py)?;
+        Ok((
+            PyBytes::new(py, &out),
+            manifest.original_size,
+            manifest.crc32c,
+        ))
+    }
+
+    /// Decompress `data` against the bound dictionary. `original_size`
+    /// and `crc32c` are the matching manifest fields from `compress` (or
+    /// the S4F2 frame header for gateway-written objects).
+    fn decompress<'py>(
+        &self,
+        py: Python<'py>,
+        data: &Bound<'py, PyBytes>,
+        original_size: u64,
+        crc32c: u32,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let input = Bytes::copy_from_slice(data.as_bytes());
+        let manifest = manifest_from_parts(
+            CodecKind::CpuZstdDict,
+            input.len() as u64,
+            original_size,
+            crc32c,
+        );
+        let codec = self.inner.clone();
+        let out = block_on(py, async move { codec.decompress(input, &manifest).await })
+            .map_err(codec_err_to_py)?;
+        Ok(PyBytes::new(py, &out))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CpuZstdDict(dict_len={}, level={})",
+            self.inner.dict().len(),
+            self.level
+        )
+    }
+}
+
 /// True iff the wheel was built with `--features nvcomp-gpu` AND a
 /// CUDA-capable GPU is reachable at runtime. Default wheels return False.
 #[pyfunction]
@@ -271,11 +354,154 @@ fn gpu_available() -> bool {
     s4_codec_rs::nvcomp::is_gpu_available()
 }
 
+fn frame_err_to_py(e: FrameError) -> PyErr {
+    S4FrameError::new_err(format!("frame error: {e}"))
+}
+
+fn index_err_to_py(e: IndexError) -> PyErr {
+    S4IndexError::new_err(format!("index error: {e}"))
+}
+
+/// S4F2 frame header → Python dict
+/// `{codec: str, original_size: int, compressed_size: int, crc32c: int}`.
+/// `codec` is the stable `CodecKind::as_str()` name (`"cpu-zstd"`, …).
+fn frame_header_dict<'py>(py: Python<'py>, h: &FrameHeader) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("codec", h.codec.as_str())?;
+    d.set_item("original_size", h.original_size)?;
+    d.set_item("compressed_size", h.compressed_size)?;
+    d.set_item("crc32c", h.crc32c)?;
+    Ok(d)
+}
+
+/// Parse one S4F2 frame off the front of `data`.
+///
+/// Returns `(header: dict, payload: bytes, rest: bytes)` where `header`
+/// is `{codec, original_size, compressed_size, crc32c}`, `payload` is the
+/// (still-compressed) frame payload, and `rest` is everything after the
+/// frame. Raises `S4FrameError` on truncated / bad-magic / unknown-codec
+/// input. Thin wrapper over `s4_codec::multipart::read_frame` — the wire
+/// layout is the frozen v1.0 S4F2 format.
+#[pyfunction]
+fn read_frame<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyBytes>,
+) -> PyResult<(Bound<'py, PyDict>, Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    let input = Bytes::copy_from_slice(data.as_bytes());
+    let (header, payload, rest) =
+        s4_codec_rs::multipart::read_frame(input).map_err(frame_err_to_py)?;
+    Ok((
+        frame_header_dict(py, &header)?,
+        PyBytes::new(py, &payload),
+        PyBytes::new(py, &rest),
+    ))
+}
+
+/// Parse `data` as a sequence of S4F2 frames (S4P1 padding frames are
+/// skipped, matching the gateway's GET path). Returns a list of
+/// `(header: dict, payload: bytes)` tuples. Raises `S4FrameError` on the
+/// first malformed frame. Thin wrapper over `s4_codec::multipart::FrameIter`.
+#[pyfunction]
+fn frame_iter<'py>(py: Python<'py>, data: &Bound<'py, PyBytes>) -> PyResult<Bound<'py, PyList>> {
+    let input = Bytes::copy_from_slice(data.as_bytes());
+    let out = PyList::empty(py);
+    for item in FrameIter::new(input) {
+        let (header, payload) = item.map_err(frame_err_to_py)?;
+        out.append((frame_header_dict(py, &header)?, PyBytes::new(py, &payload)))?;
+    }
+    Ok(out)
+}
+
+/// Decode a `<key>.s4index` sidecar (v1 / v2 / v3 layouts).
+///
+/// Returns a dict:
+///
+/// ```text
+/// {
+///   "total_padded_size": int,      # backend object size incl. padding
+///   "total_original_size": int,    # decompressed size (sum of entries)
+///   "source_etag": str | None,     # v2+: backend ETag binding
+///   "source_compressed_size": int | None,
+///   "entries": [ {original_offset, original_size,
+///                 compressed_offset, compressed_size}, ... ],
+///   "sse": None | {enc_chunk_size, enc_chunk_count, enc_key_id,
+///                  enc_salt: bytes, enc_plaintext_len, enc_header_bytes},
+/// }
+/// ```
+///
+/// `entries[i].compressed_size` includes the 28-byte frame header.
+/// Raises `S4IndexError` on malformed input. Thin wrapper over
+/// `s4_codec::index::decode_index`.
+#[pyfunction]
+fn decode_index<'py>(py: Python<'py>, data: &Bound<'py, PyBytes>) -> PyResult<Bound<'py, PyDict>> {
+    let input = Bytes::copy_from_slice(data.as_bytes());
+    let idx: FrameIndex = s4_codec_rs::index::decode_index(input).map_err(index_err_to_py)?;
+    let d = PyDict::new(py);
+    d.set_item("total_padded_size", idx.total_padded_size)?;
+    d.set_item("total_original_size", idx.total_original_size())?;
+    d.set_item("source_etag", idx.source_etag.as_deref())?;
+    d.set_item("source_compressed_size", idx.source_compressed_size)?;
+    let entries = PyList::empty(py);
+    for e in &idx.entries {
+        let ed = PyDict::new(py);
+        ed.set_item("original_offset", e.original_offset)?;
+        ed.set_item("original_size", e.original_size)?;
+        ed.set_item("compressed_offset", e.compressed_offset)?;
+        ed.set_item("compressed_size", e.compressed_size)?;
+        entries.append(ed)?;
+    }
+    d.set_item("entries", entries)?;
+    match idx.sse_v3 {
+        Some(sse) => {
+            let sd = PyDict::new(py);
+            sd.set_item("enc_chunk_size", sse.enc_chunk_size)?;
+            sd.set_item("enc_chunk_count", sse.enc_chunk_count)?;
+            sd.set_item("enc_key_id", sse.enc_key_id)?;
+            sd.set_item("enc_salt", PyBytes::new(py, &sse.enc_salt))?;
+            sd.set_item("enc_plaintext_len", sse.enc_plaintext_len)?;
+            sd.set_item("enc_header_bytes", sse.enc_header_bytes)?;
+            d.set_item("sse", sd)?;
+        }
+        None => d.set_item("sse", py.None())?,
+    }
+    Ok(d)
+}
+
+/// CRC32C (Castagnoli) of `data` — the checksum the S4F2 frame header
+/// carries. Exposed so pure-Python readers (s4fs) can verify
+/// `passthrough` frame payloads without an extra dependency.
+#[pyfunction]
+#[pyo3(name = "crc32c")]
+fn crc32c_py(data: &Bound<'_, PyBytes>) -> u32 {
+    ::crc32c::crc32c(data.as_bytes())
+}
+
 #[pymodule]
 fn s4_codec(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCpuZstd>()?;
     m.add_class::<PyCpuGzip>()?;
+    m.add_class::<PyCpuZstdDict>()?;
     m.add_function(wrap_pyfunction!(gpu_available, m)?)?;
+    // v1.1 s4fs: read-side wire-format helpers (S4F2 frames + .s4index
+    // sidecars) so pure-Python clients can decode gateway-written
+    // objects without the gateway.
+    m.add_function(wrap_pyfunction!(read_frame, m)?)?;
+    m.add_function(wrap_pyfunction!(frame_iter, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_index, m)?)?;
+    m.add_function(wrap_pyfunction!(crc32c_py, m)?)?;
+    m.add(
+        "FRAME_MAGIC",
+        PyBytes::new(py, s4_codec_rs::multipart::FRAME_MAGIC),
+    )?;
+    m.add(
+        "PADDING_MAGIC",
+        PyBytes::new(py, s4_codec_rs::multipart::PADDING_MAGIC),
+    )?;
+    m.add(
+        "FRAME_HEADER_BYTES",
+        s4_codec_rs::multipart::FRAME_HEADER_BYTES,
+    )?;
+    m.add("SIDECAR_SUFFIX", s4_codec_rs::index::SIDECAR_SUFFIX)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     // v0.8.5 #85 M-5: export per-CodecError exception classes so Python
     // callers can branch on error kind. See module-level doc comments above
@@ -301,5 +527,7 @@ fn s4_codec(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("S4BackendError", py.get_type::<S4BackendError>())?;
     m.add("S4IoError", py.get_type::<S4IoError>())?;
+    m.add("S4FrameError", py.get_type::<S4FrameError>())?;
+    m.add("S4IndexError", py.get_type::<S4IndexError>())?;
     Ok(())
 }

@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "s4fs"
+version = "1.0.0"
+description = "fsspec adapter for reading S4 gateway-written objects (S4F2 framed + compressed) directly from the backend — no gateway required. Read-only by design."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "abyo software 合同会社" },
+    { name = "masumi-ryugo", email = "abyo.software@gmail.com" },
+]
+keywords = ["s3", "fsspec", "compression", "zstd", "pandas", "pyarrow"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Archiving :: Compression",
+]
+dependencies = [
+    "fsspec>=2023.1.0",
+    # PyO3 binding crate (crates/s4-codec-py) — provides the S4F2 frame /
+    # .s4index sidecar decoders and the CPU codecs.
+    "s4-codec>=1.0.0",
+]
+
+[project.optional-dependencies]
+# Default underlying filesystem for s3:// backends.
+s3 = ["s3fs>=2023.1.0"]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/abyo-software/s4"
+Repository = "https://github.com/abyo-software/s4"
+Issues = "https://github.com/abyo-software/s4/issues"
+
+# fsspec discovers the implementation lazily via the `fsspec.specs` entry
+# point group — `fsspec.filesystem("s4")` works without importing s4fs first.
+[project.entry-points."fsspec.specs"]
+s4 = "s4fs.core:S4FileSystem"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+    "e2e: end-to-end tests that require docker (MinIO) and the s4 binary",
+]
+# e2e is opt-in: `pytest -m e2e` (an explicit -m on the command line
+# overrides this default).
+addopts = "-m 'not e2e'"

@@ -339,6 +339,23 @@ codec subset (`passthrough`, `cpu-zstd`, `cpu-gzip`). See
 [`crates/s4-codec-wasm/README.md`](crates/s4-codec-wasm/README.md) for
 the API and a 10-line example.
 
+### Python dataframes (s4fs / fsspec)
+
+For pandas / pyarrow / DuckDB / Polars reading S4 objects **straight off the
+backend** — no gateway in the read path. Range reads use the `.s4index`
+sidecar to fetch only the overlapping frames; non-S4 objects pass through
+byte-for-byte. Read-only by design (writes go through the gateway); GPU
+(`nvcomp-*`) frames raise `NotImplementedError` rather than decode wrong.
+
+```python
+import pandas as pd
+opts = {"target_options": {"endpoint_url": "http://backend:9000"}}
+df = pd.read_parquet("s4://bucket/data.parquet", storage_options=opts)
+```
+
+See [`python/s4fs/README.md`](python/s4fs/README.md) for pyarrow / DuckDB
+examples and the supported-codec matrix.
+
 ### Build from source
 
 ```bash
