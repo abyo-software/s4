@@ -1,0 +1,58 @@
+# ClusterFuzzLite — PR code-change fuzzing
+#
+# PR の diff に影響される bolero fuzz target を ASan + libFuzzer で短時間
+# (5 min) 回し、merge 前に crash を検出する。深掘りは fuzz-nightly.yml
+# (30 min/target coverage-guided) が担当、こちらは regression gate。
+#
+# Build 統合は .clusterfuzzlite/ (Dockerfile / build.sh / project.yaml)。
+# corpus storage-repo は未設定 (seed corpus は repo commit 済みの
+# tests/__fuzz__/ を使う)。batch fuzzing を有効化する場合は storage repo
+# + PAT が必要: https://google.github.io/clusterfuzzlite/running-clusterfuzzlite/github-actions/
+
+name: ClusterFuzzLite PR fuzzing
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".clusterfuzzlite/**"
+      - ".github/workflows/cflite_pr.yml"
+
+permissions: read-all
+
+concurrency:
+  group: cflite-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr-fuzz:
+    name: PR fuzzing (${{ matrix.sanitizer }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address]
+    steps:
+      - name: Build fuzzers (${{ matrix.sanitizer }})
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@v1
+        with:
+          language: rust
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          sanitizer: ${{ matrix.sanitizer }}
+          # bolero の fuzz target は `<test>_fuzzer` shell wrapper (nearcore と
+          # 同方式)。bad_build_check は ELF 前提 (objdump で ASan 計装を検査 +
+          # $OUT 直下実行を仮定) なので wrapper では成立しない。target 検出
+          # 自体は `*_fuzzer` 名で通る。
+          bad-build-check: false
+      - name: Run fuzzers (${{ matrix.sanitizer }})
+        id: run
+        uses: google/clusterfuzzlite/actions/run_fuzzers@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 300
+          mode: "code-change"
+          sanitizer: ${{ matrix.sanitizer }}
