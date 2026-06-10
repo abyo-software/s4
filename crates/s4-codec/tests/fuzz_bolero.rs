@@ -191,3 +191,5 @@ fn index_roundtrip_bolero() {
             assert_eq!(decoded, idx, "FrameIndex roundtrip");
         });
 }
+
+// (cflite-verify) ClusterFuzzLite PR fuzzing の動作検証用 no-op コメント。
