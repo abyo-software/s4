@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780939567828,
+  "lastUpdate": 1781103852659,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -8343,6 +8343,232 @@ window.BENCHMARK_DATA = {
             "name": "decode_index/4096f",
             "value": 20768,
             "range": "± 43",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "f1c70bdd39c6ae60c0c5ef3756b55fe3fb67427a",
+          "message": "ci(fuzz): ClusterFuzzLite PR fuzzing — bolero targets を OSS-Fuzz 形式で実行\n\nPR の diff に対して s4-codec の bolero fuzz target 7 本を ASan + libFuzzer\nで 5 min 回す regression gate を追加 (深掘りは既存 fuzz-nightly.yml が担当)。\n\n- .clusterfuzzlite/{project.yaml,Dockerfile,build.sh}: OSS-Fuzz 互換 build\n  統合。`cargo bolero build-clusterfuzz` で tests/fuzz_bolero.rs の\n  ハーネスを `<test>_fuzzer` wrapper + libFuzzer バイナリに変換し、\n  commit 済み __fuzz__ corpus を seed_corpus.zip として同梱。\n- base image の pinned nightly (1.91) が MSRV 1.92 未満のため\n  nightly-2026-06-01 に date pin で切替。\n- OSS-Fuzz env との衝突 2 件を build.sh で吸収:\n  - RUSTFLAGS の単独 `--cfg fuzzing` が bolero の engine 選択 cfg を壊す\n    → unset し cargo-bolero に flag 構築を任せ、ASan runtime のみ\n    `-Zsanitizer=address` で常時リンク (CFLAGS 計装済み zstd-sys 対策)\n  - CXXFLAGS の -stdlib=libc++ が vendored libFuzzer の final link で\n    未解決シンボルになる → 除去\n- bad_build_check は ELF 前提 (objdump ASan 検査 + $OUT 直下実行仮定) で\n  shell wrapper 方式 (nearcore と同方式) に適用不能のため action input で\n  無効化。target 検出は `*_fuzzer` 名で通ることを cifuzz source で確認済み。\n\nローカル検証: docker compile exit 0 / 7 target + seed corpus 生成 /\nframe_parser・cpu_zstd_decompress を -runs で実行し coverage feedback 動作確認。\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-06-10T23:55:44+09:00",
+          "tree_id": "0d4b3bbbd69d27256b48cff8029b345a00668ed6",
+          "url": "https://github.com/abyo-software/s4/commit/f1c70bdd39c6ae60c0c5ef3756b55fe3fb67427a"
+        },
+        "date": 1781103851525,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 48099,
+            "range": "± 2797",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 57637,
+            "range": "± 1003",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 428,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2218015,
+            "range": "± 311825",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50554528,
+            "range": "± 112435",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201244,
+            "range": "± 2522",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 49359890,
+            "range": "± 2524633",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 922114534,
+            "range": "± 3364168",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3264809,
+            "range": "± 22969",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 28061,
+            "range": "± 1912",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 32383,
+            "range": "± 1035",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 419,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 576572,
+            "range": "± 4451",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1655607,
+            "range": "± 15876",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201207,
+            "range": "± 377",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 11319393,
+            "range": "± 80071",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 28150827,
+            "range": "± 242313",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3277200,
+            "range": "± 40341",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1464568,
+            "range": "± 24529",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2189581,
+            "range": "± 47226",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 330527475,
+            "range": "± 6299159",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 136,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 8880,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 912,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 14184,
+            "range": "± 106",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2755,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 21333,
+            "range": "± 115",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 85360,
+            "range": "± 163",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 632,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 5222,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 20713,
+            "range": "± 232",
             "unit": "ns/iter"
           },
           {
