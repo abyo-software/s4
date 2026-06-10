@@ -102,3 +102,12 @@ harness = false
 [[bench]]
 name = "index_codec"
 harness = false
+
+# v1.2 `--gpu-batch-small-puts` evidence bench — wall-clock A/B/C comparison
+# of cpu-zstd-3 vs per-object nvcomp-zstd vs batched nvcomp-zstd on 1000 x
+# 8 KiB objects. Plain `fn main` (not criterion): the GPU gate + one-shot
+# batch shape doesn't fit criterion's sampling model. Compiles to a skip
+# stub without `--features nvcomp-gpu`, so default `cargo bench` stays green.
+[[bench]]
+name = "gpu_small_batch"
+harness = false

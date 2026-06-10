@@ -28,8 +28,12 @@ mod error;
 #[cfg(feature = "nvcomp-gpu")]
 pub mod nvcomp_sys;
 
+// v1.2 GPU small-PUT batching: `pub(crate)` (was private) so the sibling
+// `crate::nvcomp_batched` module can reuse the FCG1 framing helpers
+// (`write_header`, `check_cuda`, ...) — visibility-only change, zero
+// behaviour difference for existing callers.
 #[cfg(feature = "nvcomp-gpu")]
-mod nvcomp;
+pub(crate) mod nvcomp;
 
 #[cfg(feature = "nvcomp-gpu")]
 mod nvcomp_hlif;

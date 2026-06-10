@@ -45,7 +45,7 @@ use super::{Algo, BitcompDataType, Codec, Error, Result};
 
 const FRAME_MAGIC: [u8; 4] = *b"FCG1";
 const HEADER_FIXED_BYTES: usize = 4 + 1 + 3 + 8 + 4 + 4;
-const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
+pub(crate) const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 
 pub struct NvcompCodec {
     algo: Algo,
@@ -382,7 +382,7 @@ enum PinnedKind {
 
 // ---------- Error helpers ----------
 
-fn check_cuda(rc: cudaError_t, what: &'static str) -> Result<()> {
+pub(crate) fn check_cuda(rc: cudaError_t, what: &'static str) -> Result<()> {
     if rc == CUDA_SUCCESS {
         return Ok(());
     }
@@ -399,7 +399,7 @@ fn check_cuda(rc: cudaError_t, what: &'static str) -> Result<()> {
     )))
 }
 
-fn check_nvcomp(status: nvcompStatus_t, what: &'static str) -> Result<()> {
+pub(crate) fn check_nvcomp(status: nvcompStatus_t, what: &'static str) -> Result<()> {
     if status == nvcompSuccess {
         Ok(())
     } else {
@@ -412,7 +412,7 @@ fn check_nvcomp(status: nvcompStatus_t, what: &'static str) -> Result<()> {
 
 // ---------- Algo dispatch helpers ----------
 
-fn compress_get_max_output_chunk_size(algo: Algo, max_chunk: usize) -> Result<usize> {
+pub(crate) fn compress_get_max_output_chunk_size(algo: Algo, max_chunk: usize) -> Result<usize> {
     let mut out = 0usize;
     let status = unsafe {
         match algo {
@@ -449,7 +449,7 @@ fn compress_get_max_output_chunk_size(algo: Algo, max_chunk: usize) -> Result<us
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compress_get_temp_size(
+pub(crate) fn compress_get_temp_size(
     algo: Algo,
     d_uncomp_ptrs: *const *const c_void,
     d_uncomp_sizes: *const usize,
@@ -514,7 +514,7 @@ fn compress_get_temp_size(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_compress(
+pub(crate) fn dispatch_compress(
     algo: Algo,
     d_uncomp_ptrs: *const *const c_void,
     d_uncomp_sizes: *const usize,
@@ -999,7 +999,7 @@ fn compress_chunked(
     Ok(())
 }
 
-fn write_header(
+pub(crate) fn write_header(
     algo: Algo,
     chunk_size: usize,
     orig_size: usize,

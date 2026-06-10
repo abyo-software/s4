@@ -224,6 +224,25 @@ pub mod names {
     /// `--zstd-dict` flag); any `err` rate means dict-compressed
     /// objects are currently unreadable.
     pub const DICT_FETCH_TOTAL: &str = "s4_dict_fetch_total";
+    /// v1.2 `--gpu-batch-small-puts`: bumped once per small PUT that was
+    /// considered for batched GPU compression. Labels: `result`
+    /// (= `"batched"` — the body was compressed by the nvCOMP batch
+    /// aggregator and stored as `nvcomp-zstd`; `"fallback"` — the batch
+    /// path declined (queue full, GPU error, or the batched output was
+    /// not smaller than the input) and the PUT proceeded on the
+    /// pre-existing cpu-zstd framed path). Cardinality 2. Operators
+    /// compare `batched` vs `fallback` rates to confirm the batching
+    /// window / queue depth are sized for the workload — a sustained
+    /// `fallback` rate means the flag is configured but not paying off.
+    pub const GPU_BATCH_TOTAL: &str = "s4_gpu_batch_total";
+}
+
+/// v1.2 `--gpu-batch-small-puts`: bump the small-PUT GPU-batch outcome
+/// counter. `result` is `"batched"` (stored as batch-compressed
+/// nvcomp-zstd) or `"fallback"` (declined / failed → pre-existing
+/// cpu-zstd framed path). See [`names::GPU_BATCH_TOTAL`].
+pub fn record_gpu_batch(result: &'static str) {
+    metrics::counter!(names::GPU_BATCH_TOTAL, "result" => result).increment(1);
 }
 
 /// v1.1 `--zstd-dict`: bump the lazy dictionary-fetch counter. `result`

@@ -651,6 +651,15 @@ pub struct S4Service<B: S3> {
     /// path fetches `.s4dict/<id>` from the object's bucket, verifies
     /// the content-addressed fingerprint, and caches it here.
     dict_cache: Arc<crate::dict::DictCache>,
+    /// v1.2 `--gpu-batch-small-puts`: optional GPU batch-compression
+    /// aggregator handle. `None` (default) keeps every PUT bit-for-bit on
+    /// the pre-batch path. `Some(...)` routes small cpu-zstd PUT bodies
+    /// (`--gpu-batch-floor-bytes <= len < --gpu-min-bytes`, no dict match)
+    /// through the nvCOMP batched-zstd aggregator; any decline (queue
+    /// full / GPU error / output not smaller than input) falls back to
+    /// the unchanged cpu-zstd framed path. Wired by `main.rs` only when
+    /// the flag is on AND the `nvcomp-gpu` build has a CUDA GPU at boot.
+    gpu_batch: Option<crate::gpu_batch::GpuBatchHandle>,
 }
 
 /// v0.8.17 G-2: which AWS error shape the reserved-name guard
@@ -750,7 +759,22 @@ impl<B: S3> S4Service<B> {
             // carry the `s4-dict-id` metadata stamp.
             zstd_dicts: None,
             dict_cache: Arc::new(crate::dict::DictCache::default()),
+            // v1.2 `--gpu-batch-small-puts`: off by default — no GPU
+            // batch aggregator, zero behaviour change.
+            gpu_batch: None,
         }
+    }
+
+    /// v1.2 `--gpu-batch-small-puts`: attach the GPU small-PUT batch
+    /// aggregator handle. Small cpu-zstd PUTs inside the handle's
+    /// `[floor_bytes, max_bytes)` size window are compressed through the
+    /// nvCOMP batched-zstd path (one kernel launch per batch); everything
+    /// the batch path declines falls back to the unchanged cpu-zstd
+    /// framed path. Stored objects are standard `nvcomp-zstd` bodies —
+    /// the GET path needs (and has) no batch awareness.
+    pub fn with_gpu_batch(mut self, handle: crate::gpu_batch::GpuBatchHandle) -> Self {
+        self.gpu_batch = Some(handle);
+        self
     }
 
     /// v1.1 `--zstd-dict`: attach the boot-time dictionary store. PUTs
@@ -3159,6 +3183,23 @@ impl<B: S3> S3 for S4Service<B> {
                 None
             };
             let mut stamped_dict_id: Option<String> = None;
+            // v1.2 `--gpu-batch-small-puts`: small-PUT GPU batch window.
+            // Eligible only when (a) the aggregator is wired (flag on +
+            // GPU build + CUDA device at boot), (b) the dispatcher picked
+            // cpu-zstd (the exact case the per-object GPU path rejects as
+            // too small), (c) no dictionary matched (dict path wins — it
+            // exists precisely for small homogeneous objects), and (d)
+            // the declared Content-Length sits inside
+            // `[--gpu-batch-floor-bytes, --gpu-min-bytes)`. Chunked
+            // transfers (no Content-Length) stay on the unchanged path —
+            // same refuse-to-buffer-blind rule as the dict path.
+            let gpu_batch_handle = if dict_candidate.is_none() && kind == CodecKind::CpuZstd {
+                self.gpu_batch
+                    .as_ref()
+                    .filter(|h| total_size_hint.is_some_and(|n| h.eligible_size(n)))
+            } else {
+                None
+            };
             let use_framed = supports_streaming_compress(kind) && kind != CodecKind::Passthrough;
             let (compressed, manifest, is_framed) = if let Some((dict_id, dict)) = dict_candidate {
                 // Bodies on this path are ≤ --zstd-dict-max-bytes
@@ -3241,6 +3282,123 @@ impl<B: S3> S3 for S4Service<B> {
                     .await
                     .map_err(internal("framed compress (dict-path size fallback)"))?;
                     (body, manifest, true)
+                }
+            } else if let Some(batch) = gpu_batch_handle {
+                // v1.2 `--gpu-batch-small-puts`: buffered small-PUT GPU
+                // batch path. Bodies here are < --gpu-min-bytes (default
+                // 1 MiB) by the eligibility gate, so buffering is cheaper
+                // than the dict path's ceiling. Verification mirrors the
+                // buffered branches: all six header checksums + the
+                // SigV4-streaming trailer comparison.
+                let bytes = collect_with_sample(sample, rest_stream, self.max_body_bytes)
+                    .await
+                    .map_err(internal("collect put body (gpu-batch path)"))?;
+                verify_client_body_checksums(
+                    &bytes,
+                    req.input.content_md5.as_deref(),
+                    req.input.checksum_crc32.as_deref(),
+                    req.input.checksum_crc32c.as_deref(),
+                    req.input.checksum_sha1.as_deref(),
+                    req.input.checksum_sha256.as_deref(),
+                    req.input.checksum_crc64nvme.as_deref(),
+                )?;
+                if let Some(announced) = req
+                    .headers
+                    .get("x-amz-trailer")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    let which =
+                        crate::streaming_checksum::WhichHashers::from_trailer_header(announced);
+                    let computed = if which.any() {
+                        crate::streaming_checksum::compute_digests(&bytes, which)
+                    } else {
+                        crate::streaming_checksum::ComputedDigests::default()
+                    };
+                    verify_client_trailer_checksums(
+                        Some(announced),
+                        req.trailing_headers.as_ref(),
+                        &computed,
+                    )?;
+                }
+                debug!(
+                    bucket = ?req.input.bucket,
+                    key = ?req.input.key,
+                    bytes = bytes.len(),
+                    path = "gpu-batch",
+                    "S4 put_object: compressing (buffered, nvCOMP batched zstd)"
+                );
+                // Re-check the wire size: a lying client (Content-Length
+                // inside the window, actual body outside it) skips the
+                // batch and lands on the standard fallback below.
+                let batched = if batch.eligible_size(bytes.len() as u64) {
+                    batch.try_compress(bytes.clone()).await
+                } else {
+                    Err(crate::gpu_batch::GpuBatchError::Codec(
+                        s4_codec::CodecError::Backend(anyhow::anyhow!(
+                            "actual body size {} outside the gpu-batch window",
+                            bytes.len()
+                        )),
+                    ))
+                };
+                match batched {
+                    // Ratio guard: accept the batched output only when it
+                    // actually shrank the body. Small objects can come out
+                    // of GPU zstd *larger* than cpu-zstd-3 would make them
+                    // (per-chunk framing overhead dominates near the
+                    // floor); when the batch output is >= the input we
+                    // fall back to the pre-existing cpu-zstd framed path
+                    // — the same regime a passthrough-vs-compress
+                    // decision follows elsewhere.
+                    Ok((body, manifest)) if (body.len() as u64) < manifest.original_size => {
+                        crate::metrics::record_gpu_batch("batched");
+                        // Buffered raw-blob shape — exactly the existing
+                        // per-object GPU-codec PUT path (is_framed=false).
+                        (body, manifest, false)
+                    }
+                    Ok((body, manifest)) => {
+                        debug!(
+                            bucket = ?req.input.bucket,
+                            key = ?req.input.key,
+                            compressed = body.len(),
+                            original = manifest.original_size,
+                            "gpu-batch output not smaller than input; falling back to cpu-zstd"
+                        );
+                        crate::metrics::record_gpu_batch("fallback");
+                        let actual_len = bytes.len() as u64;
+                        let (body, manifest) = streaming_compress_to_frames(
+                            bytes_to_blob(bytes),
+                            Arc::clone(&self.registry),
+                            kind,
+                            pick_chunk_size(Some(actual_len)),
+                            None,
+                        )
+                        .await
+                        .map_err(internal("framed compress (gpu-batch ratio fallback)"))?;
+                        (body, manifest, true)
+                    }
+                    Err(e) => {
+                        // Queue full / worker gone / CUDA failure — the
+                        // PUT must still succeed exactly as it would have
+                        // without the flag.
+                        debug!(
+                            bucket = ?req.input.bucket,
+                            key = ?req.input.key,
+                            error = %e,
+                            "gpu-batch declined; falling back to cpu-zstd framed path"
+                        );
+                        crate::metrics::record_gpu_batch("fallback");
+                        let actual_len = bytes.len() as u64;
+                        let (body, manifest) = streaming_compress_to_frames(
+                            bytes_to_blob(bytes),
+                            Arc::clone(&self.registry),
+                            kind,
+                            pick_chunk_size(Some(actual_len)),
+                            None,
+                        )
+                        .await
+                        .map_err(internal("framed compress (gpu-batch error fallback)"))?;
+                        (body, manifest, true)
+                    }
                 }
             } else if use_framed {
                 // streaming fast path: input は memory に collect しない

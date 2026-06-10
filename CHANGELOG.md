@@ -8,6 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`--gpu-batch-small-puts`** (opt-in, requires the `nvcomp-gpu` build +
+  a CUDA-capable GPU at boot — the server refuses to start otherwise) —
+  batch **concurrent small PUTs** into a single nvCOMP batched-zstd
+  kernel launch so the GPU pays its fixed launch + PCIe cost once per
+  batch instead of once per object. Eligibility: sampling dispatcher
+  picked `cpu-zstd`, no `--zstd-dict` prefix match, declared
+  `Content-Length` in `[--gpu-batch-floor-bytes (default 4 KiB),
+  --gpu-min-bytes (default 1 MiB))`. Companion knobs:
+  `--gpu-batch-max-items` (flush at N pending bodies, default 32) and
+  `--gpu-batch-window-ms` (flush after T ms, default 4 — also the
+  worst-case latency the batch path adds to a PUT). **Wire format is
+  unchanged**: batched objects are byte-layout-identical standard
+  `nvcomp-zstd` bodies (same FCG1 framing + `CodecKind::NvcompZstd`
+  manifest as the per-object GPU path; no new codec id, no new
+  metadata) and the GET path has zero batch awareness — proven by
+  GPU-gated tests that decompress batch output through the unmodified
+  per-object path, plus a MinIO e2e (`tests/gpu_batch_e2e.rs`).
+  Fail-open semantics: queue full (backpressure), GPU error, or a
+  batched result that is not smaller than the input all fall back to
+  the pre-existing cpu-zstd framed path — observable via the new
+  `s4_gpu_batch_total{result="batched"|"fallback"}` counter. Measured
+  on 1000 × 8 KiB log-like objects (RTX 4070 Ti SUPER, nvCOMP
+  5.2.0.10): batched GPU = 29.7 ms vs 702 ms per-object GPU (~24×) vs
+  15.7–19.5 ms single-thread cpu-zstd-3; GPU output ~10% smaller
+  (12.31× vs 11.14× ratio). Honest verdict in README §"GPU small-PUT
+  batching": this offloads CPU and improves ratio — it does not beat a
+  free CPU core on raw wall time at 8 KiB. New public surface:
+  `s4_codec::nvcomp_batched::NvcompZstdBatchEncoder` (feature-gated),
+  `s4_server::gpu_batch` (aggregator + `GpuBatchHandle`),
+  `S4Service::with_gpu_batch`, and the `gpu_small_batch` bench. Flag
+  off (default) = bit-for-bit unchanged PUT behaviour.
 - **`s4 recompact <bucket>[/prefix] --endpoint-url <BACKEND> [--execute]`** —
   rewrite cpu-zstd framed objects at a higher zstd level during a quiet
   window (LSM-compaction for S3). The gateway's PUT path favours latency

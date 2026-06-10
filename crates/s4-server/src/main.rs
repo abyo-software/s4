@@ -173,6 +173,43 @@ struct Opt {
     #[clap(long, default_value_t = false)]
     prefer_columnar_gpu: bool,
 
+    /// v1.2: batch small PUT bodies (`--gpu-batch-floor-bytes` ≤ size <
+    /// `--gpu-min-bytes`) into a single nvCOMP batched-zstd kernel launch.
+    /// Amortises the per-call GPU launch + PCIe overhead that normally
+    /// makes CPU win below `--gpu-min-bytes`, at the cost of up to
+    /// `--gpu-batch-window-ms` added PUT latency while a batch fills.
+    /// Stored objects are standard `nvcomp-zstd` bodies (identical wire
+    /// format to the per-object GPU path — GET needs no batch awareness);
+    /// any decline (queue full / GPU error / output not smaller) falls
+    /// back to the unchanged cpu-zstd path. Requires a build with
+    /// `--features nvcomp-gpu` AND a CUDA-capable GPU at boot — the
+    /// server refuses to start otherwise (no silent degradation).
+    #[clap(long, default_value_t = false)]
+    gpu_batch_small_puts: bool,
+
+    /// v1.2: flush the GPU small-PUT batch when this many bodies are
+    /// pending. Bigger batches amortise the kernel launch better but pin
+    /// more bodies in host memory (`max-items × ~gpu-min-bytes` worst
+    /// case). Only meaningful with `--gpu-batch-small-puts`.
+    #[clap(long, default_value_t = 32)]
+    gpu_batch_max_items: usize,
+
+    /// v1.2: flush the GPU small-PUT batch when the oldest pending body
+    /// has waited this many milliseconds. This is the worst-case latency
+    /// the batch path adds to a small PUT under low concurrency. Only
+    /// meaningful with `--gpu-batch-small-puts`.
+    #[clap(long, default_value_t = 4)]
+    gpu_batch_window_ms: u64,
+
+    /// v1.2: minimum body size (bytes) eligible for GPU batch
+    /// compression. Below this, per-chunk framing overhead makes GPU
+    /// zstd ratios noticeably worse than cpu-zstd, so tiny bodies stay
+    /// on the CPU path. Must be < `--gpu-min-bytes` (the window's
+    /// exclusive upper bound). Only meaningful with
+    /// `--gpu-batch-small-puts`.
+    #[clap(long, default_value_t = 4096)]
+    gpu_batch_floor_bytes: usize,
+
     /// ログ出力形式 (pretty / json)。production では json 推奨
     #[clap(long, value_enum, default_value = "pretty")]
     log_format: LogFormat,
@@ -1479,7 +1516,68 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         "S4 codec registry built"
     );
 
+    // v1.2 `--gpu-batch-small-puts`: GPU small-PUT batch aggregator.
+    // Fail-closed at boot — the flag on a CPU-only build (or a GPU build
+    // with no CUDA device at runtime) is a configuration error, not a
+    // silent degradation.
+    let gpu_batch_handle: Option<s4_server::gpu_batch::GpuBatchHandle> = if opt.gpu_batch_small_puts
+    {
+        #[cfg(not(feature = "nvcomp-gpu"))]
+        {
+            return Err("--gpu-batch-small-puts requires S4 to be built with \
+                        `--features nvcomp-gpu` (this binary was built without GPU \
+                        support); rebuild with the feature or drop the flag"
+                .into());
+        }
+        #[cfg(feature = "nvcomp-gpu")]
+        {
+            if !s4_codec::nvcomp::is_gpu_available() {
+                return Err("--gpu-batch-small-puts requires a CUDA-capable GPU at \
+                            runtime, but none was detected at boot; fix the driver / \
+                            device visibility or drop the flag"
+                    .into());
+            }
+            if opt.gpu_batch_max_items == 0 {
+                return Err("--gpu-batch-max-items must be >= 1".into());
+            }
+            if opt.gpu_batch_floor_bytes >= opt.gpu_min_bytes {
+                return Err(format!(
+                    "--gpu-batch-floor-bytes ({}) must be < --gpu-min-bytes ({}) — \
+                     the batch window [floor, gpu-min) is empty as configured",
+                    opt.gpu_batch_floor_bytes, opt.gpu_min_bytes
+                )
+                .into());
+            }
+            let encoder = s4_codec::nvcomp_batched::NvcompZstdBatchEncoder::new().map_err(|e| {
+                format!("--gpu-batch-small-puts: nvCOMP batch encoder init failed: {e}")
+            })?;
+            let cfg = s4_server::gpu_batch::GpuBatchConfig {
+                max_items: opt.gpu_batch_max_items,
+                window: std::time::Duration::from_millis(opt.gpu_batch_window_ms),
+                floor_bytes: opt.gpu_batch_floor_bytes as u64,
+                max_bytes: opt.gpu_min_bytes as u64,
+                // Backpressure threshold: enough queue for a few batches'
+                // worth of bursst; beyond that PUTs fall back to the CPU
+                // path immediately rather than queueing latency.
+                queue_depth: (opt.gpu_batch_max_items * 4).max(64),
+            };
+            info!(
+                max_items = opt.gpu_batch_max_items,
+                window_ms = opt.gpu_batch_window_ms,
+                floor_bytes = opt.gpu_batch_floor_bytes,
+                max_bytes = opt.gpu_min_bytes,
+                "GPU small-PUT batch compression enabled (nvCOMP batched zstd)"
+            );
+            Some(s4_server::gpu_batch::spawn(Arc::new(encoder), cfg))
+        }
+    } else {
+        None
+    };
+
     let mut s4 = S4Service::new(proxy, registry, dispatcher);
+    if let Some(handle) = gpu_batch_handle {
+        s4 = s4.with_gpu_batch(handle);
+    }
     // v0.3 #13: tell the policy evaluator whether traffic is reaching us
     // over TLS so the `aws:SecureTransport` Condition key resolves
     // correctly. Either an operator-provided cert (--tls-cert) or ACME

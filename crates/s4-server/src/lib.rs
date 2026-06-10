@@ -7,6 +7,7 @@ pub mod blob;
 pub mod cors;
 pub mod dict;
 pub mod estimate;
+pub mod gpu_batch;
 pub mod inventory;
 pub mod kms;
 pub mod lifecycle;

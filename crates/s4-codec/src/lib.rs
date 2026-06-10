@@ -30,6 +30,12 @@ pub mod gpu_select;
 pub mod index;
 pub mod multipart;
 pub mod nvcomp;
+/// v1.2 GPU small-PUT batching: many-objects-one-kernel-launch nvCOMP zstd
+/// encoder. Output frames are byte-layout-identical to the per-object
+/// `nvcomp::NvcompZstdCodec` (same FCG1 framing, same `CodecKind::NvcompZstd`
+/// manifest) — purely an encoder-execution optimisation, zero wire change.
+#[cfg(feature = "nvcomp-gpu")]
+pub mod nvcomp_batched;
 pub mod passthrough;
 pub mod registry;
 
