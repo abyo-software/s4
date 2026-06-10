@@ -45,6 +45,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MigrateParams`, `MigrateReport`, `MigrateError` / `SkipReason`
   `#[non_exhaustive]`). Additive only — no existing flag, default, or
   PUT/GET behavior changed.
+- **Shared zstd dictionaries for small objects** (`s4 train-dict` +
+  `--zstd-dict`) — new codec `cpu-zstd-dict` (**codec id 8**; additive:
+  the S4F2 frame layout is unchanged, only a new id is allocated).
+  `s4 train-dict <bucket>/<prefix> --endpoint-url <BACKEND>
+  [--max-samples 1000] [--max-dict-bytes 112640] [--min-samples 8]
+  [--sample-max-bytes 65536]` samples small raw objects under the prefix
+  (already-S4 bodies skipped), trains a stock zstd dictionary
+  (`zstd::dict::from_samples` / ZDICT), stores it at the content-addressed
+  in-bucket object `.s4dict/<dict-id>` (`<dict-id>` = first 16 hex of the
+  dictionary's SHA-256; immutable, idempotent re-train), and prints the
+  gateway flag. The gateway flag `--zstd-dict
+  '<bucket>/<key-prefix>=<dict-id>'` (repeatable; dictionaries fetched +
+  fingerprint-verified at boot, missing dict = boot error) makes
+  single-PUT cpu-zstd bodies ≤ `--zstd-dict-max-bytes` (default 1 MiB)
+  whose key longest-prefix-matches compress against the dictionary —
+  **only when it actually beats dict-less cpu-zstd** (both compressed and
+  compared per small PUT; ties / losses fall back to a plain `cpu-zstd`
+  frame with no dict reference). The dictionary id travels in the new
+  `s4-dict-id` object-metadata key, never in the frame. GETs resolve the
+  dictionary preloaded → LRU → lazy backend fetch of `.s4dict/<id>`
+  (fingerprint-verified, ~16-entry cache), so a gateway booted **without**
+  the flag still reads dict-compressed objects; fetch failures are 5xx +
+  the new `s4_dict_fetch_total{result}` counter. `.s4dict/` keys are
+  hidden from gateway listings (same treatment as `.s4index` /
+  `.__s4ver__/`). Measured on the minio E2E (100 × ~300-byte
+  same-schema JSON events): 8 903 bytes stored vs 21 923 dict-less =
+  2.46×. No lock-in: the payload is a stock zstd frame and `.s4dict/<id>`
+  is raw zstd dictionary bytes — `zstd -D <dictfile> -d` decodes without
+  any S4 software (pinned by the E2E against the real CLI). New modules
+  `s4_codec::cpu_zstd_dict` (`CpuZstdDict`, `train_from_samples`,
+  blocking helpers) and `s4_server::dict` (`DictStore`, `DictCache`,
+  `run_train_dict`, …). **Compatibility note:** pre-v1.1 readers fail a
+  GET of a `cpu-zstd-dict` object with the existing *unknown codec id*
+  error (graceful typed failure, no silent corruption) — roll mixed
+  fleets forward before enabling the flag. Multipart, CopyObject, and
+  `s4-codec-py` / `s4-codec-wasm` native decode are out of scope
+  (follow-ups). Without `--zstd-dict`, PUT/GET behavior is bit-for-bit
+  unchanged.
 
 ## [1.0.0] — 2026-06-09
 

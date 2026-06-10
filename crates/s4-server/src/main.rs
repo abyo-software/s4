@@ -706,6 +706,28 @@ struct Opt {
     #[clap(long, value_name = "MODE", value_enum)]
     compliance_mode: Option<ComplianceMode>,
 
+    /// v1.1: map a key prefix to a trained zstd dictionary. Repeatable.
+    /// Format `<bucket>/<key-prefix>=<dict-id>` where `<dict-id>` is the
+    /// 16-hex id printed by `s4 train-dict` (= SHA-256 prefix of the
+    /// dictionary bytes stored at `.s4dict/<dict-id>` in the bucket).
+    /// Each dictionary is fetched from the backend at boot (missing
+    /// dictionary = startup error). PUTs whose key longest-prefix-matches
+    /// and whose Content-Length is ≤ --zstd-dict-max-bytes compress with
+    /// the dictionary when it actually beats plain cpu-zstd; everything
+    /// else (and every PUT when this flag is absent) is unchanged.
+    /// GETs of dict-compressed objects work even WITHOUT this flag —
+    /// the gateway lazy-fetches `.s4dict/<id>` on demand.
+    #[clap(long, value_name = "BUCKET/PREFIX=DICT_ID")]
+    zstd_dict: Vec<String>,
+
+    /// v1.1: body-size ceiling for the `--zstd-dict` PUT path. Bodies
+    /// larger than this (or chunked uploads without a Content-Length)
+    /// skip the dictionary comparison and take the normal streaming
+    /// path. Default 1 MiB — shared dictionaries only pay off on small
+    /// objects, and the dict path buffers + compresses the body twice.
+    #[clap(long, value_name = "BYTES", default_value_t = s4_server::dict::DEFAULT_DICT_MAX_OBJECT_BYTES)]
+    zstd_dict_max_bytes: usize,
+
     /// v0.5 #31: optional subcommand. When omitted, runs the gateway
     /// (existing v0.4 behaviour). Available subcommands:
     /// `verify-audit-log <FILE> --hmac-key <SPEC>` walks an audit-log
@@ -779,6 +801,18 @@ enum Cmd {
     /// MUST point at the backend (not the S4 gateway) because the
     /// gateway hides `.s4index` from listings by design.
     SweepOrphanSidecars(SweepOrphanSidecarsArgs),
+
+    /// v1.1: train a shared zstd dictionary from small objects under
+    /// `<bucket>/<prefix>` and store it at `.s4dict/<dict-id>` in the
+    /// bucket (raw zstd dictionary bytes — decodable with stock
+    /// `zstd -D <dictfile> -d`, no gateway needed). Prints the
+    /// `--zstd-dict '<bucket>/<prefix>=<dict-id>'` flag to start the
+    /// gateway with. Objects already in S4 format and objects larger
+    /// than --sample-max-bytes are skipped; fewer than --min-samples
+    /// usable objects is an error. The endpoint MUST point at the
+    /// backend (not an S4 gateway, which would decompress bodies and
+    /// hide `.s4dict/`).
+    TrainDict(TrainDictArgs),
 }
 
 /// v1.1: `s4 estimate` output format.
@@ -968,6 +1002,32 @@ struct SweepOrphanSidecarsArgs {
     /// Requires `--delete`.
     #[clap(long, default_value_t = false, requires = "delete")]
     delete_undecodable: bool,
+}
+
+#[derive(Debug, Args)]
+struct TrainDictArgs {
+    /// Training target as `<bucket>` or `<bucket>/<prefix>`. Slashes
+    /// after the first belong to the prefix.
+    target: String,
+
+    /// Stop sampling after this many objects.
+    #[clap(long, value_name = "N", default_value_t = s4_server::dict::DEFAULT_TRAIN_MAX_SAMPLES)]
+    max_samples: usize,
+
+    /// Dictionary output size cap. Default 112640 (110 KiB, the zstd
+    /// upstream recommendation).
+    #[clap(long, value_name = "BYTES", default_value_t = s4_server::dict::DEFAULT_MAX_DICT_BYTES)]
+    max_dict_bytes: usize,
+
+    /// Refuse to train when fewer than this many usable samples were
+    /// found (a dictionary trained on a handful of objects is noise).
+    #[clap(long, value_name = "N", default_value_t = s4_server::dict::DEFAULT_TRAIN_MIN_SAMPLES)]
+    min_samples: usize,
+
+    /// Skip objects larger than this during sampling — the feature
+    /// targets small objects, and big bodies skew ZDICT training.
+    #[clap(long, value_name = "BYTES", default_value_t = s4_server::dict::DEFAULT_TRAIN_SAMPLE_MAX_BYTES)]
+    sample_max_bytes: u64,
 }
 
 #[derive(Debug, Args)]
@@ -1243,6 +1303,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     );
     // ready_check 用に client を 1 つ複製して保持
     let ready_client = client.clone();
+    // v1.1 `--zstd-dict`: boot-time dictionary fetch needs a direct
+    // backend client before the move into the proxy.
+    let dict_client = client.clone();
     let proxy = s3s_aws::Proxy::from(client);
 
     let default_kind = opt.codec.as_kind();
@@ -1347,6 +1410,67 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
              (migration mode; mutating ops still rejected). Disable once legacy data \
              has been moved off the reserved suffix (v0.8.17 G-4)."
         );
+    }
+    // v1.1 `--zstd-dict`: parse the prefix→dict-id mappings, fetch every
+    // dictionary from the backend (missing dict = boot error so a typo'd
+    // id can't silently disable the feature), fingerprint-verify, and
+    // attach the store. No flag → no store → PUT path bit-for-bit
+    // unchanged.
+    if !opt.zstd_dict.is_empty() {
+        let mut entries = Vec::with_capacity(opt.zstd_dict.len());
+        for spec in &opt.zstd_dict {
+            entries.push(
+                s4_server::dict::parse_zstd_dict_flag(spec)
+                    .map_err(|e| format!("--zstd-dict {spec:?}: {e}"))?,
+            );
+        }
+        let mut dict_bytes: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        for entry in &entries {
+            if dict_bytes.contains_key(&entry.dict_id) {
+                continue;
+            }
+            let dict_key = s4_server::dict::dict_object_key(&entry.dict_id);
+            let resp = dict_client
+                .get_object()
+                .bucket(&entry.bucket)
+                .key(&dict_key)
+                .send()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "--zstd-dict {:?}: failed to fetch dictionary {}/{dict_key} from the \
+                         backend (run `s4 train-dict` first?): {e}",
+                        entry.prefix, entry.bucket
+                    )
+                })?;
+            let body = resp
+                .body
+                .collect()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "--zstd-dict {:?}: failed to read dictionary body {}/{dict_key}: {e}",
+                        entry.prefix, entry.bucket
+                    )
+                })?
+                .into_bytes();
+            dict_bytes.insert(entry.dict_id.clone(), body.to_vec());
+        }
+        let store = s4_server::dict::DictStore::new(
+            entries,
+            dict_bytes,
+            opt.zstd_dict_max_bytes,
+            opt.zstd_level,
+        )
+        .map_err(|e| format!("--zstd-dict: {e}"))?;
+        info!(
+            mappings = ?store.entries(),
+            max_object_bytes = opt.zstd_dict_max_bytes,
+            "S4 zstd dictionaries loaded (v1.1 --zstd-dict) — small cpu-zstd PUTs under the \
+             configured prefixes compress with the trained dictionary when it wins"
+        );
+        s4 = s4.with_zstd_dicts(std::sync::Arc::new(store));
     }
     // v0.8.19 D-1: wire --max-body-bytes (the cap the threat model
     // already documents). Pre-D-1 the only way to change the cap
@@ -2255,6 +2379,7 @@ async fn run_subcommand(
         Cmd::SweepOrphanSidecars(args) => run_sweep_orphan_sidecars(opt, args).await,
         Cmd::Estimate(args) => run_estimate_cmd(opt, args).await,
         Cmd::Migrate(args) => run_migrate_cmd(opt, args).await,
+        Cmd::TrainDict(args) => run_train_dict_cmd(opt, args).await,
         Cmd::VerifyAuditLog(args) => {
             let key = s4_server::audit_log::AuditHmacKey::from_str(&args.hmac_key)
                 .map_err(|e| format!("--hmac-key: {e}"))?;
@@ -2467,6 +2592,57 @@ async fn run_migrate_cmd(
     if report.failed > 0 {
         return Err(format!("{} object(s) failed to migrate", report.failed).into());
     }
+    Ok(())
+}
+
+/// v1.1: `s4 train-dict <bucket>[/prefix] --endpoint-url <BACKEND>`.
+/// Samples small objects, trains a stock zstd dictionary, PUTs it to
+/// `.s4dict/<dict-id>`, and prints the gateway flag to copy-paste.
+async fn run_train_dict_cmd(
+    opt: &Opt,
+    args: &TrainDictArgs,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    let (bucket, prefix) = s4_server::dict::parse_bucket_prefix(&args.target)
+        .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.into() })?;
+    let client = build_sidecar_client(opt).await?;
+    let params = s4_server::dict::TrainDictParams {
+        prefix,
+        max_samples: args.max_samples,
+        max_dict_bytes: args.max_dict_bytes,
+        min_samples: args.min_samples,
+        sample_max_bytes: args.sample_max_bytes,
+        zstd_level: opt.zstd_level,
+    };
+    let report = s4_server::dict::run_train_dict(&client, &bucket, &params)
+        .await
+        .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.to_string().into() })?;
+    println!(
+        "trained zstd dictionary from {} object(s) ({} bytes sampled) under {}/{}",
+        report.sampled_objects, report.sampled_bytes, report.bucket, report.prefix
+    );
+    if report.skipped_too_large > 0 || report.skipped_already_s4 > 0 {
+        println!(
+            "  skipped: {} over --sample-max-bytes, {} already S4-compressed",
+            report.skipped_too_large, report.skipped_already_s4
+        );
+    }
+    println!(
+        "dictionary: {} bytes at {}/.s4dict/{}{}",
+        report.dict_bytes,
+        report.bucket,
+        report.dict_id,
+        if report.dict_already_existed {
+            " (already existed, identical bytes)"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "external decode (no gateway needed): aws s3 cp + `zstd -D <dictfile> -d` — the \
+         object is raw zstd dictionary bytes"
+    );
+    println!("start the gateway with:");
+    println!("  {}", report.gateway_flag);
     Ok(())
 }
 

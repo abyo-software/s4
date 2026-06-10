@@ -1043,6 +1043,77 @@ Honest limitations (the report prints the run-specific ones):
 - **Objects above 5 GiB are skipped**, not re-split into multipart —
   migrate buffers the whole body for the mandatory roundtrip verify.
 
+### Shared zstd dictionaries for small objects (`s4 train-dict` + `--zstd-dict`)
+
+Single-digit-KiB objects (JSON events, per-line log PUTs, small API
+payloads) barely compress with plain zstd — the window never sees
+redundancy *across* objects. A **shared dictionary** trained on a sample
+of similar objects moves that redundancy out of band; each object then
+compresses against the dictionary. Three steps:
+
+```bash
+# 1. Train from existing small objects (backend-direct tool, like migrate).
+#    Writes the dictionary to `.s4dict/<dict-id>` inside the bucket and
+#    prints the gateway flag.
+s4 train-dict mybucket/events/ --endpoint-url https://s3.example.com
+#   → --zstd-dict 'mybucket/events/=0123456789abcdef'
+
+# 2. Start the gateway with the printed mapping (repeatable per prefix).
+s4 --endpoint-url https://s3.example.com \
+   --zstd-dict 'mybucket/events/=0123456789abcdef'
+
+# 3. Confirm the effect: codec label `cpu-zstd-dict` in the access log /
+#    `s4_requests_total{codec="cpu-zstd-dict"}`, and backend object sizes.
+```
+
+Measured effect (minio E2E `dict_minio.rs`, 100 × ~300-byte JSON events
+of identical schema): **8 903 bytes stored with the dictionary vs
+21 923 bytes with plain cpu-zstd — 2.46× smaller (40 % of the dict-less
+size)**. The win scales with how homogeneous the objects are; on
+heterogeneous prefixes the dictionary won't beat plain zstd, and the
+gateway then **falls back to plain cpu-zstd automatically** (both are
+compressed and compared per PUT — affordable because the path is capped
+at `--zstd-dict-max-bytes`, default 1 MiB).
+
+Mechanics and operational notes:
+
+- **When the dict path applies**: dispatcher picked `cpu-zstd` + key
+  longest-prefix-matches a configured `<bucket>/<prefix>` + declared
+  `Content-Length` ≤ `--zstd-dict-max-bytes`. Everything else — and
+  *every* PUT when no `--zstd-dict` flag is set — is bit-for-bit
+  unchanged. Multipart uploads and chunked uploads without a
+  Content-Length never take the dict path.
+- **Wire format is additive**: the object is a normal single-frame S4F2
+  body whose frame carries the new codec id 8 (`cpu-zstd-dict`); the
+  dictionary id travels in the `s4-dict-id` object-metadata key. The
+  S4F2 layout itself is unchanged.
+- **Pre-v1.1 readers** (older gateway / `s4-codec` builds) fail a GET of
+  a dict-compressed object with the existing *unknown codec id* error —
+  a clean, typed failure, not silent corruption. Roll gateways forward
+  before enabling the flag if you run mixed fleets.
+- **Dropping the flag doesn't strand data**: a gateway booted without
+  `--zstd-dict` lazily fetches `.s4dict/<id>` from the object's bucket
+  on first GET (fingerprint-verified, small LRU cache; failures surface
+  as 5xx + `s4_dict_fetch_total{result="err"}`).
+- **`.s4dict/<dict-id>`** is hidden from gateway listings, named by the
+  SHA-256 prefix of its bytes (content-addressed, immutable; re-training
+  the same corpus is idempotent).
+- **No lock-in**: the stored payload is a **stock zstd frame** and the
+  dictionary object is **raw zstd dictionary bytes**. Decode without any
+  S4 software (the E2E pins this recipe against the real `zstd` CLI):
+
+  ```bash
+  # strip the 28-byte S4F2 frame header, then:
+  aws s3 cp s3://mybucket/.s4dict/0123456789abcdef dict.bin
+  zstd -D dict.bin -d payload.zst -o original.json
+  # python: zstandard.ZstdDecompressor(dict_data=ZstdCompressionDict(dict.bin))
+  ```
+
+- **Scope-outs (follow-ups)**: `s4-codec-py` / `s4-codec-wasm` don't
+  decode `cpu-zstd-dict` natively yet; CopyObject and multipart parts
+  never use dictionaries; re-training (schema drift) requires a new
+  flag value + gateway restart.
+
 ## Production Features
 
 ### Streaming I/O

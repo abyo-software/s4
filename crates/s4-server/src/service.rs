@@ -635,6 +635,22 @@ pub struct S4Service<B: S3> {
     /// injection from M-1 / F-13 stays closed. Default
     /// `false` matches the v0.8.16 behaviour.
     allow_legacy_reserved_key_reads: bool,
+    /// v1.1 `--zstd-dict`: optional prefix→dictionary store for the PUT
+    /// side. `None` (default) leaves every PUT bit-for-bit on the
+    /// pre-dict path; `Some(...)` makes small cpu-zstd PUTs whose key
+    /// longest-prefix-matches a configured prefix try `cpu-zstd-dict`
+    /// (falling back to plain cpu-zstd when the dictionary doesn't
+    /// actually shrink the body). Built in `main.rs` from the repeated
+    /// `--zstd-dict <bucket>/<prefix>=<dict-id>` flags; every dictionary
+    /// is fetched from the backend at boot.
+    zstd_dicts: Option<Arc<crate::dict::DictStore>>,
+    /// v1.1 `--zstd-dict` GET resilience: small LRU of lazily-fetched
+    /// dictionaries. Always present (no flag needed) so objects stamped
+    /// with `s4-dict-id` stay readable on a gateway that never loaded —
+    /// or has since dropped — the matching `--zstd-dict` flag: the GET
+    /// path fetches `.s4dict/<id>` from the object's bucket, verifies
+    /// the content-addressed fingerprint, and caches it here.
+    dict_cache: Arc<crate::dict::DictCache>,
 }
 
 /// v0.8.17 G-2: which AWS error shape the reserved-name guard
@@ -728,7 +744,24 @@ impl<B: S3> S4Service<B> {
             // `with_allow_legacy_reserved_key_reads(true)` for the
             // migration window only.
             allow_legacy_reserved_key_reads: false,
+            // v1.1 `--zstd-dict`: PUT-side dict store off by default
+            // (no behaviour change without the flag); the GET-side lazy
+            // cache is always live but only consulted for objects that
+            // carry the `s4-dict-id` metadata stamp.
+            zstd_dicts: None,
+            dict_cache: Arc::new(crate::dict::DictCache::default()),
         }
+    }
+
+    /// v1.1 `--zstd-dict`: attach the boot-time dictionary store. PUTs
+    /// whose key longest-prefix-matches a configured `<bucket>/<prefix>`
+    /// and whose declared size fits `--zstd-dict-max-bytes` compress
+    /// with the trained dictionary when it beats plain cpu-zstd. When
+    /// unset (default), PUT behaviour is bit-for-bit unchanged.
+    #[must_use]
+    pub fn with_zstd_dicts(mut self, store: Arc<crate::dict::DictStore>) -> Self {
+        self.zstd_dicts = Some(store);
+        self
     }
 
     /// v0.8.17 G-4: opt in to a migration window where GET / HEAD /
@@ -2304,6 +2337,214 @@ impl<B: S3> S4Service<B> {
         }
         Ok(out.freeze())
     }
+
+    // ===================================================================
+    // v1.1 `--zstd-dict` helpers
+    // ===================================================================
+
+    /// Resolve dictionary bytes for `dict_id`, in priority order:
+    /// 1. boot-time preloaded store (`--zstd-dict` flags),
+    /// 2. the lazy LRU cache,
+    /// 3. backend fetch of `.s4dict/<dict_id>` from the object's bucket
+    ///    (fingerprint-verified, then inserted into the LRU).
+    ///
+    /// Step 3 is what keeps dict objects readable after the operator
+    /// drops the `--zstd-dict` flag. A failed fetch is a 5xx with an
+    /// explicit message (and a `s4_dict_fetch_total{result="err"}` bump)
+    /// — NOT a silent passthrough of compressed bytes.
+    async fn resolve_dict(&self, bucket: &str, dict_id: &str) -> S3Result<Arc<[u8]>> {
+        if let Some(store) = self.zstd_dicts.as_ref()
+            && let Some(dict) = store.get_preloaded(dict_id)
+        {
+            return Ok(dict);
+        }
+        if let Some(dict) = self.dict_cache.get(dict_id) {
+            return Ok(dict);
+        }
+        let dict_key = crate::dict::dict_object_key(dict_id);
+        let uri = safe_object_uri(bucket, &dict_key)?;
+        let get_req = S3Request {
+            input: GetObjectInput {
+                bucket: bucket.into(),
+                key: dict_key.clone(),
+                ..Default::default()
+            },
+            method: http::Method::GET,
+            uri,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let fetch_failed = |cause: String| {
+            crate::metrics::record_dict_fetch("err");
+            S3Error::with_message(
+                S3ErrorCode::InternalError,
+                format!(
+                    "object requires zstd dictionary {dict_id} but `{bucket}/{dict_key}` \
+                     could not be fetched from the backend: {cause}"
+                ),
+            )
+        };
+        let resp = self
+            .backend
+            .get_object(get_req)
+            .await
+            .map_err(|e| fetch_failed(format!("{e}")))?;
+        let blob = resp
+            .output
+            .body
+            .ok_or_else(|| fetch_failed("backend returned no body".into()))?;
+        // Dictionaries are ≤ ~110 KiB by construction; 16 MiB is a
+        // generous hard cap against a hostile oversized `.s4dict/` blob.
+        let bytes = collect_blob(blob, 16 * 1024 * 1024)
+            .await
+            .map_err(|e| fetch_failed(format!("collect dictionary body: {e}")))?;
+        let actual_id = crate::dict::dict_id_of(&bytes);
+        if actual_id != dict_id {
+            return Err(fetch_failed(format!(
+                "fingerprint mismatch: object hashes to {actual_id} (corrupted / tampered \
+                 dictionary object?)"
+            )));
+        }
+        let dict: Arc<[u8]> = Arc::from(bytes.to_vec().into_boxed_slice());
+        self.dict_cache
+            .insert(dict_id.to_owned(), Arc::clone(&dict));
+        crate::metrics::record_dict_fetch("ok");
+        debug!(
+            bucket,
+            dict_id, "S4 zstd dictionary lazy-fetched from backend and cached"
+        );
+        Ok(dict)
+    }
+
+    /// GET-side decompress for `s4-dict-id`-stamped objects. Same S4F2
+    /// frame walk as [`Self::decompress_multipart`] (incl. the aggregate
+    /// output cap), with `cpu-zstd-dict` frames decoded against `dict`
+    /// instead of going through the registry.
+    async fn decompress_framed_with_dict(
+        &self,
+        bytes: bytes::Bytes,
+        dict: Arc<[u8]>,
+    ) -> S3Result<bytes::Bytes> {
+        let dict_codec = s4_codec::cpu_zstd_dict::CpuZstdDict::new(
+            dict,
+            s4_codec::cpu_zstd_dict::CpuZstdDict::DEFAULT_LEVEL,
+        )
+        .map_err(internal("build cpu-zstd-dict codec"))?;
+        let mut out = BytesMut::new();
+        let aggregate_cap = self.max_body_bytes;
+        let mut produced: usize = 0;
+        for frame in FrameIter::new(bytes) {
+            let (header, payload) = frame.map_err(|e| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("dict-framed object frame parse: {e}"),
+                )
+            })?;
+            let chunk_manifest = ChunkManifest {
+                codec: header.codec,
+                original_size: header.original_size,
+                compressed_size: header.compressed_size,
+                crc32c: header.crc32c,
+            };
+            if (produced as u64).saturating_add(header.original_size) > aggregate_cap as u64 {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!(
+                        "dict-framed aggregate output exceeds cap: would reach {} bytes \
+                         after this frame, cap is {aggregate_cap}",
+                        (produced as u64).saturating_add(header.original_size),
+                    ),
+                ));
+            }
+            let decompressed = if header.codec == CodecKind::CpuZstdDict {
+                use s4_codec::Codec as _;
+                dict_codec
+                    .decompress(payload, &chunk_manifest)
+                    .await
+                    .map_err(internal("dict frame decompress"))?
+            } else {
+                // Defensive: a mixed body (e.g. a fallback frame written
+                // as plain cpu-zstd) still decodes via the registry.
+                self.registry
+                    .decompress(payload, &chunk_manifest)
+                    .await
+                    .map_err(internal("dict-framed frame decompress"))?
+            };
+            produced = produced.saturating_add(decompressed.len());
+            if produced > aggregate_cap {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!(
+                        "dict-framed aggregate output exceeded cap: {produced} bytes \
+                         emitted, cap is {aggregate_cap}"
+                    ),
+                ));
+            }
+            out.extend_from_slice(&decompressed);
+        }
+        Ok(out.freeze())
+    }
+
+    /// PUT-side dict path: compress the (small, already-buffered) body
+    /// BOTH with the trained dictionary and with plain cpu-zstd, keep
+    /// whichever is smaller, and wrap the winner in a single S4F2 frame
+    /// (same layout the streaming path writes for a ≤1-chunk body).
+    ///
+    /// Returns `(framed_body, aggregate_manifest, used_dict)` —
+    /// `used_dict == false` is the fallback shape: a normal `cpu-zstd`
+    /// framed object, indistinguishable from a non-dict PUT, and no
+    /// `s4-dict-id` stamp.
+    async fn compress_small_with_dict(
+        &self,
+        bytes: bytes::Bytes,
+        dict: Arc<[u8]>,
+        level: i32,
+    ) -> S3Result<(bytes::Bytes, ChunkManifest, bool)> {
+        use s4_codec::Codec as _;
+        let dict_codec = s4_codec::cpu_zstd_dict::CpuZstdDict::new(dict, level)
+            .map_err(internal("build cpu-zstd-dict codec"))?;
+        let (dict_payload, dict_manifest) = dict_codec
+            .compress(bytes.clone())
+            .await
+            .map_err(internal("cpu-zstd-dict compress"))?;
+        let (plain_payload, plain_manifest) = self
+            .registry
+            .compress(bytes, CodecKind::CpuZstd)
+            .await
+            .map_err(internal("cpu-zstd compress (dict comparison)"))?;
+        let used_dict = crate::dict::dict_wins(dict_payload.len(), plain_payload.len());
+        let (payload, chunk_manifest) = if used_dict {
+            (dict_payload, dict_manifest)
+        } else {
+            (plain_payload, plain_manifest)
+        };
+        let mut framed = BytesMut::with_capacity(FRAME_HEADER_BYTES + payload.len());
+        write_frame(
+            &mut framed,
+            FrameHeader {
+                codec: chunk_manifest.codec,
+                original_size: chunk_manifest.original_size,
+                compressed_size: payload.len() as u64,
+                crc32c: chunk_manifest.crc32c,
+            },
+            &payload,
+        );
+        let framed = framed.freeze();
+        // Aggregate manifest mirrors `streaming_compress_to_frames`:
+        // codec = the frame codec, compressed_size = total framed bytes
+        // (incl. the 28-byte header), crc32c = crc of the *input*.
+        let manifest = ChunkManifest {
+            codec: chunk_manifest.codec,
+            original_size: chunk_manifest.original_size,
+            compressed_size: framed.len() as u64,
+            crc32c: chunk_manifest.crc32c,
+        };
+        Ok((framed, manifest, used_dict))
+    }
 }
 
 /// Parse a CopySourceRange header value (`bytes=N-M`, `bytes=N-`, `bytes=-N`)
@@ -2416,6 +2657,26 @@ const META_MULTIPART: &str = "s4-multipart";
 /// 旧 v0.1 single-PUT は raw 圧縮 bytes (この flag なし)。GET 時にこの flag を
 /// 見て framed 経路 (= multipart と同じ FrameIter parse) に流す。
 pub(crate) const META_FRAMED: &str = "s4-framed";
+/// v1.1 `--zstd-dict`: 16-hex dictionary id (`.s4dict/<id>` の `<id>`) を
+/// 指す。`cpu-zstd-dict` (codec id 8) で圧縮した single-PUT framed object に
+/// だけ stamp される。GET 側はこの id で辞書を解決する (preloaded →
+/// lazy-fetch LRU → backend `.s4dict/<id>`)。フレーム自体には辞書 id を
+/// 入れない (S4F2 レイアウト不変 = additive wire change)。
+pub(crate) const META_DICT_ID: &str = "s4-dict-id";
+
+/// v1.1 `--zstd-dict`: pull the validated dict-id off object metadata.
+/// Invalid shapes (non-16-hex) are treated as absent — the GET path then
+/// falls through to the frame parser, which fails typed on the
+/// `cpu-zstd-dict` frame instead of splicing a tainted id into a
+/// backend key.
+fn extract_dict_id(metadata: &Option<Metadata>) -> Option<String> {
+    let id = metadata.as_ref()?.get(META_DICT_ID)?;
+    if crate::dict::is_valid_dict_id(id) {
+        Some(id.clone())
+    } else {
+        None
+    }
+}
 
 fn is_framed_v2_object(metadata: &Option<Metadata>) -> bool {
     metadata
@@ -2864,8 +3125,114 @@ impl<B: S3> S3 for S4Service<B> {
                 .map(crate::streaming_checksum::WhichHashers::from_trailer_header)
                 .unwrap_or_default();
             let which_hashers = client_checksums.which_hashers().or(trailer_hashers);
+            // v1.1 `--zstd-dict`: small-object shared-dictionary path.
+            // Applies only when (a) a dict store is configured, (b) the
+            // dispatcher picked cpu-zstd, (c) the key longest-prefix-
+            // matches a configured `<bucket>/<prefix>`, and (d) the
+            // declared Content-Length fits `--zstd-dict-max-bytes`
+            // (chunked transfers without a length stay on the unchanged
+            // path — we refuse to buffer blind). With no `--zstd-dict`
+            // flag, `dict_candidate` is always `None` and every PUT is
+            // bit-for-bit on the pre-dict path.
+            let dict_candidate = if kind == CodecKind::CpuZstd {
+                self.zstd_dicts.as_ref().and_then(|store| {
+                    let fits = total_size_hint
+                        .map(|n| n <= store.max_object_bytes() as u64)
+                        .unwrap_or(false);
+                    if fits {
+                        store.lookup(&put_bucket, &put_key)
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+            let mut stamped_dict_id: Option<String> = None;
             let use_framed = supports_streaming_compress(kind) && kind != CodecKind::Passthrough;
-            let (compressed, manifest, is_framed) = if use_framed {
+            let (compressed, manifest, is_framed) = if let Some((dict_id, dict)) = dict_candidate {
+                // Bodies on this path are ≤ --zstd-dict-max-bytes
+                // (default 1 MiB), so buffering + compress-both-ways is
+                // an acceptable cost for the 2-5× ratio win on
+                // homogeneous small objects.
+                let bytes = collect_with_sample(sample, rest_stream, self.max_body_bytes)
+                    .await
+                    .map_err(internal("collect put body (dict path)"))?;
+                // Same buffered-path integrity checkpoint as the
+                // bytes-buffered branch below: all six header checksums
+                // plus the SigV4-streaming trailer comparison.
+                verify_client_body_checksums(
+                    &bytes,
+                    req.input.content_md5.as_deref(),
+                    req.input.checksum_crc32.as_deref(),
+                    req.input.checksum_crc32c.as_deref(),
+                    req.input.checksum_sha1.as_deref(),
+                    req.input.checksum_sha256.as_deref(),
+                    req.input.checksum_crc64nvme.as_deref(),
+                )?;
+                if let Some(announced) = req
+                    .headers
+                    .get("x-amz-trailer")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    let which =
+                        crate::streaming_checksum::WhichHashers::from_trailer_header(announced);
+                    let computed = if which.any() {
+                        crate::streaming_checksum::compute_digests(&bytes, which)
+                    } else {
+                        crate::streaming_checksum::ComputedDigests::default()
+                    };
+                    verify_client_trailer_checksums(
+                        Some(announced),
+                        req.trailing_headers.as_ref(),
+                        &computed,
+                    )?;
+                }
+                let dict_level = self
+                    .zstd_dicts
+                    .as_ref()
+                    .map(|s| s.level())
+                    .unwrap_or(s4_codec::cpu_zstd::CpuZstd::DEFAULT_LEVEL);
+                debug!(
+                    bucket = ?req.input.bucket,
+                    key = ?req.input.key,
+                    bytes = bytes.len(),
+                    dict_id = %dict_id,
+                    path = "dict-framed",
+                    "S4 put_object: compressing (buffered, dict vs plain cpu-zstd)"
+                );
+                if bytes.len()
+                    <= self
+                        .zstd_dicts
+                        .as_ref()
+                        .map(|s| s.max_object_bytes())
+                        .unwrap_or(crate::dict::DEFAULT_DICT_MAX_OBJECT_BYTES)
+                {
+                    let (body, manifest, used_dict) = self
+                        .compress_small_with_dict(bytes, dict, dict_level)
+                        .await?;
+                    if used_dict {
+                        stamped_dict_id = Some(dict_id);
+                    }
+                    (body, manifest, true)
+                } else {
+                    // The declared Content-Length fit the dict ceiling
+                    // but the wire body didn't (lying client). Re-frame
+                    // through the standard chunked path — same output
+                    // shape a non-dict PUT of this body would produce.
+                    let actual_len = bytes.len() as u64;
+                    let (body, manifest) = streaming_compress_to_frames(
+                        bytes_to_blob(bytes),
+                        Arc::clone(&self.registry),
+                        kind,
+                        pick_chunk_size(Some(actual_len)),
+                        None,
+                    )
+                    .await
+                    .map_err(internal("framed compress (dict-path size fallback)"))?;
+                    (body, manifest, true)
+                }
+            } else if use_framed {
                 // streaming fast path: input は memory に collect しない
                 let chained = chain_sample_with_rest(sample, rest_stream);
                 // v0.9 #106: tee the chained input through a multi-hasher
@@ -3096,6 +3463,16 @@ impl<B: S3> S3 for S4Service<B> {
                     .metadata
                     .get_or_insert_with(Default::default)
                     .insert(META_FRAMED.into(), "true".into());
+            }
+            // v1.1 `--zstd-dict`: record which dictionary the body was
+            // compressed against. Only stamped when the dict actually won
+            // the size comparison — fallback bodies are plain `cpu-zstd`
+            // frames and carry no dict reference.
+            if let Some(ref dict_id) = stamped_dict_id {
+                req.input
+                    .metadata
+                    .get_or_insert_with(Default::default)
+                    .insert(META_DICT_ID.into(), dict_id.clone());
             }
             // 重要: content_length を圧縮後サイズで更新する。
             // これを忘れると下流 (aws-sdk-s3 → S3) が宣言サイズ分の bytes を
@@ -3950,6 +4327,9 @@ impl<B: S3> S3 for S4Service<B> {
         // multipart と同じ path に流す。
         let needs_frame_parse = is_multipart || is_framed_v2;
         let manifest_opt = extract_manifest(&resp.output.metadata);
+        // v1.1 `--zstd-dict`: dict-compressed objects are framed single-
+        // PUTs whose frames need the dictionary named by `s4-dict-id`.
+        let dict_id_meta = extract_dict_id(&resp.output.metadata);
 
         if !needs_frame_parse && manifest_opt.is_none() {
             // S4 が書いていないオブジェクトは透過 (raw bucket pre-existing object 等)
@@ -4209,7 +4589,14 @@ impl<B: S3> S3 for S4Service<B> {
                 .await
                 .map_err(internal("collect get body"))?;
 
-            let decompressed = if needs_frame_parse {
+            let decompressed = if let Some(ref dict_id) = dict_id_meta {
+                // v1.1 `--zstd-dict`: resolve the dictionary (preloaded →
+                // LRU → lazy backend fetch of `.s4dict/<id>`) and walk the
+                // S4F2 frames with the dict-aware decoder. Works even on a
+                // gateway booted without any `--zstd-dict` flag.
+                let dict = self.resolve_dict(&get_bucket, dict_id).await?;
+                self.decompress_framed_with_dict(bytes, dict).await?
+            } else if needs_frame_parse {
                 // multipart objects と framed-v2 single-PUT objects は同じ
                 // S4F2 frame 列なので decompress_multipart で統一処理
                 self.decompress_multipart(bytes).await?
@@ -4792,6 +5179,10 @@ impl<B: S3> S3 for S4Service<B> {
                     META_CRC32C,
                     META_MULTIPART,
                     META_FRAMED,
+                    // v1.1 `--zstd-dict`: without the dict reference the
+                    // destination of a REPLACE-directive copy could not
+                    // resolve its dictionary at GET time.
+                    META_DICT_ID,
                 ] {
                     if let Some(v) = src_meta.get(key) {
                         dest_meta.insert(key.to_string(), v.clone());
@@ -4832,7 +5223,11 @@ impl<B: S3> S3 for S4Service<B> {
             contents.retain(|o| {
                 o.key
                     .as_ref()
-                    .map(|k| !k.ends_with(".s4index") && !is_versioning_shadow_key(k))
+                    .map(|k| {
+                        !k.ends_with(".s4index")
+                            && !is_versioning_shadow_key(k)
+                            && !crate::dict::is_dict_key(k)
+                    })
                     .unwrap_or(true)
             });
         }
@@ -4850,7 +5245,11 @@ impl<B: S3> S3 for S4Service<B> {
             contents.retain(|o| {
                 o.key
                     .as_ref()
-                    .map(|k| !k.ends_with(".s4index") && !is_versioning_shadow_key(k))
+                    .map(|k| {
+                        !k.ends_with(".s4index")
+                            && !is_versioning_shadow_key(k)
+                            && !crate::dict::is_dict_key(k)
+                    })
                     .unwrap_or(true)
             });
             // key_count も補正 (S3 spec compliance)
@@ -4938,7 +5337,11 @@ impl<B: S3> S3 for S4Service<B> {
             versions.retain(|v| {
                 v.key
                     .as_ref()
-                    .map(|k| !k.ends_with(".s4index") && !is_versioning_shadow_key(k))
+                    .map(|k| {
+                        !k.ends_with(".s4index")
+                            && !is_versioning_shadow_key(k)
+                            && !crate::dict::is_dict_key(k)
+                    })
                     .unwrap_or(true)
             });
         }
@@ -4946,7 +5349,11 @@ impl<B: S3> S3 for S4Service<B> {
             markers.retain(|m| {
                 m.key
                     .as_ref()
-                    .map(|k| !k.ends_with(".s4index") && !is_versioning_shadow_key(k))
+                    .map(|k| {
+                        !k.ends_with(".s4index")
+                            && !is_versioning_shadow_key(k)
+                            && !crate::dict::is_dict_key(k)
+                    })
                     .unwrap_or(true)
             });
         }
@@ -8246,6 +8653,28 @@ mod tests {
         meta.insert(META_CODEC.into(), "cpu-zstd".into());
         let opt = Some(meta);
         assert!(extract_manifest(&opt).is_none());
+    }
+
+    /// v1.1 `--zstd-dict`: `extract_dict_id` must reject anything that
+    /// isn't exactly 16 lowercase hex chars — the value is spliced into
+    /// a backend object key (`.s4dict/<id>`), so tainted metadata must
+    /// not smuggle path segments.
+    #[test]
+    fn extract_dict_id_validates_shape() {
+        let with = |v: &str| {
+            let mut meta = Metadata::new();
+            meta.insert(META_DICT_ID.into(), v.into());
+            Some(meta)
+        };
+        assert_eq!(
+            extract_dict_id(&with("0123456789abcdef")).as_deref(),
+            Some("0123456789abcdef")
+        );
+        assert!(extract_dict_id(&with("../../../etc/pwd")).is_none());
+        assert!(extract_dict_id(&with("0123456789ABCDEF")).is_none());
+        assert!(extract_dict_id(&with("0123456789abcde")).is_none());
+        assert!(extract_dict_id(&with("")).is_none());
+        assert!(extract_dict_id(&None).is_none());
     }
 
     #[test]

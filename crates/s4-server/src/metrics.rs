@@ -212,6 +212,25 @@ pub mod names {
     /// `rate(s4_sigusr1_dump_total{result="err"} > 0)` so silent
     /// snapshot-write failures surface in dashboards.
     pub const SIGUSR1_DUMP_TOTAL: &str = "s4_sigusr1_dump_total";
+    /// v1.1 `--zstd-dict`: bumped on every **lazy** GET-side dictionary
+    /// fetch (`.s4dict/<id>` pulled from the backend because the dict
+    /// was neither preloaded via `--zstd-dict` nor already in the LRU).
+    /// Labels: `result` (= `"ok"` / `"err"` — `err` covers backend GET
+    /// failure, missing object, and fingerprint mismatch; the GET that
+    /// needed the dictionary returns 5xx in the `err` case). Boot-time
+    /// preloads and LRU hits do NOT bump this counter — a sustained
+    /// `ok` rate therefore means GET traffic depends on a dictionary
+    /// the gateway wasn't configured with (operator should re-add the
+    /// `--zstd-dict` flag); any `err` rate means dict-compressed
+    /// objects are currently unreadable.
+    pub const DICT_FETCH_TOTAL: &str = "s4_dict_fetch_total";
+}
+
+/// v1.1 `--zstd-dict`: bump the lazy dictionary-fetch counter. `result`
+/// is `"ok"` (fetched + fingerprint-verified + cached) or `"err"` (the
+/// GET that needed the dictionary failed with 5xx).
+pub fn record_dict_fetch(result: &'static str) {
+    metrics::counter!(names::DICT_FETCH_TOTAL, "result" => result).increment(1);
 }
 
 /// v0.8.5 #86 (audit M-3): bump the SIGUSR1 snapshot dump-back counter.

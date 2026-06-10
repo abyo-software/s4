@@ -99,8 +99,9 @@ fn frame_roundtrip_bolero() {
     use bolero::generator::*;
     bolero::check!()
         .with_generator((
-            // codec_id 0..=5 (有効な variant)
-            (0u32..6),
+            // codec_id 0..=8 (有効な variant 全部。6=gdeflate / 7=gzip は
+            // 追加時に範囲更新が漏れていた、8=cpu-zstd-dict で気付いて拡張)
+            (0u32..9),
             // original_size
             (0u64..100_000),
             // payload (実際の長さ = compressed_size)

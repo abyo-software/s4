@@ -14,6 +14,7 @@ use thiserror::Error;
 
 pub mod cpu_gzip;
 pub mod cpu_zstd;
+pub mod cpu_zstd_dict;
 pub mod dietgpu;
 pub mod dispatcher;
 #[cfg(feature = "nvcomp-gpu")]
@@ -59,6 +60,15 @@ pub enum CodecKind {
     /// S4. Pair with the `Content-Encoding: gzip` header to serve to a
     /// browser / curl that's never heard of S4.
     CpuGzip,
+    /// CPU zstd with a shared trained dictionary (v1.1 `--zstd-dict`).
+    /// Same wire bytes as stock `zstd -D <dictfile>` — a plain zstd frame
+    /// that references an external dictionary. The dictionary itself is
+    /// NOT in the frame; the s4-server PUT path records which dictionary
+    /// was used in the `s4-dict-id` object-metadata key, and the GET path
+    /// resolves it back. Readers older than this variant fail with the
+    /// existing unknown-codec-id error (additive wire change: new id, no
+    /// layout change).
+    CpuZstdDict,
 }
 
 impl CodecKind {
@@ -72,6 +82,7 @@ impl CodecKind {
             Self::CpuZstd => "cpu-zstd",
             Self::NvcompGDeflate => "nvcomp-gdeflate",
             Self::CpuGzip => "cpu-gzip",
+            Self::CpuZstdDict => "cpu-zstd-dict",
         }
     }
 
@@ -87,6 +98,7 @@ impl CodecKind {
             Self::DietGpuAns => 5,
             Self::NvcompGDeflate => 6,
             Self::CpuGzip => 7,
+            Self::CpuZstdDict => 8,
         }
     }
 
@@ -100,6 +112,7 @@ impl CodecKind {
             5 => Self::DietGpuAns,
             6 => Self::NvcompGDeflate,
             7 => Self::CpuGzip,
+            8 => Self::CpuZstdDict,
             _ => return None,
         })
     }
@@ -121,6 +134,7 @@ impl FromStr for CodecKind {
             "cpu-zstd" => Self::CpuZstd,
             "nvcomp-gdeflate" => Self::NvcompGDeflate,
             "cpu-gzip" => Self::CpuGzip,
+            "cpu-zstd-dict" => Self::CpuZstdDict,
             other => return Err(ParseCodecKindError(other.into())),
         })
     }
