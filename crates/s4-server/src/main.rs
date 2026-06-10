@@ -794,6 +794,28 @@ enum Cmd {
     /// object migrated or was skipped; exit 1 when any object failed.
     Migrate(MigrateArgs),
 
+    /// v1.1: rewrite cpu-zstd framed objects at a higher zstd level
+    /// during a quiet window (LSM-compaction for S3) — the PUT path
+    /// favours latency (`--zstd-level`, default 3); this bakes cold
+    /// objects at `--target-zstd-level` (default 19). Only S4-framed
+    /// cpu-zstd objects are touched: plain objects skip as `not-s4`
+    /// (run `s4 migrate` first), `passthrough` / `cpu-gzip` /
+    /// `nvcomp-*` / `cpu-zstd-dict` skip as `unsupported-codec`.
+    /// **Dry-run by default** — pass `--execute` to write. Rewritten
+    /// objects are stamped `s4-zstd-level`, so a re-run skips them
+    /// (`already-compacted`) — idempotent without a checkpoint file.
+    /// Rewrites only happen when the new frames shrink the stored
+    /// bytes by `--min-gain-percent` (default 3%), every write is
+    /// preceded by a mandatory decompress-roundtrip byte comparison
+    /// (no off switch) and a pre-PUT HEAD ETag check (narrows, does
+    /// not close, the concurrent-writer race). `--older-than 30d`
+    /// limits the run to cold objects. The endpoint MUST point at the
+    /// backend (not an S4 gateway). SSE-enabled deployments are
+    /// rejected. Versioned buckets work but old versions double-bill
+    /// until expired (the report warns). Exit 0 when every object was
+    /// recompacted or skipped; exit 1 when any object failed.
+    Recompact(RecompactArgs),
+
     /// v0.9 #106: scan every `*.s4index` in a bucket and report
     /// sidecars whose paired key is missing or whose embedded
     /// ETag / size disagrees with the live HEAD. Dry-run by default;
@@ -923,6 +945,87 @@ struct MigrateArgs {
     /// Output format.
     #[clap(long, value_enum, default_value = "table")]
     format: MigrateFormat,
+}
+
+/// v1.1: `s4 recompact` output format.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RecompactFormat {
+    /// Human-readable summary + notes (default).
+    Table,
+    /// Structured JSON (`s4_server::recompact::RecompactReport` serde shape).
+    Json,
+}
+
+#[derive(Debug, Args)]
+struct RecompactArgs {
+    /// Recompact target as `<bucket>` or `<bucket>/<prefix>`. Slashes
+    /// after the first belong to the prefix, so `mybucket/logs/2026`
+    /// recompacts only the keys under `logs/2026`.
+    target: String,
+
+    /// Actually rewrite objects (and sidecars). Without this flag the
+    /// run is a dry-run: it GETs + decodes + recompresses + verifies
+    /// and reports measured would-be savings, but never PUTs.
+    #[clap(long, default_value_t = false)]
+    execute: bool,
+
+    /// Only rewrite objects whose backend LastModified is at least
+    /// this old — `<integer><s|m|h|d>`, e.g. `30d` or `12h`. Newer
+    /// objects are skipped (`too-recent`). No default = no age filter.
+    #[clap(
+        long,
+        value_name = "DUR",
+        value_parser = s4_server::recompact::parse_duration_suffix
+    )]
+    older_than: Option<std::time::Duration>,
+
+    /// zstd level the frames are rewritten at; also the threshold the
+    /// `s4-zstd-level` idempotency stamp is compared against
+    /// (`already-compacted` skip when stamp >= target).
+    #[clap(
+        long,
+        value_name = "LEVEL",
+        default_value_t = s4_server::recompact::DEFAULT_TARGET_ZSTD_LEVEL,
+        value_parser = clap::value_parser!(i32).range(1..=22)
+    )]
+    target_zstd_level: i32,
+
+    /// Minimum shrink (percent of the currently stored bytes) required
+    /// before an object is rewritten; smaller wins are skipped
+    /// (`insufficient-gain`).
+    #[clap(
+        long,
+        value_name = "PERCENT",
+        default_value_t = s4_server::recompact::DEFAULT_MIN_GAIN_PERCENT
+    )]
+    min_gain_percent: f64,
+
+    /// Objects processed in parallel. Each in-flight object buffers
+    /// its stored body, decoded original and re-framed output in RAM.
+    #[clap(
+        long,
+        value_name = "N",
+        default_value_t = s4_server::recompact::DEFAULT_RECOMPACT_CONCURRENCY
+    )]
+    concurrency: usize,
+
+    /// Stop listing after this many objects (`.s4index` / `.s4dict/`
+    /// keys are excluded before counting). Keys beyond the cap are not
+    /// examined; re-running continues because recompacted objects are
+    /// skipped.
+    #[clap(long, value_name = "N")]
+    max_objects: Option<usize>,
+
+    /// Per-object cap on both the stored body and the decoded original
+    /// — larger objects are skipped (`too-large`) because recompact
+    /// buffers both for the decode + roundtrip verify. Default 5 GiB
+    /// matches `migrate --max-body-bytes`.
+    #[clap(long, value_name = "BYTES", default_value_t = DEFAULT_REPAIR_BODY_BYTES_CLI)]
+    max_body_bytes: u64,
+
+    /// Output format.
+    #[clap(long, value_enum, default_value = "table")]
+    format: RecompactFormat,
 }
 
 #[derive(Debug, Args)]
@@ -2379,6 +2482,7 @@ async fn run_subcommand(
         Cmd::SweepOrphanSidecars(args) => run_sweep_orphan_sidecars(opt, args).await,
         Cmd::Estimate(args) => run_estimate_cmd(opt, args).await,
         Cmd::Migrate(args) => run_migrate_cmd(opt, args).await,
+        Cmd::Recompact(args) => run_recompact_cmd(opt, args).await,
         Cmd::TrainDict(args) => run_train_dict_cmd(opt, args).await,
         Cmd::VerifyAuditLog(args) => {
             let key = s4_server::audit_log::AuditHmacKey::from_str(&args.hmac_key)
@@ -2591,6 +2695,57 @@ async fn run_migrate_cmd(
     // Exit contract: all-migrated / all-skipped = 0, any hard failure = 1.
     if report.failed > 0 {
         return Err(format!("{} object(s) failed to migrate", report.failed).into());
+    }
+    Ok(())
+}
+
+/// v1.1: `s4 recompact <bucket>[/prefix] --endpoint-url <BACKEND>`.
+/// High-level re-bake of cpu-zstd framed objects — see
+/// `s4_server::recompact` for the pipeline and the honesty constraints
+/// baked into the report notes.
+async fn run_recompact_cmd(
+    opt: &Opt,
+    args: &RecompactArgs,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    // Scope guard, same shape as migrate: recompact writes
+    // plaintext-framed bytes straight to the backend, and encrypted
+    // bodies never carry the frame magic anyway.
+    if opt.sse_s4_key.is_some() || !opt.sse_s4_key_rotated.is_empty() || opt.kms_local_dir.is_some()
+    {
+        return Err(
+            "recompact does not support SSE-enabled deployments yet; route writes through a \
+             running gateway instead"
+                .into(),
+        );
+    }
+    let (bucket, prefix) = s4_server::estimate::parse_bucket_prefix(&args.target)
+        .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.to_string().into() })?;
+    let client = build_sidecar_client(opt).await?;
+
+    let params = s4_server::recompact::RecompactParams {
+        prefix,
+        execute: args.execute,
+        concurrency: args.concurrency,
+        max_objects: args.max_objects,
+        max_body_bytes: args.max_body_bytes,
+        target_zstd_level: args.target_zstd_level,
+        min_gain_percent: args.min_gain_percent,
+        older_than: args.older_than,
+    };
+    let report = s4_server::recompact::run_recompact(&client, &bucket, &params)
+        .await
+        .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.to_string().into() })?;
+    match args.format {
+        RecompactFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        RecompactFormat::Table => {
+            print!("{}", s4_server::recompact::render_human(&report));
+        }
+    }
+    // Exit contract: all-recompacted / all-skipped = 0, any hard failure = 1.
+    if report.failed > 0 {
+        return Err(format!("{} object(s) failed to recompact", report.failed).into());
     }
     Ok(())
 }

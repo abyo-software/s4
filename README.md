@@ -138,9 +138,9 @@ Why this scope shape? An exhaustive "freeze every `pub` item" contract would ove
 
 ### Modules NOT in the freeze list
 
-`s4-server` ships 30 `pub mod` declarations from `crates/s4-server/src/lib.rs` so the `s4` binary (which is a separate crate) + the integration tests + the example binaries can reach the surface they need. Five modules contribute frozen items above: `repair`, `service`, `sse`, `streaming`, and `service_arc` (the last contributes only `SharedService`; the rest of `service_arc`'s contents are not frozen).
+`s4-server` ships 34 `pub mod` declarations from `crates/s4-server/src/lib.rs` so the `s4` binary (which is a separate crate) + the integration tests + the example binaries can reach the surface they need. Five modules contribute frozen items above: `repair`, `service`, `sse`, `streaming`, and `service_arc` (the last contributes only `SharedService`; the rest of `service_arc`'s contents are not frozen).
 
-Library consumers MAY `use s4_server::<other_module>::*;` — Rust visibility allows it — but those imports are **not frozen** and may break in any v1.x minor release without notice. The other 25 modules (`access_log`, `acme`, `audit_log`, `blob`, `cors`, `inventory`, `kms`, `lifecycle`, `lock_recovery`, `metrics`, `mfa`, `multipart_state`, `notifications`, `object_lock`, `policy`, `rate_limit`, `replication`, `routing`, `select`, `sigv4a`, `state_loader`, `streaming_checksum`, `tagging`, `tls`, `versioning`) exist as `pub mod` for binary-and-tests' needs, not as a published surface.
+Library consumers MAY `use s4_server::<other_module>::*;` — Rust visibility allows it — but those imports are **not frozen** and may break in any v1.x minor release without notice. The other 29 modules (`access_log`, `acme`, `audit_log`, `blob`, `cors`, `dict`, `estimate`, `inventory`, `kms`, `lifecycle`, `lock_recovery`, `metrics`, `mfa`, `migrate`, `multipart_state`, `notifications`, `object_lock`, `policy`, `rate_limit`, `recompact`, `replication`, `routing`, `select`, `sigv4a`, `state_loader`, `streaming_checksum`, `tagging`, `tls`, `versioning`) exist as `pub mod` for binary-and-tests' needs, not as a published surface.
 
 If you depend on one of these unfrozen modules, pin a precise `=1.x.y` (rather than `^1`) and treat any minor bump as a manual integration step. If you would like an item promoted to the frozen surface, please file an issue with the use case.
 
@@ -1059,6 +1059,118 @@ Honest limitations (the report prints the run-specific ones):
   GPU gateway reads the cpu-zstd frames unchanged.
 - **Objects above 5 GiB are skipped**, not re-split into multipart —
   migrate buffers the whole body for the mandatory roundtrip verify.
+
+### Background recompaction to higher zstd levels (`s4 recompact`)
+
+The gateway's PUT path favours latency: bodies are framed with
+`cpu-zstd` at `--zstd-level` (default 3). `s4 recompact` is the LSM
+take on that trade — during a quiet window it "bakes" cold S4-framed
+cpu-zstd objects at a higher level (`--target-zstd-level`, default 19),
+shrinking the backend bill without touching the read path: compression
+level is encode-side only, so every gateway build reads level-19 frames
+exactly like level-3 frames. Like `migrate`, it is **dry-run by
+default** and must point at the **backend**, not an S4 gateway:
+
+```bash
+s4 recompact <bucket>[/prefix] --endpoint-url https://s3.example.com            # dry-run
+s4 recompact <bucket>[/prefix] --endpoint-url https://s3.example.com --execute  # write
+```
+
+Per object it (1) probes the first 4 bytes + metadata and selects
+**only S4-framed cpu-zstd objects** — the exact inverse of `migrate`'s
+selection: plain objects skip as `not-s4` (run `s4 migrate` first),
+`passthrough` / `cpu-gzip` / `nvcomp-*` / `cpu-zstd-dict` skip as
+`unsupported-codec`; (2) skips objects already stamped
+`s4-zstd-level >= target` (`already-compacted`) — **the idempotency
+core**: a re-run resumes automatically with no checkpoint file;
+(3) decodes the existing frames in-process with the same `FrameIter` +
+registry path the gateway's GET uses (recovering the original bytes
+doubles as an integrity check on the stored frames); (4) re-frames the
+original with the same `streaming_compress_to_frames` call and
+chunk-size policy as the PUT path, and **only rewrites when the new
+frames shrink the currently stored bytes by `--min-gain-percent`
+(default 3%)** — smaller wins skip as `insufficient-gain`, so the run
+never churns objects for noise; (5) decompresses the new frames back
+and byte-compares against the decoded original — **no verify, no
+write, no off switch** — then re-checks the source ETag with a HEAD
+immediately before the overwrite PUT (`etag-raced` on mismatch);
+(6) refreshes the `<key>.s4index` sidecar for multi-frame bodies (and
+deletes a now-stale sidecar when the rewrite came out single-frame).
+User metadata and Content-Type survive the rewrite; the `s4-*`
+manifest keys are re-stamped for the new frames plus the
+`s4-zstd-level` marker.
+
+`--older-than <DUR>` (`30d`, `12h`, `45m`, `90s`) restricts the run to
+objects whose backend `LastModified` is at least that old — newer ones
+skip as `too-recent`. That makes a nightly cron the natural way to run
+it ("recompact what has gone cold this month"):
+
+```cron
+# /etc/cron.d/s4-recompact — nightly at 03:30, only objects idle 30+ days
+30 3 * * *  s4  s4 recompact mybucket --endpoint-url https://s3.example.com \
+    --older-than 30d --execute --format json >> /var/log/s4-recompact.log 2>&1
+```
+
+Re-runs are cheap by design: everything already at the target level
+skips in one probe GET per object.
+
+Example run (the `recompact_minio` e2e seed: two varied-text log
+objects framed at zstd-3 by `s4 migrate`, one never-migrated plain
+object, one passthrough-stamped random binary — output verbatim):
+
+```
+S4 recompact s4-recompact-test — execute
+  target zstd level: 19   min gain: 3%
+  objects: 4   total: 285.0 KiB (291883 bytes)
+  recompacted: 2 object(s), 218.0 KiB -> 187.6 KiB (saves 30.4 KiB)
+  skipped: 1 not-s4, 0 already-compacted, 1 unsupported-codec, 0 insufficient-gain, 0 too-large, 0 etag-raced, 0 too-recent
+  failed: 0
+
+Notes:
+  - conflict safety: the source ETag is re-checked via HEAD immediately before each overwrite, but S3 has no compare-and-swap — a writer landing between the HEAD and the PUT is silently overwritten
+  - 1 object(s) skipped as not-s4 — they are not S4-framed; run `s4 migrate` first to frame them, then recompact
+```
+
+(That ~14% shrink on already-compressed bytes is specific to this
+varied-log corpus at zstd-3 → 19; your gain depends entirely on the
+data — run the dry-run first, its sizes are measured on the real
+re-framed output, not estimated.)
+
+Exit code is 0 when every object was recompacted or skipped, 1 when
+any object failed (failed objects are left untouched; re-running
+resumes). `--format json` emits the full report
+(`s4_server::recompact::RecompactReport` serde shape).
+
+Honest limitations (the report prints the run-specific ones):
+
+- **cpu-zstd → cpu-zstd only.** GPU-written (`nvcomp-*`), gzip,
+  dictionary (`cpu-zstd-dict`) and passthrough objects are skipped,
+  not converted.
+- **The ETag re-check narrows but does not close the overwrite race**
+  — same caveat as `migrate`. Recompact during a write-quiet window,
+  or rely on `--older-than` to keep the run on cold keys.
+- **SSE-enabled deployments are rejected** (`--sse-s4-key` /
+  `--kms-local-dir`); encrypted bodies never carry the frame magic and
+  classify as `not-s4` defensively anyway.
+- **Versioned buckets work but double-bill**: the overwrite PUT leaves
+  the previous version in place until lifecycle rules expire it. The
+  report prints a `WARNING` line when versioning is `Enabled`.
+- **The `s4-zstd-level` stamp is recompact-only and not propagated by
+  CopyObject** — a copied object is simply re-examined on the next run
+  and typically skips as `insufficient-gain` (its frames are already
+  high-level), at the cost of one decode + recompress.
+- **Multipart-written objects are rewritten as single-PUT framed
+  objects** (padding frames and the `s4-multipart` flag dropped) —
+  byte-identical through the gateway, but the multipart ETag shape is
+  lost (any overwrite PUT changes the ETag regardless).
+- **Objects above `--max-body-bytes` (default 5 GiB) are skipped** —
+  recompact buffers the stored body, the decoded original, and the
+  re-framed output for the decode + roundtrip verify.
+- **CPU cost is real**: zstd-19 encodes orders of magnitude slower
+  than zstd-3 (`zstd -b3` vs `-b19` on the e2e log corpus: ~1930 MB/s
+  vs ~3.4 MB/s on one desktop core; decode speed is unaffected) — that
+  is exactly why this runs nightly on cold data instead of on the PUT
+  hot path.
 
 ### Shared zstd dictionaries for small objects (`s4 train-dict` + `--zstd-dict`)
 

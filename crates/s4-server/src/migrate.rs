@@ -258,8 +258,9 @@ fn size_precheck(size: u64, max_body_bytes: u64) -> Option<SkipReason> {
 
 /// Strip surrounding quotes from a wire ETag — the sidecar stores the
 /// normalized form (same canonical form `repair::normalize_etag` and
-/// the gateway's `write_sidecar` use).
-fn normalize_etag(s: &str) -> String {
+/// the gateway's `write_sidecar` use). `pub(crate)` for `recompact`,
+/// which needs the identical canonical form; behaviour unchanged.
+pub(crate) fn normalize_etag(s: &str) -> String {
     s.trim_matches('"').to_owned()
 }
 
@@ -334,7 +335,12 @@ async fn list_inventory(
 /// `GetBucketVersioning` → `Ok(true)` iff the bucket reports `Enabled`.
 /// Errors are surfaced (the caller downgrades them to a report note —
 /// the warning is best-effort, the migration itself is not affected).
-async fn versioning_enabled(client: &Client, bucket: &str) -> Result<bool, MigrateError> {
+/// `pub(crate)` for `recompact` (same best-effort probe, same warning);
+/// behaviour unchanged.
+pub(crate) async fn versioning_enabled(
+    client: &Client,
+    bucket: &str,
+) -> Result<bool, MigrateError> {
     let resp = client
         .get_bucket_versioning()
         .bucket(bucket)
@@ -378,8 +384,9 @@ fn build_write_registry(params: &MigrateParams) -> CodecRegistry {
 }
 
 /// Wrap an in-memory body as the `StreamingBlob` input
-/// [`streaming_compress_to_frames`] expects.
-fn bytes_blob(body: Bytes) -> s3s::dto::StreamingBlob {
+/// [`streaming_compress_to_frames`] expects. `pub(crate)` for
+/// `recompact`; behaviour unchanged.
+pub(crate) fn bytes_blob(body: Bytes) -> s3s::dto::StreamingBlob {
     s3s::dto::StreamingBlob::wrap(futures::stream::once(async move {
         Ok::<_, std::io::Error>(body)
     }))
@@ -389,7 +396,13 @@ fn bytes_blob(body: Bytes) -> s3s::dto::StreamingBlob {
 /// `FrameIter` the gateway's GET path uses, decompress each frame, and
 /// compare the concatenation byte-for-byte against the original body.
 /// Any parse / decompress error or byte difference returns `false`.
-async fn verify_roundtrip(registry: &Arc<CodecRegistry>, framed: Bytes, original: &[u8]) -> bool {
+/// `pub(crate)` for `recompact`, which runs the same mandatory pre-write
+/// check on its re-framed bytes; behaviour unchanged.
+pub(crate) async fn verify_roundtrip(
+    registry: &Arc<CodecRegistry>,
+    framed: Bytes,
+    original: &[u8],
+) -> bool {
     let mut out = BytesMut::with_capacity(original.len());
     for frame in FrameIter::new(framed) {
         let Ok((header, payload)) = frame else {
@@ -860,7 +873,8 @@ pub async fn run_migrate(
 }
 
 /// Format a byte count as a short human string (binary units).
-fn human_bytes(n: u64) -> String {
+/// `pub(crate)` for `recompact`'s table renderer; behaviour unchanged.
+pub(crate) fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut v = n as f64;
     let mut unit = 0;

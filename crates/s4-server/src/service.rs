@@ -2663,6 +2663,16 @@ pub(crate) const META_FRAMED: &str = "s4-framed";
 /// lazy-fetch LRU → backend `.s4dict/<id>`)。フレーム自体には辞書 id を
 /// 入れない (S4F2 レイアウト不変 = additive wire change)。
 pub(crate) const META_DICT_ID: &str = "s4-dict-id";
+/// v1.1 `s4 recompact`: the zstd compression level the object's frames
+/// were last (re)written at. **Recompact-only stamp** — the gateway
+/// neither reads nor writes this key (PUT-path objects simply lack it),
+/// and GET-path behaviour is identical with or without it. Recompact
+/// uses it as its idempotency marker: an object whose stamp is already
+/// `>= --target-zstd-level` is skipped (`already-compacted`) on
+/// re-runs. Not propagated by CopyObject's reserved-key allowlist —
+/// copies are simply re-examined on the next recompact run and skip as
+/// `insufficient-gain`.
+pub(crate) const META_ZSTD_LEVEL: &str = "s4-zstd-level";
 
 /// v1.1 `--zstd-dict`: pull the validated dict-id off object metadata.
 /// Invalid shapes (non-16-hex) are treated as absent — the GET path then

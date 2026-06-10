@@ -8,6 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`s4 recompact <bucket>[/prefix] --endpoint-url <BACKEND> [--execute]`** —
+  rewrite cpu-zstd framed objects at a higher zstd level during a quiet
+  window (LSM-compaction for S3). The gateway's PUT path favours latency
+  (`--zstd-level`, default 3); recompact decodes each S4-framed cpu-zstd
+  object in-process (same `FrameIter` walk as the GET path — doubles as
+  an integrity check on the stored frames), re-frames the original bytes
+  with the same `streaming_compress_to_frames` + `pick_chunk_size` pair
+  the PUT path uses at `--target-zstd-level` (default 19), and overwrites
+  only when the new frames shrink the **stored** bytes by
+  `--min-gain-percent` (default 3%). Rewritten objects are stamped with
+  new `s4-zstd-level` metadata (recompact-only stamp — the gateway
+  neither reads nor writes it), making re-runs idempotent
+  (`already-compacted` skip) with no checkpoint file.
+  `--older-than <DUR>` (`30d` / `12h` / `45m` / `90s`) restricts the run
+  to cold objects by backend `LastModified`. Dry-run by default;
+  mandatory decompress-roundtrip byte comparison before every write (no
+  off switch) and a pre-PUT HEAD ETag re-check (narrows, does not close,
+  the concurrent-writer race). Skip taxonomy: `not-s4` (run `s4 migrate`
+  first) / `already-compacted` / `unsupported-codec` (passthrough,
+  `cpu-gzip`, `nvcomp-*`, `cpu-zstd-dict` — this tool is cpu-zstd →
+  cpu-zstd only) / `insufficient-gain` / `too-large` (`--max-body-bytes`,
+  default 5 GiB) / `etag-raced` / `too-recent`. Multi-frame rewrites
+  refresh the `<key>.s4index` sidecar; single-frame rewrites delete a
+  now-stale one. `--concurrency` (default 4), `--max-objects`,
+  `--format table|json`; exit 1 iff any object failed. SSE-enabled
+  deployments are rejected (same guard as migrate). New library module
+  `s4_server::recompact` (`run_recompact`, `RecompactParams`,
+  `RecompactReport`, `RecompactError` `#[non_exhaustive]`,
+  `parse_duration_suffix`). Additive only — no existing flag, metadata
+  key, or default changed (`s4-server` internals: a handful of private
+  `migrate` helpers became `pub(crate)` for reuse, behaviour unchanged).
 - **`s4 estimate <bucket>[/prefix] --endpoint-url <BACKEND>`** — read-only
   pre-deployment savings simulator. Lists the bucket (`.s4index` excluded,
   capped at `--max-list-keys`), stratifies objects by extension, samples

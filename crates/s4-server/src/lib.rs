@@ -19,6 +19,7 @@ pub mod notifications;
 pub mod object_lock;
 pub mod policy;
 pub mod rate_limit;
+pub mod recompact;
 pub mod repair;
 pub mod replication;
 pub mod routing;
