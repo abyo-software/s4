@@ -12,6 +12,7 @@ pub mod lifecycle;
 pub mod lock_recovery;
 pub mod metrics;
 pub mod mfa;
+pub mod migrate;
 pub mod multipart_state;
 pub mod notifications;
 pub mod object_lock;

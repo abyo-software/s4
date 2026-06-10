@@ -755,6 +755,23 @@ enum Cmd {
     /// listing).
     Estimate(EstimateArgs),
 
+    /// v1.1: bulk retro-compression of pre-existing objects into the
+    /// gateway's S4F2 framed format (same dispatcher decision, same
+    /// framing call, same metadata + sidecar contract as the PUT
+    /// path). **Dry-run by default** — pass `--execute` to write.
+    /// Objects already in S4 format are skipped, so a re-run resumes
+    /// automatically. Every write is preceded by a mandatory
+    /// decompress-roundtrip byte comparison (no off switch) and a
+    /// pre-PUT HEAD ETag check (narrows, but does not close, the
+    /// concurrent-writer race window — S3 has no compare-and-swap).
+    /// The endpoint MUST point at the backend (not an S4 gateway).
+    /// SSE-enabled deployments are rejected — route writes through a
+    /// running gateway instead. Versioned buckets work but the old
+    /// (uncompressed) versions remain and double-bill until expired;
+    /// the report warns when versioning is Enabled. Exit 0 when every
+    /// object migrated or was skipped; exit 1 when any object failed.
+    Migrate(MigrateArgs),
+
     /// v0.9 #106: scan every `*.s4index` in a bucket and report
     /// sidecars whose paired key is missing or whose embedded
     /// ETag / size disagrees with the live HEAD. Dry-run by default;
@@ -824,6 +841,54 @@ struct EstimateArgs {
     /// Output format.
     #[clap(long, value_enum, default_value = "table")]
     format: EstimateFormat,
+}
+
+/// v1.1: `s4 migrate` output format.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum MigrateFormat {
+    /// Human-readable summary + notes (default).
+    Table,
+    /// Structured JSON (`s4_server::migrate::MigrateReport` serde shape).
+    Json,
+}
+
+#[derive(Debug, Args)]
+struct MigrateArgs {
+    /// Migrate target as `<bucket>` or `<bucket>/<prefix>`. Slashes
+    /// after the first belong to the prefix, so `mybucket/logs/2026`
+    /// migrates only the keys under `logs/2026`.
+    target: String,
+
+    /// Actually rewrite objects (and write sidecars). Without this
+    /// flag the run is a dry-run: it GETs + compresses + verifies and
+    /// reports measured would-be savings, but never PUTs.
+    #[clap(long, default_value_t = false)]
+    execute: bool,
+
+    /// Objects processed in parallel. Each in-flight object buffers
+    /// its body and compressed output in RAM.
+    #[clap(
+        long,
+        value_name = "N",
+        default_value_t = s4_server::migrate::DEFAULT_MIGRATE_CONCURRENCY
+    )]
+    concurrency: usize,
+
+    /// Stop listing after this many objects (`.s4index` sidecars are
+    /// excluded before counting). Keys beyond the cap are not examined;
+    /// re-running continues because migrated objects are skipped.
+    #[clap(long, value_name = "N")]
+    max_objects: Option<usize>,
+
+    /// Per-object body cap — larger objects are skipped (`too-large`)
+    /// because migrate buffers the full body for the roundtrip verify.
+    /// Default 5 GiB matches `repair-sidecar --max-body-bytes`.
+    #[clap(long, value_name = "BYTES", default_value_t = DEFAULT_REPAIR_BODY_BYTES_CLI)]
+    max_body_bytes: u64,
+
+    /// Output format.
+    #[clap(long, value_enum, default_value = "table")]
+    format: MigrateFormat,
 }
 
 #[derive(Debug, Args)]
@@ -2189,6 +2254,7 @@ async fn run_subcommand(
         Cmd::RepairSidecar(args) => run_repair_sidecar(opt, args).await,
         Cmd::SweepOrphanSidecars(args) => run_sweep_orphan_sidecars(opt, args).await,
         Cmd::Estimate(args) => run_estimate_cmd(opt, args).await,
+        Cmd::Migrate(args) => run_migrate_cmd(opt, args).await,
         Cmd::VerifyAuditLog(args) => {
             let key = s4_server::audit_log::AuditHmacKey::from_str(&args.hmac_key)
                 .map_err(|e| format!("--hmac-key: {e}"))?;
@@ -2338,6 +2404,68 @@ async fn run_estimate_cmd(
                 print!("{}", s4_server::estimate::render_human(&report));
             }
         }
+    }
+    Ok(())
+}
+
+/// v1.1: `s4 migrate <bucket>[/prefix] --endpoint-url <BACKEND>`.
+/// Bulk retro-compression — see `s4_server::migrate` for the pipeline
+/// and the honesty constraints baked into the report notes.
+async fn run_migrate_cmd(
+    opt: &Opt,
+    args: &MigrateArgs,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    // Scope guard: migrate writes plaintext-framed bytes straight to the
+    // backend, so an SSE-configured deployment would end up with a mix
+    // of encrypted (gateway-written) and unencrypted (migrate-written)
+    // objects — and migrate cannot read the encrypted ones anyway.
+    if opt.sse_s4_key.is_some() || !opt.sse_s4_key_rotated.is_empty() || opt.kms_local_dir.is_some()
+    {
+        return Err(
+            "migrate does not support SSE-enabled deployments yet; route writes through a \
+             running gateway instead"
+                .into(),
+        );
+    }
+    let (bucket, prefix) = s4_server::estimate::parse_bucket_prefix(&args.target)
+        .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.to_string().into() })?;
+    let client = build_sidecar_client(opt).await?;
+
+    // Real GPU probe only — unlike `estimate` there is no simulate mode:
+    // the dispatcher pick is reported, but the frames written are always
+    // cpu-zstd (see `s4_server::migrate::write_kind`).
+    #[cfg(feature = "nvcomp-gpu")]
+    let gpu_present = s4_codec::nvcomp::is_gpu_available();
+    #[cfg(not(feature = "nvcomp-gpu"))]
+    let gpu_present = false;
+
+    let params = s4_server::migrate::MigrateParams {
+        prefix,
+        execute: args.execute,
+        concurrency: args.concurrency,
+        max_objects: args.max_objects,
+        max_body_bytes: args.max_body_bytes,
+        default_codec: opt.codec.as_kind(),
+        zstd_level: opt.zstd_level,
+        use_sampling_dispatcher: matches!(opt.dispatcher, DispatcherChoice::Sampling),
+        gpu_min_bytes: opt.gpu_min_bytes,
+        prefer_columnar_gpu: opt.prefer_columnar_gpu,
+        gpu_present,
+    };
+    let report = s4_server::migrate::run_migrate(&client, &bucket, &params)
+        .await
+        .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.to_string().into() })?;
+    match args.format {
+        MigrateFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        MigrateFormat::Table => {
+            print!("{}", s4_server::migrate::render_human(&report));
+        }
+    }
+    // Exit contract: all-migrated / all-skipped = 0, any hard failure = 1.
+    if report.failed > 0 {
+        return Err(format!("{} object(s) failed to migrate", report.failed).into());
     }
     Ok(())
 }

@@ -961,6 +961,88 @@ Honesty notes (always printed with the report):
 Exit code is 0 on any completed estimate, including an empty listing
 (`no objects found`).
 
+### Bulk retro-compression of existing buckets (`s4 migrate`)
+
+`s4 migrate` rewrites the uncompressed objects already sitting in a
+bucket into the same S4F2 framed format the gateway writes at PUT time
+— the follow-up to `s4 estimate` once the numbers say yes. Like
+`sweep-orphan-sidecars`, it is **dry-run by default**; like every
+sidecar subcommand, point it at the **backend**, not an S4 gateway:
+
+```bash
+s4 migrate <bucket>[/prefix] --endpoint-url https://s3.example.com            # dry-run
+s4 migrate <bucket>[/prefix] --endpoint-url https://s3.example.com --execute  # write
+```
+
+Per object it (1) probes the first 4 bytes + metadata and **skips
+anything already in S4 format** — which makes a re-run resume
+automatically with no checkpoint file; (2) runs the **same
+`SamplingDispatcher` decision the gateway runs at PUT time** (the
+server-side `--codec` / `--dispatcher` / `--zstd-level` /
+`--gpu-min-bytes` / `--prefer-columnar-gpu` flags are honored, passed
+*before* the subcommand) and skips passthrough picks / bodies the
+framing doesn't shrink; (3) frames the body with the same
+`streaming_compress_to_frames` call and chunk-size policy as the
+gateway's PUT path; (4) **decompresses the result in-process and
+byte-compares it against the original — no verify, no write, and there
+is deliberately no flag to turn this off**; (5) re-checks the source
+ETag with a HEAD immediately before the overwrite PUT and skips on
+mismatch (`etag-raced`); (6) writes the same `<key>.s4index` sidecar
+the gateway writes for multi-frame bodies, so Range GETs keep the
+partial-fetch fast path. `--concurrency` (default 4) objects run in
+parallel; objects above `--max-body-bytes` (default 5 GiB, same cap as
+`repair-sidecar`) are skipped as `too-large`.
+
+Example run (5-object MinIO demo bucket — 3 repetitive logs, one JSON
+export, one random binary):
+
+```
+$ s4 migrate demo --endpoint-url http://127.0.0.1:9000 --execute
+S4 migrate demo — execute
+  objects: 5   total: 4.8 MiB (5032356 bytes)
+  migrated: 4 object(s), 3.8 MiB -> 7.7 KiB (saves 3.8 MiB)
+  skipped: 0 already-s4, 1 not-compressible, 0 too-large, 0 etag-raced, 0 verify-failed
+  failed: 0
+  codecs: cpu-zstd×4
+
+Notes:
+  - conflict safety: the source ETag is re-checked via HEAD immediately before each overwrite, but S3 has no compare-and-swap — a writer landing between the HEAD and the PUT is silently overwritten
+
+$ s4 migrate demo --endpoint-url http://127.0.0.1:9000 --execute   # idempotent re-run
+S4 migrate demo — execute
+  objects: 5   total: 1.0 MiB (1056431 bytes)
+  migrated: 0 object(s), 0 B -> 0 B (saves 0 B)
+  skipped: 4 already-s4, 1 not-compressible, 0 too-large, 0 etag-raced, 0 verify-failed
+  failed: 0
+```
+
+Exit code is 0 when every object was migrated or skipped, 1 when any
+object failed (failed objects are left untouched; re-running resumes).
+`--format json` emits the full report
+(`s4_server::migrate::MigrateReport` serde shape).
+
+Honest limitations (the report prints the run-specific ones):
+
+- **The ETag re-check narrows but does not close the overwrite race.**
+  S3 has no compare-and-swap, so a writer landing between migrate's
+  HEAD and its PUT is silently overwritten. Migrate buckets during a
+  write-quiet window, or scope with `<bucket>/<prefix>` to cold data.
+- **SSE-enabled deployments are rejected** (`--sse-s4-key` /
+  `--kms-local-dir`): `migrate does not support SSE-enabled deployments
+  yet; route writes through a running gateway instead`.
+- **Versioned buckets work but double-bill**: the overwrite PUT leaves
+  the previous (uncompressed) version in place until lifecycle rules
+  expire it. The report prints a `WARNING` line when
+  `GetBucketVersioning` reports `Enabled`.
+- **CPU-only writes.** When the dispatcher's pick is a GPU
+  (`nvcomp-*`) or non-streaming (`cpu-gzip`) codec, migrate really
+  falls back to `cpu-zstd` at `--zstd-level` — same direction as a
+  non-GPU gateway build — and the codec breakdown shows
+  `picked != wrote_with` with a note. Frames are self-describing, so a
+  GPU gateway reads the cpu-zstd frames unchanged.
+- **Objects above 5 GiB are skipped**, not re-split into multipart —
+  migrate buffers the whole body for the mandatory roundtrip verify.
+
 ## Production Features
 
 ### Streaming I/O

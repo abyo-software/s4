@@ -2401,17 +2401,21 @@ fn is_multipart_object(metadata: &Option<Metadata>) -> bool {
         .unwrap_or(false)
 }
 
-const META_CODEC: &str = "s4-codec";
-const META_ORIGINAL_SIZE: &str = "s4-original-size";
-const META_COMPRESSED_SIZE: &str = "s4-compressed-size";
-const META_CRC32C: &str = "s4-crc32c";
+// v1.1 `s4 migrate`: the five manifest keys are `pub(crate)` (NOT `pub`)
+// so `crate::migrate` can stamp byte-identical metadata to what this PUT
+// path writes, without widening the SemVer-frozen public surface. The
+// values and semantics are unchanged.
+pub(crate) const META_CODEC: &str = "s4-codec";
+pub(crate) const META_ORIGINAL_SIZE: &str = "s4-original-size";
+pub(crate) const META_COMPRESSED_SIZE: &str = "s4-compressed-size";
+pub(crate) const META_CRC32C: &str = "s4-crc32c";
 /// Multipart upload で per-part frame format を使ったオブジェクトであることを示す。
 /// GET 時にこの flag を見て frame parser を起動する。
 const META_MULTIPART: &str = "s4-multipart";
 /// v0.2 #4: single-PUT でも S4F2 framed format で書かれていることを示す。
 /// 旧 v0.1 single-PUT は raw 圧縮 bytes (この flag なし)。GET 時にこの flag を
 /// 見て framed 経路 (= multipart と同じ FrameIter parse) に流す。
-const META_FRAMED: &str = "s4-framed";
+pub(crate) const META_FRAMED: &str = "s4-framed";
 
 fn is_framed_v2_object(metadata: &Option<Metadata>) -> bool {
     metadata

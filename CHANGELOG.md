@@ -22,6 +22,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `s4_server::estimate` (`run_estimate`, `EstimateParams`,
   `EstimateReport`, `EstimateError` `#[non_exhaustive]`). Additive only —
   no existing flag or default changed.
+- **`s4 migrate <bucket>[/prefix] --endpoint-url <BACKEND> [--execute]`** —
+  bulk retro-compression of pre-existing objects into the gateway's S4F2
+  framed format (same `SamplingDispatcher` decision, same
+  `streaming_compress_to_frames` framing + chunk-size policy, same
+  `s4-codec`/`s4-framed` metadata and `<key>.s4index` sidecar contract as
+  the PUT path — gateway GETs decompress migrated objects transparently).
+  Dry-run by default; `--execute` to write. Already-S4 objects (frame
+  magic or `s4-codec` metadata) are skipped, so re-runs resume
+  automatically without a checkpoint file. Every write requires an
+  in-process decompress-roundtrip byte comparison (no off switch) and a
+  pre-PUT HEAD ETag re-check (narrows, does not close, the concurrent-
+  writer race — documented). Skip taxonomy: `already-s4` /
+  `not-compressible` (passthrough pick or no size gain; object untouched)
+  / `too-large` (`--max-body-bytes`, default 5 GiB) / `etag-raced` /
+  `verify-failed`. `--concurrency` (default 4), `--max-objects`,
+  `--format table|json`; exit 1 iff any object failed. GPU / `cpu-gzip`
+  dispatcher picks really fall back to `cpu-zstd` at `--zstd-level`
+  (reported as `picked != wrote_with`). SSE-configured invocations are
+  rejected; versioning-Enabled buckets get a double-billing `WARNING`
+  note. New library module `s4_server::migrate` (`run_migrate`,
+  `MigrateParams`, `MigrateReport`, `MigrateError` / `SkipReason`
+  `#[non_exhaustive]`). Additive only — no existing flag, default, or
+  PUT/GET behavior changed.
 
 ## [1.0.0] — 2026-06-09
 
