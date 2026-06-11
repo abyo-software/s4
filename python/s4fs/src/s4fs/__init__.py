@@ -16,7 +16,16 @@ from fsspec import register_implementation
 from s4fs.core import S4File, S4FileSystem
 
 __all__ = ["S4File", "S4FileSystem"]
-__version__ = "1.0.0"
+
+# Single source of truth is pyproject.toml; a hardcoded string here
+# shipped 1.1.0 wheels reporting __version__ == "1.0.0" (post-release
+# audit catch), so resolve it from the installed dist metadata instead.
+try:
+    from importlib.metadata import PackageNotFoundError, version
+
+    __version__ = version("s4fs")
+except PackageNotFoundError:  # source checkout without an install
+    __version__ = "0.0.0+unknown"
 
 # Idempotent: the `fsspec.specs` entry point in pyproject.toml already
 # advertises the implementation; registering here covers source checkouts
