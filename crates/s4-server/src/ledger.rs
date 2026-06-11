@@ -47,6 +47,23 @@
 //!   meaningless. Each skipped removal is tallied per bucket in
 //!   [`LedgerSnapshot::skipped_unaccounted`] and disclosed as a report
 //!   note.
+//! - **The marker means "the ledger was enabled when this object was
+//!   written"**, NOT "this object's bytes are currently in the
+//!   counters" (v1.2 audit R2 P3). Two known gaps: (a) a multipart
+//!   Complete whose assembled body cannot be fetched or exceeds
+//!   `--max-body-bytes` keeps the Create-time marker but skips the add
+//!   (WARN-logged at Complete); (b) toggling the flag off→on across an
+//!   object's lifetime leaves marker-carrying objects from an earlier
+//!   ledger epoch with no matching add in the current state file. In
+//!   both cases a later DELETE subtracts through the marker gate bytes
+//!   that were never added — the zero-clamp on subtraction plus the
+//!   report's ratio floor + drift note are the disclosed guard rails
+//!   (counters under-claim, never over-claim).
+//! - Cross-bucket replication replicas are written with the marker
+//!   **stripped** (the dispatcher hands the destination a marker-less
+//!   metadata snapshot), keeping "replicas are not counted" symmetric:
+//!   a gateway-routed DELETE of a replica is a tallied skip, not a
+//!   phantom subtraction.
 //! - For marker-carrying objects the probe resolves `original_bytes`
 //!   from `s4-original-size` metadata, falling back to the sidecar for
 //!   multipart objects, falling back to `original = stored`. Probes
@@ -451,7 +468,12 @@ pub fn build_savings_report(snapshot: &LedgerSnapshot, price_per_gb_month: f64) 
          accounted (internal `s4-ledger` marker); removals of non-ledger-managed \
          objects are skipped and tallied separately. The HEAD probe is best-effort — \
          a raced probe leaves the counters slightly stale rather than failing the \
-         request"
+         request. The marker records that the ledger was enabled at write time, not \
+         that the bytes are in the counters: a multipart Complete skipped for an \
+         oversized/unfetchable body, or a flag toggled off->on, can leave \
+         marker-carrying objects that were never added — their later removal \
+         subtracts with clamping at zero (under-claim, surfaced by the drift note \
+         when it floors a bucket)"
             .to_owned(),
         "storage bytes only: request, egress, and (on GPU deployments) compute costs \
          are unchanged by S4"
@@ -478,7 +500,9 @@ pub fn build_savings_report(snapshot: &LedgerSnapshot, price_per_gb_month: f64) 
         notes.push(format!(
             "bucket(s) {}: stored_bytes exceeds original_bytes — savings ratio and \
              $/month are floored at 0 (counter drift from probe races / unaccounted \
-             writes, or negative compression gain on incompressible data)",
+             writes / marker-carrying objects that were never added (multipart adds \
+             skipped over --max-body-bytes, ledger flag toggled off->on), or negative \
+             compression gain on incompressible data)",
             drifted.join(", ")
         ));
     }

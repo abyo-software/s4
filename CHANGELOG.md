@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (v1.2 audit round 2 — adversarial verification of the round-1 fix wave)
+- **P2** Replication replicas no longer carry the `s4-ledger` marker
+  (they are never ledger-counted, so a gateway-routed delete of a
+  replica would have re-opened the asymmetric-subtraction bug round 1
+  closed). Both replication metadata capture sites route through a
+  marker-stripping snapshot helper.
+- **P2** Ledger add and subtract now resolve the same logical size on
+  churn: ledger-enabled SSE/versioned multipart re-PUTs stamp
+  `s4-original-size`/`s4-compressed-size` (the exact values the add
+  used), REPLACE copies stamp the probe-resolved original, and
+  COPY-directive copies probe the *destination* for the add. Previously
+  each add→delete cycle of a sidecar-suppressed multipart object
+  stranded phantom original bytes (overstated savings). New e2e pins a
+  versioned-multipart churn returning bucket totals to exactly zero.
+- **P3** Marker-without-add cases (cap-exceeded multipart Complete,
+  ledger flag toggles) are now disclosed in the module contract, the
+  report notes, and the Complete-path WARN — not eliminated
+  (zero-clamp + drift note remain the guard rails).
+- **P3** Access-point copy sources: REPLACE copies now strip
+  client-supplied `s4-*` metadata regardless of the source-addressing
+  variant (forged `s4-ledger`/`s4-original-size` via AP ARN closed),
+  and AP sources can no longer read reserved keys (`.s4index` /
+  `.s4dict/`).
+
 ### Fixed (v1.2 audit round 1 — 4 reviewers over v1.1.0..HEAD, 2026-06-12)
 - **P2** The savings ledger no longer subtracts objects it never added:
   gateway writes made with the ledger enabled stamp an unforgeable

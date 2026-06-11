@@ -1100,15 +1100,22 @@ they bound what the numbers mean):
 - Overwrite / DELETE subtraction adds **one best-effort HEAD probe per
   write-shaped request** (plus a sidecar HEAD where relevant) — this
   extra backend traffic exists *only* when the flag is set.
-- **Only ledger-accounted objects are ever subtracted** (audit round 1):
-  gateway writes made while the ledger is enabled carry an internal
-  `s4-ledger` metadata marker (client-supplied copies are stripped, so
-  it can't be forged), and deletes/overwrites of objects *without* the
-  marker — backend-direct, `s4fs`-written, `migrate`/`recompact` output,
-  pre-ledger writes — skip subtraction and are tallied per bucket as
-  `skipped_unaccounted` with a report note. This is what keeps a
-  migrate-baked bucket's ratio from going negative; ratio and $/month
-  additionally floor at 0 with a drift note if counters ever disagree.
+- **Only ledger-accounted objects are ever subtracted** (audit rounds
+  1-2): gateway writes made while the ledger is enabled carry an
+  internal `s4-ledger` metadata marker (client-supplied copies are
+  stripped — including via access-point copy sources — so it can't be
+  forged; replication replicas are written marker-*stripped* because
+  they are never counted), and deletes/overwrites of objects *without*
+  the marker — backend-direct, `s4fs`-written, `migrate`/`recompact`
+  output, pre-ledger writes — skip subtraction and are tallied per
+  bucket as `skipped_unaccounted` with a report note. The marker means
+  "the ledger was enabled at write time", not "the bytes are in the
+  counters" — a cap-exceeded multipart or a flag toggle can strand a
+  marker without an add (zero-clamp + drift note are the guard rails).
+  Ledger-enabled SSE/versioned multipart completes and REPLACE copies
+  also stamp `s4-original-size` so the add and the eventual subtract
+  resolve the same logical size (no phantom savings on churn); ratio
+  and $/month floor at 0 with a drift note if counters ever disagree.
 - State-file durability matches the other `--*-state-file` managers
   plus an event-driven flush (atomic tmp+rename on every mutation;
   SIGUSR1 re-dumps it too) — a crash loses at most the in-flight

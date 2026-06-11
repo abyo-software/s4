@@ -3096,6 +3096,24 @@ fn strip_reserved_client_metadata(metadata: &mut Option<Metadata>) {
     }
 }
 
+/// v1.2 audit R2 P2: snapshot of the metadata handed to the cross-bucket
+/// replication dispatcher. The dispatcher PUTs the replica directly
+/// against the backend (it never re-enters `put_object`), so replicas
+/// are — by documented design — **not** added to the savings ledger. A
+/// verbatim clone of the source metadata would carry the `s4-ledger`
+/// marker onto that unaccounted replica, and a later gateway-routed
+/// DELETE of the replica would then subtract bytes that were never
+/// added (the exact asymmetry the marker exists to prevent). Strip the
+/// marker; every other key (codec manifest, SSE markers, client
+/// metadata) is forwarded verbatim so the replica stays readable.
+fn replication_metadata_snapshot(metadata: &Option<Metadata>) -> Option<Metadata> {
+    let mut snap = metadata.clone();
+    if let Some(m) = snap.as_mut() {
+        m.remove(META_LEDGER);
+    }
+    snap
+}
+
 /// v1.1 `--zstd-dict`: pull the validated dict-id off object metadata.
 /// Invalid shapes (non-16-hex) are treated as absent — the GET path then
 /// falls through to the frame parser, which fails typed on the
@@ -4341,7 +4359,9 @@ impl<B: S3> S3 for S4Service<B> {
             // succeeds) can hand the same backend bytes to the
             // destination bucket. `Bytes` clone is cheap (refcounted).
             let replication_body = body_to_send.clone();
-            let replication_metadata = req.input.metadata.clone();
+            // v1.2 audit R2 P2: NOT a verbatim clone — the ledger marker
+            // must not ride along to the (never-accounted) replica.
+            let replication_metadata = replication_metadata_snapshot(&req.input.metadata);
             // v0.7 #48 BUG-1 fix: SSE encryption (S4E1/E2/E3/E4 frames)
             // makes the body longer than the post-compression bytes
             // (header + nonce + tag overhead). The earlier
@@ -5936,14 +5956,30 @@ impl<B: S3> S3 for S4Service<B> {
         // v0.8.15 M-1 / v0.8.17 G-2: shared reserved-name guard.
         self.check_not_reserved_key(&dst_key, ReservedKeyMode::Mutating)?;
         self.enforce_policy(&req, "s3:PutObject", &dst_bucket, Some(&dst_key))?;
-        if let CopySource::Bucket { bucket, key, .. } = &req.input.copy_source {
-            // v0.8.17 G-2: source `<key>.s4index` would let
-            // CopyObject expose the raw sidecar (frame layout +
-            // source ETag) into a writable destination, bypassing
-            // the F-13 GET reject. Same guard, Read mode (returns
-            // NoSuchKey to match listing semantics).
-            self.check_not_reserved_key(key, ReservedKeyMode::Read)?;
-            self.enforce_policy(&req, "s3:GetObject", bucket, Some(key))?;
+        match &req.input.copy_source {
+            CopySource::Bucket { bucket, key, .. } => {
+                // v0.8.17 G-2: source `<key>.s4index` would let
+                // CopyObject expose the raw sidecar (frame layout +
+                // source ETag) into a writable destination, bypassing
+                // the F-13 GET reject. Same guard, Read mode (returns
+                // NoSuchKey to match listing semantics).
+                self.check_not_reserved_key(key, ReservedKeyMode::Read)?;
+                self.enforce_policy(&req, "s3:GetObject", bucket, Some(key))?;
+            }
+            CopySource::AccessPoint { key, .. } => {
+                // v1.2 audit R2 P3: the reserved-key guard is a pure
+                // key-namespace check — apply it regardless of how the
+                // source is addressed, so an access-point ARN can't
+                // read `<key>.s4index` / `.s4dict/<id>` around the G-2
+                // gate. `s3:GetObject` policy enforcement, however,
+                // needs a bucket name; resolving an access-point ARN
+                // to its underlying bucket is backend-specific, so
+                // source-side policy for AP copies remains the
+                // backend's responsibility (documented limitation —
+                // the destination-side `s3:PutObject` gate above still
+                // applies).
+                self.check_not_reserved_key(key, ReservedKeyMode::Read)?;
+            }
         }
         // S4-aware copy: source object に s4-* metadata がある場合、それを
         // destination に確実に preserve する。
@@ -5960,6 +5996,30 @@ impl<B: S3> S3 for S4Service<B> {
             .as_ref()
             .map(|d| d.as_str() == MetadataDirective::REPLACE)
             .unwrap_or(false);
+        // v0.8.16 F-8: strip the client-supplied `s4-*` keys
+        // *unconditionally* — the v0.8.15 M-2 fix only ran the
+        // strip inside the `if let Ok(head) = ...` block, so a
+        // backend HEAD failure (transient 5xx, NoSuchKey on a
+        // racing delete) left attacker-injected `s4-*` /
+        // `S4-*` metadata intact on the destination. We strip
+        // first, then re-populate from the source HEAD when
+        // available — HEAD failure simply means the destination
+        // loses the codec markers (correct: a CopyObject without
+        // the source's codec metadata produces an unreadable
+        // object, but doesn't allow injection).
+        //
+        // v1.2 audit R2 P3: the strip is hoisted out of the
+        // `CopySource::Bucket` gate — it is a pure function of the
+        // *destination* metadata and must not depend on how the source
+        // is addressed. Pre-fix, a REPLACE copy whose source was an
+        // access-point ARN skipped the strip entirely, letting a
+        // client-supplied `x-amz-meta-s4-ledger` + forged
+        // `s4-original-size` land on the destination verbatim — a
+        // forgeable marker breaks the ledger's "clients cannot forge
+        // it" subtraction contract.
+        if needs_merge {
+            strip_reserved_client_metadata(&mut req.input.metadata);
+        }
         if needs_merge
             && let CopySource::Bucket {
                 bucket,
@@ -5967,20 +6027,6 @@ impl<B: S3> S3 for S4Service<B> {
                 version_id,
             } = &req.input.copy_source
         {
-            // v0.8.16 F-8: strip the client-supplied `s4-*` keys
-            // *unconditionally* — the v0.8.15 M-2 fix only ran the
-            // strip inside the `if let Ok(head) = ...` block, so a
-            // backend HEAD failure (transient 5xx, NoSuchKey on a
-            // racing delete) left attacker-injected `s4-*` /
-            // `S4-*` metadata intact on the destination. Now we
-            // strip first, then re-populate from the source HEAD
-            // when available — HEAD failure simply means the
-            // destination loses the codec markers (correct: a
-            // CopyObject without the source's codec metadata
-            // produces an unreadable object, but doesn't allow
-            // injection).
-            let dest_meta = req.input.metadata.get_or_insert_with(Default::default);
-            dest_meta.retain(|k, _| !k.to_ascii_lowercase().starts_with("s4-"));
             let head_input = HeadObjectInput {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -6104,13 +6150,16 @@ impl<B: S3> S3 for S4Service<B> {
                     .await?;
             }
         }
-        // v1.2 savings ledger: capture (a) the source footprint — the
-        // copy writes byte-identical content at the destination, so the
-        // source probe doubles as the new-dst footprint — and (b) the
-        // old destination footprint, BEFORE the backend copy replaces
-        // it. Same-bucket same-key REPLACE copies net out to zero (old
-        // == new), which is exactly the "metadata rewrite, not new
-        // data" semantics. Probes exist only when the ledger is on.
+        // v1.2 savings ledger: capture (a) the source footprint — used
+        // to stamp the REPLACE destination's `s4-original-size` below
+        // and as the fallback when the post-copy destination probe
+        // races a delete (the copy writes byte-identical content, so
+        // the source resolution is the best available stand-in) — and
+        // (b) the old destination footprint, BEFORE the backend copy
+        // replaces it. Same-bucket same-key REPLACE copies net out to
+        // zero (old == new), which is exactly the "metadata rewrite,
+        // not new data" semantics. Probes exist only when the ledger
+        // is on.
         let ledger_probes: Option<(Option<LedgerFootprint>, Option<LedgerFootprint>)> =
             if self.savings_ledger.is_some() {
                 let src = if let CopySource::Bucket {
@@ -6129,20 +6178,54 @@ impl<B: S3> S3 for S4Service<B> {
             } else {
                 None
             };
+        // v1.2 audit R2 P2: symmetrize the original-size resolution
+        // across the copy. Multipart sources carry no
+        // `s4-original-size` metadata — their logical size lives in
+        // the *source's* `.s4index`, which a copy does NOT carry to
+        // the destination — so the destination's later DELETE probe
+        // would fall back to `original = stored` while this copy's add
+        // resolved the sidecar's logical size: every copy→delete cycle
+        // would leave `logical − stored` phantom original bytes behind.
+        // For REPLACE copies the gateway owns the metadata: stamp the
+        // resolved original so the future probe sees the value the add
+        // used. (`or_insert` — a source-merged `s4-original-size` from
+        // the block above stays authoritative; only accounted sources
+        // are stamped, mirroring the add gate below.)
+        if needs_merge
+            && self.savings_ledger.is_some()
+            && let Some((Some(src), _)) = ledger_probes.as_ref()
+            && src.accounted
+        {
+            req.input
+                .metadata
+                .get_or_insert_with(Default::default)
+                .entry(META_ORIGINAL_SIZE.to_owned())
+                .or_insert_with(|| src.original_bytes.to_string());
+        }
         let copy_resp = self.backend.copy_object(req).await;
         if let (Some(ledger), Some((src, old_dst)), Ok(_)) = (
             self.savings_ledger.as_ref(),
             ledger_probes,
             copy_resp.as_ref(),
         ) {
-            // Source probe missed (raced delete that the copy itself
-            // survived, or a non-bucket copy source)? Fall back to
-            // probing the freshly-written destination — its metadata is
-            // the source's (COPY directive) or the merged set (REPLACE
-            // keeps the s4-* stamps), so the same resolution applies.
-            let new_dst = match src {
+            // v1.2 audit R2 P2: resolve the ADD from the freshly-written
+            // *destination* probe, so the add is — by construction —
+            // exactly what the destination's later DELETE probe will
+            // subtract (metadata `s4-original-size` → destination
+            // sidecar → `original = stored` fallback). Pre-fix the add
+            // trusted the *source* probe, whose sidecar-resolved
+            // logical size a COPY-directive destination can never
+            // reproduce (the sidecar isn't copied) — churn left phantom
+            // savings behind. The trade: a COPY-directive copy of a
+            // multipart source now adds `original == stored` (zero
+            // claimed savings for that copy — honest under-claim
+            // instead of an unpayable over-claim); REPLACE copies keep
+            // the logical size via the stamp above. The source probe
+            // remains the fallback for a destination probe lost to a
+            // raced delete.
+            let new_dst = match self.ledger_probe_object(&dst_bucket, &dst_key, None).await {
                 Some(f) => Some(f),
-                None => self.ledger_probe_object(&dst_bucket, &dst_key, None).await,
+                None => src,
             };
             match new_dst {
                 Some(new) => {
@@ -7128,6 +7211,31 @@ impl<B: S3> S3 for S4Service<B> {
                 // enabled (or the HEAD above failed).
                 if self.savings_ledger.is_some() {
                     new_metadata.insert(META_LEDGER.into(), META_LEDGER_ACCOUNTED.into());
+                    // v1.2 audit R2 P2: this re-PUT path (SSE multipart
+                    // and versioning-Enabled multipart) suppresses the
+                    // `.s4index` sidecar, so without an
+                    // `s4-original-size` stamp the later DELETE probe
+                    // falls back to `original = stored` while the
+                    // Complete's add used the frame-scan logical size —
+                    // every add→delete cycle would leave
+                    // `logical − stored` phantom original bytes behind
+                    // (overstated savings, no disclosure). Stamp the
+                    // same semantics `write_manifest` records on the
+                    // single-PUT path: original = logical client bytes
+                    // (the exact frame-scan sum the ledger add below
+                    // uses), compressed = the pre-SSE assembled framed
+                    // length. `insert` overwrites any HEAD-inherited
+                    // stale value — the gateway's own scan is
+                    // authoritative. Ledger-gated: flag-off deployments
+                    // keep bit-for-bit pre-ledger metadata. GET-path
+                    // behaviour is unchanged — `extract_manifest`
+                    // additionally requires `s4-crc32c`, which multipart
+                    // objects never carry, so the single-chunk decode
+                    // path stays unreachable for them.
+                    if let Some(original) = ledger_new_original {
+                        new_metadata.insert(META_ORIGINAL_SIZE.into(), original.to_string());
+                        new_metadata.insert(META_COMPRESSED_SIZE.into(), body.len().to_string());
+                    }
                 }
                 let new_body = match &ctx.sse {
                     crate::multipart_state::MultipartSseMode::SseC { key, key_md5 } => {
@@ -7270,7 +7378,10 @@ impl<B: S3> S3 for S4Service<B> {
                     };
                     let _ = self.backend.delete_object(del_req).await;
                 }
-                applied_metadata = Some(new_metadata);
+                // v1.2 audit R2 P2: same marker strip as the single-PUT
+                // replication capture — the replica is never ledger-
+                // accounted, so it must not carry `s4-ledger`.
+                applied_metadata = replication_metadata_snapshot(&Some(new_metadata));
             }
             // v0.8 #54 BUG-6 commit: register the new version with
             // the VersioningManager so list_object_versions /
@@ -7396,11 +7507,22 @@ impl<B: S3> S3 for S4Service<B> {
                     );
                 }
                 _ => {
+                    // v1.2 audit R2 P3: the marker was stamped at Create
+                    // time and survives on the completed object even
+                    // though this add is being skipped — disclose the
+                    // marker/accounting mismatch loudly (the object's
+                    // later DELETE will subtract via the marker gate;
+                    // the zero-clamp + report drift note are the
+                    // documented guard rails).
                     tracing::warn!(
                         bucket = %bucket,
                         key = %key,
                         "S4 savings ledger: multipart Complete not accounted \
-                         (assembled body unavailable); counters unchanged for this object"
+                         (assembled body unavailable — backend GET failed or the body \
+                         exceeds --max-body-bytes); counters unchanged for this object. \
+                         NOTE: this object will carry the ledger marker without being \
+                         counted, so its later DELETE may subtract bytes that were never \
+                         added (clamped at zero, disclosed via the report drift note)"
                     );
                 }
             }
@@ -10230,6 +10352,10 @@ mod tests {
         mp_metadata: std::sync::Mutex<Vec<Option<Metadata>>>,
         /// `(bucket, key, version_id)` of every `HeadObject` forwarded.
         head_probes: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
+        /// Metadata of every `CopyObject` forwarded (v1.2 audit R2 P3:
+        /// the access-point REPLACE strip asserts on what reaches the
+        /// backend wire).
+        copy_metadata: std::sync::Mutex<Vec<Option<Metadata>>>,
     }
 
     #[derive(Clone, Default)]
@@ -10276,8 +10402,13 @@ mod tests {
 
         async fn copy_object(
             &self,
-            _req: S3Request<CopyObjectInput>,
+            req: S3Request<CopyObjectInput>,
         ) -> S3Result<S3Response<CopyObjectOutput>> {
+            self.state
+                .copy_metadata
+                .lock()
+                .expect("lock")
+                .push(req.input.metadata.clone());
             Ok(S3Response::new(CopyObjectOutput::default()))
         }
     }
@@ -10394,5 +10525,129 @@ mod tests {
                 "HEAD probe must pin the requested source version"
             );
         }
+    }
+
+    /// v1.2 audit R2 P2: the metadata snapshot handed to the
+    /// replication dispatcher must NOT carry the `s4-ledger` marker —
+    /// the replica PUT bypasses `put_object` (never ledger-added), so a
+    /// marker-carrying replica would be subtracted on a later gateway
+    /// DELETE without ever having been added. Everything else (codec
+    /// manifest, SSE markers, client keys) must be forwarded verbatim.
+    #[test]
+    fn replication_metadata_snapshot_drops_ledger_marker() {
+        let mut meta = Metadata::new();
+        meta.insert(META_LEDGER.into(), META_LEDGER_ACCOUNTED.into());
+        meta.insert(META_CODEC.into(), "cpu-zstd".into());
+        meta.insert(META_ORIGINAL_SIZE.into(), "1234".into());
+        meta.insert("s4-encrypted".into(), "aes-256-gcm".into());
+        meta.insert("app-team".into(), "kept".into());
+        let snap = replication_metadata_snapshot(&Some(meta.clone()))
+            .expect("map survives, only the marker is removed");
+        assert!(
+            !snap.contains_key(META_LEDGER),
+            "ledger marker must not reach the replica: {snap:?}"
+        );
+        assert_eq!(snap.get(META_CODEC).map(String::as_str), Some("cpu-zstd"));
+        assert_eq!(
+            snap.get(META_ORIGINAL_SIZE).map(String::as_str),
+            Some("1234"),
+            "codec manifest keys must survive (the replica must stay readable)"
+        );
+        assert_eq!(
+            snap.get("s4-encrypted").map(String::as_str),
+            Some("aes-256-gcm")
+        );
+        assert_eq!(snap.get("app-team").map(String::as_str), Some("kept"));
+        // The source request's own metadata is untouched (clone, not
+        // mutate) — the source object keeps its marker.
+        assert!(meta.contains_key(META_LEDGER));
+        // None stays None (zero-length / body-less PUT shape).
+        assert!(replication_metadata_snapshot(&None).is_none());
+    }
+
+    /// v1.2 audit R2 P3: a REPLACE-directive copy whose source is an
+    /// access-point ARN must strip client-supplied `s4-*` destination
+    /// metadata exactly like a bucket-addressed copy — pre-fix the
+    /// strip lived behind the `CopySource::Bucket` gate, so an AP copy
+    /// let a forged `x-amz-meta-s4-ledger` + `s4-original-size` land on
+    /// the destination verbatim (a forgeable marker breaks the ledger's
+    /// subtraction contract).
+    #[tokio::test]
+    async fn access_point_replace_copy_strips_reserved_metadata() {
+        let (svc, state) = recording_service();
+        let mut builder = CopyObjectInput::builder();
+        builder.set_bucket("dst-bkt".to_owned());
+        builder.set_key("dst.bin".to_owned());
+        builder.set_copy_source(CopySource::AccessPoint {
+            region: "us-east-1".to_owned().into_boxed_str(),
+            account_id: "123456789012".to_owned().into_boxed_str(),
+            access_point_name: "my-ap".to_owned().into_boxed_str(),
+            key: "src.bin".to_owned().into_boxed_str(),
+        });
+        builder.set_metadata_directive(Some(MetadataDirective::from_static(
+            MetadataDirective::REPLACE,
+        )));
+        let mut meta = Metadata::new();
+        meta.insert(META_LEDGER.into(), META_LEDGER_ACCOUNTED.into());
+        meta.insert(META_ORIGINAL_SIZE.into(), "999999999999".into());
+        meta.insert("S4-Codec".into(), "cpu-zstd".into());
+        meta.insert("app-team".into(), "kept".into());
+        builder.set_metadata(Some(meta));
+        let input = builder.build().expect("input");
+        svc.copy_object(synthetic_req(input, http::Method::PUT))
+            .await
+            .expect("copy_object with access-point source");
+
+        let recorded = state.copy_metadata.lock().expect("lock");
+        assert_eq!(recorded.len(), 1, "exactly one backend forward");
+        let meta = recorded[0].as_ref().expect("metadata reaches the backend");
+        assert!(
+            !meta.contains_key(META_LEDGER),
+            "forged ledger marker must be stripped on AP REPLACE copies, got {meta:?}"
+        );
+        assert!(
+            !meta.contains_key(META_ORIGINAL_SIZE),
+            "forged s4-original-size must be stripped, got {meta:?}"
+        );
+        assert!(
+            !meta.contains_key("S4-Codec"),
+            "strip must stay case-insensitive, got {meta:?}"
+        );
+        assert_eq!(
+            meta.get("app-team").map(String::as_str),
+            Some("kept"),
+            "non-reserved client metadata must survive"
+        );
+    }
+
+    /// v1.2 audit R2 P3: the G-2 reserved-key guard on the copy
+    /// *source* must also apply to access-point addressing — an AP ARN
+    /// must not read `<key>.s4index` / `.s4dict/<id>` around the gate.
+    #[tokio::test]
+    async fn access_point_copy_source_reserved_key_rejected() {
+        let (svc, state) = recording_service();
+        let mut builder = CopyObjectInput::builder();
+        builder.set_bucket("dst-bkt".to_owned());
+        builder.set_key("dst.bin".to_owned());
+        builder.set_copy_source(CopySource::AccessPoint {
+            region: "us-east-1".to_owned().into_boxed_str(),
+            account_id: "123456789012".to_owned().into_boxed_str(),
+            access_point_name: "my-ap".to_owned().into_boxed_str(),
+            key: "secret.bin.s4index".to_owned().into_boxed_str(),
+        });
+        let input = builder.build().expect("input");
+        let err = svc
+            .copy_object(synthetic_req(input, http::Method::PUT))
+            .await
+            .expect_err("sidecar source via access point must be rejected");
+        assert_eq!(
+            err.code().as_str(),
+            "NoSuchKey",
+            "Read-mode guard mirrors listing semantics, got {err:?}"
+        );
+        assert!(
+            state.copy_metadata.lock().expect("lock").is_empty(),
+            "the rejected copy must never reach the backend"
+        );
     }
 }

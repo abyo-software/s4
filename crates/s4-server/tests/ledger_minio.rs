@@ -781,3 +781,152 @@ async fn ledger_e2e_versioning_enabled_accounting() {
 
     let _ = gw_stop.send(());
 }
+
+/// v1.2 audit R2 P2 — add/subtract symmetry for the sidecar-suppressed
+/// multipart re-PUT path. A versioning-Enabled multipart Complete
+/// re-PUTs the assembled body under a shadow key and writes NO
+/// `.s4index` sidecar, so pre-fix the object carried no
+/// `s4-original-size` either: the Complete's ledger add used the
+/// frame-scan logical size while the version's later DELETE probe fell
+/// back to `original = stored` — every add→delete cycle left
+/// `logical − stored` phantom original bytes behind (overstated
+/// savings, no disclosure). Post-fix the re-PUT stamps the resolved
+/// original onto the object metadata, so a full add→delete churn cycle
+/// must return the bucket's totals to **exactly zero**.
+#[tokio::test]
+#[ignore = "requires Docker (MinIO testcontainer); run with --ignored"]
+async fn ledger_e2e_versioned_multipart_churn_returns_to_zero() {
+    const MBKT: &str = "vmp-bkt";
+    let minio = start_minio().await;
+    let backend = build_aws_client(&minio.endpoint_url);
+    backend
+        .create_bucket()
+        .bucket(MBKT)
+        .send()
+        .await
+        .expect("create bucket");
+    let state_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = state_dir.path().join("savings-ledger.json");
+    let ledger = Arc::new(SavingsLedger::attach(
+        LedgerSnapshot::default(),
+        state_path.clone(),
+    ));
+    let v_mgr = Arc::new(s4_server::versioning::VersioningManager::new());
+    let (gw_url, gw_stop) =
+        spawn_s4_server_with(&minio.endpoint_url, Arc::clone(&ledger), Some(v_mgr)).await;
+    let gw = build_aws_client(&gw_url);
+    gw.put_bucket_versioning()
+        .bucket(MBKT)
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("enable versioning");
+
+    // Multipart upload: a heavily compressible part (logical size far
+    // above the stored frames — this is exactly the gap that leaked
+    // pre-fix) plus a noise part.
+    let mp_part1 = compressible_body(8 * 1024 * 1024);
+    let mp_part2 = random_body(1024 * 1024, 0xC0FFEE);
+    let mp_len = (mp_part1.len() + mp_part2.len()) as u64;
+    let create = gw
+        .create_multipart_upload()
+        .bucket(MBKT)
+        .key("mp/churn.bin")
+        .send()
+        .await
+        .expect("create multipart");
+    let upload_id = create.upload_id().expect("upload id").to_owned();
+    let mut completed_parts = Vec::new();
+    for (part_number, body) in [(1, mp_part1), (2, mp_part2)] {
+        let part = gw
+            .upload_part()
+            .bucket(MBKT)
+            .key("mp/churn.bin")
+            .upload_id(&upload_id)
+            .part_number(part_number)
+            .body(aws_sdk_s3::primitives::ByteStream::from(body))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("upload part {part_number}: {e}"));
+        completed_parts.push(
+            CompletedPart::builder()
+                .part_number(part_number)
+                .e_tag(part.e_tag().expect("part etag"))
+                .build(),
+        );
+    }
+    let complete = gw
+        .complete_multipart_upload()
+        .bucket(MBKT)
+        .key("mp/churn.bin")
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(completed_parts))
+                .build(),
+        )
+        .send()
+        .await
+        .expect("complete multipart");
+    let vid = complete
+        .version_id()
+        .expect("versioned multipart Complete must mint a version id")
+        .to_owned();
+
+    // Add: original == uploaded logical bytes, stored == measured
+    // backend usage (shadow key only — the versioned multipart path
+    // writes no sidecar), and the add must show real savings so the
+    // zero-roundtrip below is a non-trivial assertion.
+    let t = totals_in(&read_snapshot(&state_path), MBKT);
+    assert_eq!(t.objects, 1, "one stored version");
+    assert_eq!(
+        t.original_bytes, mp_len,
+        "multipart add must use the logical part bytes"
+    );
+    assert_eq!(
+        t.stored_bytes,
+        stored_total_in(&backend, MBKT).await,
+        "stored must equal the measured backend bytes (shadow key, no sidecar)"
+    );
+    assert!(
+        t.stored_bytes < t.original_bytes,
+        "compressible multipart must store fewer bytes than it claims original \
+         (otherwise the churn assertion below is vacuous)"
+    );
+
+    // Delete the specific version: the shadow object's stamped
+    // `s4-original-size` must make the subtraction resolve the exact
+    // value the add used — totals return to zero, no phantom residue.
+    gw.delete_object()
+        .bucket(MBKT)
+        .key("mp/churn.bin")
+        .version_id(&vid)
+        .send()
+        .await
+        .expect("delete the multipart version");
+    let snap = read_snapshot(&state_path);
+    let t = totals_in(&snap, MBKT);
+    assert_eq!(
+        t,
+        s4_server::ledger::BucketTotals::default(),
+        "add→delete churn must return the bucket totals to exactly zero \
+         (pre-fix residue: original {} − stored would remain)",
+        mp_len
+    );
+    assert_eq!(
+        snap.skipped_unaccounted.get(MBKT).copied().unwrap_or(0),
+        0,
+        "the version was marker-accounted; nothing may be tallied as skipped"
+    );
+    assert_eq!(
+        stored_total_in(&backend, MBKT).await,
+        0,
+        "backend must be empty after the version delete"
+    );
+
+    let _ = gw_stop.send(());
+}
