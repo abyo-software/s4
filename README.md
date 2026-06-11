@@ -182,6 +182,14 @@ The compat-matrix job's start-step gates for every docker-tier backend **except 
 - Cross-region replication promoted from experimental scaffolding to production-grade, with Jepsen-style consistency tests.
 - Re-introducing Garage + Ceph as `✓ gating` in the backend compat matrix once the upstream signature-interop drifts are resolved.
 - Additional codec backends (Snappy, LZ4 if user demand emerges).
+- v1.2 audit follow-ups (open, recorded for tracking): a
+  `skipped_unaccounted` Prometheus gauge for the savings ledger
+  (state-file/report only today); clearing `DictWinTracker` windows on
+  SIGHUP dictionary rotation (doc-disclosed caveat today); an SSE
+  multipart variant of the ledger churn e2e; access-point copy sources
+  bypass source-side `s3:GetObject` policy enforcement at the gateway
+  (no AP-ARN→bucket mapping; the backend enforces); `s4-codec-wasm`
+  native `cpu-zstd-dict` decode.
 
 ### Stability policy in practice
 
@@ -1085,7 +1093,7 @@ DELETE and flushed to the state file on every write event. Three steps:
    Notes:
      - the ledger observes gateway-traversing writes only: backend-direct writes, `s4 migrate`, and `s4 recompact` (both backend-direct) are not reflected; `recompact` savings appear only after the gateway next rewrites the object
      - aborted multipart uploads are never counted (parts are recorded at Complete time only); cross-bucket replication replicas are not counted
-     - DELETE / overwrite subtraction uses a best-effort HEAD probe of the removed object — a raced probe leaves the counters slightly stale rather than failing the request
+     - DELETE / overwrite subtraction applies only to objects the gateway itself accounted (internal `s4-ledger` marker); removals of non-ledger-managed objects are skipped and tallied separately. The HEAD probe is best-effort — a raced probe leaves the counters slightly stale rather than failing the request. The marker records that the ledger was enabled at write time, not that the bytes are in the counters: a multipart Complete skipped for an oversized/unfetchable body, or a flag toggled off->on, can leave marker-carrying objects that were never added — their later removal subtracts with clamping at zero (under-claim, surfaced by the drift note when it floors a bucket)
      - storage bytes only: request, egress, and (on GPU deployments) compute costs are unchanged by S4
    ```
 
@@ -1098,8 +1106,10 @@ they bound what the numbers mean):
   after the gateway itself next rewrites that object. Replication
   replicas and aborted-multipart part bytes are likewise not counted.
 - Overwrite / DELETE subtraction adds **one best-effort HEAD probe per
-  write-shaped request** (plus a sidecar HEAD where relevant) — this
-  extra backend traffic exists *only* when the flag is set.
+  write-shaped request** (plus a sidecar HEAD where relevant; a
+  ledger-enabled CopyObject probes up to three — source, old
+  destination, new destination) — this extra backend traffic exists
+  *only* when the flag is set.
 - **Only ledger-accounted objects are ever subtracted** (audit rounds
   1-2): gateway writes made while the ledger is enabled carry an
   internal `s4-ledger` metadata marker (client-supplied copies are

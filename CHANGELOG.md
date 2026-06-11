@@ -22,9 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stranded phantom original bytes (overstated savings). New e2e pins a
   versioned-multipart churn returning bucket totals to exactly zero.
 - **P3** Marker-without-add cases (cap-exceeded multipart Complete,
-  ledger flag toggles) are now disclosed in the module contract, the
-  report notes, and the Complete-path WARN — not eliminated
-  (zero-clamp + drift note remain the guard rails).
+  ledger flag toggles, and replicas written between the round-1 and
+  round-2 fixes — moot for releases since v1.2 ships both) are now
+  disclosed in the module contract, the report notes, and the
+  Complete-path WARN — not eliminated (zero-clamp + drift note remain
+  the guard rails).
 - **P3** Access-point copy sources: REPLACE copies now strip
   client-supplied `s4-*` metadata regardless of the source-addressing
   variant (forged `s4-ledger`/`s4-original-size` via AP ARN closed),
