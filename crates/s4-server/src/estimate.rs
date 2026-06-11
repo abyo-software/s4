@@ -366,13 +366,47 @@ fn is_already_s4_metadata(metadata: Option<&HashMap<String, String>>) -> bool {
 }
 
 /// `true` when the sampled body bytes themselves are S4-managed output:
-/// an `S4F2`/`S4P1` frame stream ([`crate::migrate::is_s4_frame_prefix`])
-/// or an `S4E1`..`S4E6` SSE-S4 ciphertext ([`crate::sse::looks_encrypted`]
-/// — length-gated at the 36-byte minimum header, so a < 36-byte sample
-/// can only be caught via the metadata stamp). Covers objects whose
-/// metadata was stripped (e.g. a backend-side copy).
-fn is_already_s4_body(body_prefix: &[u8]) -> bool {
-    crate::migrate::is_s4_frame_prefix(body_prefix) || crate::sse::looks_encrypted(body_prefix)
+/// an `S4F2`/`S4P1` frame stream or an `S4E1`..`S4E6` SSE-S4 ciphertext
+/// ([`crate::sse::looks_encrypted`] — length-gated at the 36-byte
+/// minimum header, so a < 36-byte sample can only be caught via the
+/// metadata stamp). Covers objects whose metadata was stripped (e.g. a
+/// backend-side copy).
+///
+/// Audit R3 P3: the 4-byte magic alone is not enough — a legitimate
+/// customer object could start with the same bytes and would silently
+/// drop out of the measurement. For `S4F2` we additionally require the
+/// fixed header to parse structurally (known codec id, payload length
+/// that fits inside the object); for `S4P1` the padding length must fit.
+fn is_already_s4_body(body_prefix: &[u8], object_size: u64) -> bool {
+    use s4_codec::multipart::{
+        FRAME_HEADER_BYTES, FRAME_MAGIC, PADDING_HEADER_BYTES, PADDING_MAGIC,
+    };
+    if body_prefix.starts_with(FRAME_MAGIC) {
+        if body_prefix.len() < FRAME_HEADER_BYTES {
+            return false; // shorter than one header can't be a frame stream
+        }
+        let (Ok(codec_bytes), Ok(size_bytes)) = (
+            <[u8; 4]>::try_from(&body_prefix[4..8]),
+            <[u8; 8]>::try_from(&body_prefix[16..24]),
+        ) else {
+            return false; // unreachable given the length check above
+        };
+        let codec_id = u32::from_le_bytes(codec_bytes);
+        let compressed_size = u64::from_le_bytes(size_bytes);
+        return s4_codec::CodecKind::from_id(codec_id).is_some()
+            && compressed_size.saturating_add(FRAME_HEADER_BYTES as u64) <= object_size;
+    }
+    if body_prefix.starts_with(PADDING_MAGIC) {
+        if body_prefix.len() < PADDING_HEADER_BYTES {
+            return false;
+        }
+        let Ok(pad_bytes) = <[u8; 8]>::try_from(&body_prefix[4..12]) else {
+            return false; // unreachable given the length check above
+        };
+        let pad_len = u64::from_le_bytes(pad_bytes);
+        return pad_len.saturating_add(PADDING_HEADER_BYTES as u64) <= object_size;
+    }
+    crate::sse::looks_encrypted(body_prefix)
 }
 
 #[derive(Debug, Clone)]
@@ -560,7 +594,8 @@ async fn measure_one(
     }
     // Body-magic gate: S4F2/S4P1 frames or S4E* ciphertext written by
     // the gateway but with the metadata stamp stripped (backend copy).
-    if is_already_s4_body(&body) {
+    // Structurally validated against the full object size (audit R3 P3).
+    if is_already_s4_body(&body, obj.size) {
         return Ok(SampleOutcome::AlreadyS4);
     }
     let sample_len = body.len().min(DISPATCH_SAMPLE_BYTES);
@@ -1019,28 +1054,55 @@ mod tests {
         assert!(!is_already_s4_metadata(Some(&meta)));
         assert!(!is_already_s4_metadata(None));
 
-        // Frame magic (reused from migrate::is_s4_frame_prefix).
-        assert!(is_already_s4_body(b"S4F2rest-of-frame"));
-        assert!(is_already_s4_body(b"S4P1\0\0\0\0"));
+        // Frame magic — structurally validated (audit R3 P3): a real
+        // frame written by the production writer classifies...
+        let mut framed = bytes::BytesMut::new();
+        s4_codec::multipart::write_frame(
+            &mut framed,
+            s4_codec::multipart::FrameHeader {
+                codec: s4_codec::CodecKind::CpuZstd,
+                original_size: 11,
+                compressed_size: 7,
+                crc32c: 0,
+            },
+            b"payload",
+        );
+        let framed = framed.freeze();
+        assert!(is_already_s4_body(&framed, framed.len() as u64));
+        // ...but customer bytes that merely start with the 4-byte magic
+        // do not (unknown codec id / payload larger than the object).
+        assert!(!is_already_s4_body(
+            b"S4F2rest-of-frame-but-not-a-frame-header....",
+            44
+        ));
+        // S4P1 padding: a plausible padding header classifies, a bogus
+        // one (claimed pad larger than the object) does not.
+        let mut pad = b"S4P1".to_vec();
+        pad.extend_from_slice(&4u64.to_le_bytes());
+        pad.extend_from_slice(&[0u8; 4]);
+        assert!(is_already_s4_body(&pad, pad.len() as u64));
+        let mut bogus_pad = b"S4P1".to_vec();
+        bogus_pad.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(!is_already_s4_body(&bogus_pad, 12));
         // SSE magic — looks_encrypted is length-gated at the 36-byte
         // minimum header, so pad past it.
         for magic in [b"S4E1", b"S4E2", b"S4E3", b"S4E4", b"S4E5", b"S4E6"] {
             let mut body = magic.to_vec();
             body.extend_from_slice(&[0u8; 40]);
             assert!(
-                is_already_s4_body(&body),
+                is_already_s4_body(&body, body.len() as u64),
                 "{} body must classify as already-s4",
                 String::from_utf8_lossy(magic)
             );
         }
         // A too-short S4E* body is NOT caught by the magic (metadata
         // stamp covers gateway-written ones) — documented gate.
-        assert!(!is_already_s4_body(b"S4E2 too short"));
+        assert!(!is_already_s4_body(b"S4E2 too short", 14));
         // Plain customer bytes pass through to measurement.
-        assert!(!is_already_s4_body(b"plain text log line"));
-        assert!(!is_already_s4_body(b""));
+        assert!(!is_already_s4_body(b"plain text log line", 19));
+        assert!(!is_already_s4_body(b"", 0));
         // zstd magic alone is not S4 management.
-        assert!(!is_already_s4_body(&[0x28, 0xb5, 0x2f, 0xfd]));
+        assert!(!is_already_s4_body(&[0x28, 0xb5, 0x2f, 0xfd], 4));
     }
 
     #[test]

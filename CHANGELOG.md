@@ -33,6 +33,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they were compressible plaintext (`already_s4` count + note).
 - **P3** (s4fs) the sidecar staleness check reuses a cached live-info
   snapshot instead of issuing a second backend HEAD per `info()`.
+  Trade-off disclosed: external overwrites during one filesystem
+  instance's lifetime are detected on the next `invalidate_cache()` /
+  new instance, not per-read (same contract as the metadata cache).
+
+### Fixed (audit round 3 — convergence check)
+- **P3** `s4 estimate`'s already-S4 body detection is structurally
+  validated (known codec id + payload fits the object for `S4F2`,
+  plausible padding length for `S4P1`) so customer data that merely
+  starts with the 4-byte magic isn't silently dropped from sampling.
+- **P3** README/CHANGELOG drift from the round-1/2 fixes corrected:
+  dictionary 1 MiB cap is documented as one three-surface contract,
+  migrate/recompact sample outputs show the full current skip taxonomy,
+  `--no-tags` / `tags-unreadable` / `already-s4` estimate exclusions
+  documented.
 
 ### Fixed (audit round 1 — 4 reviewers over v1.0.0..HEAD, 2026-06-11)
 - **P1** `s4 migrate` could rewrite `.s4dict/<id>` dictionary objects as
@@ -142,8 +156,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the concurrent-writer race). Skip taxonomy: `not-s4` (run `s4 migrate`
   first) / `already-compacted` / `unsupported-codec` (passthrough,
   `cpu-gzip`, `nvcomp-*`, `cpu-zstd-dict` — this tool is cpu-zstd →
-  cpu-zstd only) / `insufficient-gain` / `too-large` (`--max-body-bytes`,
-  default 5 GiB) / `etag-raced` / `too-recent`. Multi-frame rewrites
+  cpu-zstd only) / `unstamped-framed` (audit round 1: backend-written
+  frames without gateway metadata; opt in with
+  `--assume-unstamped-framed`) / `insufficient-gain` / `too-large`
+  (`--max-body-bytes`, default 5 GiB) / `etag-raced` / `too-recent` /
+  `tags-unreadable` (audit round 2; `--no-tags` opts out of tag
+  inheritance). Multi-frame rewrites
   refresh the `<key>.s4index` sidecar; single-frame rewrites delete a
   now-stale one. `--concurrency` (default 4), `--max-objects`,
   `--format table|json`; exit 1 iff any object failed. SSE-enabled
@@ -181,7 +199,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writer race — documented). Skip taxonomy: `already-s4` /
   `not-compressible` (passthrough pick or no size gain; object untouched)
   / `too-large` (`--max-body-bytes`, default 5 GiB) / `etag-raced` /
-  `verify-failed`. `--concurrency` (default 4), `--max-objects`,
+  `tags-unreadable` (audit round 2; `--no-tags` opts out of tag
+  inheritance). A roundtrip-verify failure is a hard failure (exit 1)
+  since the round-1 audit — the `skipped_verify_failed` JSON field
+  remains for shape compatibility but is always 0.
+  `--concurrency` (default 4), `--max-objects`,
   `--format table|json`; exit 1 iff any object failed. GPU / `cpu-gzip`
   dispatcher picks really fall back to `cpu-zstd` at `--zstd-level`
   (reported as `picked != wrote_with`). SSE-configured invocations are

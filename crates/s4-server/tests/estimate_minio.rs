@@ -289,10 +289,22 @@ async fn estimate_excludes_already_s4_objects() {
         noise.extend_from_slice(&x.to_le_bytes());
     }
 
-    // (1) Framed body magic, NO metadata (e.g. backend-side copy that
-    // stripped the stamp): caught by the S4F2 prefix.
-    let mut framed = b"S4F2".to_vec();
-    framed.extend_from_slice(&noise);
+    // (1) Framed body, NO metadata (e.g. backend-side copy that
+    // stripped the stamp): caught by the S4F2 prefix + structural
+    // header validation (audit R3 — a bare 4-byte magic no longer
+    // classifies, so this must be a real frame).
+    let mut framed_buf = bytes::BytesMut::new();
+    s4_codec::multipart::write_frame(
+        &mut framed_buf,
+        s4_codec::multipart::FrameHeader {
+            codec: s4_codec::CodecKind::CpuZstd,
+            original_size: noise.len() as u64,
+            compressed_size: noise.len() as u64,
+            crc32c: 0,
+        },
+        &noise,
+    );
+    let framed = framed_buf.freeze().to_vec();
     client
         .put_object()
         .bucket(bucket)

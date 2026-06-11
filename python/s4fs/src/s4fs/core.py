@@ -380,7 +380,9 @@ class S4FileSystem(AbstractFileSystem):
 
     def _sidecar_matches(self, path: str, idx: Dict[str, Any]) -> bool:
         """Staleness / binding check: compare the sidecar's source ETag /
-        compressed size against the live backend object. A mismatch means
+        compressed size against the backend object (a cached per-instance
+        ``info()`` snapshot — call :meth:`invalidate_cache` after external
+        overwrites, same contract as the metadata cache). A mismatch means
         the object was overwritten after the sidecar was written — fall
         back to a full read instead of fetching wrong byte ranges.
 
@@ -453,6 +455,9 @@ class S4FileSystem(AbstractFileSystem):
         base = dict(self.fs.info(path, **kwargs))
         base["name"] = path
         if base.get("type") == "file":
+            # Seed the live-info snapshot so the sidecar staleness check
+            # below reuses this very response instead of a second HEAD.
+            self._live_info_cache[path] = base
             size, exact = self._resolve_size(path, base)
             base["size"] = size
             base["s4_size_exact"] = exact

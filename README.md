@@ -976,8 +976,13 @@ existing bucket?" **before** you deploy the gateway. Fully read-only
 s4 estimate <bucket>[/prefix] --endpoint-url https://s3.example.com [--format json]
 ```
 
-It lists the bucket (`.s4index` sidecars excluded, capped at
+It lists the bucket (S4-internal keys excluded: `*.s4index` sidecars,
+`.s4dict/` dictionaries, `*.__s4ver__/*` versioning shadows; capped at
 `--max-list-keys`, default 100000), stratifies objects by extension,
+excludes already-S4 objects from sampling (gateway metadata or
+`S4F2`/`S4P1`/`S4E*` magic, structurally validated — re-estimating a
+gateway-operated bucket won't measure framed/encrypted bytes as
+plaintext; they are reported per-stratum as `already-s4`),
 samples up to `--samples-per-stratum` (default 8) objects per stratum
 (size-weighted, deterministic under `--seed`, default 42), runs the
 **same `SamplingDispatcher` decision the gateway would run at PUT
@@ -1061,10 +1066,13 @@ S4-internal keys (`*.s4index` sidecars, `.s4dict/` dictionaries,
 never rewritten. The rewrite PUT inherits the source's **storage class
 and object tags** in addition to content-type and user metadata; object
 ACLs and Object Lock retention are **not** inherited (stated in the
-report notes — re-apply them after migrating locked buckets). A
-roundtrip-verify failure is a hard failure (exit 1), not a skip: it
-means the tool's own output didn't decode, which is a bug worth a loud
-stop.
+report notes — re-apply them after migrating locked buckets). When the
+credential can't read tags (`GetObjectTagging` denied / unimplemented)
+the object skips as `tags-unreadable` rather than being rewritten
+tag-less; pass `--no-tags` to explicitly rewrite without reading or
+preserving tags. A roundtrip-verify failure is a hard failure (exit 1),
+not a skip: it means the tool's own output didn't decode, which is a
+bug worth a loud stop.
 
 Example run (5-object MinIO demo bucket — 3 repetitive logs, one JSON
 export, one random binary):
@@ -1074,7 +1082,7 @@ $ s4 migrate demo --endpoint-url http://127.0.0.1:9000 --execute
 S4 migrate demo — execute
   objects: 5   total: 4.8 MiB (5032356 bytes)
   migrated: 4 object(s), 3.8 MiB -> 7.7 KiB (saves 3.8 MiB)
-  skipped: 0 already-s4, 1 not-compressible, 0 too-large, 0 etag-raced, 0 verify-failed
+  skipped: 0 already-s4, 1 not-compressible, 0 too-large, 0 etag-raced, 0 verify-failed, 0 tags-unreadable
   failed: 0
   codecs: cpu-zstd×4
 
@@ -1085,7 +1093,7 @@ $ s4 migrate demo --endpoint-url http://127.0.0.1:9000 --execute   # idempotent 
 S4 migrate demo — execute
   objects: 5   total: 1.0 MiB (1056431 bytes)
   migrated: 0 object(s), 0 B -> 0 B (saves 0 B)
-  skipped: 4 already-s4, 1 not-compressible, 0 too-large, 0 etag-raced, 0 verify-failed
+  skipped: 4 already-s4, 1 not-compressible, 0 too-large, 0 etag-raced, 0 verify-failed, 0 tags-unreadable
   failed: 0
 ```
 
@@ -1155,8 +1163,9 @@ deletes a now-stale sidecar when the rewrite came out single-frame).
 
 Like `migrate`, internal keys (`*.s4index`, `.s4dict/`, `*.__s4ver__/*`)
 are excluded, storage class + object tags are inherited on rewrite
-(ACLs / Object Lock retention are not), and the `--max-body-bytes` cap
-is enforced before buffering. Backend-written framed objects that carry
+(ACLs / Object Lock retention are not; unreadable tags skip as
+`tags-unreadable`, `--no-tags` opts out), and the `--max-body-bytes`
+cap is enforced before buffering. Backend-written framed objects that carry
 **no gateway metadata** skip as `unstamped-framed` by default — pass
 `--assume-unstamped-framed` only when you know such objects are genuine
 S4 frames, because recompacting one changes what a gateway GET serves
@@ -1188,7 +1197,7 @@ S4 recompact s4-recompact-test — execute
   target zstd level: 19   min gain: 3%
   objects: 4   total: 285.0 KiB (291883 bytes)
   recompacted: 2 object(s), 218.0 KiB -> 187.6 KiB (saves 30.4 KiB)
-  skipped: 1 not-s4, 0 already-compacted, 1 unsupported-codec, 0 insufficient-gain, 0 too-large, 0 etag-raced, 0 too-recent
+  skipped: 1 not-s4, 0 already-compacted, 1 unsupported-codec, 0 unstamped-framed, 0 insufficient-gain, 0 too-large, 0 etag-raced, 0 too-recent, 0 tags-unreadable
   failed: 0
 
 Notes:
@@ -1314,10 +1323,12 @@ Mechanics and operational notes:
   dictionaries with `s4 train-dict` against the backend. `train-dict`
   also stamps the full digest as `s4-dict-sha256` metadata, which the
   lazy-fetch path verifies when present (pre-existing dictionaries
-  without the stamp fall back to the 16-hex prefix check). Lazy-fetched
-  dictionaries are capped at 1 MiB — if you train with
-  `--max-dict-bytes` above that, boot-time `--zstd-dict` preload still
-  works but flag-less lazy fetch refuses.
+  without the stamp fall back to the 16-hex prefix check). Dictionary
+  size is one 1 MiB contract enforced at all three surfaces:
+  `train-dict --max-dict-bytes` rejects above-cap requests, boot-time
+  `--zstd-dict` preload refuses an above-cap dictionary, and the
+  flag-less lazy fetch refuses it too — so a dictionary that works with
+  the flag can never become unreadable without it.
 - **Reserved metadata namespace**: the gateway strips client-supplied
   `x-amz-meta-s4-*` keys on PUT — they are S4's manifest namespace and
   forging them (e.g. a stray `s4-dict-id`) must not change GET behavior.
