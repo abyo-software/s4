@@ -43,6 +43,13 @@ print("GPU available:", gpu_available())
 | `<codec>.compress(data: bytes) -> (bytes, int, int)` | Returns `(compressed, original_size, crc32c)`. |
 | `<codec>.decompress(data, original_size, crc32c) -> bytes` | Inverse of `compress`. |
 | `gpu_available() -> bool` | True iff the wheel was built with `--features nvcomp-gpu` and a CUDA-capable GPU is reachable. |
+| `CpuZstdDict(dict_bytes, level: int = 3)` | CPU zstd bound to a trained dictionary (`cpu-zstd-dict` objects). |
+| `read_frame(data)` / `frame_iter(data)` | Parse S4F2 frames (wire format the gateway writes); used by s4fs reads. |
+| `decode_index(data) -> dict` | Decode a `<key>.s4index` sidecar (v1/v2/v3). |
+| `crc32c(data) -> int` | CRC32C (Castagnoli), the S4F2 header checksum. |
+| `encode_s4_object(data, codec="cpu-zstd", level=3) -> dict` | Gateway-identical single-PUT encoding: `{"body", "sidecar", "metadata"}` — framed body, optional multi-frame `.s4index` payload, and the S3 user-metadata manifest to stamp. Codecs: `cpu-zstd`, `passthrough`. Used by s4fs writes. |
+| `bind_index(sidecar, source_compressed_size, source_etag=None) -> bytes` | Stamp the v2 version binding (backend ETag + size, post-PUT) into an `encode_s4_object` sidecar. |
+| `pick_chunk_size(content_length: int) -> int` | The gateway's single-PUT chunk-size policy table (1 MiB / 4 MiB / 16 MiB). |
 
 The `(original_size, crc32c)` tuple corresponds to the
 `ChunkManifest.original_size` / `ChunkManifest.crc32c` fields the Rust

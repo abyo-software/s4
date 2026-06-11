@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **s4fs write support (opt-in)**: `S4FileSystem(write_enabled=True)`
+  (or `storage_options={"write_enabled": True}` through fsspec/pandas)
+  enables `pipe_file` / `put_file` / `open(path, "wb")`, writing
+  gateway-compatible S4 objects **directly to the backend**:
+  `df.to_parquet("s4://bucket/key")` now works without the gateway.
+  The encoder (`s4_codec.encode_s4_object`, new in the Python binding
+  alongside `bind_index` + `pick_chunk_size`) reproduces the gateway's
+  single-PUT path byte-compatibly — S4F2 `cpu-zstd` frames using the
+  gateway chunk-size policy (1 MiB / 4 MiB / 16 MiB thresholds), the
+  five manifest metadata keys (`s4-codec` / `s4-original-size` /
+  `s4-compressed-size` / `s4-crc32c` / `s4-framed`), and, for
+  multi-frame bodies, a `<key>.s4index` sidecar bound to the backend
+  ETag + size after the body PUT (single-frame overwrites clean up a
+  stale sidecar). Verified end-to-end against MinIO + the real
+  gateway binary: gateway GET and Range GET return the original
+  bytes, `s4 verify-sidecar` reports OK with the version binding
+  intact, and pandas/pyarrow round-trip through both s4fs and the
+  gateway. `write_codec="passthrough"` stores raw stamped bodies;
+  everything else (cpu-gzip / cpu-zstd-dict / nvcomp-* / SSE /
+  append / versioning) is refused with a typed error pointing at the
+  gateway. Underlying filesystems that cannot stamp S3 user metadata
+  are refused with `S4MetadataUnsupportedError` (an unstamped framed
+  body would be served raw by the gateway); s3fs is supported out of
+  the box. Default behaviour without the flag is unchanged
+  (read-only).
+
 - **Per-prefix dictionary metrics**: the `--zstd-dict` PUT branch now
   exports `s4_dict_put_total{prefix,outcome="win"|"loss"}` and
   `s4_dict_put_bytes_total{prefix,kind="original"|"dict"|"plain"}` —
@@ -96,6 +122,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `contrib/grafana/s4-savings-dashboard.json` (saved bytes / savings
   ratio / per-bucket split / $-per-month with a `price_per_gb_month`
   variable; import steps in `docs/observability.md`).
+
+### Fixed
+- **s4fs**: `info()` no longer poisons the per-instance live-info
+  snapshot with the rewritten (decompressed) size — previously any
+  `info()` call before a range read made the sidecar source-size
+  binding check fail, silently disabling the partial-fetch fast-path
+  (full-object read + warning) until the cache was invalidated. Also
+  fixed: reading back the gateway's zero-frame body (an *empty*
+  object PUT through the gateway, or written by s4fs) raised
+  `S4IoError` on the full-read path because the empty framed body
+  carries no `S4F2` magic and fell into the unframed-decode branch;
+  the `s4-framed` metadata stamp now routes it through the frame
+  parser, which correctly yields `b""`.
 
 ## [1.1.0] — 2026-06-11
 

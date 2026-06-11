@@ -1,6 +1,7 @@
-"""s4fs — fsspec adapter for S4 gateway-written objects (read-only).
+"""s4fs — fsspec adapter for S4 gateway-format objects.
 
-Usage::
+Reads work out of the box; writes are opt-in via ``write_enabled=True``
+(client-side S4 encode, fully gateway-compatible). Usage::
 
     import s4fs  # registers the "s4" protocol
     import pandas as pd
@@ -9,13 +10,21 @@ Usage::
         "s4://bucket/data.parquet",
         storage_options={"target_options": {"endpoint_url": "http://backend:9000"}},
     )
+
+    df.to_parquet(
+        "s4://bucket/data.parquet",
+        storage_options={
+            "write_enabled": True,
+            "target_options": {"endpoint_url": "http://backend:9000"},
+        },
+    )
 """
 
 from fsspec import register_implementation
 
-from s4fs.core import S4File, S4FileSystem
+from s4fs.core import S4File, S4FileSystem, S4MetadataUnsupportedError
 
-__all__ = ["S4File", "S4FileSystem"]
+__all__ = ["S4File", "S4FileSystem", "S4MetadataUnsupportedError"]
 
 # Single source of truth is pyproject.toml; a hardcoded string here
 # shipped 1.1.0 wheels reporting __version__ == "1.0.0" (post-release

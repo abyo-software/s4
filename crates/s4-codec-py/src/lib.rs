@@ -21,13 +21,13 @@
 
 use std::sync::{Arc, OnceLock};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use pyo3::create_exception;
-use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyIOError, PyNotImplementedError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use s4_codec_rs::index::{FrameIndex, IndexError};
-use s4_codec_rs::multipart::{FrameError, FrameHeader, FrameIter};
+use s4_codec_rs::multipart::{write_frame, FrameError, FrameHeader, FrameIter};
 use s4_codec_rs::{cpu_gzip, cpu_zstd, cpu_zstd_dict, ChunkManifest, Codec, CodecError, CodecKind};
 use tokio::runtime::{Builder, Runtime};
 
@@ -476,6 +476,233 @@ fn crc32c_py(data: &Bound<'_, PyBytes>) -> u32 {
     ::crc32c::crc32c(data.as_bytes())
 }
 
+// ---------------------------------------------------------------------------
+// v1.2 s4fs write support: gateway-equivalent client-side object encoder.
+// ---------------------------------------------------------------------------
+
+/// Default S4F2 chunk size for client-side framed writes.
+///
+/// KEEP IN SYNC with `crates/s4-server/src/streaming.rs`
+/// (`DEFAULT_S4F2_CHUNK_SIZE` + `pick_chunk_size`). This crate cannot
+/// depend on `s4-server` (the server depends on this codec layer, and the
+/// Python wheel must not pull the full gateway), so the gateway's
+/// single-PUT chunk policy is replicated here verbatim. A drift between
+/// the two would NOT corrupt data (each S4F2 frame is self-describing and
+/// the GET path parses whatever frame sizes it finds) but it would change
+/// the Range-GET partial-fetch granularity vs gateway-written objects.
+const DEFAULT_S4F2_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+/// Replicates `s4_server::streaming::pick_chunk_size(Some(len))` — the
+/// chunk size the gateway uses for a single PUT whose `Content-Length`
+/// is known (a client-side writer always knows the buffer length, so the
+/// `None`/chunked-transfer arm is intentionally not replicated).
+///
+/// KEEP IN SYNC with `crates/s4-server/src/streaming.rs::pick_chunk_size`:
+/// `<= 1 MiB → 1 MiB`, `<= 100 MiB → 4 MiB`, `> 100 MiB → 16 MiB`.
+fn pick_chunk_size_impl(content_length: u64) -> usize {
+    if content_length <= 1024 * 1024 {
+        1024 * 1024
+    } else if content_length <= 100 * 1024 * 1024 {
+        DEFAULT_S4F2_CHUNK_SIZE
+    } else {
+        16 * 1024 * 1024
+    }
+}
+
+/// Chunk size (bytes) the S4 gateway — and [`encode_s4_object`] — uses
+/// for an object of `content_length` bytes. Exposed so tests can pin the
+/// threshold table without allocating 100 MiB+ bodies.
+#[pyfunction]
+fn pick_chunk_size(content_length: u64) -> usize {
+    pick_chunk_size_impl(content_length)
+}
+
+/// Compress `input` into a gateway-identical S4F2 framed body with
+/// `cpu-zstd` frames. Mirrors the server's
+/// `streaming_compress_to_frames` output for a fully-buffered input:
+/// per-chunk frame header carries the *chunk* original size / crc32c,
+/// the aggregate manifest carries the rolling crc32c of the whole
+/// original body and the framed body length as `compressed_size`.
+fn encode_framed_zstd(
+    py: Python<'_>,
+    input: Bytes,
+    level: i32,
+) -> PyResult<(Bytes, ChunkManifest)> {
+    let chunk_size = pick_chunk_size_impl(input.len() as u64);
+    let codec = cpu_zstd::CpuZstd::new(level);
+    let res: Result<(Bytes, ChunkManifest), CodecError> = block_on(py, async move {
+        let mut framed = BytesMut::new();
+        let mut rolling_crc: u32 = 0;
+        let total = input.len() as u64;
+        let mut off = 0usize;
+        while off < input.len() {
+            let end = usize::min(off + chunk_size, input.len());
+            let chunk = input.slice(off..end);
+            let chunk_crc = ::crc32c::crc32c(&chunk);
+            rolling_crc = ::crc32c::crc32c_append(rolling_crc, &chunk);
+            let chunk_len = chunk.len() as u64;
+            let (compressed, _manifest) = codec.compress(chunk).await?;
+            let header = FrameHeader {
+                codec: CodecKind::CpuZstd,
+                original_size: chunk_len,
+                compressed_size: compressed.len() as u64,
+                crc32c: chunk_crc,
+            };
+            write_frame(&mut framed, header, &compressed);
+            off = end;
+        }
+        let body = framed.freeze();
+        let compressed_size = body.len() as u64;
+        Ok((
+            body,
+            ChunkManifest {
+                codec: CodecKind::CpuZstd,
+                original_size: total,
+                compressed_size,
+                crc32c: rolling_crc,
+            },
+        ))
+    });
+    res.map_err(codec_err_to_py)
+}
+
+/// Encode `data` exactly the way the S4 gateway's single-PUT path would
+/// store it, so a client (s4fs) can write S4-format objects **without**
+/// the gateway and the gateway / `s4 verify-sidecar` / s4fs itself can
+/// read them back.
+///
+/// Returns a dict:
+///
+/// ```text
+/// {
+///   "body":     bytes,         # what to PUT as the object body
+///   "sidecar":  bytes | None,  # `<key>.s4index` payload (multi-frame only,
+///                              # UNBOUND — pass through `bind_index` with the
+///                              # backend ETag/size after the body PUT)
+///   "metadata": {str: str},    # S3 user metadata to stamp on the body PUT
+/// }
+/// ```
+///
+/// Codec support: `"cpu-zstd"` (S4F2 framed, the gateway default) and
+/// `"passthrough"` (raw body, manifest metadata only — matching the
+/// gateway, which never frames passthrough). Anything else (cpu-gzip /
+/// cpu-zstd-dict / nvcomp-* / dietgpu-ans) raises `NotImplementedError`
+/// pointing at the gateway, which owns those codec paths.
+///
+/// Metadata keys/values restate the gateway's PUT-path stamps.
+/// KEEP IN SYNC with `crates/s4-server/src/service.rs` (`write_manifest`
+/// + the `META_*` constants and the `META_FRAMED` stamp) and
+/// `crates/s4-server/src/migrate.rs` (same five keys):
+///
+/// - `s4-codec`:           `CodecKind::as_str()` of the manifest codec
+/// - `s4-original-size`:   decimal length of the original body
+/// - `s4-compressed-size`: decimal length of the stored body (framed
+///   bytes incl. the 28-byte headers for cpu-zstd; == original for
+///   passthrough)
+/// - `s4-crc32c`:          decimal CRC32C of the **original** body
+/// - `s4-framed`:          `"true"` — framed bodies only (absent on
+///   passthrough, exactly like the gateway)
+#[pyfunction]
+#[pyo3(signature = (data, codec = "cpu-zstd", level = 3))]
+fn encode_s4_object<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyBytes>,
+    codec: &str,
+    level: i32,
+) -> PyResult<Bound<'py, PyDict>> {
+    let input = Bytes::copy_from_slice(data.as_bytes());
+    let (body, manifest, framed) = match codec {
+        "cpu-zstd" => {
+            let (body, manifest) = encode_framed_zstd(py, input, level)?;
+            (body, manifest, true)
+        }
+        // Passthrough buys nothing from S4F2 wrapping; the gateway stores
+        // it as a raw blob with manifest metadata and NO `s4-framed` flag
+        // (see service.rs "Passthrough buys nothing…" comment). Mirror that.
+        "passthrough" => {
+            let crc = ::crc32c::crc32c(&input);
+            let len = input.len() as u64;
+            let manifest = ChunkManifest {
+                codec: CodecKind::Passthrough,
+                original_size: len,
+                compressed_size: len,
+                crc32c: crc,
+            };
+            (input, manifest, false)
+        }
+        other => {
+            return Err(PyNotImplementedError::new_err(format!(
+                "encode_s4_object supports codecs 'cpu-zstd' and 'passthrough' only; \
+                 {other:?} (cpu-gzip / cpu-zstd-dict / nvcomp-* / dietgpu-ans) must be \
+                 written through the S4 gateway, which owns those codec paths"
+            )));
+        }
+    };
+    // Sidecar policy mirrors the gateway PUT path (service.rs): emit only
+    // for framed bodies with MORE than one frame — a single-frame sidecar
+    // buys nothing (partial fetch == full body).
+    let sidecar = if framed {
+        let idx = s4_codec_rs::index::build_index_from_body(&body).map_err(frame_err_to_py)?;
+        if idx.entries.len() > 1 {
+            Some(s4_codec_rs::index::encode_index(&idx))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let out = PyDict::new(py);
+    out.set_item("body", PyBytes::new(py, &body))?;
+    match sidecar {
+        Some(s) => out.set_item("sidecar", PyBytes::new(py, &s))?,
+        None => out.set_item("sidecar", py.None())?,
+    }
+    let meta = PyDict::new(py);
+    // KEEP IN SYNC: literal metadata key names restate s4-server/src/
+    // service.rs META_CODEC / META_ORIGINAL_SIZE / META_COMPRESSED_SIZE /
+    // META_CRC32C / META_FRAMED (pub(crate) there, so not importable).
+    meta.set_item("s4-codec", manifest.codec.as_str())?;
+    meta.set_item("s4-original-size", manifest.original_size.to_string())?;
+    meta.set_item("s4-compressed-size", manifest.compressed_size.to_string())?;
+    meta.set_item("s4-crc32c", manifest.crc32c.to_string())?;
+    if framed {
+        meta.set_item("s4-framed", "true")?;
+    }
+    out.set_item("metadata", meta)?;
+    Ok(out)
+}
+
+/// Stamp the v2 source binding (`source_etag` + `source_compressed_size`)
+/// into a `.s4index` sidecar produced by [`encode_s4_object`].
+///
+/// The gateway stamps these AFTER its backend PUT returns the
+/// authoritative ETag (service.rs `put_object` → `write_sidecar`); a
+/// client-side writer must do the same: PUT the body, read the backend
+/// ETag, then `bind_index` and PUT the sidecar. Without the binding the
+/// sidecar decodes as "legacy v1 / unbound" and neither the gateway's
+/// Range-GET fast-path nor s4fs's partial fetch will trust it
+/// (`s4 verify-sidecar` reports `LegacyV1` instead of `OK`).
+///
+/// `source_etag` must be the **quote-stripped** entity-tag (the form s3s
+/// `ETag::value()` yields and the gateway writes; see
+/// `s4-server/src/repair.rs::normalize_etag`). Pass `None` on
+/// ETag-less backends — the size-only binding is still a valid v2
+/// sidecar the verifier accepts.
+#[pyfunction]
+#[pyo3(signature = (sidecar, source_compressed_size, source_etag = None))]
+fn bind_index<'py>(
+    py: Python<'py>,
+    sidecar: &Bound<'py, PyBytes>,
+    source_compressed_size: u64,
+    source_etag: Option<String>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let raw = Bytes::copy_from_slice(sidecar.as_bytes());
+    let mut idx: FrameIndex = s4_codec_rs::index::decode_index(raw).map_err(index_err_to_py)?;
+    idx.source_compressed_size = Some(source_compressed_size);
+    idx.source_etag = source_etag;
+    Ok(PyBytes::new(py, &s4_codec_rs::index::encode_index(&idx)))
+}
+
 #[pymodule]
 fn s4_codec(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCpuZstd>()?;
@@ -489,6 +716,11 @@ fn s4_codec(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(frame_iter, m)?)?;
     m.add_function(wrap_pyfunction!(decode_index, m)?)?;
     m.add_function(wrap_pyfunction!(crc32c_py, m)?)?;
+    // v1.2 s4fs write support: gateway-equivalent client-side encoder +
+    // sidecar version binding + the gateway's chunk-size policy table.
+    m.add_function(wrap_pyfunction!(encode_s4_object, m)?)?;
+    m.add_function(wrap_pyfunction!(bind_index, m)?)?;
+    m.add_function(wrap_pyfunction!(pick_chunk_size, m)?)?;
     m.add(
         "FRAME_MAGIC",
         PyBytes::new(py, s4_codec_rs::multipart::FRAME_MAGIC),

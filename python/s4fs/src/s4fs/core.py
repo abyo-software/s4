@@ -1,4 +1,4 @@
-"""S4FileSystem — read S4 gateway-written objects directly from the backend.
+"""S4FileSystem — read/write S4 gateway-format objects directly on the backend.
 
 The S4 gateway (https://github.com/abyo-software/s4) stores objects on an
 S3-compatible backend as a sequence of S4F2 frames (compressed chunks with
@@ -14,8 +14,17 @@ read those objects **without the gateway**:
   frames that overlap the requested range;
 - non-S4 objects (no S4F2 magic) pass through byte-for-byte.
 
-The filesystem is **read-only**: writes must go through the S4 gateway,
-which owns the framing / sidecar / metadata contract.
+Writes are **opt-in** (``write_enabled=True``): ``pipe_file`` /
+``put_file`` / ``open(path, "wb")`` encode the body in the exact format
+the gateway's single-PUT path produces (S4F2 frames + manifest metadata +
+``.s4index`` sidecar for multi-frame bodies), so gateway GET / Range GET,
+``s4 verify-sidecar`` and s4fs itself all read the result back. The
+underlying filesystem must support stamping S3 user metadata on writes
+(s3fs does) — without the metadata stamp the gateway would serve the
+framed bytes raw, so metadata-less filesystems are refused with
+:class:`S4MetadataUnsupportedError`. Out of scope (use the gateway):
+append, SSE encryption, zstd-dictionary compression, versioning-aware
+overwrites.
 
 Wire-format references (frozen as of s4 v1.0):
 
@@ -59,7 +68,40 @@ _FRAME_MAGICS = (s4_codec.FRAME_MAGIC, s4_codec.PADDING_MAGIC)
 _SSE_MAGICS = (b"S4E1", b"S4E2", b"S4E3", b"S4E4", b"S4E5", b"S4E6")
 _DICT_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 
-_READ_ONLY_MSG = "s4fs is read-only; write through the S4 gateway"
+_WRITE_DISABLED_MSG = (
+    "s4fs is read-only by default; pass write_enabled=True "
+    "(storage_options={'write_enabled': True} via fsspec/pandas) to enable "
+    "client-side S4-format writes, or write through the S4 gateway"
+)
+_UNSUPPORTED_OP_MSG = (
+    "s4fs does not implement this operation; use the S4 gateway or the "
+    "underlying backend filesystem directly"
+)
+_METADATA_UNSUPPORTED_MSG = (
+    "the underlying filesystem {fs!r} cannot stamp S3 user metadata on "
+    "writes. S4 writes MUST carry the s4-codec/s4-original-size/"
+    "s4-compressed-size/s4-crc32c/s4-framed manifest metadata: a framed "
+    "body without the stamp would be served raw (compressed bytes) by the "
+    "S4 gateway instead of being decoded. Use an s3fs-backed S4FileSystem, "
+    "or expose a `s4fs_metadata_pipe_kwarg` attribute naming the "
+    "pipe_file() keyword that accepts a {{str: str}} metadata dict"
+)
+
+
+class S4MetadataUnsupportedError(NotImplementedError):
+    """Writing was refused because the underlying filesystem cannot stamp
+    S3 user metadata.
+
+    The S4 gateway decides how to serve an object from its metadata
+    manifest (``s4-codec`` / ``s4-original-size`` / ``s4-compressed-size``
+    / ``s4-crc32c`` / ``s4-framed`` — ``s4-server/src/service.rs``). An
+    S4F2-framed body written *without* those keys is indistinguishable
+    from a user's raw bytes, so the gateway would return the compressed
+    frames verbatim (the "unstamped-framed" hazard). s4fs therefore
+    refuses to write through filesystems that cannot pass metadata along
+    with the object body, rather than producing objects that silently
+    read back wrong through the gateway.
+    """
 _SSE_MSG = (
     "s4fs does not decrypt SSE objects; read through the gateway "
     "(the encryption keyring / KMS / SSE-C key never leaves the gateway)"
@@ -105,7 +147,8 @@ def _normalize_range(start: Optional[int], end: Optional[int], size: int) -> Tup
 
 
 class S4FileSystem(AbstractFileSystem):
-    """Read-only fsspec filesystem decoding S4 gateway-written objects.
+    """fsspec filesystem decoding (and, opt-in, writing) S4 gateway-format
+    objects directly on the backend.
 
     Parameters
     ----------
@@ -126,6 +169,22 @@ class S4FileSystem(AbstractFileSystem):
         clamps reads to ``info()["size"]``, which would be the
         *compressed* size — silently truncating the decompressed stream.
         Pass ``True`` to restore the pre-1.0.1 clamped behavior.
+    write_enabled:
+        Default ``False`` (read-only, the pre-1.2 contract). Pass ``True``
+        to enable ``pipe_file`` / ``put_file`` / ``open(path, "wb")``,
+        which write gateway-compatible S4 objects (S4F2 framed body +
+        manifest metadata + bound ``.s4index`` sidecar for multi-frame
+        bodies) directly to the backend. Writes cover **create and
+        overwrite only**; append is ``NotImplementedError``. SSE
+        encryption, zstd-dictionary compression and gateway versioning
+        are out of scope — PUT through the gateway for those.
+    write_codec:
+        Codec for client-side writes: ``"cpu-zstd"`` (default) or
+        ``"passthrough"``. Other gateway codecs (cpu-gzip /
+        cpu-zstd-dict / nvcomp-*) raise ``NotImplementedError``.
+    write_zstd_level:
+        zstd compression level for ``write_codec="cpu-zstd"`` (default 3,
+        the gateway default; clamped to 1..=22).
 
     Notes
     -----
@@ -150,10 +209,16 @@ class S4FileSystem(AbstractFileSystem):
         target_protocol: str = "s3",
         target_options: Optional[Dict[str, Any]] = None,
         allow_inexact_open: bool = False,
+        write_enabled: bool = False,
+        write_codec: str = "cpu-zstd",
+        write_zstd_level: int = 3,
         **kwargs: Any,
     ):
         super().__init__(**kwargs)
         self.allow_inexact_open = allow_inexact_open
+        self.write_enabled = write_enabled
+        self.write_codec = write_codec
+        self.write_zstd_level = write_zstd_level
         if fs is None:
             fs = fsspec.filesystem(target_protocol, **(target_options or {}))
         self.fs = fs
@@ -364,6 +429,13 @@ class S4FileSystem(AbstractFileSystem):
         # codec dispatch can fall through to the raw-passthrough branch.
         self._guard_sse(path, head=data)
         meta = self._object_metadata(path)
+        if meta.get("s4-framed") == "true":
+            # `s4-framed` objects normally start with the S4F2/S4P1 magic
+            # and never reach here; the exception is the ZERO-frame body
+            # the gateway stores for an empty PUT (no frames = no magic).
+            # Decode through the framed path (frame_iter of b"" -> b"")
+            # instead of mis-treating the body as a raw compressed blob.
+            return self._decode_framed(data, path)
         codec = meta.get("s4-codec")
         if codec is None or codec == "passthrough":
             return data
@@ -457,7 +529,13 @@ class S4FileSystem(AbstractFileSystem):
         if base.get("type") == "file":
             # Seed the live-info snapshot so the sidecar staleness check
             # below reuses this very response instead of a second HEAD.
-            self._live_info_cache[path] = base
+            # MUST be a copy: `base["size"]` is rewritten to the original
+            # (decompressed) size below, and the snapshot's job is to keep
+            # the *backend* size for the sidecar's source_compressed_size
+            # comparison — caching the mutated dict would fail every
+            # binding check after an info() call and silently disable the
+            # partial-fetch fast-path (full-read fallback + warning).
+            self._live_info_cache[path] = dict(base)
             size, exact = self._resolve_size(path, base)
             base["size"] = size
             base["s4_size_exact"] = exact
@@ -534,8 +612,35 @@ class S4FileSystem(AbstractFileSystem):
         cache_options: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> "S4File":
+        if mode == "wb":
+            self._check_write_enabled()
+            # Fail fast on metadata-less filesystems BEFORE the caller
+            # buffers a body into the handle (the actual stamp happens in
+            # _write_object on close).
+            if not getattr(self.fs, "s4fs_metadata_pipe_kwarg", None) and "s3fs" not in {
+                c.__module__.split(".", 1)[0] for c in type(self.fs).__mro__
+            }:
+                raise S4MetadataUnsupportedError(
+                    _METADATA_UNSUPPORTED_MSG.format(fs=type(self.fs).__name__)
+                )
+            return S4File(
+                self,
+                self._strip_protocol(path),
+                mode=mode,
+                block_size=block_size,
+                autocommit=autocommit,
+                cache_options=cache_options,
+                **kwargs,
+            )
         if mode != "rb":
-            raise NotImplementedError(_READ_ONLY_MSG)
+            # "ab"/"a" (append) needs read-modify-write of compressed
+            # frames; "rb+" needs in-place patching. Out of scope.
+            raise NotImplementedError(
+                _WRITE_DISABLED_MSG
+                if not self.write_enabled
+                else f"s4fs supports modes 'rb' and 'wb' only, not {mode!r} "
+                "(append / read-write require the S4 gateway)"
+            )
         # AbstractBufferedFile clamps every read to info()["size"]. For a
         # framed object whose original size could not be resolved exactly
         # (no usable sidecar, no s4-original-size metadata) that size is
@@ -583,50 +688,179 @@ class S4FileSystem(AbstractFileSystem):
         if hasattr(self.fs, "invalidate_cache"):
             self.fs.invalidate_cache(path)
 
-    # -- write API: intentionally unsupported --------------------------------
+    # -- write API (opt-in via write_enabled=True) ----------------------------
+
+    def _check_write_enabled(self) -> None:
+        if not self.write_enabled:
+            raise NotImplementedError(_WRITE_DISABLED_MSG)
+
+    def _metadata_pipe(self, path: str, body: bytes, metadata: Dict[str, str]) -> Any:
+        """PUT ``body`` at ``path`` on the underlying fs WITH S3 user
+        metadata, or raise :class:`S4MetadataUnsupportedError`.
+
+        The metadata stamp is mandatory: the gateway dispatches its GET
+        path on the ``s4-codec`` / ``s4-framed`` manifest keys, so a
+        framed body without them would be served as raw compressed bytes
+        (see :class:`S4MetadataUnsupportedError`). Supported underlying
+        filesystems:
+
+        - s3fs: ``pipe_file(path, body, Metadata=...)`` — the kwarg flows
+          into botocore ``put_object`` / ``create_multipart_upload``
+          verbatim (verified against s3fs 2026.4.0);
+        - any fs exposing a ``s4fs_metadata_pipe_kwarg`` attribute naming
+          the ``pipe_file`` keyword that accepts a ``{str: str}`` dict
+          (test stubs / custom backends).
+
+        Returns whatever the underlying ``pipe_file`` returned (s3fs
+        returns the botocore PUT response, whose ``ETag`` feeds the
+        sidecar version binding).
+        """
+        fs = self.fs
+        kwarg = getattr(fs, "s4fs_metadata_pipe_kwarg", None)
+        if kwarg:
+            return fs.pipe_file(path, body, **{kwarg: metadata})
+        mods = {c.__module__.split(".", 1)[0] for c in type(fs).__mro__}
+        if "s3fs" in mods:
+            return fs.pipe_file(path, body, Metadata=metadata)
+        raise S4MetadataUnsupportedError(_METADATA_UNSUPPORTED_MSG.format(fs=type(fs).__name__))
+
+    def _backend_etag(self, path: str, put_response: Any) -> Optional[str]:
+        """Quote-stripped ETag of the object just written (PUT response
+        first, then a HEAD/info fallback for multipart or non-dict
+        responses). ``None`` on ETag-less backends — the sidecar then
+        carries a size-only binding, which the gateway / ``s4
+        verify-sidecar`` accept as a valid v2 binding."""
+        if isinstance(put_response, dict):
+            etag = _strip_etag(put_response.get("ETag") or put_response.get("etag"))
+            if etag:
+                return etag
+        try:
+            if hasattr(self.fs, "invalidate_cache"):
+                self.fs.invalidate_cache(path)
+            info = self.fs.info(path)
+        except (FileNotFoundError, OSError):
+            return None
+        return _strip_etag(info.get("ETag") or info.get("etag"))
+
+    def _write_object(self, path: str, data: bytes) -> None:
+        """Encode ``data`` exactly like the gateway's single-PUT path and
+        write body (+ metadata stamp) and, for multi-frame bodies, the
+        ETag-bound ``<key>.s4index`` sidecar to the underlying fs.
+
+        Create-and-overwrite only. Not in scope (write through the
+        gateway instead): append, SSE encryption, zstd-dictionary
+        compression, gateway versioning (a gateway-side version chain is
+        not advanced by a direct backend overwrite).
+        """
+        self._check_write_enabled()
+        if self._hidden(path):
+            raise ValueError(
+                f"cannot write to {path!r}: S4-reserved key "
+                "(.s4index sidecars / .s4dict dictionaries / version shadows)"
+            )
+        enc = s4_codec.encode_s4_object(
+            data, codec=self.write_codec, level=self.write_zstd_level
+        )
+        resp = self._metadata_pipe(path, enc["body"], enc["metadata"])
+        sidecar_path = path + SIDECAR_SUFFIX
+        if enc["sidecar"] is not None:
+            # The gateway stamps the sidecar's version binding from the
+            # backend PUT response's ETag (service.rs write_sidecar); we
+            # do the same so gateway Range GET trusts the sidecar and
+            # `s4 verify-sidecar` reports OK instead of LegacyV1.
+            etag = self._backend_etag(path, resp)
+            bound = s4_codec.bind_index(
+                enc["sidecar"],
+                source_compressed_size=len(enc["body"]),
+                source_etag=etag,
+            )
+            self.fs.pipe_file(sidecar_path, bound)
+        else:
+            # Single-frame body: no sidecar is written (gateway policy),
+            # but a stale one from a previous multi-frame overwrite would
+            # linger. Readers reject it on the ETag binding, so this is
+            # hygiene, not correctness — best effort.
+            try:
+                if self.fs.exists(sidecar_path):
+                    self.fs.rm_file(sidecar_path)
+            except Exception:  # noqa: BLE001 — cleanup is best-effort
+                pass
+        self.invalidate_cache(path)
 
     def pipe_file(self, path: str, value: bytes, **kwargs: Any) -> None:
-        raise NotImplementedError(_READ_ONLY_MSG)
+        self._write_object(self._strip_protocol(path), bytes(value))
 
     def put_file(self, lpath: str, rpath: str, **kwargs: Any) -> None:
-        raise NotImplementedError(_READ_ONLY_MSG)
+        self._check_write_enabled()
+        import os
 
-    def cp_file(self, path1: str, path2: str, **kwargs: Any) -> None:
-        raise NotImplementedError(_READ_ONLY_MSG)
-
-    def mv(self, path1: str, path2: str, **kwargs: Any) -> None:
-        raise NotImplementedError(_READ_ONLY_MSG)
-
-    def rm_file(self, path: str) -> None:
-        raise NotImplementedError(_READ_ONLY_MSG)
-
-    def _rm(self, path: str) -> None:
-        raise NotImplementedError(_READ_ONLY_MSG)
-
-    def rm(self, path: str, recursive: bool = False, maxdepth: Optional[int] = None) -> None:
-        raise NotImplementedError(_READ_ONLY_MSG)
+        if os.path.isdir(lpath):
+            return  # fsspec semantics: directories materialize implicitly
+        with open(lpath, "rb") as f:
+            data = f.read()
+        self._write_object(self._strip_protocol(rpath), data)
 
     def touch(self, path: str, truncate: bool = True, **kwargs: Any) -> None:
-        raise NotImplementedError(_READ_ONLY_MSG)
+        path = self._strip_protocol(path)
+        if not truncate and self.exists(path):
+            return
+        self._write_object(path, b"")
 
     def mkdir(self, path: str, create_parents: bool = True, **kwargs: Any) -> None:
-        raise NotImplementedError(_READ_ONLY_MSG)
+        # Object stores have no real directories; pyarrow/pandas call
+        # this before writing — a no-op when writes are enabled.
+        self._check_write_enabled()
 
     def makedirs(self, path: str, exist_ok: bool = False) -> None:
-        raise NotImplementedError(_READ_ONLY_MSG)
+        self._check_write_enabled()
+
+    # -- mutations that stay unsupported --------------------------------------
+    # Copy/rename would need the gateway's reserved-metadata handling and
+    # delete would need its sidecar/version cleanup — out of scope here.
+
+    def cp_file(self, path1: str, path2: str, **kwargs: Any) -> None:
+        raise NotImplementedError(_UNSUPPORTED_OP_MSG)
+
+    def mv(self, path1: str, path2: str, **kwargs: Any) -> None:
+        raise NotImplementedError(_UNSUPPORTED_OP_MSG)
+
+    def rm_file(self, path: str) -> None:
+        raise NotImplementedError(_UNSUPPORTED_OP_MSG)
+
+    def _rm(self, path: str) -> None:
+        raise NotImplementedError(_UNSUPPORTED_OP_MSG)
+
+    def rm(self, path: str, recursive: bool = False, maxdepth: Optional[int] = None) -> None:
+        raise NotImplementedError(_UNSUPPORTED_OP_MSG)
 
     def rmdir(self, path: str) -> None:
-        raise NotImplementedError(_READ_ONLY_MSG)
+        raise NotImplementedError(_UNSUPPORTED_OP_MSG)
 
 
 class S4File(AbstractBufferedFile):
-    """Read-only file handle; range fetches decode through the parent fs."""
+    """File handle. Reads range-fetch + decode through the parent fs;
+    writes buffer in memory and PUT the whole S4-encoded object on close.
+
+    The whole-object buffering is structural: S4F2 chunk sizing, the
+    aggregate manifest CRC and the sidecar offsets all describe the
+    complete body, so a true streaming multipart upload would need the
+    gateway's multipart path (out of scope client-side).
+    """
 
     def _fetch_range(self, start: int, end: int) -> bytes:
         return self.fs.cat_file(self.path, start=start, end=end)
 
     def _upload_chunk(self, final: bool = False) -> bool:
-        raise NotImplementedError(_READ_ONLY_MSG)
+        if not final:
+            # Returning False keeps fsspec's buffer accumulating across
+            # block-size flushes — the object is encoded + PUT once, on
+            # close (see class docstring).
+            return False
+        self.buffer.seek(0)
+        self.fs._write_object(self.path, self.buffer.read())
+        return True
 
     def _initiate_upload(self) -> None:
-        raise NotImplementedError(_READ_ONLY_MSG)
+        # Nothing to initiate: the upload happens wholesale in
+        # _upload_chunk(final=True).
+        pass

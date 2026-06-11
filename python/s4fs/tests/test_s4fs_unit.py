@@ -158,6 +158,24 @@ def test_range_read_fetches_less_than_full_object(s4fs_factory):
     )
 
 
+def test_range_read_after_info_still_uses_sidecar(s4fs_factory):
+    """Regression (v1.2): info() rewrites size to the *original* size; the
+    live-info snapshot it seeds for the sidecar binding check must keep
+    the *backend* size, or every post-info() range read silently loses
+    the partial-fetch fast-path (full-read fallback + warning)."""
+    fs, stub = s4fs_factory(("multi.bin", "multi_zstd"))
+    path = f"{BUCKET}/multi.bin"
+    orig = datagen.multi_frame_body()
+    assert fs.info(path)["size"] == len(orig)  # poisons the cache pre-fix
+    stub.bytes_fetched = 0
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # the fallback path warns — fail on it
+        assert fs.cat_file(path, start=10, end=1000) == orig[10:1000]
+    assert stub.bytes_fetched < len(load_fixture("multi_zstd")["body"])
+
+
 def test_range_read_on_raw_object_delegates(s4fs_factory):
     fs, _ = s4fs_factory(("raw.bin", "raw"))
     orig = load_fixture("raw")["orig"]
@@ -452,26 +470,40 @@ def test_corrupted_frame_payload_raises(s4fs_factory):
         fs.cat_file(path)
 
 
-# -- read-only enforcement ---------------------------------------------------------
+# -- read-only enforcement (write_enabled defaults to False) -------------------
 
 
 @pytest.mark.parametrize(
     "op",
     [
         lambda fs: fs.pipe_file("b/x", b"data"),
-        lambda fs: fs.rm("b/x"),
-        lambda fs: fs.rm_file("b/x"),
+        lambda fs: fs.put_file("/etc/hostname", "b/x"),
         lambda fs: fs.mkdir("b/x"),
         lambda fs: fs.makedirs("b/x"),
         lambda fs: fs.touch("b/x"),
-        lambda fs: fs.mv("b/x", "b/y"),
-        lambda fs: fs.cp_file("b/x", "b/y"),
         lambda fs: fs.open("b/x", "wb"),
     ],
 )
-def test_write_apis_raise_read_only(s4fs_factory, op):
+def test_write_apis_raise_read_only_by_default(s4fs_factory, op):
     fs, _ = s4fs_factory(("text.txt", "text_zstd"))
     with pytest.raises(NotImplementedError, match="read-only"):
+        op(fs)
+
+
+@pytest.mark.parametrize(
+    "op",
+    [
+        lambda fs: fs.rm("b/x"),
+        lambda fs: fs.rm_file("b/x"),
+        lambda fs: fs.mv("b/x", "b/y"),
+        lambda fs: fs.cp_file("b/x", "b/y"),
+        lambda fs: fs.rmdir("b/x"),
+    ],
+)
+def test_mutation_apis_stay_unsupported_even_with_writes_enabled(op):
+    stub = stub_with(("text.txt", "text_zstd"))
+    fs = S4FileSystem(fs=stub, write_enabled=True)
+    with pytest.raises(NotImplementedError, match="does not implement"):
         op(fs)
 
 
@@ -484,3 +516,172 @@ def test_protocol_registered():
     stub = stub_with(("text.txt", "text_zstd"))
     fs = fsspec.filesystem("s4", fs=stub)
     assert isinstance(fs, S4FileSystem)
+
+
+# -- write support (v1.2, opt-in) ----------------------------------------------
+
+
+def _writable(**kwargs):
+    """Fresh writable S4FileSystem over an empty stub backend.
+
+    The stub starts with one pre-existing raw object so the bucket
+    "exists" for ls()-style probes."""
+    stub = stub_with(("raw.bin", "raw"))
+    fs = S4FileSystem(fs=stub, write_enabled=True, **kwargs)
+    return fs, stub
+
+
+def test_write_single_frame_stamps_gateway_metadata():
+    fs, stub = _writable()
+    data = datagen.text_body()
+    path = f"{BUCKET}/written.txt"
+    fs.pipe_file(path, data)
+
+    stored = stub.files[path]
+    assert stored[:4] == b"S4F2", "body must be S4F2-framed"
+    assert len(stored) < len(data), "zstd frame should compress the text"
+    # Metadata restates the gateway PUT-path stamp (service.rs
+    # write_manifest + META_FRAMED).
+    meta = stub.meta[path]
+    assert meta["s4-codec"] == "cpu-zstd"
+    assert meta["s4-original-size"] == str(len(data))
+    assert meta["s4-compressed-size"] == str(len(stored))
+    assert meta["s4-crc32c"] == str(s4_codec.crc32c(data))
+    assert meta["s4-framed"] == "true"
+    # Single frame => no sidecar (gateway policy).
+    assert path + ".s4index" not in stub.files
+
+    # Read back through a *fresh* instance (no warm caches).
+    fresh = S4FileSystem(fs=stub)
+    assert fresh.cat_file(path) == data
+    assert fresh.info(path)["size"] == len(data)
+    assert fresh.info(path)["s4_size_exact"] is True
+
+
+def test_write_multi_frame_emits_bound_sidecar_and_partial_reads():
+    fs, stub = _writable(write_zstd_level=1)
+    data = datagen.multi_frame_body()  # ~5.1 MiB -> two 4 MiB-chunk frames
+    path = f"{BUCKET}/multi-written.bin"
+    fs.pipe_file(path, data)
+
+    body = stub.files[path]
+    sidecar = stub.files[path + ".s4index"]
+    idx = s4_codec.decode_index(sidecar)
+    assert len(idx["entries"]) == 2
+    assert idx["total_original_size"] == len(data)
+    assert idx["total_padded_size"] == len(body)
+    # Version binding == what the backend reported for the body PUT
+    # (gateway write_sidecar contract; quote-stripped ETag form).
+    assert idx["source_compressed_size"] == len(body)
+    assert idx["source_etag"] == stub.etags[path].strip('"')
+
+    fresh = S4FileSystem(fs=stub)
+    assert fresh.cat_file(path) == data
+    # Sidecar-driven range read fetches less than the compressed body.
+    stub.bytes_fetched = 0
+    assert fresh.cat_file(path, start=10, end=900) == data[10:900]
+    assert stub.bytes_fetched < len(body)
+    # Frame-boundary crossing decodes correctly.
+    lo, hi = 4 * 1024 * 1024 - 64, 4 * 1024 * 1024 + 64
+    assert fresh.cat_file(path, start=lo, end=hi) == data[lo:hi]
+
+
+def test_overwrite_single_frame_removes_stale_sidecar():
+    fs, stub = _writable(write_zstd_level=1)
+    path = f"{BUCKET}/shrinking.bin"
+    fs.pipe_file(path, datagen.multi_frame_body())
+    assert path + ".s4index" in stub.files
+    fs.pipe_file(path, b"now tiny")
+    assert path + ".s4index" not in stub.files, "stale sidecar must be cleaned up"
+    fresh = S4FileSystem(fs=stub)
+    assert fresh.cat_file(path) == b"now tiny"
+
+
+def test_write_passthrough_codec_stores_raw_bytes():
+    fs, stub = _writable()
+    fs.write_codec = "passthrough"
+    data = b"already compressed \x00\x01\x02" * 100
+    path = f"{BUCKET}/raw-written.bin"
+    fs.pipe_file(path, data)
+    assert stub.files[path] == data, "passthrough body is byte-identical"
+    meta = stub.meta[path]
+    assert meta["s4-codec"] == "passthrough"
+    assert "s4-framed" not in meta, "gateway never frames passthrough"
+    assert S4FileSystem(fs=stub).cat_file(path) == data
+
+
+def test_write_empty_object():
+    fs, stub = _writable()
+    path = f"{BUCKET}/empty.bin"
+    fs.pipe_file(path, b"")
+    assert stub.files[path] == b""
+    assert stub.meta[path]["s4-original-size"] == "0"
+    assert S4FileSystem(fs=stub).cat_file(path) == b""
+
+
+def test_open_wb_buffers_and_writes_on_close():
+    fs, stub = _writable()
+    data = datagen.text_body()
+    path = f"{BUCKET}/streamed.txt"
+    with fs.open(path, "wb") as f:
+        f.write(data[: len(data) // 2])
+        f.write(data[len(data) // 2 :])
+    assert stub.files[path][:4] == b"S4F2"
+    assert stub.meta[path]["s4-original-size"] == str(len(data))
+    assert S4FileSystem(fs=stub).cat_file(path) == data
+
+
+def test_put_file_roundtrip(tmp_path):
+    fs, stub = _writable()
+    local = tmp_path / "local.bin"
+    data = b"local file payload " * 500
+    local.write_bytes(data)
+    fs.put_file(str(local), f"{BUCKET}/uploaded.bin")
+    assert S4FileSystem(fs=stub).cat_file(f"{BUCKET}/uploaded.bin") == data
+
+
+def test_write_refused_on_metadata_less_fs():
+    """A backend that drops metadata would produce 'unstamped framed'
+    objects the gateway serves raw — refuse with the typed error."""
+    from conftest import NoMetadataStubFileSystem
+
+    from s4fs import S4MetadataUnsupportedError
+
+    stub = NoMetadataStubFileSystem({})
+    fs = S4FileSystem(fs=stub, write_enabled=True)
+    with pytest.raises(S4MetadataUnsupportedError, match="metadata"):
+        fs.pipe_file(f"{BUCKET}/x.bin", b"data")
+    with pytest.raises(S4MetadataUnsupportedError, match="metadata"):
+        fs.open(f"{BUCKET}/x.bin", "wb")
+    assert f"{BUCKET}/x.bin" not in stub.files, "no body may land without the stamp"
+
+
+def test_write_to_reserved_keys_rejected():
+    fs, _ = _writable()
+    with pytest.raises(ValueError, match="reserved"):
+        fs.pipe_file(f"{BUCKET}/x.s4index", b"data")
+    with pytest.raises(ValueError, match="reserved"):
+        fs.pipe_file(f"{BUCKET}/.s4dict/0123456789abcdef", b"data")
+
+
+def test_append_mode_rejected():
+    fs, _ = _writable()
+    with pytest.raises(NotImplementedError, match="'rb' and 'wb'"):
+        fs.open(f"{BUCKET}/x.bin", "ab")
+
+
+def test_write_unsupported_codec_points_at_gateway():
+    fs, _ = _writable(write_codec="cpu-gzip")
+    with pytest.raises(NotImplementedError, match="gateway"):
+        fs.pipe_file(f"{BUCKET}/x.bin", b"data")
+
+
+def test_storage_options_enable_writes_via_fsspec():
+    import fsspec
+
+    stub = stub_with(("raw.bin", "raw"))
+    fs = fsspec.filesystem("s4", fs=stub, write_enabled=True, skip_instance_cache=True)
+    data = b"via storage_options " * 64
+    with fsspec.open(f"s4://{BUCKET}/opt.bin", "wb", fs=stub, write_enabled=True) as f:
+        f.write(data)
+    assert fs.cat_file(f"{BUCKET}/opt.bin") == data

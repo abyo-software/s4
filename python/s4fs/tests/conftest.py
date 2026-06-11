@@ -26,10 +26,18 @@ class StubFileSystem(AbstractFileSystem):
     Tracks how many payload bytes each ``cat_file`` call transferred so
     tests can assert that sidecar-driven range reads fetch less than the
     full object.
+
+    Writes mimic the slice of the s3fs surface s4fs needs: ``pipe_file``
+    accepts a metadata dict (declared via ``s4fs_metadata_pipe_kwarg``,
+    the s4fs capability hook), stores it alongside the body, and assigns
+    an MD5 ETag the way S3/MinIO do for single PUTs.
     """
 
     protocol = "stub"
     cachable = False
+    #: s4fs capability hook: pipe_file(..., metadata={...}) stamps S3
+    #: user metadata (the s3fs equivalent is ``Metadata=``).
+    s4fs_metadata_pipe_kwarg = "metadata"
 
     def __init__(
         self,
@@ -107,6 +115,45 @@ class StubFileSystem(AbstractFileSystem):
             return True
         prefix = path.rstrip("/") + "/"
         return any(n.startswith(prefix) for n in self.files)
+
+    def pipe_file(
+        self,
+        path: str,
+        value: bytes,
+        metadata: Optional[Dict[str, str]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        import hashlib
+
+        path = self._strip_protocol(path)
+        self.files[path] = bytes(value)
+        if metadata is not None:
+            self.meta[path] = dict(metadata)
+        else:
+            self.meta.pop(path, None)
+        # Single-PUT S3 semantics: ETag is the quoted body MD5.
+        etag = f'"{hashlib.md5(bytes(value)).hexdigest()}"'
+        self.etags[path] = etag
+        self.calls.append(("pipe_file", path, metadata))
+        return {"ETag": etag}
+
+    def rm_file(self, path: str) -> None:
+        path = self._strip_protocol(path)
+        self.files.pop(path, None)
+        self.meta.pop(path, None)
+        self.etags.pop(path, None)
+
+
+class NoMetadataStubFileSystem(StubFileSystem):
+    """Stub WITHOUT the metadata capability hook — pipe_file silently drops
+    metadata, like fsspec's memory:// would. s4fs must refuse to write
+    through it (unstamped-framed hazard)."""
+
+    s4fs_metadata_pipe_kwarg = None
+
+    def pipe_file(self, path: str, value: bytes, **kwargs: Any) -> None:  # type: ignore[override]
+        path = self._strip_protocol(path)
+        self.files[path] = bytes(value)
 
 
 def load_fixture(name: str) -> Dict[str, Any]:

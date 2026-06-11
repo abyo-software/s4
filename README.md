@@ -386,7 +386,11 @@ the API and a 10-line example.
 For pandas / pyarrow / DuckDB / Polars reading S4 objects **straight off the
 backend** — no gateway in the read path. Range reads use the `.s4index`
 sidecar to fetch only the overlapping frames; non-S4 objects pass through
-byte-for-byte. Read-only by design (writes go through the gateway); GPU
+byte-for-byte. Read-only by default; pass `write_enabled=True` to also
+*write* gateway-compatible S4 objects directly to the backend (S4F2
+framed `cpu-zstd` body + manifest metadata + ETag-bound sidecar — gateway
+GET / Range GET and `s4 verify-sidecar` accept the result; append, SSE,
+dictionaries and gateway versioning still go through the gateway). GPU
 (`nvcomp-*`) frames and SSE-encrypted objects raise `NotImplementedError`
 rather than decode wrong (SSE detection is triple-layered: `s4-encrypted`
 metadata, sidecar SSE binding, and `S4E1`–`S4E6` magic-byte sniff).
@@ -395,10 +399,13 @@ metadata, sidecar SSE binding, and `S4E1`–`S4E6` magic-byte sniff).
 import pandas as pd
 opts = {"target_options": {"endpoint_url": "http://backend:9000"}}
 df = pd.read_parquet("s4://bucket/data.parquet", storage_options=opts)
+df.to_parquet(  # write-back without the gateway (opt-in)
+    "s4://bucket/data.parquet", storage_options={**opts, "write_enabled": True}
+)
 ```
 
 See [`python/s4fs/README.md`](python/s4fs/README.md) for pyarrow / DuckDB
-examples and the supported-codec matrix.
+examples, the supported-codec matrix and the write constraints.
 
 ### Build from source
 

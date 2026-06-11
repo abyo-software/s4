@@ -350,3 +350,149 @@ def test_exception_class_hierarchy():
     assert issubclass(S4IoError, OSError)  # IOError is OSError in py3
     assert not issubclass(S4BackendError, S4Error)
     assert not issubclass(S4IoError, S4Error)
+
+
+# ---------------------------------------------------------------------------
+# v1.2 s4fs write support: encode_s4_object / bind_index / pick_chunk_size.
+# Roundtrips are verified through the binding's own *read* helpers
+# (read_frame / frame_iter / decode_index), which the suites above pin
+# against the frozen v1.0 wire formats.
+# ---------------------------------------------------------------------------
+
+from s4_codec import bind_index, encode_s4_object, pick_chunk_size
+
+_MIB = 1024 * 1024
+
+
+def _decode_body(enc) -> bytes:
+    """Decode an encode_s4_object framed body via the read-side helpers."""
+    out = b""
+    for header, payload in frame_iter(enc["body"]):
+        assert header["codec"] == "cpu-zstd"
+        out += CpuZstd().decompress(payload, header["original_size"], header["crc32c"])
+    return out
+
+
+def test_pick_chunk_size_threshold_table():
+    """Restates s4-server/src/streaming.rs::pick_chunk_size (keep-in-sync)."""
+    assert pick_chunk_size(0) == _MIB
+    assert pick_chunk_size(64 * 1024) == _MIB
+    assert pick_chunk_size(_MIB) == _MIB
+    assert pick_chunk_size(_MIB + 1) == 4 * _MIB
+    assert pick_chunk_size(50 * _MIB) == 4 * _MIB
+    assert pick_chunk_size(100 * _MIB) == 4 * _MIB
+    assert pick_chunk_size(100 * _MIB + 1) == 16 * _MIB
+    assert pick_chunk_size(10 * 1024 * _MIB) == 16 * _MIB
+
+
+def test_encode_single_frame_roundtrip_and_metadata():
+    data = b"compress me please " * 4000  # ~76 KiB -> one 1 MiB chunk
+    enc = encode_s4_object(data, codec="cpu-zstd", level=3)
+    assert _decode_body(enc) == data
+    assert len(frame_iter(enc["body"])) == 1
+    # Single frame => no sidecar (mirrors the gateway's >1-entry policy).
+    assert enc["sidecar"] is None
+    meta = enc["metadata"]
+    assert meta["s4-codec"] == "cpu-zstd"
+    assert meta["s4-original-size"] == str(len(data))
+    assert meta["s4-compressed-size"] == str(len(enc["body"]))
+    assert meta["s4-crc32c"] == str(crc32c(data))
+    assert meta["s4-framed"] == "true"
+
+
+@pytest.mark.parametrize(
+    ("size", "expected_frames"),
+    [
+        (_MIB, 1),  # <= 1 MiB -> 1 MiB chunk -> 1 frame
+        (4 * _MIB - 1, 1),  # 4 MiB chunking, just under the boundary
+        (4 * _MIB, 1),  # exactly one full 4 MiB chunk
+        (4 * _MIB + 1, 2),  # one byte over -> second frame
+        (9 * _MIB, 3),  # 4 + 4 + 1
+    ],
+)
+def test_encode_frame_count_at_chunk_boundaries(size, expected_frames):
+    # Mildly compressible, position-dependent payload: catches chunk
+    # reordering / off-by-one slicing that uniform bytes would mask.
+    data = bytes((i * 31 + (i >> 13)) & 0xFF for i in range(size))
+    enc = encode_s4_object(data, level=1)
+    frames = frame_iter(enc["body"])
+    assert len(frames) == expected_frames, size
+    assert _decode_body(enc) == data
+    assert sum(h["original_size"] for h, _p in frames) == size
+    # Per-frame headers carry per-chunk sizes/CRCs; aggregate metadata
+    # carries whole-body values (gateway streaming_compress_to_frames).
+    assert enc["metadata"]["s4-original-size"] == str(size)
+    assert enc["metadata"]["s4-crc32c"] == str(crc32c(data))
+    if expected_frames > 1:
+        assert enc["sidecar"] is not None
+    else:
+        assert enc["sidecar"] is None
+
+
+def test_encode_multi_frame_sidecar_layout_and_binding():
+    size = 9 * _MIB
+    data = bytes((i * 7 + 3) & 0xFF for i in range(size))
+    enc = encode_s4_object(data, level=1)
+    idx = decode_index(enc["sidecar"])
+    assert idx["total_original_size"] == size
+    assert idx["total_padded_size"] == len(enc["body"])
+    # Unbound until the caller PUTs the body and learns the backend ETag.
+    assert idx["source_etag"] is None
+    assert idx["source_compressed_size"] is None
+    # Entries tile the original space contiguously and point at real frames.
+    off = 0
+    for e in idx["entries"]:
+        assert e["original_offset"] == off
+        off += e["original_size"]
+        header, _payload, _rest = read_frame(
+            enc["body"][e["compressed_offset"] : e["compressed_offset"] + e["compressed_size"]]
+        )
+        assert header["original_size"] == e["original_size"]
+    assert off == size
+
+    bound = bind_index(enc["sidecar"], source_compressed_size=len(enc["body"]), source_etag="abc")
+    b = decode_index(bound)
+    assert b["source_etag"] == "abc"
+    assert b["source_compressed_size"] == len(enc["body"])
+    assert b["entries"] == idx["entries"]
+    # ETag-less backends: size-only binding is still a valid v2 sidecar.
+    sizeonly = decode_index(bind_index(enc["sidecar"], source_compressed_size=123))
+    assert sizeonly["source_etag"] is None
+    assert sizeonly["source_compressed_size"] == 123
+
+
+def test_encode_empty_body():
+    enc = encode_s4_object(b"")
+    assert enc["body"] == b""
+    assert enc["sidecar"] is None
+    meta = enc["metadata"]
+    assert meta["s4-original-size"] == "0"
+    assert meta["s4-compressed-size"] == "0"
+    assert meta["s4-crc32c"] == "0"
+    assert meta["s4-framed"] == "true"
+    assert frame_iter(enc["body"]) == []
+
+
+def test_encode_passthrough_is_raw_and_unframed():
+    data = b"do not compress me"
+    enc = encode_s4_object(data, codec="passthrough")
+    assert enc["body"] == data  # byte-identical, no S4F2 wrapping
+    assert enc["sidecar"] is None
+    meta = enc["metadata"]
+    assert meta["s4-codec"] == "passthrough"
+    assert meta["s4-original-size"] == str(len(data))
+    assert meta["s4-compressed-size"] == str(len(data))
+    assert meta["s4-crc32c"] == str(crc32c(data))
+    # The gateway never stamps s4-framed on passthrough bodies.
+    assert "s4-framed" not in meta
+
+
+@pytest.mark.parametrize("codec", ["cpu-gzip", "cpu-zstd-dict", "nvcomp-lz4", "dietgpu-ans"])
+def test_encode_unsupported_codecs_point_at_gateway(codec):
+    with pytest.raises(NotImplementedError, match="gateway"):
+        encode_s4_object(b"x", codec=codec)
+
+
+def test_bind_index_rejects_garbage():
+    with pytest.raises(S4IndexError):
+        bind_index(b"NOPE" + b"\x00" * 64, source_compressed_size=1)
