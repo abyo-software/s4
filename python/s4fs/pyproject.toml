@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "s4fs"
-version = "1.0.0"
+version = "1.1.0"
 description = "fsspec adapter for reading S4 gateway-written objects (S4F2 framed + compressed) directly from the backend — no gateway required. Read-only by design."
 readme = "README.md"
 requires-python = ">=3.9"

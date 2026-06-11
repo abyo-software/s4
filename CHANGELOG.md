@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-06-11
+
+**v1.1 — adoption tooling + small-object compression.** Six additive
+features (`s4 estimate` / `s4 migrate` / zstd dictionaries +
+`s4 train-dict` / `s4fs` fsspec adapter / `s4 recompact` / GPU batched
+small-PUT compression) hardened by a 3-round dual-reviewer audit
+(Claude ×3 + Codex; findings 20 → 7 → 5, P1/P2 zero at round 3). The
+v1.0 freeze contract holds: every change below is additive and
+default-off; flag-less PUT/GET behavior is bit-for-bit unchanged.
+
 ### Fixed (audit round 2 — adversarial verification of the round-1 fix wave)
 - **P2** `CreateMultipartUpload` now strips client-supplied `s4-*`
   metadata like `put_object` does — a forged `x-amz-meta-s4-encrypted`
