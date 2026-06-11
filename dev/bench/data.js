@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781169798993,
+  "lastUpdate": 1781171310315,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -11751,6 +11751,232 @@ window.BENCHMARK_DATA = {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
             "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "43cabd3432cfbce448d4b3fd130d3713c5aa319b",
+          "message": "feat(python): s4fs 書き込み対応 — pandas/pyarrow が gateway レスで S4 形式を直接書く\n\ndf.to_parquet('s4://...') が S4F2 frames + manifest metadata + sidecar\nを gateway の単一 PUT 経路と同一形式で書く。write_enabled=True opt-in\n(既定は従来どおり read-only)。\n\n- s4-codec-py (additive): encode_s4_object / bind_index /\n  pick_chunk_size。s4-codec の pub API のみ使用 (wire 自作なし)、\n  chunk 方針・metadata key・sidecar binding は server 実装との\n  keep-in-sync コメント付き\n- metadata を渡せない underlying fs は S4MetadataUnsupportedError で\n  fail-closed (unstamped-framed 回避が理由、docstring 明記)\n- gateway 互換を e2e で証明: 実 gateway GET byte 一致 / verify-sidecar\n  Ok / Range GET frame 境界跨ぎ / pandas roundtrip / gateway 配信\n  bytes の pyarrow parse\n- 副産物の read 経路バグ 2 件修正 (live-info cache への decompressed\n  size 混入で range fast-path 喪失 / 空 framed body の誤 unframed 判定)\n\ntests: binding 38 + unit 64 + e2e 17 (write 8 新規 + read 9 回帰) /\ncargo clippy -D warnings / fmt — 全 green (orchestrator 再実行済)。\nSSE / dict / multipart / append は typed error で gateway 案内。\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-06-11T18:40:45+09:00",
+          "tree_id": "ceb24ec069d95d96cf2ccafb0b2ae30d1b9af63f",
+          "url": "https://github.com/abyo-software/s4/commit/43cabd3432cfbce448d4b3fd130d3713c5aa319b"
+        },
+        "date": 1781171309707,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 54951,
+            "range": "± 3452",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 55226,
+            "range": "± 7618",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 365,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2503829,
+            "range": "± 127388",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 42466983,
+            "range": "± 145945",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192118,
+            "range": "± 822",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 50616548,
+            "range": "± 920309",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 769768105,
+            "range": "± 3499017",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3062639,
+            "range": "± 40239",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 33674,
+            "range": "± 3405",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 37321,
+            "range": "± 2594",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 377,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 570854,
+            "range": "± 8948",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1593376,
+            "range": "± 33104",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 191940,
+            "range": "± 1038",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12653275,
+            "range": "± 464801",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27428916,
+            "range": "± 358917",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3070002,
+            "range": "± 28340",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1503052,
+            "range": "± 14009",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2465941,
+            "range": "± 19387",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 338011915,
+            "range": "± 537712",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 141,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 8052,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 795,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 12621,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 3196,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 25116,
+            "range": "± 51",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 99906,
+            "range": "± 142",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 589,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4416,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 17830,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 28,
+            "range": "± 1",
             "unit": "ns/iter"
           }
         ]
