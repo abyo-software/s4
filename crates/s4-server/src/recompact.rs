@@ -335,8 +335,9 @@ pub fn parse_duration_suffix(s: &str) -> Result<Duration, String> {
 }
 
 /// Render whole seconds back as the shortest `<n><unit>` form, for the
-/// table output (`2592000` → `30d`).
-fn human_duration_secs(secs: u64) -> String {
+/// table output (`2592000` → `30d`). `pub(crate)` for `maintain`'s
+/// table renderer; behaviour unchanged.
+pub(crate) fn human_duration_secs(secs: u64) -> String {
     if secs >= 86_400 && secs.is_multiple_of(86_400) {
         format!("{}d", secs / 86_400)
     } else if secs >= 3600 && secs.is_multiple_of(3600) {
@@ -352,8 +353,13 @@ fn human_duration_secs(secs: u64) -> String {
 /// object qualifies only when its `LastModified` is at or before the
 /// cutoff. No cutoff (`None`) admits everything; an unknown
 /// `LastModified` under an active cutoff is conservatively `TooRecent`
-/// (we cannot prove the object is old enough to rewrite).
-fn is_too_recent(last_modified_epoch_secs: Option<i64>, cutoff_epoch_secs: Option<i64>) -> bool {
+/// (we cannot prove the object is old enough to rewrite). `pub(crate)`
+/// for `migrate` (the `s4 maintain` `older-than` gate) and `maintain`'s
+/// transition action — same semantics everywhere; behaviour unchanged.
+pub(crate) fn is_too_recent(
+    last_modified_epoch_secs: Option<i64>,
+    cutoff_epoch_secs: Option<i64>,
+) -> bool {
     match cutoff_epoch_secs {
         None => false,
         Some(cutoff) => match last_modified_epoch_secs {

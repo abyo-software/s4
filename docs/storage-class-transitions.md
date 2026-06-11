@@ -211,6 +211,60 @@ config and either wait for the next transition or run a one-off
 
 ---
 
+## Automating transitions with `s4 maintain` (v1.2)
+
+Everything above describes **S3 lifecycle configuration** — rules the
+backend evaluates on its own schedule, where keeping the main/sidecar
+pair together is your responsibility (Patterns A/B). Since v1.2 the
+same outcome can be driven from the S4 side instead: a `transition`
+rule in an `s4 maintain` policy changes the storage class of cold
+objects via same-key server-side `CopyObject`, and **always moves the
+`<key>.s4index` sidecar into the same class as its main object** — the
+pair cannot split by construction, and a sidecar that drifted (e.g.
+from an earlier interrupted run or a misconfigured lifecycle filter)
+is realigned on the next run.
+
+```toml
+# s4-maintain.toml
+[[rule]]
+name = "archive-old-logs"
+bucket = "my-s4-bucket"
+prefix = "foo/"
+action = "transition"
+older-than = "60d"
+storage-class = "GLACIER"
+```
+
+```bash
+s4 maintain --policy s4-maintain.toml --endpoint-url https://s3.example.com            # dry-run
+s4 maintain --policy s4-maintain.toml --endpoint-url https://s3.example.com --execute  # apply
+```
+
+See the `s4 maintain` section of the README for the full policy
+schema (the same file can also carry `migrate` / `recompact` rules)
+and the resident `--interval` mode.
+
+Differences from a lifecycle rule, honestly stated:
+
+- `s4 maintain` only acts while it runs (one-shot or `--interval`
+  resident); a lifecycle rule is evaluated by the backend even when
+  no S4 tooling is running.
+- The transition is a `CopyObject`, so on **versioning-enabled
+  buckets it leaves the previous version behind** (double-billed
+  until expired), whereas a native lifecycle transition replaces the
+  storage class in place.
+- Objects already in `GLACIER` / `DEEP_ARCHIVE` cannot be copied
+  without a restore — `s4 maintain` cannot bring data back up the
+  tiers, and the restore workflow below applies unchanged.
+- Single-operation `CopyObject` caps at 5 GiB; larger objects are
+  skipped (`too-large`) and need a lifecycle rule or a multipart copy.
+
+The existing lifecycle patterns remain fully supported — pick one
+mechanism per bucket/prefix rather than racing both against the same
+keys.
+
+---
+
 ## Restore semantics (Glacier / Deep Archive)
 
 If your lifecycle moves objects to `GLACIER` or `DEEP_ARCHIVE`, a

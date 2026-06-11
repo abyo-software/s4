@@ -1317,6 +1317,141 @@ Honest limitations (the report prints the run-specific ones):
   is exactly why this runs nightly on cold data instead of on the PUT
   hot path.
 
+### Policy-driven maintenance (`s4 maintain`, v1.2)
+
+`migrate` and `recompact` are one-bucket, one-action invocations; in
+practice you chain several of them in cron. `s4 maintain` lifts that
+into a single declarative TOML policy that also adds a third action,
+`transition` (storage-class changes with sidecar pairing — see below):
+
+```toml
+# s4-maintain.toml — rules run sequentially, top to bottom
+[[rule]]
+name = "compress-new-logs"        # required, unique
+bucket = "prod-logs"              # required
+prefix = "app/"                   # optional
+action = "migrate"                # migrate | recompact | transition
+older-than = "7d"                 # optional age gate, all actions
+
+[[rule]]
+name = "bake-cold-logs"
+bucket = "prod-logs"
+prefix = "archive/"
+action = "recompact"              # action params = the CLI flags:
+target-zstd-level = 19            #   no-tags / concurrency / max-objects /
+older-than = "30d"                #   min-gain-percent / … same names, same defaults
+
+[[rule]]
+name = "cool-app-logs"
+bucket = "prod-logs"
+prefix = "app/"
+action = "transition"
+older-than = "90d"
+storage-class = "GLACIER_IR"      # required for transition
+```
+
+```bash
+s4 maintain --policy s4-maintain.toml --endpoint-url https://s3.example.com            # dry-run
+s4 maintain --policy s4-maintain.toml --endpoint-url https://s3.example.com --execute  # apply
+```
+
+Like every offline tool here it is **dry-run by default** and must
+point at the **backend**, not an S4 gateway. The policy is fully
+validated up front — unknown keys, unknown actions, duplicate rule
+names, malformed durations and action/parameter mismatches are all
+reported in one pass before any rule runs. `migrate` / `recompact`
+rules call the exact same library paths as the stand-alone subcommands
+(identical selection, mandatory roundtrip verify, ETag race guard,
+sidecar handling, skip taxonomy); `older-than` on a migrate rule
+applies the same conservative `LastModified` gate as
+`recompact --older-than`.
+
+The new `transition` action changes the storage class of cold objects
+via a same-key server-side `CopyObject` — the programmatic twin of the
+lifecycle configuration in `docs/storage-class-transitions.md`, with
+one S4-specific guarantee a generic lifecycle filter cannot give you:
+**the `<key>.s4index` sidecar always accompanies its main object into
+the same class** (and a sidecar that drifted in an earlier interrupted
+run is realigned), so the pair never splits the way a size- or
+suffix-filtered lifecycle rule can. Sidecars are never transitioned on
+their own. Skip taxonomy follows the house style:
+`already-target-class` (the idempotency core), `too-recent`,
+`etag-raced` (pre-copy HEAD guard), `too-large` (single `CopyObject`
+caps at 5 GiB).
+
+Example run against MinIO (the `maintain_minio` e2e seed shape: two
+plain text logs under `app/`, one zstd-3-framed log under `archive/`;
+output verbatim, per-rule note blocks elided for space):
+
+```
+S4 maintain — execute
+  rules: 3 (3 run, 0 failed)
+
+=== rule "compress-new-logs" — migrate prod-logs/app/ ===
+S4 migrate prod-logs/app/ — execute
+  objects: 2   total: 4.8 MiB (5075120 bytes)
+  migrated: 2 object(s), 4.8 MiB -> 218.0 KiB (saves 4.6 MiB)
+  skipped: 0 already-s4, 0 not-compressible, 0 too-large, 0 etag-raced, 0 verify-failed, 0 tags-unreadable
+  failed: 0
+  codecs: cpu-zstd×2
+  …
+
+=== rule "bake-cold-logs" — recompact prod-logs/archive/ ===
+S4 recompact prod-logs/archive/ — execute
+  target zstd level: 19   min gain: 3%
+  objects: 1   total: 212.1 KiB (217223 bytes)
+  recompacted: 1 object(s), 212.1 KiB -> 183.0 KiB (saves 29.2 KiB)
+  …
+
+=== rule "cool-app-logs" — transition prod-logs/app/ ===
+S4 transition prod-logs/app/ — execute
+  target storage class: REDUCED_REDUNDANCY
+  objects: 2   total: 218.0 KiB (223247 bytes)
+  transitioned: 2 object(s) + 1 sidecar(s)
+  skipped: 0 already-target-class, 0 too-recent, 0 etag-raced, 0 too-large
+  failed: 0
+  …
+
+Notes:
+  - rules run sequentially against the bucket's current state; a dry-run cannot simulate the effects of earlier rules in the same policy (e.g. a transition rule's dry-run does not see the sidecars a preceding migrate rule would create)
+```
+
+A second `--execute` run skips everything — all three actions are
+idempotent with no checkpoint file (same run, output verbatim):
+
+```
+  skipped: 2 already-s4, 0 not-compressible, 0 too-large, 0 etag-raced, 0 verify-failed, 0 tags-unreadable
+  skipped: 0 not-s4, 1 already-compacted, 0 unsupported-codec, 0 unstamped-framed, 0 insufficient-gain, 0 too-large, 0 etag-raced, 0 too-recent, 0 tags-unreadable
+  skipped: 2 already-target-class, 0 too-recent, 0 etag-raced, 0 too-large
+```
+
+`--interval 24h` replaces the cron line entirely: the command stays
+resident (run → sleep → re-run), logs each cycle structurally instead
+of printing reports, and exits gracefully on SIGTERM / SIGINT —
+finishing the rule in flight first, never mid-rule. Rule failures in
+resident mode are logged and the loop keeps cycling (idempotence makes
+the next cycle the retry); in one-shot mode any failed rule exits 1.
+`--format json` emits the full structured report
+(`s4_server::maintain::MaintainReport` serde shape, per-rule
+`MigrateReport` / `RecompactReport` / `TransitionReport` nested).
+
+Honest limitations:
+
+- **A dry-run cannot simulate rule interactions** — each rule's
+  dry-run sees the bucket as it is now, not as earlier rules would
+  leave it (the report repeats this in `notes`).
+- **`transition` is a `CopyObject`**, so on versioning-enabled buckets
+  the previous version stays behind (double-billed until expired), the
+  ETag can change for multipart-uploaded or SSE-encrypted originals
+  (sidecar ETag binding falls back to full-read until the next gateway
+  write — perf-only), objects already in `GLACIER` / `DEEP_ARCHIVE`
+  need a restore before they can move, and single-op copies cap at
+  5 GiB (`too-large`).
+- **SSE-enabled deployments are rejected** (`--sse-s4-key` /
+  `--kms-local-dir`) — same scope guard as `migrate` / `recompact`.
+- **One endpoint per run**: every rule in a policy file runs against
+  the same `--endpoint-url` backend.
+
 ### Shared zstd dictionaries for small objects (`s4 train-dict` + `--zstd-dict`)
 
 Single-digit-KiB objects (JSON events, per-line log PUTs, small API
@@ -1559,6 +1694,9 @@ envelopes are v0.11+ roadmap candidates, not promised features.
 - See [docs/storage-class-transitions.md](docs/storage-class-transitions.md)
   for two example lifecycle JSONs (IA-after-30d and prefix→Glacier-after-60d),
   the anti-pattern walkthrough, and a `head-object` drift-audit recipe.
+- v1.2: a `transition` rule in an `s4 maintain` policy automates the
+  same change from the S4 side, with the sidecar guaranteed to
+  accompany its main object — see "Policy-driven maintenance" above.
 
 ### S3 API coverage (45+ ops)
 - Compression hook: `put_object`, `get_object`, `upload_part`

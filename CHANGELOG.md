@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`s4 maintain --policy <FILE> [--execute] [--interval <DUR>]
+  [--format table|json]`**: policy-driven bucket maintenance. A TOML
+  file of `[[rule]]` entries (unique `name`, `bucket`, optional
+  `prefix`, common `older-than` age gate) runs sequentially top to
+  bottom; `action = "migrate" | "recompact"` reuse the v1.1 library
+  paths with the same parameters as their CLI flags (`no-tags`,
+  `target-zstd-level`, `min-gain-percent`, …), and the new
+  `action = "transition"` (`storage-class = "GLACIER_IR"` etc.)
+  changes cold objects' storage class via same-key server-side
+  CopyObject with the `<key>.s4index` sidecar always accompanying its
+  main object into the same class (drift from earlier partial runs is
+  realigned; sidecars are never moved on their own). Dry-run by
+  default; policy validation reports every problem in one pass;
+  `--interval` keeps the command resident (run → sleep → re-run,
+  structured per-cycle logs, graceful SIGTERM/SIGINT that finishes the
+  in-flight rule). All three actions are idempotent, so re-runs and
+  resident cycles skip settled objects
+  (`already-s4` / `already-compacted` / `already-target-class`).
 - **Savings ledger** (`--savings-ledger-state-file <PATH>`, opt-in,
   default-off): the gateway maintains measured per-bucket cumulative
   counters — `original_bytes` (logical client-PUT bytes),

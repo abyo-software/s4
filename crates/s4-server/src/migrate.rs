@@ -341,6 +341,10 @@ pub(crate) fn is_internal_key(key: &str) -> bool {
 struct ObjectJob {
     key: String,
     size: u64,
+    /// Backend `LastModified` as epoch seconds (`None` when the listing
+    /// omitted it). Only consulted by the v1.2 `s4 maintain` path
+    /// ([`run_migrate_with_cutoff`]); plain `s4 migrate` ignores it.
+    last_modified_epoch_secs: Option<i64>,
 }
 
 struct Inventory {
@@ -390,6 +394,7 @@ async fn list_inventory(
             objects.push(ObjectJob {
                 key: k.to_owned(),
                 size,
+                last_modified_epoch_secs: obj.last_modified().map(|t| t.secs()),
             });
         }
         if resp.is_truncated().unwrap_or(false) {
@@ -1027,7 +1032,34 @@ pub async fn run_migrate(
     bucket: &str,
     params: &MigrateParams,
 ) -> Result<MigrateReport, MigrateError> {
+    run_migrate_with_cutoff(client, bucket, params, None)
+        .await
+        .map(|(report, _)| report)
+}
+
+/// v1.2 (`s4 maintain`): [`run_migrate`] plus an optional `older_than`
+/// age cutoff — only objects whose backend `LastModified` is at least
+/// that old are examined (same conservative gate as `s4 recompact
+/// --older-than`: unknown `LastModified` under an active cutoff counts
+/// as too recent). Returns the report and the number of listed objects
+/// the cutoff excluded.
+///
+/// The too-recent count rides **next to** the report, not inside it:
+/// [`MigrateParams`] / [`MigrateReport`] predate the age filter and are
+/// plain (non-`non_exhaustive`) pub structs, so adding a field would
+/// break downstream struct literals — the v1.0 freeze forbids that.
+/// Excluded objects still count in `total_objects` / `total_bytes`
+/// (they were listed) and a note flags the exclusion. `pub(crate)`:
+/// the public surface for this knob is the `older-than` key of an
+/// `s4 maintain` migrate rule, not a new library entry point.
+pub(crate) async fn run_migrate_with_cutoff(
+    client: &Client,
+    bucket: &str,
+    params: &MigrateParams,
+    older_than: Option<std::time::Duration>,
+) -> Result<(MigrateReport, u64), MigrateError> {
     let concurrency = params.concurrency.max(1);
+    let cutoff_epoch_secs = crate::maintain::cutoff_epoch_secs(older_than);
 
     let inventory =
         list_inventory(client, bucket, params.prefix.as_deref(), params.max_objects).await?;
@@ -1041,8 +1073,17 @@ pub async fn run_migrate(
     let dispatcher = build_migrate_dispatcher(params);
     let registry = Arc::new(build_write_registry(params));
 
+    // Age gate BEFORE any per-object network call — same placement as
+    // `recompact_one`'s gate. With no cutoff (the plain `s4 migrate`
+    // path) every listed object is eligible, exactly as before.
+    let (eligible, too_recent): (Vec<&ObjectJob>, Vec<&ObjectJob>) =
+        inventory.objects.iter().partition(|job| {
+            !crate::recompact::is_too_recent(job.last_modified_epoch_secs, cutoff_epoch_secs)
+        });
+    let skipped_too_recent = too_recent.len() as u64;
+
     use futures::StreamExt as _;
-    let results: Vec<(String, ObjectOutcome)> = futures::stream::iter(inventory.objects.iter())
+    let results: Vec<(String, ObjectOutcome)> = futures::stream::iter(eligible)
         .map(|job| {
             let dispatcher = &dispatcher;
             let registry = &registry;
@@ -1099,6 +1140,13 @@ pub async fn run_migrate(
 
     if total_objects == 0 {
         report.notes.push("no objects found".into());
+    }
+    if skipped_too_recent > 0 {
+        report.notes.push(format!(
+            "{skipped_too_recent} listed object(s) were newer than the older-than cutoff and \
+             not examined (counted in total_objects but in no skip bucket — the `s4 maintain` \
+             rule report carries the too-recent count)"
+        ));
     }
     if report.dry_run {
         report.notes.push(
@@ -1182,7 +1230,7 @@ pub async fn run_migrate(
         ));
     }
 
-    Ok(report)
+    Ok((report, skipped_too_recent))
 }
 
 /// Format a byte count as a short human string (binary units).

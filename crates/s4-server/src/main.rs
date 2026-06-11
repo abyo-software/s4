@@ -893,6 +893,27 @@ enum Cmd {
     /// recompacted or skipped; exit 1 when any object failed.
     Recompact(RecompactArgs),
 
+    /// v1.2: run a declarative maintenance policy — a TOML file of
+    /// `[[rule]]` entries (`action = "migrate" | "recompact" |
+    /// "transition"`, each with the matching CLI flags as keys plus a
+    /// common `older-than` age gate) executed sequentially top to
+    /// bottom. `migrate` / `recompact` rules call the same library
+    /// paths as the stand-alone subcommands (identical verification,
+    /// sidecar and skip behaviour); `transition` changes cold objects'
+    /// storage class via same-key server-side CopyObject and always
+    /// moves the `<key>.s4index` sidecar into the same class as its
+    /// main object (see docs/storage-class-transitions.md).
+    /// **Dry-run by default** — pass `--execute` to write. With
+    /// `--interval <DUR>` the command stays resident (run → sleep →
+    /// re-run), logs each cycle structurally, and exits gracefully on
+    /// SIGTERM / SIGINT after finishing the rule in flight. The
+    /// endpoint MUST point at the backend (not an S4 gateway).
+    /// SSE-enabled deployments are rejected — route writes through a
+    /// running gateway instead. One-shot exit code: 0 when every rule
+    /// ran clean, 1 when any rule failed; resident mode logs failures
+    /// and keeps cycling (all three actions are idempotent).
+    Maintain(MaintainArgs),
+
     /// v0.9 #106: scan every `*.s4index` in a bucket and report
     /// sidecars whose paired key is missing or whose embedded
     /// ETag / size disagrees with the live HEAD. Dry-run by default;
@@ -1163,6 +1184,48 @@ struct RecompactArgs {
     /// Output format.
     #[clap(long, value_enum, default_value = "table")]
     format: RecompactFormat,
+}
+
+/// v1.2: `s4 maintain` output format.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum MaintainFormat {
+    /// Human-readable per-rule sections + notes (default).
+    Table,
+    /// Structured JSON (`s4_server::maintain::MaintainReport` serde shape).
+    Json,
+}
+
+#[derive(Debug, Args)]
+struct MaintainArgs {
+    /// Path to the maintenance policy TOML (`[[rule]]` entries; see
+    /// `s4_server::maintain` for the schema). Parsed and fully
+    /// validated up front — every problem in the file is reported in
+    /// one pass before any rule runs.
+    #[clap(long, value_name = "PATH")]
+    policy: std::path::PathBuf,
+
+    /// Actually apply the policy (rewrite / copy objects). Without
+    /// this flag every rule runs in its dry-run mode: measured counts,
+    /// no writes.
+    #[clap(long, default_value_t = false)]
+    execute: bool,
+
+    /// Stay resident: run the policy, sleep this long, run it again —
+    /// `<integer><s|m|h|d>`, e.g. `24h`. Each cycle is logged
+    /// structurally (the per-cycle report is not printed); SIGTERM /
+    /// SIGINT exit gracefully after the in-flight rule completes.
+    /// Omit for a single run that prints the report and exits.
+    #[clap(
+        long,
+        value_name = "DUR",
+        value_parser = s4_server::recompact::parse_duration_suffix
+    )]
+    interval: Option<std::time::Duration>,
+
+    /// Output format for the one-shot report (ignored with
+    /// `--interval`, which logs instead of printing).
+    #[clap(long, value_enum, default_value = "table")]
+    format: MaintainFormat,
 }
 
 #[derive(Debug, Args)]
@@ -2747,6 +2810,7 @@ async fn run_subcommand(
         Cmd::Savings(args) => run_savings_cmd(args),
         Cmd::Migrate(args) => run_migrate_cmd(opt, args).await,
         Cmd::Recompact(args) => run_recompact_cmd(opt, args).await,
+        Cmd::Maintain(args) => run_maintain_cmd(opt, args).await,
         Cmd::TrainDict(args) => run_train_dict_cmd(opt, args).await,
         Cmd::VerifyAuditLog(args) => {
             let key = s4_server::audit_log::AuditHmacKey::from_str(&args.hmac_key)
@@ -3041,6 +3105,203 @@ async fn run_recompact_cmd(
         return Err(format!("{} object(s) failed to recompact", report.failed).into());
     }
     Ok(())
+}
+
+/// v1.2: `s4 maintain --policy <FILE> --endpoint-url <BACKEND>`.
+/// Policy-driven bucket maintenance — see `s4_server::maintain` for the
+/// policy schema, the per-action behaviour and the honesty constraints
+/// baked into the reports.
+async fn run_maintain_cmd(
+    opt: &Opt,
+    args: &MaintainArgs,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    // Scope guard, same shape as migrate / recompact: a policy may
+    // contain migrate / recompact rules, both of which write
+    // plaintext-framed bytes straight to the backend.
+    if opt.sse_s4_key.is_some() || !opt.sse_s4_key_rotated.is_empty() || opt.kms_local_dir.is_some()
+    {
+        return Err(
+            "maintain does not support SSE-enabled deployments yet; route writes through a \
+             running gateway instead"
+                .into(),
+        );
+    }
+    // Load + validate the whole policy before touching the network —
+    // every validation problem is reported in one pass. Printed to
+    // stderr directly (not via the returned error) because the
+    // PolicyInvalid message is multi-line and `main`'s `Result` exit
+    // path Debug-escapes newlines.
+    let policy = match s4_server::maintain::load_policy(&args.policy) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return Err(format!("invalid maintain policy {}", args.policy.display()).into());
+        }
+    };
+    let client = build_sidecar_client(opt).await?;
+
+    // Real GPU probe only, same as `s4 migrate` (the migrate rules'
+    // dispatcher pick is reported; the frames written are always
+    // cpu-zstd).
+    #[cfg(feature = "nvcomp-gpu")]
+    let gpu_present = s4_codec::nvcomp::is_gpu_available();
+    #[cfg(not(feature = "nvcomp-gpu"))]
+    let gpu_present = false;
+
+    let params = s4_server::maintain::MaintainParams {
+        execute: args.execute,
+        default_codec: opt.codec.as_kind(),
+        zstd_level: opt.zstd_level,
+        use_sampling_dispatcher: matches!(opt.dispatcher, DispatcherChoice::Sampling),
+        gpu_min_bytes: opt.gpu_min_bytes,
+        prefer_columnar_gpu: opt.prefer_columnar_gpu,
+        gpu_present,
+    };
+
+    // Graceful-shutdown plumbing (one-shot AND resident mode): a signal
+    // listener flips `shutdown` — `run_maintain` checks it between
+    // rules, so the in-flight rule always completes — and pokes
+    // `notify` so the resident loop's sleep wakes immediately.
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let notify = Arc::new(tokio::sync::Notify::new());
+    {
+        let shutdown = Arc::clone(&shutdown);
+        let notify = Arc::clone(&notify);
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("maintain: cannot install SIGTERM handler: {e}");
+                            return;
+                        }
+                    };
+                tokio::select! {
+                    _ = sigterm.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+            shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+            notify.notify_waiters();
+        });
+    }
+
+    let Some(interval) = args.interval else {
+        // One-shot: run, print, map failures to exit 1.
+        let report =
+            s4_server::maintain::run_maintain(&client, &policy, &params, Some(&shutdown)).await;
+        match args.format {
+            MaintainFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+            MaintainFormat::Table => print!("{}", s4_server::maintain::render_human(&report)),
+        }
+        if report.rules_failed > 0 {
+            return Err(format!("{} rule(s) failed", report.rules_failed).into());
+        }
+        return Ok(());
+    };
+
+    // Resident mode: structured logs per cycle (stdout report printing
+    // is skipped — `--format` only shapes the one-shot output). Rule
+    // failures are logged and the loop keeps cycling: all three actions
+    // are idempotent, so the next cycle simply retries; the operator's
+    // signal is the only clean exit.
+    setup_tracing(
+        opt.log_format,
+        opt.otlp_endpoint.as_deref(),
+        &opt.service_name,
+    )?;
+    let mut cycle: u64 = 0;
+    loop {
+        cycle += 1;
+        info!(
+            cycle,
+            policy = %args.policy.display(),
+            execute = args.execute,
+            rules = policy.rules.len(),
+            "maintain cycle start"
+        );
+        let report =
+            s4_server::maintain::run_maintain(&client, &policy, &params, Some(&shutdown)).await;
+        for rule in &report.rules {
+            use s4_server::maintain::RuleOutcome;
+            match &rule.outcome {
+                RuleOutcome::Migrate {
+                    report: r,
+                    skipped_too_recent,
+                } => info!(
+                    cycle,
+                    rule = %rule.name,
+                    bucket = %rule.bucket,
+                    action = "migrate",
+                    migrated = r.migrated,
+                    bytes_before = r.migrated_bytes_before,
+                    bytes_after = r.migrated_bytes_after,
+                    skipped_too_recent,
+                    failed = r.failed,
+                    "maintain rule complete"
+                ),
+                RuleOutcome::Recompact { report: r } => info!(
+                    cycle,
+                    rule = %rule.name,
+                    bucket = %rule.bucket,
+                    action = "recompact",
+                    recompacted = r.recompacted,
+                    bytes_before = r.recompacted_bytes_before,
+                    bytes_after = r.recompacted_bytes_after,
+                    failed = r.failed,
+                    "maintain rule complete"
+                ),
+                RuleOutcome::Transition { report: r } => info!(
+                    cycle,
+                    rule = %rule.name,
+                    bucket = %rule.bucket,
+                    action = "transition",
+                    storage_class = %r.storage_class,
+                    transitioned = r.transitioned,
+                    transitioned_sidecars = r.transitioned_sidecars,
+                    failed = r.failed,
+                    "maintain rule complete"
+                ),
+                RuleOutcome::Error { message } => tracing::error!(
+                    cycle,
+                    rule = %rule.name,
+                    bucket = %rule.bucket,
+                    action = %rule.action,
+                    %message,
+                    "maintain rule failed"
+                ),
+                // `RuleOutcome` is #[non_exhaustive]; future actions log
+                // through the cycle summary below until wired here.
+                _ => {}
+            }
+        }
+        info!(
+            cycle,
+            rules_run = report.rules_run,
+            rules_failed = report.rules_failed,
+            dry_run = report.dry_run,
+            interrupted = report.interrupted,
+            "maintain cycle complete"
+        );
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            info!(cycle, "maintain: shutdown signal received — exiting");
+            return Ok(());
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = notify.notified() => {
+                info!(cycle, "maintain: shutdown signal received during sleep — exiting");
+                return Ok(());
+            }
+        }
+    }
 }
 
 /// v1.1: `s4 train-dict <bucket>[/prefix] --endpoint-url <BACKEND>`.

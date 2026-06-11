@@ -149,6 +149,10 @@ percent-encoding = "2"
 # wrapper that calls `T::zeroize()` in its `Drop`, so the existing call
 # sites that go through `Deref<Target=T>` keep compiling untouched.
 zeroize = { version = "1", features = ["zeroize_derive"] }
+# v1.2 `s4 maintain`: parse the s4-maintain.toml policy file. serde
+# integration only — the policy is read once at subcommand start and
+# never re-serialized.
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
