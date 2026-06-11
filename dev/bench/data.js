@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781150264980,
+  "lastUpdate": 1781165826382,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -11072,6 +11072,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "4f302785fbbf3b3b23cf775f68720386d019bd23",
+          "message": "feat(server): savings ledger — 実績節約額の継続可視化 (--savings-ledger-state-file + s4 savings)\n\nestimate (予測) の対になる実績側。per-bucket の original/stored/objects\nを gateway が累積し、state file 永続化 + Prometheus gauge +\ns4 savings CLI + Grafana dashboard で「実際いくら節約できているか」に\n常時答える。v1.2 の看板機能。\n\n- 更新点: PUT / multipart complete / copy / delete 全経路。削除・\n  上書きは破壊操作前の HEAD probe で減算 (metadata → sidecar →\n  original=stored fallback の対称設計、非 S4 オブジェクトの節約は 0 計上)\n- 永続化: 既存 state-file 流儀 (atomic tmp+rename、SIGUSR1 dump-back\n  にも参加)。flag 無指定はコードパス完全不変\n- s4 savings: state file 読むだけ (gateway 停止不要)、table|json\n- contrib/grafana/s4-savings-dashboard.json (metric 名 grep 検証済) +\n  docs/observability.md 更新\n- honest notes: gateway 経由の書き込みのみ観測 (migrate/recompact/\n  backend 直接は不可視)、ledger 有効時は write 系 1 req +1 HEAD\n\ntests: lib 564 / ledger minio e2e (実測 bytes 一致 + 再起動 reload +\nCLI 出力一致) / multipart + dict e2e 回帰 / clippy -D warnings / fmt\n— 全 green (orchestrator 再実行済)。\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-06-11T17:09:33+09:00",
+          "tree_id": "a87d6ffec12348c0866cbaf4f95d264de0a0be25",
+          "url": "https://github.com/abyo-software/s4/commit/4f302785fbbf3b3b23cf775f68720386d019bd23"
+        },
+        "date": 1781165825436,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 60444,
+            "range": "± 5094",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 45924,
+            "range": "± 1906",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 395,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2256685,
+            "range": "± 41269",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 28473997,
+            "range": "± 184453",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 152638,
+            "range": "± 2117",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 48668566,
+            "range": "± 491320",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 506423309,
+            "range": "± 1685803",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 2519256,
+            "range": "± 104694",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 28134,
+            "range": "± 4337",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 32254,
+            "range": "± 4141",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 395,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 539053,
+            "range": "± 6789",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1477786,
+            "range": "± 71797",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 152206,
+            "range": "± 1919",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 13943535,
+            "range": "± 658765",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 26802860,
+            "range": "± 132904",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 2499199,
+            "range": "± 22006",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1352692,
+            "range": "± 60203",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2141259,
+            "range": "± 40093",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 416051472,
+            "range": "± 4039660",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 141,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 5869,
+            "range": "± 53",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 810,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 12693,
+            "range": "± 81",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2464,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 19019,
+            "range": "± 375",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 75780,
+            "range": "± 134",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 557,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4526,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19237,
+            "range": "± 103",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 30,
             "range": "± 0",
             "unit": "ns/iter"
           }
