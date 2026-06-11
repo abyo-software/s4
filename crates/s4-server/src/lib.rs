@@ -10,6 +10,7 @@ pub mod estimate;
 pub mod gpu_batch;
 pub mod inventory;
 pub mod kms;
+pub mod ledger;
 pub mod lifecycle;
 pub mod lock_recovery;
 pub mod metrics;

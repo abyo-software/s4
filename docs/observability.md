@@ -55,6 +55,34 @@ prometheus exporter).
 | `s4_replication_replicated_total` | counter | `bucket`, `dest` | cross-bucket replication PUT succeeded |
 | `s4_mfa_delete_denials_total` | counter | `bucket` | MFA-Delete gate refusal |
 
+### v1.2 — savings ledger (opt-in: `--savings-ledger-state-file`)
+
+| name | type | labels | set on |
+|------|------|--------|--------|
+| `s4_ledger_original_bytes` | gauge | `bucket` | every ledger mutation (PUT / multipart Complete / Copy / DELETE) + once per restored bucket at boot — cumulative logical bytes clients PUT |
+| `s4_ledger_stored_bytes` | gauge | `bucket` | same — cumulative bytes actually written to the backend (frames + SSE envelope + sidecars) |
+| `s4_ledger_objects` | gauge | `bucket` | same — currently-stored gateway-written objects (versions count) |
+
+These gauges mirror the ledger's state file exactly (`set`, not
+`increment`), so a scrape and `s4 savings --state-file <PATH>` always
+agree. They are **never registered when the flag is off** — the ledger
+is the only call site and it only exists when the operator opted in.
+Cardinality is bounded by the bucket count. Savings ratio in PromQL:
+`1 - sum(s4_ledger_stored_bytes) / sum(s4_ledger_original_bytes)`.
+
+Scope honesty (same notes as the `s4 savings` report): the ledger
+observes gateway-traversing writes only — backend-direct writes,
+`s4 migrate` / `s4 recompact` (backend-direct), aborted-multipart part
+bytes, and replication replicas are not reflected.
+
+A drop-in Grafana dashboard for these gauges (plus the always-on
+`s4_bytes_in_total` / `s4_bytes_out_total` PUT-path counters) ships at
+[`contrib/grafana/s4-savings-dashboard.json`](../contrib/grafana/s4-savings-dashboard.json).
+Import it via *Dashboards → New → Import → Upload JSON file*, pick your
+Prometheus datasource when prompted, and set the `price_per_gb_month`
+dashboard variable to your storage tier (default 0.023 = S3 Standard
+us-east-1 first-50TB) — the $/month panel scales linearly with it.
+
 ## Recommended Grafana layout (4-panel GPU dashboard)
 
 The four panels below cover the v0.8 #55 GPU pipeline and read
@@ -93,10 +121,13 @@ naturally left-to-right as a single row (12-column grid, 6×3 each):
    request-level dashboard to attribute error spikes to GPU OOM
    versus generic backend / network failures.
 
-A drop-in dashboard JSON is intentionally not shipped — the panel
-PromQL above is verbatim what we use internally and is short enough
-that operators can paste it into a fresh dashboard without us
-maintaining a Grafana JSON in the s4 repo.
+A drop-in dashboard JSON for these GPU panels is intentionally not
+shipped — the panel PromQL above is verbatim what we use internally
+and is short enough that operators can paste it into a fresh dashboard
+without us maintaining another Grafana JSON in the s4 repo. (The v1.2
+savings-ledger dashboard at `contrib/grafana/s4-savings-dashboard.json`
+is the deliberate exception: it is the product's headline number and
+worth a one-click import.)
 
 ## Limitations (v0.8 #55 follow-ups)
 

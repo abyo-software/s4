@@ -660,6 +660,18 @@ pub struct S4Service<B: S3> {
     /// the unchanged cpu-zstd framed path. Wired by `main.rs` only when
     /// the flag is on AND the `nvcomp-gpu` build has a CUDA GPU at boot.
     gpu_batch: Option<crate::gpu_batch::GpuBatchHandle>,
+    /// v1.2 `--savings-ledger-state-file`: optional measured-savings
+    /// ledger. `None` (default) keeps every code path bit-for-bit on
+    /// the pre-ledger behaviour (every hook is `if let Some(...)`
+    /// guarded). `Some(...)` makes write-shaped handlers (PUT /
+    /// CompleteMultipartUpload / CopyObject / DELETE) maintain
+    /// per-bucket cumulative `original_bytes` / `stored_bytes` /
+    /// `objects` counters, flushed event-driven to the operator's
+    /// state file and exported as `s4_ledger_*` gauges. Overwrite /
+    /// DELETE subtraction relies on best-effort HEAD probes of the
+    /// to-be-replaced object — the extra backend requests exist
+    /// **only** when this field is `Some` (documented in the README).
+    savings_ledger: Option<Arc<crate::ledger::SavingsLedger>>,
 }
 
 /// v0.8.17 G-2: which AWS error shape the reserved-name guard
@@ -673,6 +685,17 @@ pub struct S4Service<B: S3> {
 enum ReservedKeyMode {
     Read,
     Mutating,
+}
+
+/// v1.2 savings ledger: byte footprint of one backend object as seen
+/// by a [`S4Service::ledger_probe_object`] HEAD probe. `stored_bytes`
+/// is the backend Content-Length (frames + SSE envelope, NO sidecar —
+/// sidecars are probed separately because their lifecycle differs);
+/// `original_bytes` is the logical pre-compression size.
+#[derive(Clone, Copy, Debug)]
+struct LedgerFootprint {
+    original_bytes: u64,
+    stored_bytes: u64,
 }
 
 impl<B: S3> S4Service<B> {
@@ -762,7 +785,29 @@ impl<B: S3> S4Service<B> {
             // v1.2 `--gpu-batch-small-puts`: off by default — no GPU
             // batch aggregator, zero behaviour change.
             gpu_batch: None,
+            // v1.2 `--savings-ledger-state-file`: off by default — no
+            // ledger counters, no probe HEADs, zero behaviour change.
+            savings_ledger: None,
         }
+    }
+
+    /// v1.2 `--savings-ledger-state-file`: attach the measured-savings
+    /// ledger. Write-shaped handlers then maintain per-bucket
+    /// cumulative original/stored/objects counters (flushed to the
+    /// ledger's state file on every mutation, exported as
+    /// `s4_ledger_*` gauges, readable offline via `s4 savings`).
+    /// When unset (default), every handler is bit-for-bit unchanged.
+    #[must_use]
+    pub fn with_savings_ledger(mut self, ledger: Arc<crate::ledger::SavingsLedger>) -> Self {
+        self.savings_ledger = Some(ledger);
+        self
+    }
+
+    /// v1.2: introspection accessor for the attached savings ledger
+    /// (SIGUSR1 dump-back walk in `main.rs`; same shape as
+    /// [`Self::tag_manager`] and friends).
+    pub fn savings_ledger(&self) -> Option<&Arc<crate::ledger::SavingsLedger>> {
+        self.savings_ledger.as_ref()
     }
 
     /// v1.2 `--gpu-batch-small-puts`: attach the GPU small-PUT batch
@@ -2153,7 +2198,11 @@ impl<B: S3> S4Service<B> {
     /// `<key>.s4index` sidecar object を backend に書く。失敗しても本体 PUT は
     /// 成功扱いにしたいので、err は warn ログのみ (Range GET の partial path が
     /// 使えなくなるが、full read fallback で意味的には正しい結果を返す)。
-    async fn write_sidecar(&self, bucket: &str, key: &str, index: &FrameIndex) {
+    /// Returns the number of sidecar bytes actually written to the
+    /// backend (`0` on skip / failure) so the v1.2 savings ledger can
+    /// fold the sidecar into the object's `stored_bytes` footprint.
+    /// Callers without a ledger ignore the value.
+    async fn write_sidecar(&self, bucket: &str, key: &str, index: &FrameIndex) -> u64 {
         let bytes = encode_index(index);
         let len = bytes.len() as i64;
         let sidecar = sidecar_key(key);
@@ -2170,7 +2219,7 @@ impl<B: S3> S4Service<B> {
                     key,
                     "S4 write_sidecar skipped (key not URI-encodable): {e}"
                 );
-                return;
+                return 0;
             }
         };
         let put_input = PutObjectInput {
@@ -2192,12 +2241,16 @@ impl<B: S3> S4Service<B> {
             service: None,
             trailing_headers: None,
         };
-        if let Err(e) = self.backend.put_object(put_req).await {
-            tracing::warn!(
-                bucket,
-                key,
-                "S4 write_sidecar failed (Range GET will fall back to full read): {e}"
-            );
+        match self.backend.put_object(put_req).await {
+            Ok(_) => len as u64,
+            Err(e) => {
+                tracing::warn!(
+                    bucket,
+                    key,
+                    "S4 write_sidecar failed (Range GET will fall back to full read): {e}"
+                );
+                0
+            }
         }
     }
 
@@ -2314,6 +2367,113 @@ impl<B: S3> S4Service<B> {
         let blob = resp.output.body?;
         let bytes = collect_blob(blob, 64 * 1024 * 1024).await.ok()?;
         decode_index(bytes).ok()
+    }
+
+    /// v1.2 savings ledger: best-effort HEAD probe of one backend
+    /// object's byte footprint, used for DELETE / overwrite
+    /// subtraction. Only called when `--savings-ledger-state-file` is
+    /// configured (the extra HEAD per write/delete is the documented
+    /// cost of the opt-in).
+    ///
+    /// Resolution order for `original_bytes`:
+    /// 1. the `s4-original-size` manifest stamp (single-PUT gateway
+    ///    writes);
+    /// 2. for stamped-S4 objects without it (multipart Completes carry
+    ///    `s4-codec` only), the `<key>.s4index` sidecar's
+    ///    `total_original_size()`;
+    /// 3. otherwise `original = stored` (non-S4 / backend-direct
+    ///    objects, and S4 objects whose logical size is unrecoverable —
+    ///    e.g. encrypted multipart without a sidecar). The symmetric
+    ///    fallback means such objects contribute zero measured savings
+    ///    rather than a fabricated number.
+    ///
+    /// `None` = the object does not exist or the probe failed; callers
+    /// treat that as "nothing to subtract" (best-effort, disclosed in
+    /// the report notes).
+    async fn ledger_probe_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> Option<LedgerFootprint> {
+        let uri = safe_object_uri(bucket, key).ok()?;
+        let head_input = HeadObjectInput {
+            bucket: bucket.into(),
+            key: key.into(),
+            version_id: version_id.map(str::to_owned),
+            ..Default::default()
+        };
+        let head_req = S3Request {
+            input: head_input,
+            method: http::Method::HEAD,
+            uri,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let head = self.backend.head_object(head_req).await.ok()?;
+        let stored_bytes = head
+            .output
+            .content_length
+            .and_then(|n| u64::try_from(n).ok())?;
+        let meta = head.output.metadata.as_ref();
+        if let Some(original_bytes) = meta
+            .and_then(|m| m.get(META_ORIGINAL_SIZE))
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            return Some(LedgerFootprint {
+                original_bytes,
+                stored_bytes,
+            });
+        }
+        if meta.is_some_and(|m| m.contains_key(META_CODEC))
+            && let Some(idx) = self.read_sidecar(bucket, key).await
+        {
+            return Some(LedgerFootprint {
+                original_bytes: idx.total_original_size(),
+                stored_bytes,
+            });
+        }
+        Some(LedgerFootprint {
+            original_bytes: stored_bytes,
+            stored_bytes,
+        })
+    }
+
+    /// v1.2 savings ledger: HEAD `<key>.s4index` and return its
+    /// Content-Length (`0` when absent / unprobeable). Used to fold a
+    /// to-be-replaced or to-be-deleted sidecar into the subtraction.
+    async fn ledger_probe_sidecar_bytes(&self, bucket: &str, key: &str) -> u64 {
+        let sidecar = sidecar_key(key);
+        let Ok(uri) = safe_object_uri(bucket, &sidecar) else {
+            return 0;
+        };
+        let head_req = S3Request {
+            input: HeadObjectInput {
+                bucket: bucket.into(),
+                key: sidecar,
+                ..Default::default()
+            },
+            method: http::Method::HEAD,
+            uri,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        match self.backend.head_object(head_req).await {
+            Ok(head) => head
+                .output
+                .content_length
+                .and_then(|n| u64::try_from(n).ok())
+                .unwrap_or(0),
+            Err(_) => 0,
+        }
     }
 
     /// Multipart object (frame 列) を解凍 → 元 bytes を再構築。
@@ -4102,6 +4262,22 @@ impl<B: S3> S3 for S4Service<B> {
             // the live HEAD `Content-Length` on Range GET to detect a
             // backend-side mutation.
             let backend_object_size = req.input.content_length.and_then(|n| u64::try_from(n).ok());
+            // v1.2 savings ledger: probe the to-be-replaced footprint
+            // BEFORE the backend PUT overwrites it. Versioning-Enabled
+            // buckets skip the probe — the PUT lands under a fresh
+            // shadow key and the prior version's bytes stay on the
+            // backend (each stored version is a ledger object). The
+            // extra HEAD exists only when the ledger flag is on.
+            let ledger_versioned_put = pending_version
+                .as_ref()
+                .map(|pv| pv.versioned_response)
+                .unwrap_or(false);
+            let ledger_old_main: Option<LedgerFootprint> =
+                if self.savings_ledger.is_some() && !ledger_versioned_put {
+                    self.ledger_probe_object(&put_bucket, &put_key, None).await
+                } else {
+                    None
+                };
             let mut backend_resp = self.backend.put_object(req).await;
             // v0.9 #106 (Codex P2): on the SSE-S4 chunked PUT path,
             // if we *couldn't* recover the per-PUT salt / key_id /
@@ -4118,6 +4294,12 @@ impl<B: S3> S3 for S4Service<B> {
             // the GET falls back to buffered = correct.
             let suppress_sidecar_for_failed_sse_binding =
                 sse_s4_chunked_path && sse_binding.is_none();
+            // v1.2 savings ledger: sidecar bytes folded into the stored
+            // footprint. `old` is probed only when a new sidecar is
+            // about to overwrite it (a stale sidecar that stays on the
+            // backend keeps counting — it still occupies bytes there).
+            let mut ledger_sidecar_old: u64 = 0;
+            let mut ledger_sidecar_new: u64 = 0;
             if let Some(mut idx) = sidecar_index
                 && let Ok(ref resp) = backend_resp
                 && idx.entries.len() > 1
@@ -4145,7 +4327,11 @@ impl<B: S3> S3 for S4Service<B> {
                 // fast-path. `None` keeps the sidecar at v2 layout
                 // (= existing behaviour for non-SSE-S4-chunked PUTs).
                 idx.sse_v3 = sse_binding;
-                self.write_sidecar(&put_bucket, &put_key, &idx).await;
+                if self.savings_ledger.is_some() {
+                    ledger_sidecar_old =
+                        self.ledger_probe_sidecar_bytes(&put_bucket, &put_key).await;
+                }
+                ledger_sidecar_new = self.write_sidecar(&put_bucket, &put_key, &idx).await;
             }
             // v0.5 #34: commit the new version into the manager only on
             // backend success. Use the pre-allocated vid so the response
@@ -4217,6 +4403,26 @@ impl<B: S3> S3 for S4Service<B> {
                     mgr.set(&put_bucket, &put_key, state);
                 }
                 mgr.apply_default_on_put(&put_bucket, &put_key, chrono::Utc::now());
+            }
+            // v1.2 savings ledger: commit the PUT's footprint as one
+            // delta — subtract whatever the probe saw at this key
+            // (overwrite = swap, not double-count), add the new body +
+            // sidecar bytes. Versioned PUTs skipped the probe, so they
+            // are pure adds (every stored version is a ledger object).
+            if let (Some(ledger), true) = (self.savings_ledger.as_ref(), backend_resp.is_ok()) {
+                let stored_new = backend_object_size
+                    .unwrap_or(0)
+                    .saturating_add(ledger_sidecar_new);
+                let (old_original, old_stored) = ledger_old_main
+                    .map(|f| (f.original_bytes, f.stored_bytes))
+                    .unwrap_or((0, 0));
+                let old_stored = old_stored.saturating_add(ledger_sidecar_old);
+                ledger.apply_delta(
+                    &put_bucket,
+                    crate::ledger::signed_delta(original_size, old_original),
+                    crate::ledger::signed_delta(stored_new, old_stored),
+                    if ledger_old_main.is_some() { 0 } else { 1 },
+                );
             }
             let _ = (original_size, compressed_size); // mute unused warnings
             let elapsed = put_start.elapsed();
@@ -4339,7 +4545,34 @@ impl<B: S3> S3 for S4Service<B> {
         {
             req.input.key = versioned_shadow_key(&put_key, &pv.version_id);
         }
+        // v1.2 savings ledger: same pre-PUT replace probe as the
+        // body-bearing branch (a zero-length PUT can still overwrite a
+        // non-empty object, which must subtract the old footprint).
+        let ledger_versioned_put = pending_version
+            .as_ref()
+            .map(|pv| pv.versioned_response)
+            .unwrap_or(false);
+        let ledger_old_main: Option<LedgerFootprint> =
+            if self.savings_ledger.is_some() && !ledger_versioned_put {
+                self.ledger_probe_object(&put_bucket, &put_key, None).await
+            } else {
+                None
+            };
         let mut backend_resp = self.backend.put_object(req).await;
+        // v1.2 savings ledger: a zero-length object stores zero bytes —
+        // the delta is purely the removal of whatever it replaced (plus
+        // an object-count bump when the key is new).
+        if let (Some(ledger), true) = (self.savings_ledger.as_ref(), backend_resp.is_ok()) {
+            let (old_original, old_stored) = ledger_old_main
+                .map(|f| (f.original_bytes, f.stored_bytes))
+                .unwrap_or((0, 0));
+            ledger.apply_delta(
+                &put_bucket,
+                crate::ledger::signed_delta(0, old_original),
+                crate::ledger::signed_delta(0, old_stored),
+                if ledger_old_main.is_some() { 0 } else { 1 },
+            );
+        }
         if let (Some(mgr), Some(pv), Ok(resp)) = (
             self.versioning.as_ref(),
             pending_version.as_ref(),
@@ -5181,6 +5414,15 @@ impl<B: S3> S3 for S4Service<B> {
                         .map(|o| !o.is_delete_marker)
                         .unwrap_or(false);
                     if was_real_version {
+                        // v1.2 savings ledger: probe the version's
+                        // footprint before its backend bytes vanish
+                        // (extra HEAD only when the ledger is on).
+                        let ledger_old: Option<LedgerFootprint> = if self.savings_ledger.is_some() {
+                            self.ledger_probe_object(&bucket, &backend_target, None)
+                                .await
+                        } else {
+                            None
+                        };
                         // Best-effort backend cleanup; missing bytes
                         // are not an error (e.g. shadow key already
                         // GC'd).
@@ -5200,7 +5442,21 @@ impl<B: S3> S3 for S4Service<B> {
                             service: req.service.clone(),
                             trailing_headers: None,
                         };
-                        let _ = self.backend.delete_object(backend_req).await;
+                        let backend_del = self.backend.delete_object(backend_req).await;
+                        // v1.2 savings ledger: subtract only when the
+                        // backend actually dropped the bytes.
+                        if let (Some(ledger), Some(f), Ok(_)) = (
+                            self.savings_ledger.as_ref(),
+                            ledger_old,
+                            backend_del.as_ref(),
+                        ) {
+                            ledger.apply_delta(
+                                &bucket,
+                                crate::ledger::signed_delta(0, f.original_bytes),
+                                crate::ledger::signed_delta(0, f.stored_bytes),
+                                -1,
+                            );
+                        }
                     }
                     let mut output = DeleteObjectOutput {
                         version_id: Some(vid.clone()),
@@ -5225,6 +5481,14 @@ impl<B: S3> S3 for S4Service<B> {
                 // No version_id: record a delete marker (state-aware).
                 let outcome = mgr.record_delete(&bucket, &key);
                 if state == crate::versioning::VersioningState::Suspended {
+                    // v1.2 savings ledger: the prior `<key>` (null
+                    // version) bytes are physically evicted below —
+                    // probe before, subtract on confirmed delete.
+                    let ledger_old: Option<LedgerFootprint> = if self.savings_ledger.is_some() {
+                        self.ledger_probe_object(&bucket, &key, None).await
+                    } else {
+                        None
+                    };
                     // Suspended buckets also evict the prior `<key>`
                     // bytes (the previous null version is gone too).
                     let backend_input = DeleteObjectInput {
@@ -5243,7 +5507,19 @@ impl<B: S3> S3 for S4Service<B> {
                         service: req.service.clone(),
                         trailing_headers: None,
                     };
-                    let _ = self.backend.delete_object(backend_req).await;
+                    let backend_del = self.backend.delete_object(backend_req).await;
+                    if let (Some(ledger), Some(f), Ok(_)) = (
+                        self.savings_ledger.as_ref(),
+                        ledger_old,
+                        backend_del.as_ref(),
+                    ) {
+                        ledger.apply_delta(
+                            &bucket,
+                            crate::ledger::signed_delta(0, f.original_bytes),
+                            crate::ledger::signed_delta(0, f.stored_bytes),
+                            -1,
+                        );
+                    }
                 }
                 let output = DeleteObjectOutput {
                     delete_marker: Some(true),
@@ -5265,7 +5541,22 @@ impl<B: S3> S3 for S4Service<B> {
         }
         // Legacy / Unversioned path: physical delete on the backend +
         // best-effort sidecar cleanup (mirrors v0.4 behaviour).
+        //
+        // v1.2 savings ledger: probe the doomed object's footprint
+        // before the backend forgets it (one extra HEAD — plus a
+        // sidecar HEAD below — only when the ledger flag is on; a
+        // probe miss means the key didn't exist and S3 DELETE still
+        // returns 204, so nothing is subtracted).
+        let ledger_old_main: Option<LedgerFootprint> = if self.savings_ledger.is_some() {
+            self.ledger_probe_object(&bucket, &key, None).await
+        } else {
+            None
+        };
         let resp = self.backend.delete_object(req).await?;
+        // Accumulated stored-bytes removal for the single ledger commit
+        // at the end of this path (main object now, sidecar appended
+        // below once its own DELETE is confirmed).
+        let mut ledger_removed_stored: u64 = ledger_old_main.map(|f| f.stored_bytes).unwrap_or(0);
         // v0.5 #30: drop any per-object lock state once the delete has
         // succeeded so the freed key can be re-armed by a future PUT
         // under the bucket default. Reaching here implies the lock had
@@ -5287,6 +5578,15 @@ impl<B: S3> S3 for S4Service<B> {
         // already succeeded and a stale sidecar is harmless (Range GET
         // re-validates the underlying object on next read).
         if let Ok(uri) = safe_object_uri(&bucket, &sidecar) {
+            // v1.2 savings ledger: the sidecar's bytes leave the
+            // backend with this DELETE — measure them first (HEAD,
+            // ledger-on only), subtract only on confirmed removal.
+            let ledger_sidecar_bytes: u64 =
+                if self.savings_ledger.is_some() && ledger_old_main.is_some() {
+                    self.ledger_probe_sidecar_bytes(&bucket, &key).await
+                } else {
+                    0
+                };
             let sidecar_input = DeleteObjectInput {
                 bucket: bucket.clone(),
                 key: sidecar,
@@ -5303,7 +5603,21 @@ impl<B: S3> S3 for S4Service<B> {
                 service: None,
                 trailing_headers: None,
             };
-            let _ = self.backend.delete_object(sidecar_req).await;
+            let sidecar_del = self.backend.delete_object(sidecar_req).await;
+            if ledger_sidecar_bytes > 0 && sidecar_del.is_ok() {
+                ledger_removed_stored = ledger_removed_stored.saturating_add(ledger_sidecar_bytes);
+            }
+        }
+        // v1.2 savings ledger: one combined subtraction (main object +
+        // confirmed sidecar). Skipped entirely when the probe saw no
+        // object (DELETE of a nonexistent key is still 204).
+        if let (Some(ledger), Some(f)) = (self.savings_ledger.as_ref(), ledger_old_main) {
+            ledger.apply_delta(
+                &bucket,
+                crate::ledger::signed_delta(0, f.original_bytes),
+                crate::ledger::signed_delta(0, ledger_removed_stored),
+                -1,
+            );
         }
         // v0.6 #35: legacy unversioned-bucket hard delete fires the
         // canonical `ObjectRemoved:Delete` event.
@@ -5598,7 +5912,69 @@ impl<B: S3> S3 for S4Service<B> {
                     .await?;
             }
         }
-        self.backend.copy_object(req).await
+        // v1.2 savings ledger: capture (a) the source footprint — the
+        // copy writes byte-identical content at the destination, so the
+        // source probe doubles as the new-dst footprint — and (b) the
+        // old destination footprint, BEFORE the backend copy replaces
+        // it. Same-bucket same-key REPLACE copies net out to zero (old
+        // == new), which is exactly the "metadata rewrite, not new
+        // data" semantics. Probes exist only when the ledger is on.
+        let ledger_probes: Option<(Option<LedgerFootprint>, Option<LedgerFootprint>)> =
+            if self.savings_ledger.is_some() {
+                let src = if let CopySource::Bucket {
+                    bucket,
+                    key,
+                    version_id,
+                } = &req.input.copy_source
+                {
+                    self.ledger_probe_object(bucket, key, version_id.as_deref())
+                        .await
+                } else {
+                    None
+                };
+                let old_dst = self.ledger_probe_object(&dst_bucket, &dst_key, None).await;
+                Some((src, old_dst))
+            } else {
+                None
+            };
+        let copy_resp = self.backend.copy_object(req).await;
+        if let (Some(ledger), Some((src, old_dst)), Ok(_)) = (
+            self.savings_ledger.as_ref(),
+            ledger_probes,
+            copy_resp.as_ref(),
+        ) {
+            // Source probe missed (raced delete that the copy itself
+            // survived, or a non-bucket copy source)? Fall back to
+            // probing the freshly-written destination — its metadata is
+            // the source's (COPY directive) or the merged set (REPLACE
+            // keeps the s4-* stamps), so the same resolution applies.
+            let new_dst = match src {
+                Some(f) => Some(f),
+                None => self.ledger_probe_object(&dst_bucket, &dst_key, None).await,
+            };
+            match new_dst {
+                Some(new) => {
+                    let (old_original, old_stored) = old_dst
+                        .map(|f| (f.original_bytes, f.stored_bytes))
+                        .unwrap_or((0, 0));
+                    ledger.apply_delta(
+                        &dst_bucket,
+                        crate::ledger::signed_delta(new.original_bytes, old_original),
+                        crate::ledger::signed_delta(new.stored_bytes, old_stored),
+                        if old_dst.is_some() { 0 } else { 1 },
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        bucket = %dst_bucket,
+                        key = %dst_key,
+                        "S4 savings ledger: CopyObject footprint unprobeable \
+                         (src and dst HEAD both failed); counters not updated for this copy"
+                    );
+                }
+            }
+        }
+        copy_resp
     }
     async fn list_objects(
         &self,
@@ -6185,6 +6561,17 @@ impl<B: S3> S3 for S4Service<B> {
         let _ = req.input.sse_customer_algorithm.take();
         let _ = req.input.sse_customer_key.take();
         let _ = req.input.sse_customer_key_md5.take();
+        // v1.2 savings ledger: Complete assembles the parts at `<key>`,
+        // destroying whatever lived there (even on versioning-Enabled
+        // buckets the plain-`<key>` bytes are overwritten and — on the
+        // shadow re-PUT path — deleted afterwards). Probe the doomed
+        // footprint before the backend call; extra HEAD only when the
+        // ledger flag is on.
+        let ledger_old_main: Option<LedgerFootprint> = if self.savings_ledger.is_some() {
+            self.ledger_probe_object(&bucket, &key, None).await
+        } else {
+            None
+        };
         let mut resp = self.backend.complete_multipart_upload(req).await?;
         // CompleteMultipartUpload 成功 → 完成した object を full fetch して frame
         // index を build、`<key>.s4index` sidecar として保存。これで Range GET の
@@ -6269,6 +6656,24 @@ impl<B: S3> S3 for S4Service<B> {
         } else {
             None
         };
+        // v1.2 savings ledger: the assembled body is the ground truth
+        // for the new object's footprint. `original` = sum of the
+        // per-part frame headers' original sizes (exactly what the
+        // client uploaded); a body the frame scanner can't parse
+        // (passthrough-codec multipart = raw parts) falls back to the
+        // body length (original == stored, zero claimed savings).
+        // `stored` starts as the assembled length and is replaced by
+        // the re-PUT length when SSE / versioning rewrites the bytes
+        // below. `None` body (NoSuchKey race) ⇒ the ledger skips this
+        // Complete with a WARN — never guess.
+        let ledger_new_original: Option<u64> = assembled_body.as_ref().map(|b| {
+            build_index_from_body(b)
+                .map(|idx| idx.total_original_size())
+                .unwrap_or(b.len() as u64)
+        });
+        let mut ledger_new_stored: Option<u64> = assembled_body.as_ref().map(|b| b.len() as u64);
+        let mut ledger_sidecar_old: u64 = 0;
+        let mut ledger_sidecar_new: u64 = 0;
         // Sidecar build (existing behaviour, gated on assembled body).
         //
         // v0.8.12 HIGH-10 fix: skip the sidecar when the Complete is
@@ -6343,7 +6748,13 @@ impl<B: S3> S3 for S4Service<B> {
                 // simply falls back to a full read on any consistency
                 // signal.
             }
-            self.write_sidecar(&bucket, &key, &index).await;
+            // v1.2 savings ledger: same sidecar replace accounting as
+            // the single-PUT path (probe the to-be-overwritten sidecar
+            // only when one is about to be written).
+            if self.savings_ledger.is_some() {
+                ledger_sidecar_old = self.ledger_probe_sidecar_bytes(&bucket, &key).await;
+            }
+            ledger_sidecar_new = self.write_sidecar(&bucket, &key, &index).await;
         }
         // From here on, post-processing depends on the context —
         // short-circuit when the upload had no captured recipe
@@ -6556,6 +6967,10 @@ impl<B: S3> S3 for S4Service<B> {
                     key.clone()
                 };
                 let new_body_len = new_body.len() as i64;
+                // v1.2 savings ledger: the re-PUT bytes (SSE envelope /
+                // shadow-key rewrite) are what actually stays on the
+                // backend — they supersede the assembled length.
+                ledger_new_stored = Some(new_body.len() as u64);
                 let put_req = S3Request {
                     input: PutObjectInput {
                         bucket: bucket.clone(),
@@ -6702,6 +7117,36 @@ impl<B: S3> S3 for S4Service<B> {
                 pending_version.as_ref(),
             );
             self.multipart_state.remove(upload_id.as_str());
+        }
+        // v1.2 savings ledger: commit the Complete as one delta —
+        // subtract whatever lived at `<key>` (plus a replaced sidecar),
+        // add the assembled/re-PUT bytes + new sidecar. When the
+        // assembled body couldn't be fetched (NoSuchKey race), skip
+        // with a WARN instead of guessing.
+        if let Some(ledger) = self.savings_ledger.as_ref() {
+            match (ledger_new_original, ledger_new_stored) {
+                (Some(new_original), Some(new_stored)) => {
+                    let new_stored = new_stored.saturating_add(ledger_sidecar_new);
+                    let (old_original, old_stored) = ledger_old_main
+                        .map(|f| (f.original_bytes, f.stored_bytes))
+                        .unwrap_or((0, 0));
+                    let old_stored = old_stored.saturating_add(ledger_sidecar_old);
+                    ledger.apply_delta(
+                        &bucket,
+                        crate::ledger::signed_delta(new_original, old_original),
+                        crate::ledger::signed_delta(new_stored, old_stored),
+                        if ledger_old_main.is_some() { 0 } else { 1 },
+                    );
+                }
+                _ => {
+                    tracing::warn!(
+                        bucket = %bucket,
+                        key = %key,
+                        "S4 savings ledger: multipart Complete not accounted \
+                         (assembled body unavailable); counters unchanged for this object"
+                    );
+                }
+            }
         }
         // v0.8.1 #59 janitor: best-effort sweep of stale completion
         // locks while we are still on the critical path of a single

@@ -654,6 +654,30 @@ struct Opt {
     #[clap(long, value_name = "PATH")]
     lifecycle_state_file: Option<std::path::PathBuf>,
 
+    /// v1.2: attach the **savings ledger** — measured (not estimated)
+    /// per-bucket compression savings for everything the gateway
+    /// writes. PUT / CompleteMultipartUpload / CopyObject / DELETE
+    /// maintain cumulative `original_bytes` / `stored_bytes` /
+    /// `objects` counters per bucket, flushed to PATH on every write
+    /// event (atomic tmp+rename; also re-dumped on SIGUSR1 like every
+    /// other `--*-state-file`) and exported as the
+    /// `s4_ledger_{original_bytes,stored_bytes,objects}{bucket}`
+    /// Prometheus gauges. Read the file offline with `s4 savings
+    /// --state-file PATH` — the gateway keeps running.
+    ///
+    /// Cost: overwrite / DELETE subtraction adds one best-effort HEAD
+    /// probe per write-shaped request (plus a sidecar HEAD where
+    /// relevant) — **only when this flag is set**. Without the flag
+    /// every code path is bit-for-bit unchanged.
+    ///
+    /// Scope (honest): only gateway-traversing writes are observed.
+    /// Backend-direct writes, `s4 migrate` / `s4 recompact`
+    /// (backend-direct), aborted-multipart part bytes, and replication
+    /// replicas are NOT reflected; `recompact` savings appear only
+    /// after the gateway next rewrites the object.
+    #[clap(long, value_name = "PATH")]
+    savings_ledger_state_file: Option<std::path::PathBuf>,
+
     /// v0.6 #37: cadence (in hours) at which the background lifecycle
     /// scheduler wakes to enumerate buckets that have lifecycle rules
     /// attached. Defaults to 24 (= once a day, matching AWS's
@@ -814,6 +838,20 @@ enum Cmd {
     /// listing).
     Estimate(EstimateArgs),
 
+    /// v1.2: report the **measured** savings recorded by a gateway
+    /// running with `--savings-ledger-state-file <PATH>` — the
+    /// after-deployment twin of `s4 estimate` (prediction). Reads the
+    /// state file only: no `--endpoint-url`, no network, and the
+    /// gateway can keep running (the ledger flushes the file on every
+    /// write event). Reports per-bucket + total original vs stored
+    /// bytes, savings ratio, and a $/month figure at
+    /// `--price-per-gb-month`. The numbers cover gateway-traversing
+    /// writes only (backend-direct writes, `s4 migrate` /
+    /// `s4 recompact`, aborted-multipart part bytes, and replication
+    /// replicas are not observed — the report's fixed notes say so).
+    /// Exit 0 on any readable (or not-yet-created) state file.
+    Savings(SavingsArgs),
+
     /// v1.1: bulk retro-compression of pre-existing objects into the
     /// gateway's S4F2 framed format (same dispatcher decision, same
     /// framing call, same metadata + sidecar contract as the PUT
@@ -936,6 +974,38 @@ struct EstimateArgs {
     /// Output format.
     #[clap(long, value_enum, default_value = "table")]
     format: EstimateFormat,
+}
+
+/// v1.2: `s4 savings` output format.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SavingsFormat {
+    /// Human-readable table + notes (default).
+    Table,
+    /// Structured JSON (`s4_server::ledger::SavingsReport` serde shape).
+    Json,
+}
+
+#[derive(Debug, Args)]
+struct SavingsArgs {
+    /// Path the gateway was started with as
+    /// `--savings-ledger-state-file <PATH>`. Read-only — a missing or
+    /// empty file (gateway hasn't served a write yet) reports zeros.
+    #[clap(long, value_name = "PATH")]
+    state_file: std::path::PathBuf,
+
+    /// Storage price in $/GB-month for the savings line (binary GB =
+    /// GiB, matching AWS billing and `s4 estimate`). Default is S3
+    /// Standard us-east-1 first-50TB ($0.023).
+    #[clap(
+        long,
+        value_name = "USD",
+        default_value_t = s4_server::ledger::DEFAULT_PRICE_PER_GB_MONTH
+    )]
+    price_per_gb_month: f64,
+
+    /// Output format.
+    #[clap(long, value_enum, default_value = "table")]
+    format: SavingsFormat,
 }
 
 /// v1.1: `s4 migrate` output format.
@@ -2138,6 +2208,29 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         } else {
             None
         };
+    // v1.2: wire the measured-savings ledger when
+    // --savings-ledger-state-file is supplied. Same load shape as the
+    // other state-file managers (empty / missing path starts fresh,
+    // corrupted snapshot WARNs + bumps
+    // `s4_state_file_load_failures_total{manager="savings_ledger"}`
+    // and starts fresh, file left in place). Unlike the other
+    // managers the ledger also flushes itself to this path on every
+    // counter mutation, so a crash loses at most the in-flight event.
+    if let Some(ref path) = opt.savings_ledger_state_file {
+        let snapshot = s4_server::state_loader::load_or_fresh(
+            "savings_ledger",
+            path,
+            s4_server::ledger::LedgerSnapshot::from_json,
+        );
+        info!(
+            path = %path.display(),
+            "S4 savings ledger attached (v1.2; gateway-traversing writes only — \
+             read offline with `s4 savings --state-file <PATH>`)"
+        );
+        s4 = s4.with_savings_ledger(std::sync::Arc::new(
+            s4_server::ledger::SavingsLedger::attach(snapshot, path.clone()),
+        ));
+    }
     if matches!(opt.compliance_mode, Some(ComplianceMode::Strict)) {
         s4 = s4.with_compliance_strict(true);
         s4_server::metrics::record_compliance_mode_active("strict");
@@ -2458,6 +2551,12 @@ struct OptSnapshotPaths {
     tagging: Option<std::path::PathBuf>,
     replication: Option<std::path::PathBuf>,
     lifecycle: Option<std::path::PathBuf>,
+    /// v1.2: the savings ledger flushes itself on every mutation, but
+    /// it joins the SIGUSR1 dump-back walk anyway so `kill -USR1`
+    /// re-emits *every* attached manager's state uniformly (and
+    /// recovers a ledger whose event-driven flushes have been failing,
+    /// e.g. after a transient disk-full).
+    savings_ledger: Option<std::path::PathBuf>,
 }
 
 #[cfg(unix)]
@@ -2473,6 +2572,7 @@ impl OptSnapshotPaths {
             tagging: opt.tagging_state_file.clone(),
             replication: opt.replication_state_file.clone(),
             lifecycle: opt.lifecycle_state_file.clone(),
+            savings_ledger: opt.savings_ledger_state_file.clone(),
         }
     }
 }
@@ -2568,6 +2668,7 @@ where
     dump_one!("tagging", s4.tag_manager(), tagging);
     dump_one!("replication", s4.replication_manager(), replication);
     dump_one!("lifecycle", s4.lifecycle_manager(), lifecycle);
+    dump_one!("savings_ledger", s4.savings_ledger(), savings_ledger);
     (ok, err)
 }
 
@@ -2643,6 +2744,7 @@ async fn run_subcommand(
         Cmd::RepairSidecar(args) => run_repair_sidecar(opt, args).await,
         Cmd::SweepOrphanSidecars(args) => run_sweep_orphan_sidecars(opt, args).await,
         Cmd::Estimate(args) => run_estimate_cmd(opt, args).await,
+        Cmd::Savings(args) => run_savings_cmd(args),
         Cmd::Migrate(args) => run_migrate_cmd(opt, args).await,
         Cmd::Recompact(args) => run_recompact_cmd(opt, args).await,
         Cmd::TrainDict(args) => run_train_dict_cmd(opt, args).await,
@@ -2793,6 +2895,32 @@ async fn run_estimate_cmd(
                 println!("no objects found under {}", args.target);
             } else {
                 print!("{}", s4_server::estimate::render_human(&report));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v1.2: `s4 savings --state-file <PATH>`. Reads the savings-ledger
+/// state file a running (or stopped) gateway maintains under
+/// `--savings-ledger-state-file` and renders the measured per-bucket /
+/// total savings — see `s4_server::ledger` for the counters' exact
+/// scope and the honesty notes baked into the report.
+fn run_savings_cmd(args: &SavingsArgs) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    let report = s4_server::ledger::run_savings(&args.state_file, args.price_per_gb_month)
+        .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.to_string().into() })?;
+    match args.format {
+        SavingsFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        SavingsFormat::Table => {
+            if report.buckets.is_empty() {
+                println!(
+                    "no ledger entries in {} (gateway hasn't recorded a write yet)",
+                    args.state_file.display()
+                );
+            } else {
+                print!("{}", s4_server::ledger::render_savings_human(&report));
             }
         }
     }
@@ -4030,5 +4158,9 @@ mod sigusr1_dump_tests {
             "replication default must be None"
         );
         assert!(paths.lifecycle.is_none(), "lifecycle default must be None");
+        assert!(
+            paths.savings_ledger.is_none(),
+            "savings_ledger default must be None"
+        );
     }
 }

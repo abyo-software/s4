@@ -235,6 +235,39 @@ pub mod names {
     /// window / queue depth are sized for the workload — a sustained
     /// `fallback` rate means the flag is configured but not paying off.
     pub const GPU_BATCH_TOTAL: &str = "s4_gpu_batch_total";
+    /// v1.2 `--savings-ledger-state-file`: gauge of cumulative logical
+    /// bytes clients PUT through the gateway (pre-compression), per
+    /// bucket. Set (not incremented) from the ledger's post-mutation
+    /// totals so the gauge always mirrors the state file. Labels:
+    /// `bucket`. Cardinality bounded by the bucket count. Never
+    /// registered when the flag is off — the ledger is the only call
+    /// site and it only exists when the operator opted in.
+    pub const LEDGER_ORIGINAL_BYTES: &str = "s4_ledger_original_bytes";
+    /// v1.2 `--savings-ledger-state-file`: gauge of cumulative bytes
+    /// the gateway actually wrote to the backend (frames + SSE
+    /// envelope + sidecars), per bucket. Pair with
+    /// [`LEDGER_ORIGINAL_BYTES`]: savings ratio =
+    /// `1 - stored/original`. Labels: `bucket`.
+    pub const LEDGER_STORED_BYTES: &str = "s4_ledger_stored_bytes";
+    /// v1.2 `--savings-ledger-state-file`: gauge of currently-stored
+    /// gateway-written objects (versions count on versioning-Enabled
+    /// buckets), per bucket. Labels: `bucket`.
+    pub const LEDGER_OBJECTS: &str = "s4_ledger_objects";
+}
+
+/// v1.2 `--savings-ledger-state-file`: stamp the three per-bucket
+/// ledger gauges from a post-mutation totals snapshot. Called by
+/// [`crate::ledger::SavingsLedger`] after every counter mutation (and
+/// once per restored bucket at boot), so the gauges always mirror the
+/// state file. With the flag off the ledger never exists and these
+/// gauges are never registered.
+pub fn record_ledger_bucket(bucket: &str, totals: &crate::ledger::BucketTotals) {
+    metrics::gauge!(names::LEDGER_ORIGINAL_BYTES, "bucket" => bucket.to_owned())
+        .set(totals.original_bytes as f64);
+    metrics::gauge!(names::LEDGER_STORED_BYTES, "bucket" => bucket.to_owned())
+        .set(totals.stored_bytes as f64);
+    metrics::gauge!(names::LEDGER_OBJECTS, "bucket" => bucket.to_owned())
+        .set(totals.objects as f64);
 }
 
 /// v1.2 `--gpu-batch-small-puts`: bump the small-PUT GPU-batch outcome
@@ -646,6 +679,25 @@ mod tests {
         record_acme_renewal("err");
         record_acme_renewal_timeout();
 
+        // v1.2 savings ledger gauges (set-not-increment semantics; the
+        // second call must overwrite the first in the rendered output).
+        record_ledger_bucket(
+            "ledgerbkt",
+            &crate::ledger::BucketTotals {
+                original_bytes: 1_000,
+                stored_bytes: 900,
+                objects: 1,
+            },
+        );
+        record_ledger_bucket(
+            "ledgerbkt",
+            &crate::ledger::BucketTotals {
+                original_bytes: 10_000,
+                stored_bytes: 1_000,
+                objects: 7,
+            },
+        );
+
         let rendered = handle.render();
         // Pre-existing assertions.
         assert!(rendered.contains("s4_requests_total"));
@@ -713,6 +765,23 @@ mod tests {
             rendered.contains("result=\"timeout\""),
             "missing result=timeout label (ACME, v0.8.4 #80) in: {rendered}"
         );
+
+        // v1.2 savings ledger gauges: all three families present with
+        // the bucket label, and the latest set() wins (gauge, not
+        // counter).
+        for name in [
+            "s4_ledger_original_bytes",
+            "s4_ledger_stored_bytes",
+            "s4_ledger_objects",
+        ] {
+            assert!(rendered.contains(name), "missing {name} in: {rendered}");
+        }
+        assert!(rendered.contains("bucket=\"ledgerbkt\""));
+        assert!(
+            rendered.contains("s4_ledger_original_bytes{bucket=\"ledgerbkt\"} 10000"),
+            "ledger gauge must reflect the latest set() in: {rendered}"
+        );
+        assert!(rendered.contains("s4_ledger_objects{bucket=\"ledgerbkt\"} 7"));
     }
 
     /// v0.8 #55: throughput gauge math. 10 MiB in 10 ms ≈ 1.05 GB/s

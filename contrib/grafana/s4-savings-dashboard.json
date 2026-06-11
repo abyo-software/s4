@@ -1,0 +1,268 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus datasource scraping the S4 gateway's /metrics endpoint",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" }
+  ],
+  "annotations": { "list": [] },
+  "description": "S4 savings ledger dashboard (v1.2). Requires the gateway to run with --savings-ledger-state-file; the s4_ledger_* gauges are only exported then. The ledger covers gateway-traversing writes only — backend-direct writes, `s4 migrate`, `s4 recompact`, aborted-multipart part bytes, and replication replicas are not reflected. Dollar figures use the price_per_gb_month dashboard variable (binary GiB, matching AWS billing).",
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Saved bytes (logical - stored)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(s4_ledger_original_bytes) - sum(s4_ledger_stored_bytes)",
+          "legendFormat": "saved bytes"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Savings ratio",
+      "description": "1 - stored/original across all ledger-tracked buckets.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "id": 2,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.2 },
+              { "color": "green", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - (sum(s4_ledger_stored_bytes) / sum(s4_ledger_original_bytes))",
+          "legendFormat": "savings ratio"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Monthly savings (USD, approx)",
+      "description": "(original - stored) / GiB x $price_per_gb_month. Storage bytes only — request, egress and (GPU deployments) compute costs are unchanged by S4.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "id": 3,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(s4_ledger_original_bytes) - sum(s4_ledger_stored_bytes)) / 1073741824 * $price_per_gb_month",
+          "legendFormat": "monthly savings"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Tracked objects",
+      "description": "Gateway-written objects currently stored (versions count on versioning-Enabled buckets).",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "id": 4,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(s4_ledger_objects)",
+          "legendFormat": "objects"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Logical vs stored bytes (ledger)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "id": 5,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(s4_ledger_original_bytes)",
+          "legendFormat": "original (logical)"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(s4_ledger_stored_bytes)",
+          "legendFormat": "stored (backend)"
+        }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "title": "Saved bytes per bucket",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "id": 6,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "s4_ledger_original_bytes - s4_ledger_stored_bytes",
+          "legendFormat": "{{bucket}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Savings ratio per bucket",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "id": 7,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "fillOpacity": 0, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - (s4_ledger_stored_bytes / s4_ledger_original_bytes)",
+          "legendFormat": "{{bucket}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "PUT write path: client bytes in vs backend bytes out",
+      "description": "Request-level counters (always on, no ledger flag needed): rate of client-received vs backend-written bytes on the PUT path. The instantaneous compression ratio is bytes_out/bytes_in.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+      "id": 8,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(s4_bytes_in_total{op=\"put\"}[5m]))",
+          "legendFormat": "client bytes in (PUT)"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(s4_bytes_out_total{op=\"put\"}[5m]))",
+          "legendFormat": "backend bytes out (PUT)"
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["s4", "savings", "storage"],
+  "templating": {
+    "list": [
+      {
+        "name": "price_per_gb_month",
+        "label": "Storage price ($/GB-month)",
+        "description": "Binary GiB, matching AWS billing. Default: S3 Standard us-east-1 first-50TB tier.",
+        "type": "textbox",
+        "query": "0.023",
+        "current": { "selected": false, "text": "0.023", "value": "0.023" },
+        "hide": 0,
+        "options": []
+      }
+    ]
+  },
+  "time": { "from": "now-7d", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "S4 — Measured savings (ledger)",
+  "uid": "s4-savings-ledger",
+  "version": 1,
+  "weekStart": ""
+}

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Savings ledger** (`--savings-ledger-state-file <PATH>`, opt-in,
+  default-off): the gateway maintains measured per-bucket cumulative
+  counters — `original_bytes` (logical client-PUT bytes),
+  `stored_bytes` (backend bytes actually written: frames + SSE
+  envelope + sidecars) and `objects` — updated on PUT /
+  CompleteMultipartUpload / CopyObject / DELETE (overwrite = footprint
+  swap via a best-effort HEAD probe; the extra HEADs exist only with
+  the flag set). State is loaded with the standard `--*-state-file`
+  fault isolation, flushed atomically on every write event, and
+  re-dumped on SIGUSR1. Scope (honest): gateway-traversing writes only
+  — backend-direct writes, `s4 migrate` / `s4 recompact`,
+  aborted-multipart part bytes and replication replicas are not
+  observed.
+- **`s4 savings --state-file <PATH> [--price-per-gb-month 0.023]
+  [--format table|json]`**: read-only report over the ledger state
+  file (per-bucket + total original/stored bytes, savings ratio,
+  $/month at the given price) — the measured twin of `s4 estimate`.
+  Works while the gateway is running; fixed honesty notes are part of
+  the output.
+- **Prometheus gauges
+  `s4_ledger_{original_bytes,stored_bytes,objects}{bucket}`** mirroring
+  the ledger state file (never registered when the flag is off), plus
+  a drop-in Grafana dashboard at
+  `contrib/grafana/s4-savings-dashboard.json` (saved bytes / savings
+  ratio / per-bucket split / $-per-month with a `price_per_gb_month`
+  variable; import steps in `docs/observability.md`).
+
 ## [1.1.0] — 2026-06-11
 
 **v1.1 — adoption tooling + small-object compression.** Six additive

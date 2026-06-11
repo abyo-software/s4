@@ -140,7 +140,7 @@ Why this scope shape? An exhaustive "freeze every `pub` item" contract would ove
 
 `s4-server` ships 34 `pub mod` declarations from `crates/s4-server/src/lib.rs` so the `s4` binary (which is a separate crate) + the integration tests + the example binaries can reach the surface they need. Five modules contribute frozen items above: `repair`, `service`, `sse`, `streaming`, and `service_arc` (the last contributes only `SharedService`; the rest of `service_arc`'s contents are not frozen).
 
-Library consumers MAY `use s4_server::<other_module>::*;` — Rust visibility allows it — but those imports are **not frozen** and may break in any v1.x minor release without notice. The other 29 modules (`access_log`, `acme`, `audit_log`, `blob`, `cors`, `dict`, `estimate`, `inventory`, `kms`, `lifecycle`, `lock_recovery`, `metrics`, `mfa`, `migrate`, `multipart_state`, `notifications`, `object_lock`, `policy`, `rate_limit`, `recompact`, `replication`, `routing`, `select`, `sigv4a`, `state_loader`, `streaming_checksum`, `tagging`, `tls`, `versioning`) exist as `pub mod` for binary-and-tests' needs, not as a published surface.
+Library consumers MAY `use s4_server::<other_module>::*;` — Rust visibility allows it — but those imports are **not frozen** and may break in any v1.x minor release without notice. The other 30 modules (`access_log`, `acme`, `audit_log`, `blob`, `cors`, `dict`, `estimate`, `inventory`, `kms`, `ledger`, `lifecycle`, `lock_recovery`, `metrics`, `mfa`, `migrate`, `multipart_state`, `notifications`, `object_lock`, `policy`, `rate_limit`, `recompact`, `replication`, `routing`, `select`, `sigv4a`, `state_loader`, `streaming_checksum`, `tagging`, `tls`, `versioning`) exist as `pub mod` for binary-and-tests' needs, not as a published surface.
 
 If you depend on one of these unfrozen modules, pin a precise `=1.x.y` (rather than `^1`) and treat any minor bump as a manual integration step. If you would like an item promoted to the frozen surface, please file an issue with the use case.
 
@@ -1026,6 +1026,77 @@ Honesty notes (always printed with the report):
 
 Exit code is 0 on any completed estimate, including an empty listing
 (`no objects found`).
+
+### Measured savings in production (`s4 savings`, v1.2)
+
+`s4 estimate` predicts; the **savings ledger** measures. With the
+ledger enabled, the gateway maintains cumulative per-bucket counters —
+`original_bytes` (logical bytes clients PUT), `stored_bytes` (bytes
+actually written to the backend: frames + SSE envelope + sidecars) and
+`objects` — updated on PUT / CompleteMultipartUpload / CopyObject /
+DELETE and flushed to the state file on every write event. Three steps:
+
+1. **Enable the ledger** (opt-in; without the flag every code path is
+   bit-for-bit unchanged):
+
+   ```bash
+   s4 --endpoint-url https://s3.example.com \
+      --savings-ledger-state-file /var/lib/s4/savings-ledger.json
+   ```
+
+2. **Let it run** — days or weeks of normal traffic. The same numbers
+   are exported live as the
+   `s4_ledger_{original_bytes,stored_bytes,objects}{bucket}` Prometheus
+   gauges, with a drop-in dashboard at
+   [`contrib/grafana/s4-savings-dashboard.json`](contrib/grafana/s4-savings-dashboard.json)
+   (see [docs/observability.md](docs/observability.md) for the import
+   steps).
+
+3. **Read the answer** — no gateway restart, no network; the CLI only
+   reads the state file (`--format json` for machines):
+
+   ```bash
+   s4 savings --state-file /var/lib/s4/savings-ledger.json
+   ```
+
+   Example output (MinIO demo run from the `ledger_minio` e2e — one
+   passthrough blob, one 8 MiB + 1 MiB multipart, one 32 KiB blob;
+   your ratios depend entirely on your data):
+
+   ```
+   S4 measured savings (gateway-written objects)
+
+     bucket                objects       original         stored    saved      $/month
+     ledgerbkt                   3        9.1 MiB        6.1 MiB    33.0%         0.00
+
+     total: 3 objects, 9.1 MiB original -> 6.1 MiB stored (33.0% saved, 3145558 bytes)
+     monthly savings: $0.00 (at $0.023/GB-month, storage bytes only)
+
+   Notes:
+     - the ledger observes gateway-traversing writes only: backend-direct writes, `s4 migrate`, and `s4 recompact` (both backend-direct) are not reflected; `recompact` savings appear only after the gateway next rewrites the object
+     - aborted multipart uploads are never counted (parts are recorded at Complete time only); cross-bucket replication replicas are not counted
+     - DELETE / overwrite subtraction uses a best-effort HEAD probe of the removed object — a raced probe leaves the counters slightly stale rather than failing the request
+     - storage bytes only: request, egress, and (on GPU deployments) compute costs are unchanged by S4
+   ```
+
+Honesty notes (always printed with the report, repeated here because
+they bound what the numbers mean):
+
+- The ledger sees **gateway-traversing writes only**. Backend-direct
+  writes, `s4 migrate` and `s4 recompact` (both talk to the backend
+  directly) are not reflected — an `s4 recompact` shrink shows up only
+  after the gateway itself next rewrites that object. Replication
+  replicas and aborted-multipart part bytes are likewise not counted.
+- Overwrite / DELETE subtraction adds **one best-effort HEAD probe per
+  write-shaped request** (plus a sidecar HEAD where relevant) — this
+  extra backend traffic exists *only* when the flag is set. Objects
+  without S4 metadata (written before S4, or backend-direct) subtract
+  as `original = stored = size`, i.e. they contribute zero claimed
+  savings.
+- State-file durability matches the other `--*-state-file` managers
+  plus an event-driven flush (atomic tmp+rename on every mutation;
+  SIGUSR1 re-dumps it too) — a crash loses at most the in-flight
+  event.
 
 ### Bulk retro-compression of existing buckets (`s4 migrate`)
 
