@@ -1684,7 +1684,28 @@ impl<B: S3> S4Service<B> {
     /// Mutating operations stay blocked regardless of the flag —
     /// the flag is a read-only migration aid, not an injection
     /// re-opener.
+    ///
+    /// v1.0.1 audit R1 P2: `.s4dict/<id>` dictionary objects get the same
+    /// Mutating-mode protection as `.s4index` sidecars — a gateway-side
+    /// PUT / Copy / DELETE against the reserved prefix would let any
+    /// client overwrite or remove the dictionary that other objects in
+    /// the bucket need at GET time. Reads stay allowed (the bytes are
+    /// content-addressed and non-secret; reading them is the documented
+    /// no-gateway escape hatch). `train-dict` is unaffected — it writes
+    /// backend-direct, never through this handler.
     fn check_not_reserved_key(&self, key: &str, mode: ReservedKeyMode) -> S3Result<()> {
+        if matches!(mode, ReservedKeyMode::Mutating) && crate::dict::is_dict_key(key) {
+            let code = S3ErrorCode::from_bytes(b"InvalidObjectName")
+                .unwrap_or(S3ErrorCode::InvalidArgument);
+            return Err(S3Error::with_message(
+                code,
+                format!(
+                    "object key {key:?} is reserved (prefix `{}` holds S4 shared-dictionary \
+                     objects; use `s4 train-dict` against the backend to manage them)",
+                    crate::dict::DICT_KEY_PREFIX,
+                ),
+            ));
+        }
         if !s4_codec::index::is_reserved_sidecar_key(key) {
             return Ok(());
         }
@@ -2382,7 +2403,10 @@ impl<B: S3> S4Service<B> {
         {
             return Ok(dict);
         }
-        if let Some(dict) = self.dict_cache.get(dict_id) {
+        // v1.0.1 audit R1 P3: the lazy cache is keyed `(bucket, id)` —
+        // see `DictCache` docs. A forged `.s4dict/<id>` planted in one
+        // bucket must not satisfy GETs against other buckets.
+        if let Some(dict) = self.dict_cache.get(bucket, dict_id) {
             return Ok(dict);
         }
         let dict_key = crate::dict::dict_object_key(dict_id);
@@ -2412,36 +2436,138 @@ impl<B: S3> S4Service<B> {
                 ),
             )
         };
-        let resp = self
+        let mut resp = self
             .backend
             .get_object(get_req)
             .await
             .map_err(|e| fetch_failed(format!("{e}")))?;
+        // v1.0.1 audit R1 P3: capture the full-SHA-256 claim (stamped by
+        // `train-dict` since v1.0.1) before the body is consumed.
+        let claimed_sha256 = resp
+            .output
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get(crate::dict::DICT_SHA256_META_KEY))
+            .cloned();
         let blob = resp
             .output
             .body
+            .take()
             .ok_or_else(|| fetch_failed("backend returned no body".into()))?;
-        // Dictionaries are ≤ ~110 KiB by construction; 16 MiB is a
-        // generous hard cap against a hostile oversized `.s4dict/` blob.
-        let bytes = collect_blob(blob, 16 * 1024 * 1024)
+        // Trained dictionaries default to ≤ ~110 KiB; the 1 MiB hard cap
+        // (`DICT_FETCH_MAX_BYTES`) leaves ~9x headroom while keeping the
+        // lazy LRU's worst-case footprint at 16 slots x 1 MiB = 16 MiB
+        // against a hostile oversized `.s4dict/` blob.
+        let bytes = collect_blob(blob, crate::dict::DICT_FETCH_MAX_BYTES)
             .await
             .map_err(|e| fetch_failed(format!("collect dictionary body: {e}")))?;
-        let actual_id = crate::dict::dict_id_of(&bytes);
+        // Fingerprint check: always verify the 16-hex id prefix; when the
+        // object carries the full-SHA-256 metadata stamp, verify the
+        // complete digest too (closes the 64-bit truncation window for
+        // post-v1.0.1 dictionaries; pre-stamp dictionaries keep the
+        // prefix-only check — back-compat).
+        let actual_sha256 = crate::dict::dict_sha256_hex(&bytes);
+        let actual_id = &actual_sha256[..crate::dict::DICT_ID_HEX_LEN];
         if actual_id != dict_id {
             return Err(fetch_failed(format!(
                 "fingerprint mismatch: object hashes to {actual_id} (corrupted / tampered \
                  dictionary object?)"
             )));
         }
+        if let Some(claimed) = claimed_sha256
+            && claimed != actual_sha256
+        {
+            return Err(fetch_failed(format!(
+                "full SHA-256 mismatch: object hashes to {actual_sha256} but its \
+                 `{}` metadata claims {claimed} (corrupted / tampered dictionary object?)",
+                crate::dict::DICT_SHA256_META_KEY,
+            )));
+        }
         let dict: Arc<[u8]> = Arc::from(bytes.to_vec().into_boxed_slice());
         self.dict_cache
-            .insert(dict_id.to_owned(), Arc::clone(&dict));
+            .insert(bucket.to_owned(), dict_id.to_owned(), Arc::clone(&dict));
         crate::metrics::record_dict_fetch("ok");
         debug!(
             bucket,
             dict_id, "S4 zstd dictionary lazy-fetched from backend and cached"
         );
         Ok(dict)
+    }
+
+    /// v1.0.1 audit R1 P2: make sure `.s4dict/<dict_id>` exists in
+    /// `bucket`, PUTting `dict` there when absent. Used by the
+    /// cross-bucket CopyObject path — dictionaries are **bucket-local**
+    /// (`resolve_dict` only ever looks in the object's own bucket), so a
+    /// copy that propagates the `s4-dict-id` stamp must carry the
+    /// dictionary object along or the destination object stays readable
+    /// only for as long as the *source* bucket (and its dict) survives.
+    ///
+    /// Idempotent by construction: the key is content-addressed, so an
+    /// existing `.s4dict/<id>` already holds the same bytes (and a lost
+    /// HEAD/PUT race just rewrites them). The PUT stamps the full-SHA-256
+    /// metadata exactly like `train-dict` does.
+    async fn ensure_dict_object_in_bucket(
+        &self,
+        bucket: &str,
+        dict_id: &str,
+        dict: &[u8],
+    ) -> S3Result<()> {
+        let dict_key = crate::dict::dict_object_key(dict_id);
+        let head_req = S3Request {
+            input: HeadObjectInput {
+                bucket: bucket.into(),
+                key: dict_key.clone(),
+                ..Default::default()
+            },
+            method: http::Method::HEAD,
+            uri: safe_object_uri(bucket, &dict_key)?,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        if self.backend.head_object(head_req).await.is_ok() {
+            return Ok(()); // content-addressed: same id ⇒ same bytes
+        }
+        let mut meta = Metadata::new();
+        meta.insert(
+            crate::dict::DICT_SHA256_META_KEY.to_owned(),
+            crate::dict::dict_sha256_hex(dict),
+        );
+        let put_req = S3Request {
+            input: PutObjectInput {
+                bucket: bucket.into(),
+                key: dict_key.clone(),
+                body: Some(bytes_to_blob(bytes::Bytes::copy_from_slice(dict))),
+                content_length: Some(dict.len() as i64),
+                metadata: Some(meta),
+                ..Default::default()
+            },
+            method: http::Method::PUT,
+            uri: safe_object_uri(bucket, &dict_key)?,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        self.backend.put_object(put_req).await.map_err(|e| {
+            S3Error::with_message(
+                S3ErrorCode::InternalError,
+                format!(
+                    "cross-bucket copy of a dict-compressed object: PUT \
+                     `{bucket}/{dict_key}` failed: {e}"
+                ),
+            )
+        })?;
+        debug!(
+            bucket,
+            dict_id, "S4 copy_object: propagated `.s4dict/` dictionary to destination bucket"
+        );
+        Ok(())
     }
 
     /// GET-side decompress for `s4-dict-id`-stamped objects. Same S4F2
@@ -2697,6 +2823,19 @@ pub(crate) const META_DICT_ID: &str = "s4-dict-id";
 /// copies are simply re-examined on the next recompact run and skip as
 /// `insufficient-gain`.
 pub(crate) const META_ZSTD_LEVEL: &str = "s4-zstd-level";
+
+/// v1.0.1 audit R1 P1: remove every client-supplied metadata key in the
+/// gateway-reserved `s4-*` namespace (case-insensitive). The PUT path
+/// calls this before compressing so a client can never pre-stamp
+/// `s4-codec` / `s4-dict-id` / `s4-encrypted` etc. — those keys are
+/// written exclusively by the gateway after it has actually performed
+/// the corresponding transform. Mirrors the CopyObject REPLACE strip
+/// (v0.8.16 F-8), which uses the same prefix predicate.
+fn strip_reserved_client_metadata(metadata: &mut Option<Metadata>) {
+    if let Some(meta) = metadata.as_mut() {
+        meta.retain(|k, _| !k.to_ascii_lowercase().starts_with("s4-"));
+    }
+}
 
 /// v1.1 `--zstd-dict`: pull the validated dict-id off object metadata.
 /// Invalid shapes (non-16-hex) are treated as absent — the GET path then
@@ -2992,6 +3131,16 @@ impl<B: S3> S3 for S4Service<B> {
         let put_key = req.input.key.clone();
         // v0.8.15 M-1 / v0.8.17 G-2: shared reserved-name guard.
         self.check_not_reserved_key(&put_key, ReservedKeyMode::Mutating)?;
+        // v1.0.1 audit R1 P1: drop client-supplied metadata in the
+        // gateway-reserved `s4-*` namespace before anything else looks at
+        // it (same unconditional strip CopyObject's REPLACE directive has
+        // had since v0.8.16 F-8). Pre-fix, a plain PUT carrying e.g.
+        // `x-amz-meta-s4-dict-id: <16hex>` was stored verbatim, and a
+        // later flag-less GET took the dictionary path for an object the
+        // gateway never dict-compressed → 5xx on a perfectly normal
+        // object (freeze violation). The gateway re-stamps its own
+        // `s4-*` manifest keys further down, after compression.
+        strip_reserved_client_metadata(&mut req.input.metadata);
         let access_preamble = self.access_log_preamble(&req);
         self.enforce_rate_limit(&req, &put_bucket)?;
         // v0.6 #39: parse `x-amz-tagging` (URL-encoded query string) so
@@ -4757,7 +4906,25 @@ impl<B: S3> S3 for S4Service<B> {
                 .await
                 .map_err(internal("collect get body"))?;
 
-            let decompressed = if let Some(ref dict_id) = dict_id_meta {
+            // v1.0.1 audit R1 P1: the dict branch is gated on the
+            // *manifest* codec (`s4-codec: cpu-zstd-dict`), not on the
+            // mere presence of `s4-dict-id` metadata. Pre-fix, any object
+            // whose metadata carried a well-formed `s4-dict-id` —
+            // regardless of how it was compressed — was routed into the
+            // dictionary path, where the `.s4dict/<id>` fetch (almost
+            // certainly absent) turned a v1.0.0-fine GET into a 5xx.
+            // Objects the gateway dict-compresses always stamp both keys
+            // together (PUT path), so requiring the pair changes nothing
+            // for genuine dict objects; a stray `s4-dict-id` on any other
+            // codec is now ignored and the object decodes exactly as it
+            // did before the dict feature existed.
+            let dict_codec_object = manifest_opt
+                .as_ref()
+                .map(|m| m.codec == CodecKind::CpuZstdDict)
+                .unwrap_or(false);
+            let decompressed = if let Some(ref dict_id) = dict_id_meta
+                && dict_codec_object
+            {
                 // v1.1 `--zstd-dict`: resolve the dictionary (preloaded →
                 // LRU → lazy backend fetch of `.s4dict/<id>`) and walk the
                 // S4F2 frames with the dict-aware decoder. Works even on a
@@ -5374,6 +5541,51 @@ impl<B: S3> S3 for S4Service<B> {
                     src_key = %key,
                     "S4 copy_object: replaced client s4-* metadata with source values across REPLACE directive (v0.8.15 M-2)"
                 );
+            }
+        }
+        // v1.0.1 audit R1 P2: cross-bucket copies of dict-compressed
+        // objects must carry the dictionary along. Both directives
+        // propagate the `s4-dict-id` stamp (COPY via the backend's
+        // metadata copy, REPLACE via the merge above), but `.s4dict/<id>`
+        // is bucket-local and `resolve_dict` only ever looks in the
+        // object's own bucket — without this, the destination object
+        // would 5xx on GET as soon as the source bucket's dictionary is
+        // gone. Resolve the dict from the *source* bucket (preloaded →
+        // LRU → lazy fetch, fingerprint-verified) and content-addressed-
+        // PUT it into the destination bucket (existing object = skip,
+        // idempotent). A propagation failure fails the copy: completing
+        // it would mint an object with a dangling dict reference.
+        if let CopySource::Bucket {
+            bucket: src_bucket,
+            key: src_key,
+            ..
+        } = &req.input.copy_source
+            && **src_bucket != *dst_bucket
+        {
+            let head_req = S3Request {
+                input: HeadObjectInput {
+                    bucket: src_bucket.to_string(),
+                    key: src_key.to_string(),
+                    ..Default::default()
+                },
+                method: http::Method::HEAD,
+                uri: safe_object_uri(src_bucket, src_key)?,
+                headers: http::HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: req.credentials.clone(),
+                region: req.region.clone(),
+                service: req.service.clone(),
+                trailing_headers: None,
+            };
+            // HEAD failure = "no dict to carry" (the copy itself will
+            // surface a missing source as its own error) — same
+            // fail-open posture as the REPLACE merge above.
+            if let Ok(head) = self.backend.head_object(head_req).await
+                && let Some(dict_id) = extract_dict_id(&head.output.metadata)
+            {
+                let dict = self.resolve_dict(src_bucket, &dict_id).await?;
+                self.ensure_dict_object_in_bucket(&dst_bucket, &dict_id, &dict)
+                    .await?;
             }
         }
         self.backend.copy_object(req).await
@@ -8821,6 +9033,67 @@ mod tests {
         meta.insert(META_CODEC.into(), "cpu-zstd".into());
         let opt = Some(meta);
         assert!(extract_manifest(&opt).is_none());
+    }
+
+    /// v1.0.1 audit R1 P1: client-supplied `s4-*` metadata must be
+    /// stripped on PUT (case-insensitive), leaving non-reserved keys
+    /// untouched. Without this, `x-amz-meta-s4-dict-id` on a normal PUT
+    /// would route the later GET into the dictionary path and 5xx.
+    #[test]
+    fn strip_reserved_client_metadata_drops_s4_namespace() {
+        let mut meta = Metadata::new();
+        meta.insert("s4-dict-id".into(), "0123456789abcdef".into());
+        meta.insert("S4-Codec".into(), "cpu-zstd".into());
+        meta.insert("s4-original-size".into(), "1".into());
+        meta.insert("s4-encrypted".into(), "aes-256-gcm".into());
+        meta.insert("custom-key".into(), "kept".into());
+        meta.insert("s4ish-but-not-reserved".into(), "kept".into());
+        let mut opt = Some(meta);
+        strip_reserved_client_metadata(&mut opt);
+        let m = opt.expect("map survives, only reserved keys removed");
+        assert!(!m.contains_key("s4-dict-id"));
+        assert!(!m.contains_key("S4-Codec"));
+        assert!(!m.contains_key("s4-original-size"));
+        assert!(!m.contains_key("s4-encrypted"));
+        assert_eq!(m.get("custom-key").map(String::as_str), Some("kept"));
+        assert_eq!(
+            m.get("s4ish-but-not-reserved").map(String::as_str),
+            Some("kept")
+        );
+        let mut none: Option<Metadata> = None;
+        strip_reserved_client_metadata(&mut none);
+        assert!(none.is_none());
+    }
+
+    /// v1.0.1 audit R1 P2: gateway-side mutations of `.s4dict/<id>` keys
+    /// are rejected (InvalidObjectName, same shape as `.s4index`), while
+    /// reads stay allowed (content-addressed bytes are the documented
+    /// no-gateway escape hatch).
+    #[test]
+    fn reserved_key_guard_blocks_dict_prefix_mutations() {
+        struct NullBackend;
+        impl S3 for NullBackend {}
+        let svc = S4Service::new(
+            NullBackend,
+            Arc::new(CodecRegistry::new(CodecKind::CpuZstd)),
+            Arc::new(s4_codec::dispatcher::AlwaysDispatcher(CodecKind::CpuZstd)),
+        );
+        let err = svc
+            .check_not_reserved_key(".s4dict/0123456789abcdef", ReservedKeyMode::Mutating)
+            .expect_err("mutating a dict object must be rejected");
+        assert!(
+            format!("{err:?}").contains("reserved"),
+            "error must explain the reserved prefix: {err:?}"
+        );
+        assert!(
+            svc.check_not_reserved_key(".s4dict/0123456789abcdef", ReservedKeyMode::Read)
+                .is_ok(),
+            "reading a dict object stays allowed"
+        );
+        assert!(
+            svc.check_not_reserved_key("normal/key.json", ReservedKeyMode::Mutating)
+                .is_ok()
+        );
     }
 
     /// v1.1 `--zstd-dict`: `extract_dict_id` must reject anything that

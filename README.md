@@ -248,7 +248,7 @@ See [docker-compose.gpu.yml](docker-compose.gpu.yml) for details.
 
 Per-object GPU compression below `--gpu-min-bytes` (default 1 MiB) loses to
 CPU because each call pays a fixed kernel-launch + PCIe round-trip.
-`--gpu-batch-small-puts` (v1.2, off by default; requires the `nvcomp-gpu`
+`--gpu-batch-small-puts` (v1.1, off by default; requires the `nvcomp-gpu`
 build + a CUDA GPU at boot, refuses to start otherwise) coalesces
 **concurrent** small PUTs into a single `nvcompBatchedZstd` kernel launch:
 
@@ -387,7 +387,9 @@ For pandas / pyarrow / DuckDB / Polars reading S4 objects **straight off the
 backend** — no gateway in the read path. Range reads use the `.s4index`
 sidecar to fetch only the overlapping frames; non-S4 objects pass through
 byte-for-byte. Read-only by design (writes go through the gateway); GPU
-(`nvcomp-*`) frames raise `NotImplementedError` rather than decode wrong.
+(`nvcomp-*`) frames and SSE-encrypted objects raise `NotImplementedError`
+rather than decode wrong (SSE detection is triple-layered: `s4-encrypted`
+metadata, sidecar SSE binding, and `S4E1`–`S4E6` magic-byte sniff).
 
 ```python
 import pandas as pd
@@ -1050,7 +1052,19 @@ mismatch (`etag-raced`); (6) writes the same `<key>.s4index` sidecar
 the gateway writes for multi-frame bodies, so Range GETs keep the
 partial-fetch fast path. `--concurrency` (default 4) objects run in
 parallel; objects above `--max-body-bytes` (default 5 GiB, same cap as
-`repair-sidecar`) are skipped as `too-large`.
+`repair-sidecar`) are skipped as `too-large` — the cap is enforced from
+the GET `Content-Length` *before* buffering, so an oversized body is
+never pulled into RAM.
+
+S4-internal keys (`*.s4index` sidecars, `.s4dict/` dictionaries,
+`*.__s4ver__/*` versioning shadows) are excluded from the listing and
+never rewritten. The rewrite PUT inherits the source's **storage class
+and object tags** in addition to content-type and user metadata; object
+ACLs and Object Lock retention are **not** inherited (stated in the
+report notes — re-apply them after migrating locked buckets). A
+roundtrip-verify failure is a hard failure (exit 1), not a skip: it
+means the tool's own output didn't decode, which is a bug worth a loud
+stop.
 
 Example run (5-object MinIO demo bucket — 3 repetitive logs, one JSON
 export, one random binary):
@@ -1138,6 +1152,15 @@ write, no off switch** — then re-checks the source ETag with a HEAD
 immediately before the overwrite PUT (`etag-raced` on mismatch);
 (6) refreshes the `<key>.s4index` sidecar for multi-frame bodies (and
 deletes a now-stale sidecar when the rewrite came out single-frame).
+
+Like `migrate`, internal keys (`*.s4index`, `.s4dict/`, `*.__s4ver__/*`)
+are excluded, storage class + object tags are inherited on rewrite
+(ACLs / Object Lock retention are not), and the `--max-body-bytes` cap
+is enforced before buffering. Backend-written framed objects that carry
+**no gateway metadata** skip as `unstamped-framed` by default — pass
+`--assume-unstamped-framed` only when you know such objects are genuine
+S4 frames, because recompacting one changes what a gateway GET serves
+for that key (raw frames before, decoded payload after).
 User metadata and Content-Type survive the rewrite; the `s4-*`
 manifest keys are re-stamped for the new frames plus the
 `s4-zstd-level` marker.
@@ -1280,10 +1303,29 @@ Mechanics and operational notes:
   # python: zstandard.ZstdDecompressor(dict_data=ZstdCompressionDict(dict.bin))
   ```
 
-- **Scope-outs (follow-ups)**: `s4-codec-py` / `s4-codec-wasm` don't
-  decode `cpu-zstd-dict` natively yet; CopyObject and multipart parts
-  never use dictionaries; re-training (schema drift) requires a new
-  flag value + gateway restart.
+- **Dictionaries are bucket-local.** GET resolves `.s4dict/<id>` from
+  the *object's own bucket*. Cross-bucket CopyObject through the
+  gateway propagates the dictionary to the destination bucket
+  automatically (content-addressed, idempotent); **cross-region
+  replication (experimental) does not** — place the dictionary in the
+  replica bucket yourself or its dict-compressed replicas fail GET
+  with a typed 5xx. `.s4dict/` keys are write-protected through the
+  gateway (`InvalidObjectName` on PUT/DELETE, reads allowed); manage
+  dictionaries with `s4 train-dict` against the backend. `train-dict`
+  also stamps the full digest as `s4-dict-sha256` metadata, which the
+  lazy-fetch path verifies when present (pre-existing dictionaries
+  without the stamp fall back to the 16-hex prefix check). Lazy-fetched
+  dictionaries are capped at 1 MiB — if you train with
+  `--max-dict-bytes` above that, boot-time `--zstd-dict` preload still
+  works but flag-less lazy fetch refuses.
+- **Reserved metadata namespace**: the gateway strips client-supplied
+  `x-amz-meta-s4-*` keys on PUT — they are S4's manifest namespace and
+  forging them (e.g. a stray `s4-dict-id`) must not change GET behavior.
+- **Scope-outs (follow-ups)**: `s4-codec-wasm` doesn't decode
+  `cpu-zstd-dict` natively yet (`s4-codec-py` does, via the
+  `CpuZstdDict` binding — s4fs uses it); multipart parts never use
+  dictionaries; re-training (schema drift) requires a new flag value +
+  gateway restart.
 
 ## Production Features
 

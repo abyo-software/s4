@@ -22,6 +22,18 @@
 //!     the dictionary bytes — and with the `zstd` CLI when present on the
 //!     host (`zstd -D <dictfile> -d`) — proving the no-gateway escape
 //!     hatch documented in the README.
+//!
+//! v1.0.1 audit R1 additions:
+//! (g) client-supplied `x-amz-meta-s4-dict-id` on a normal PUT is
+//!     stripped (never stored) and the GET succeeds exactly like v1.0.0 —
+//!     no dictionary fetch is attempted (P1 freeze fix);
+//! (h) gateway-side PUT / DELETE against `.s4dict/<id>` keys are
+//!     rejected with `InvalidObjectName` (dictionary objects are
+//!     gateway-managed; `train-dict` writes backend-direct);
+//! (i) a cross-bucket CopyObject of a dict-stamped object carries
+//!     `.s4dict/<id>` (with its full-SHA-256 metadata stamp) into the
+//!     destination bucket, so the copy stays readable after the source
+//!     bucket is gone (idempotent re-copy included).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -405,4 +417,153 @@ async fn dict_e2e_train_compress_get_and_external_decode() {
     } else {
         println!("zstd CLI not found on host — crate-level external decode verified only");
     }
+
+    // =====================================================================
+    // v1.0.1 audit R1 sections (g) / (h) / (i) — fresh flag-less gateway.
+    // =====================================================================
+    let (gw3_url, gw3_stop) = spawn_s4_server(&minio.endpoint_url, None).await;
+    let gw3 = build_aws_client(&gw3_url);
+
+    // ---- (g) client-supplied `s4-dict-id` metadata is inert --------------
+    // P1 freeze fix: pre-fix, this PUT stored the metadata verbatim and
+    // the GET routed into the dictionary path → 5xx (`.s4dict/0123...`
+    // doesn't exist). Post-fix the reserved key is stripped on PUT and
+    // the GET path additionally requires `s4-codec: cpu-zstd-dict`.
+    let evil_body = json_event(424_242, "meta").repeat(4);
+    gw3.put_object()
+        .bucket(BUCKET)
+        .key("plainmeta/normal.json")
+        .metadata("s4-dict-id", "0123456789abcdef")
+        .metadata("s4-codec", "cpu-zstd-dict")
+        .metadata("app-team", "checkout")
+        .body(aws_sdk_s3::primitives::ByteStream::from(evil_body.clone()))
+        .send()
+        .await
+        .expect("PUT with client-supplied s4-* metadata must succeed");
+    assert_eq!(
+        get_via(&gw3, "plainmeta/normal.json").await,
+        evil_body,
+        "GET must succeed like v1.0.0 — no dict fetch for a normal object"
+    );
+    let head = backend
+        .head_object()
+        .bucket(BUCKET)
+        .key("plainmeta/normal.json")
+        .send()
+        .await
+        .expect("backend HEAD");
+    let meta = head.metadata().expect("metadata");
+    assert!(
+        meta.get("s4-dict-id").is_none(),
+        "client-supplied s4-dict-id must be stripped, got {meta:?}"
+    );
+    assert_eq!(
+        meta.get("s4-codec").map(String::as_str),
+        Some("cpu-zstd"),
+        "s4-codec must be the gateway's own stamp, not the client's forgery"
+    );
+    assert_eq!(
+        meta.get("app-team").map(String::as_str),
+        Some("checkout"),
+        "non-reserved client metadata must survive"
+    );
+
+    // ---- (h) `.s4dict/` is write-protected through the gateway -----------
+    let dict_key = dict_object_key(&report.dict_id);
+    gw3.put_object()
+        .bucket(BUCKET)
+        .key(&dict_key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(vec![0u8; 32]))
+        .send()
+        .await
+        .expect_err("gateway PUT over a dictionary object must be rejected");
+    gw3.delete_object()
+        .bucket(BUCKET)
+        .key(&dict_key)
+        .send()
+        .await
+        .expect_err("gateway DELETE of a dictionary object must be rejected");
+    backend
+        .head_object()
+        .bucket(BUCKET)
+        .key(&dict_key)
+        .send()
+        .await
+        .expect("dictionary object must survive the rejected mutations");
+
+    // ---- (i) cross-bucket CopyObject carries the dictionary --------------
+    const BUCKET2: &str = "dictbkt2";
+    backend
+        .create_bucket()
+        .bucket(BUCKET2)
+        .send()
+        .await
+        .expect("create second bucket");
+    gw3.copy_object()
+        .copy_source(format!("{BUCKET}/{}", bodies[0].0))
+        .bucket(BUCKET2)
+        .key("copied/0000.json")
+        .send()
+        .await
+        .expect("cross-bucket copy of a dict-stamped object");
+    // The dictionary travelled with the copy (content-addressed PUT into
+    // the destination bucket, full-SHA-256 metadata stamped).
+    let dict_head = backend
+        .head_object()
+        .bucket(BUCKET2)
+        .key(&dict_key)
+        .send()
+        .await
+        .expect("destination bucket must now hold .s4dict/<id>");
+    assert_eq!(
+        dict_head
+            .metadata()
+            .and_then(|m| m.get("s4-dict-sha256"))
+            .map(String::as_str),
+        Some(s4_server::dict::dict_sha256_hex(&dict_bytes).as_str()),
+        "propagated dict must carry the full-SHA-256 metadata stamp"
+    );
+    let dict_copy = backend
+        .get_object()
+        .bucket(BUCKET2)
+        .key(&dict_key)
+        .send()
+        .await
+        .expect("GET propagated dict")
+        .body
+        .collect()
+        .await
+        .expect("collect propagated dict")
+        .into_bytes();
+    assert_eq!(
+        dict_copy.as_ref(),
+        dict_bytes.as_slice(),
+        "propagated dictionary bytes must be identical (content-addressed)"
+    );
+    // The copied object round-trips out of the destination bucket via a
+    // flag-less gateway (lazy fetch now resolves from BUCKET2 itself).
+    let copied = gw3
+        .get_object()
+        .bucket(BUCKET2)
+        .key("copied/0000.json")
+        .send()
+        .await
+        .expect("GET copied object")
+        .body
+        .collect()
+        .await
+        .expect("collect copied object")
+        .into_bytes();
+    assert_eq!(copied.as_ref(), bodies[0].2.as_slice());
+    // Idempotency: a second cross-bucket copy hits the existing
+    // `.s4dict/<id>` (HEAD-skip) and must not fail.
+    gw3.copy_object()
+        .copy_source(format!("{BUCKET}/{}", bodies[1].0))
+        .bucket(BUCKET2)
+        .key("copied/0001.json")
+        .send()
+        .await
+        .expect("second cross-bucket copy (idempotent dict propagation)");
+
+    let _ = gw3_stop.send(());
 }

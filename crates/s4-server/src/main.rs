@@ -837,7 +837,9 @@ enum Cmd {
     /// objects at `--target-zstd-level` (default 19). Only S4-framed
     /// cpu-zstd objects are touched: plain objects skip as `not-s4`
     /// (run `s4 migrate` first), `passthrough` / `cpu-gzip` /
-    /// `nvcomp-*` / `cpu-zstd-dict` skip as `unsupported-codec`.
+    /// `nvcomp-*` / `cpu-zstd-dict` skip as `unsupported-codec`, and
+    /// framed objects without the gateway's `s4-codec` metadata stamp
+    /// skip as `unstamped-framed` unless `--assume-unstamped-framed`.
     /// **Dry-run by default** — pass `--execute` to write. Rewritten
     /// objects are stamped `s4-zstd-level`, so a re-run skips them
     /// (`already-compacted`) — idempotent without a checkpoint file.
@@ -1015,6 +1017,16 @@ struct RecompactArgs {
         value_parser = s4_server::recompact::parse_duration_suffix
     )]
     older_than: Option<std::time::Duration>,
+
+    /// Treat S4F2/S4P1-framed objects that carry NO `s4-codec`
+    /// metadata stamp as gateway frames and recompact them. By default
+    /// such objects are skipped (`unstamped-framed`): the gateway and
+    /// `s4 migrate` always stamp, so unstamped framed bytes were
+    /// written by something else (or had their metadata stripped) and
+    /// rewriting them could mangle a foreign format that merely shares
+    /// the 4-byte prefix.
+    #[clap(long, default_value_t = false)]
+    assume_unstamped_framed: bool,
 
     /// zstd level the frames are rewritten at; also the threshold the
     /// `s4-zstd-level` idempotency stamp is compared against
@@ -2829,6 +2841,7 @@ async fn run_recompact_cmd(
         target_zstd_level: args.target_zstd_level,
         min_gain_percent: args.min_gain_percent,
         older_than: args.older_than,
+        assume_unstamped_framed: args.assume_unstamped_framed,
     };
     let report = s4_server::recompact::run_recompact(&client, &bucket, &params)
         .await

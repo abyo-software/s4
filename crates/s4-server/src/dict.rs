@@ -43,9 +43,27 @@ pub const DICT_KEY_PREFIX: &str = ".s4dict/";
 /// Hex chars of the SHA-256 prefix used as the dictionary id.
 pub const DICT_ID_HEX_LEN: usize = 16;
 
-/// LRU capacity of the lazy GET-side dictionary cache. Dictionaries are
-/// ≤ ~110 KiB each, so 16 slots bound the cache at ~2 MiB.
+/// LRU capacity of the lazy GET-side dictionary cache. Trained
+/// dictionaries default to ≤ ~110 KiB ([`DEFAULT_MAX_DICT_BYTES`]), so 16
+/// slots hold ~2 MiB in practice; the lazy fetch additionally hard-caps a
+/// single `.s4dict/` object at [`DICT_FETCH_MAX_BYTES`] (1 MiB), bounding
+/// the cache at 16 MiB even against oversized backend blobs.
 pub const DICT_CACHE_CAPACITY: usize = 16;
+
+/// Hard cap on the size of a lazily-fetched `.s4dict/<id>` object
+/// (GET-side `resolve_dict`). Trained dictionaries default to ≤ ~110 KiB
+/// ([`DEFAULT_MAX_DICT_BYTES`]); 1 MiB leaves ~9x headroom for operators
+/// who trained with a larger `--max-dict-bytes` while keeping the
+/// worst-case lazy-cache footprint at `16 slots x 1 MiB = 16 MiB`.
+pub const DICT_FETCH_MAX_BYTES: usize = 1024 * 1024;
+
+/// Backend metadata key carrying the **full** SHA-256 hex (64 chars) of a
+/// `.s4dict/<id>` object's bytes. Stamped by `train-dict` (and by the
+/// gateway's cross-bucket CopyObject dict propagation) so the GET-side
+/// lazy fetch can verify the full digest instead of only the 16-hex
+/// (64-bit) id prefix. Absent on dictionaries trained before v1.0.1 —
+/// the fetch path then falls back to the prefix check (back-compat).
+pub const DICT_SHA256_META_KEY: &str = "s4-dict-sha256";
 
 /// Default `--zstd-dict-max-bytes`: only bodies up to this size take the
 /// compress-both-ways dict path (1 MiB).
@@ -67,15 +85,23 @@ pub const DEFAULT_TRAIN_MIN_SAMPLES: usize = 8;
 /// also dominate ZDICT training unhelpfully). 64 KiB.
 pub const DEFAULT_TRAIN_SAMPLE_MAX_BYTES: u64 = 64 * 1024;
 
-/// `<dict-id>` for a dictionary's raw bytes: first 16 hex chars of its
-/// SHA-256 (lowercase).
-pub fn dict_id_of(dict_bytes: &[u8]) -> String {
+/// Full SHA-256 of a dictionary's raw bytes as 64 lowercase hex chars
+/// (the value stored under [`DICT_SHA256_META_KEY`]).
+pub fn dict_sha256_hex(dict_bytes: &[u8]) -> String {
     let digest = Sha256::digest(dict_bytes);
-    let mut s = String::with_capacity(DICT_ID_HEX_LEN);
-    for byte in digest.iter().take(DICT_ID_HEX_LEN / 2) {
+    let mut s = String::with_capacity(64);
+    for byte in digest.iter() {
         use std::fmt::Write;
         let _ = write!(s, "{byte:02x}");
     }
+    s
+}
+
+/// `<dict-id>` for a dictionary's raw bytes: first 16 hex chars of its
+/// SHA-256 (lowercase).
+pub fn dict_id_of(dict_bytes: &[u8]) -> String {
+    let mut s = dict_sha256_hex(dict_bytes);
+    s.truncate(DICT_ID_HEX_LEN);
     s
 }
 
@@ -259,8 +285,16 @@ pub fn dict_wins(dict_compressed_len: usize, plain_compressed_len: usize) -> boo
 /// with no `--zstd-dict` flags) so objects carrying `s4-dict-id` stay
 /// readable after the operator drops the flag: on miss the service
 /// fetches `.s4dict/<id>` from the object's bucket, verifies the
-/// fingerprint, and inserts here. Keyed by dict-id only — ids are
-/// content-addressed, so equal id ⇒ equal bytes regardless of bucket.
+/// fingerprint, and inserts here.
+///
+/// Keyed by `(bucket, dict-id)` — NOT by id alone. Ids are
+/// content-addressed, so for honestly-trained dictionaries equal id ⇒
+/// equal bytes regardless of bucket; but the id is only a 64-bit SHA-256
+/// prefix, and a single id-keyed cache would let a `.s4dict/<id>` object
+/// planted in one bucket (a prefix-collision forgery the 16-hex check
+/// alone cannot rule out) satisfy GETs against *every other* bucket on
+/// the gateway. Bucket-scoping the key confines any such poisoning to
+/// the bucket that already contains the hostile object.
 #[derive(Debug, Default)]
 pub struct DictCache {
     inner: Mutex<DictCacheInner>,
@@ -268,28 +302,36 @@ pub struct DictCache {
 
 #[derive(Debug, Default)]
 struct DictCacheInner {
-    map: HashMap<String, Arc<[u8]>>,
+    map: HashMap<(String, String), Arc<[u8]>>,
     /// Recency queue, most-recent at the back.
-    order: Vec<String>,
+    order: Vec<(String, String)>,
 }
 
 impl DictCache {
-    pub fn get(&self, dict_id: &str) -> Option<Arc<[u8]>> {
+    pub fn get(&self, bucket: &str, dict_id: &str) -> Option<Arc<[u8]>> {
         let mut inner = self.inner.lock().ok()?;
-        let hit = inner.map.get(dict_id).map(Arc::clone)?;
-        if let Some(pos) = inner.order.iter().position(|k| k == dict_id) {
+        let hit = inner
+            .map
+            .get(&(bucket.to_owned(), dict_id.to_owned()))
+            .map(Arc::clone)?;
+        if let Some(pos) = inner
+            .order
+            .iter()
+            .position(|(b, k)| b == bucket && k == dict_id)
+        {
             let k = inner.order.remove(pos);
             inner.order.push(k);
         }
         Some(hit)
     }
 
-    pub fn insert(&self, dict_id: String, dict: Arc<[u8]>) {
+    pub fn insert(&self, bucket: String, dict_id: String, dict: Arc<[u8]>) {
         let Ok(mut inner) = self.inner.lock() else {
             return; // poisoned lock: degrade to cache-off (refetch next GET)
         };
-        if inner.map.contains_key(&dict_id) {
-            if let Some(pos) = inner.order.iter().position(|k| *k == dict_id) {
+        let cache_key = (bucket, dict_id);
+        if inner.map.contains_key(&cache_key) {
+            if let Some(pos) = inner.order.iter().position(|k| *k == cache_key) {
                 let k = inner.order.remove(pos);
                 inner.order.push(k);
             }
@@ -302,8 +344,8 @@ impl DictCache {
             let evicted = inner.order.remove(0);
             inner.map.remove(&evicted);
         }
-        inner.map.insert(dict_id.clone(), dict);
-        inner.order.push(dict_id);
+        inner.map.insert(cache_key.clone(), dict);
+        inner.order.push(cache_key);
     }
 
     #[cfg(test)]
@@ -534,6 +576,12 @@ pub async fn run_train_dict(
             .bucket(bucket)
             .key(&dict_key)
             .content_type("application/x-zstd-dictionary")
+            // Full SHA-256 alongside the 16-hex (64-bit) id in the key:
+            // lets the gateway's lazy fetch verify the complete digest
+            // instead of only the truncated prefix. Dictionaries trained
+            // before this stamp existed simply lack the metadata and the
+            // fetch path falls back to the prefix check.
+            .metadata(DICT_SHA256_META_KEY, dict_sha256_hex(&dict))
             .body(aws_sdk_s3::primitives::ByteStream::from(dict.clone()))
             .send()
             .await
@@ -682,23 +730,55 @@ mod tests {
         let cache = DictCache::default();
         let dict: Arc<[u8]> = Arc::from(fake_dict(0).into_boxed_slice());
         for i in 0..(DICT_CACHE_CAPACITY + 4) {
-            cache.insert(format!("{i:016x}"), Arc::clone(&dict));
+            cache.insert("bkt".to_owned(), format!("{i:016x}"), Arc::clone(&dict));
         }
         assert_eq!(cache.len(), DICT_CACHE_CAPACITY);
         assert!(
-            cache.get(&format!("{:016x}", 0)).is_none(),
+            cache.get("bkt", &format!("{:016x}", 0)).is_none(),
             "oldest evicted"
         );
         assert!(
             cache
-                .get(&format!("{:016x}", DICT_CACHE_CAPACITY + 3))
+                .get("bkt", &format!("{:016x}", DICT_CACHE_CAPACITY + 3))
                 .is_some()
         );
         // Touching an entry protects it from the next eviction.
         let survivor = format!("{:016x}", 4);
-        assert!(cache.get(&survivor).is_some());
-        cache.insert(format!("{:016x}", 999), Arc::clone(&dict));
-        assert!(cache.get(&survivor).is_some(), "recently-used must survive");
+        assert!(cache.get("bkt", &survivor).is_some());
+        cache.insert("bkt".to_owned(), format!("{:016x}", 999), Arc::clone(&dict));
+        assert!(
+            cache.get("bkt", &survivor).is_some(),
+            "recently-used must survive"
+        );
+    }
+
+    /// Cache poisoning containment: an entry inserted for bucket A must
+    /// never satisfy a lookup for the same dict-id under bucket B — the
+    /// 16-hex id is only a 64-bit prefix, so cross-bucket sharing would
+    /// let one bucket's forged `.s4dict/<id>` serve every bucket.
+    #[test]
+    fn cache_is_bucket_scoped() {
+        let cache = DictCache::default();
+        let dict_a: Arc<[u8]> = Arc::from(fake_dict(1).into_boxed_slice());
+        let dict_b: Arc<[u8]> = Arc::from(fake_dict(2).into_boxed_slice());
+        let id = "0123456789abcdef";
+        cache.insert("bucket-a".to_owned(), id.to_owned(), Arc::clone(&dict_a));
+        assert!(
+            cache.get("bucket-b", id).is_none(),
+            "bucket B must not see bucket A's cached dictionary"
+        );
+        cache.insert("bucket-b".to_owned(), id.to_owned(), Arc::clone(&dict_b));
+        assert_eq!(cache.get("bucket-a", id).as_deref(), Some(dict_a.as_ref()));
+        assert_eq!(cache.get("bucket-b", id).as_deref(), Some(dict_b.as_ref()));
+    }
+
+    #[test]
+    fn full_sha256_hex_is_64_chars_and_prefixes_dict_id() {
+        let bytes = fake_dict(9);
+        let full = dict_sha256_hex(&bytes);
+        assert_eq!(full.len(), 64);
+        assert!(full.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(&full[..DICT_ID_HEX_LEN], dict_id_of(&bytes));
     }
 
     #[test]

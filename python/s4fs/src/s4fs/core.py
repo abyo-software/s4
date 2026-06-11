@@ -44,13 +44,26 @@ from fsspec.spec import AbstractBufferedFile
 SIDECAR_SUFFIX = s4_codec.SIDECAR_SUFFIX
 #: Reserved bucket-root prefix where trained zstd dictionaries live.
 DICT_KEY_PREFIX = ".s4dict/"
-#: Reserved bucket-root prefix for the gateway's versioning shadow objects.
+#: Reserved *infix* marking the gateway's versioning shadow objects.
+#: Shadow keys are ``<key>.__s4ver__/<version-id>`` — the marker appears
+#: after the user key, not at the bucket root (see
+#: ``s4-server/src/service.rs`` ``version_shadow_key`` /
+#: ``is_version_shadow_key``, which filters ``key.contains(".__s4ver__/")``).
 VERSION_SHADOW_PREFIX = ".__s4ver__/"
 
 _FRAME_MAGICS = (s4_codec.FRAME_MAGIC, s4_codec.PADDING_MAGIC)
+#: SSE envelope magics — the first 4 bytes of every body the gateway
+#: stored encrypted. Transcribed from ``crates/s4-server/src/sse.rs``
+#: (``SSE_MAGIC_V1`` .. ``SSE_MAGIC_V6``): S4E1 (v0.4 single key),
+#: S4E2 (keyring), S4E3 (SSE-C), S4E4 (SSE-KMS), S4E5/S4E6 (chunked).
+_SSE_MAGICS = (b"S4E1", b"S4E2", b"S4E3", b"S4E4", b"S4E5", b"S4E6")
 _DICT_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 
 _READ_ONLY_MSG = "s4fs is read-only; write through the S4 gateway"
+_SSE_MSG = (
+    "s4fs does not decrypt SSE objects; read through the gateway "
+    "(the encryption keyring / KMS / SSE-C key never leaves the gateway)"
+)
 _GPU_FRAME_MSG = (
     "GPU-written frames (codec {codec!r}) require the gateway or the "
     "s4-codec CLI to decode; s4fs only decodes CPU codecs "
@@ -61,6 +74,11 @@ _GPU_FRAME_MSG = (
 def _is_framed(prefix: bytes) -> bool:
     """True if ``prefix`` starts with the S4F2 frame or S4P1 padding magic."""
     return len(prefix) >= 4 and prefix[:4] in _FRAME_MAGICS
+
+
+def _is_sse(prefix: bytes) -> bool:
+    """True if ``prefix`` starts with an S4E1..S4E6 SSE envelope magic."""
+    return len(prefix) >= 4 and prefix[:4] in _SSE_MAGICS
 
 
 def _strip_etag(etag: Optional[str]) -> Optional[str]:
@@ -101,6 +119,13 @@ class S4FileSystem(AbstractFileSystem):
     target_options:
         Keyword arguments for the underlying filesystem constructor
         (e.g. ``{"endpoint_url": "http://minio:9000"}``).
+    allow_inexact_open:
+        By default ``open()`` refuses S4-framed objects whose original
+        size cannot be resolved exactly (no usable ``.s4index`` sidecar
+        and no ``s4-original-size`` metadata): ``AbstractBufferedFile``
+        clamps reads to ``info()["size"]``, which would be the
+        *compressed* size — silently truncating the decompressed stream.
+        Pass ``True`` to restore the pre-1.0.1 clamped behavior.
 
     Notes
     -----
@@ -112,6 +137,9 @@ class S4FileSystem(AbstractFileSystem):
       (sidecar GET or metadata HEAD); results are cached per instance.
     - GPU-written frames (``nvcomp-*`` / ``dietgpu-ans``) raise
       ``NotImplementedError`` — never silently-wrong bytes.
+    - SSE-encrypted objects (gateway keyring / SSE-KMS / SSE-C) raise
+      ``NotImplementedError`` — the decryption keys live gateway-side
+      and returning ciphertext would be silently-wrong bytes.
     """
 
     protocol = "s4"
@@ -121,9 +149,11 @@ class S4FileSystem(AbstractFileSystem):
         fs: Optional[AbstractFileSystem] = None,
         target_protocol: str = "s3",
         target_options: Optional[Dict[str, Any]] = None,
+        allow_inexact_open: bool = False,
         **kwargs: Any,
     ):
         super().__init__(**kwargs)
+        self.allow_inexact_open = allow_inexact_open
         if fs is None:
             fs = fsspec.filesystem(target_protocol, **(target_options or {}))
         self.fs = fs
@@ -141,12 +171,19 @@ class S4FileSystem(AbstractFileSystem):
         versions), mirroring the gateway's listing filter."""
         if path.endswith(SIDECAR_SUFFIX):
             return True
+        # Versioning shadow keys carry the marker as an *infix* after the
+        # user key — ``<key>.__s4ver__/<version-id>`` (service.rs
+        # ``is_version_shadow_key`` filters ``contains(".__s4ver__/")``).
+        # Also hide the bare ``….__s4ver__`` virtual-directory entry that
+        # fsspec synthesizes when listing the parent prefix.
+        if VERSION_SHADOW_PREFIX in path or path.endswith(VERSION_SHADOW_PREFIX.rstrip("/")):
+            return True
         parts = path.split("/", 1)
         if len(parts) == 2:
             key = parts[1]
-            for prefix in (DICT_KEY_PREFIX, VERSION_SHADOW_PREFIX):
-                if key == prefix.rstrip("/") or key.startswith(prefix):
-                    return True
+            # Trained dictionaries live under a bucket-root prefix.
+            if key == DICT_KEY_PREFIX.rstrip("/") or key.startswith(DICT_KEY_PREFIX):
+                return True
         return False
 
     def _load_index(self, path: str) -> Optional[Dict[str, Any]]:
@@ -195,15 +232,44 @@ class S4FileSystem(AbstractFileSystem):
         self._meta_cache[path] = out
         return out
 
+    def _guard_sse(
+        self,
+        path: str,
+        head: Optional[bytes] = None,
+        idx: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Refuse SSE-encrypted objects loudly — never return ciphertext.
+
+        The gateway stamps ``s4-encrypted: aes-256-gcm`` metadata on every
+        encrypted PUT and the stored body starts with an S4E1..S4E6
+        envelope (``s4-server/src/sse.rs`` / ``service.rs``). s4fs has no
+        access to the keyring / KMS / SSE-C key, so any byte it could
+        return would be ciphertext. Three independent signals are checked
+        (metadata may be unreachable on some filesystems, sidecars may be
+        absent), any one of which triggers the refusal:
+
+        - ``s4-encrypted`` object metadata;
+        - the sidecar's v3 SSE chunk binding (``idx["sse"]``);
+        - the S4E* envelope magic in the first body bytes (``head``).
+        """
+        if self._object_metadata(path).get("s4-encrypted"):
+            raise NotImplementedError(_SSE_MSG)
+        if idx is not None and idx.get("sse") is not None:
+            raise NotImplementedError(_SSE_MSG)
+        if head is not None and _is_sse(head):
+            raise NotImplementedError(_SSE_MSG)
+
     def _resolve_size(self, path: str, base_info: Dict[str, Any]) -> Tuple[int, bool]:
         """Original (decompressed) size of ``path`` and whether it is exact.
 
-        Order: sidecar entries → ``s4-original-size`` metadata → for raw
-        (non-framed) objects the backend size is already exact → otherwise
-        the compressed size with ``exact=False``.
+        Order: sidecar entries (only when the sidecar's source binding
+        matches the live object — see ``_sidecar_matches``) →
+        ``s4-original-size`` metadata → for raw (non-framed) objects the
+        backend size is already exact → otherwise the compressed size with
+        ``exact=False``.
         """
         idx = self._load_index(path)
-        if idx is not None:
+        if idx is not None and self._sidecar_matches(path, idx):
             return int(idx["total_original_size"]), True
         meta = self._object_metadata(path)
         orig = meta.get("s4-original-size")
@@ -288,6 +354,10 @@ class S4FileSystem(AbstractFileSystem):
         """Decode a non-framed gateway object using the manifest stamped in
         object metadata (``s4-codec`` / ``s4-original-size`` / ``s4-crc32c``
         — see ``s4-server/src/service.rs``)."""
+        # SSE bodies are never S4F2-framed (the envelope wraps the
+        # compressed body), so they land here — refuse before the
+        # codec dispatch can fall through to the raw-passthrough branch.
+        self._guard_sse(path, head=data)
         meta = self._object_metadata(path)
         codec = meta.get("s4-codec")
         if codec is None or codec == "passthrough":
@@ -304,19 +374,27 @@ class S4FileSystem(AbstractFileSystem):
         return self._decode_payload(header, data, path)
 
     def _sidecar_matches(self, path: str, idx: Dict[str, Any]) -> bool:
-        """Best-effort staleness check: compare the sidecar's source ETag /
+        """Staleness / binding check: compare the sidecar's source ETag /
         compressed size against the live backend object. A mismatch means
         the object was overwritten after the sidecar was written — fall
-        back to a full read instead of fetching wrong byte ranges."""
+        back to a full read instead of fetching wrong byte ranges.
+
+        Legacy v1 sidecars carry *no* source binding at all (both
+        ``source_etag`` and ``source_compressed_size`` are None — see
+        ``s4-codec/src/index.rs`` v0.8.4 #73 H-2): they cannot be tied to
+        the live object, so they are never trusted to drive range reads
+        or exact sizes."""
+        etag = _strip_etag(idx.get("source_etag"))
+        scs = idx.get("source_compressed_size")
+        if etag is None and scs is None:
+            return False  # unbound v1 sidecar — full-read fallback
         try:
             info = self.fs.info(path)
         except FileNotFoundError:
             return False
-        etag = _strip_etag(idx.get("source_etag"))
         live_etag = _strip_etag(info.get("ETag") or info.get("etag"))
         if etag and live_etag and etag != live_etag:
             return False
-        scs = idx.get("source_compressed_size")
         live_size = info.get("size")
         if scs is not None and live_size is not None and int(scs) != int(live_size):
             return False
@@ -326,6 +404,9 @@ class S4FileSystem(AbstractFileSystem):
         """Partial fetch: read only the compressed window covering frames
         overlapping ``[start, end)`` of the decompressed stream, decode
         those frames, and slice. Mirrors ``FrameIndex::lookup_range``."""
+        # A v3 sidecar with an SSE chunk binding describes *pre-encrypt*
+        # offsets of an encrypted body — refuse before fetching ciphertext.
+        self._guard_sse(path, idx=idx)
         entries: List[Dict[str, Any]] = idx["entries"]
         offsets = [e["original_offset"] for e in entries]
         first = max(0, bisect.bisect_right(offsets, start) - 1)
@@ -383,6 +464,10 @@ class S4FileSystem(AbstractFileSystem):
         **kwargs: Any,
     ) -> bytes:
         path = self._strip_protocol(path)
+        # SSE-encrypted objects are refused up front (metadata check;
+        # the magic-sniff / sidecar-binding fallbacks below catch the
+        # metadata-unreachable case) — never return ciphertext.
+        self._guard_sse(path)
         if start is None and end is None:
             data = self.fs.cat_file(path)
             if _is_framed(data):
@@ -395,11 +480,14 @@ class S4FileSystem(AbstractFileSystem):
             total = int(idx["total_original_size"])
             s, e = _normalize_range(start, end, total)
             if s >= e:
+                # Still refuse empty-range reads of SSE objects loudly.
+                self._guard_sse(path, idx=idx)
                 return b""
             return self._range_via_index(path, idx, s, e)
 
         # No usable sidecar — sniff the first bytes to tell raw from framed.
         head = self.fs.cat_file(path, start=0, end=4)
+        self._guard_sse(path, head=head)
         if not _is_framed(head):
             if self._metadata_codec(path) in (None, "passthrough"):
                 # Plain object: delegate the range read untouched.
@@ -435,6 +523,23 @@ class S4FileSystem(AbstractFileSystem):
     ) -> "S4File":
         if mode != "rb":
             raise NotImplementedError(_READ_ONLY_MSG)
+        # AbstractBufferedFile clamps every read to info()["size"]. For a
+        # framed object whose original size could not be resolved exactly
+        # (no usable sidecar, no s4-original-size metadata) that size is
+        # the *compressed* size — reads would silently stop short of the
+        # decompressed stream's tail. Refuse instead of truncating.
+        if not self.allow_inexact_open:
+            info = self.info(path)
+            if info.get("type") == "file" and not info.get("s4_size_exact", True):
+                raise ValueError(
+                    f"cannot open() {path!r}: it is S4-framed but its original "
+                    "(decompressed) size is inexact (no usable .s4index sidecar "
+                    "and no s4-original-size metadata), so buffered reads would "
+                    "be silently truncated to the compressed size. Use "
+                    "cat_file() (full decode), fetch through the S4 gateway, or "
+                    "ensure s3 metadata access; or pass "
+                    "S4FileSystem(allow_inexact_open=True) to accept truncation."
+                )
         return S4File(
             self,
             path,

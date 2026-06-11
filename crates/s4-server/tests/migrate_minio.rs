@@ -423,6 +423,155 @@ async fn migrate_dry_run_execute_idempotence_and_gateway_readback() {
     );
 }
 
+/// Regression coverage for the v1.0 audit round-1 findings:
+/// (1) `.s4dict/<id>` dictionary objects (train-dict output) must be
+///     byte-identical after `migrate --execute` — re-compressing one
+///     would break every `cpu-zstd-dict` GET that references it;
+/// (2) `.__s4ver__/` versioning shadow keys must be excluded from the
+///     listing (rewriting one would break version restore);
+/// (3) object tags and a non-STANDARD storage class must survive the
+///     rewrite PUT (MinIO supports REDUCED_REDUNDANCY + tagging; ACL /
+///     Object Lock retention carry-over is NOT covered — MinIO needs
+///     lock-enabled buckets at creation, and the tools document the
+///     non-carry-over explicitly instead).
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn migrate_excludes_internal_keys_and_carries_tags_and_storage_class() {
+    let fixture = start_minio().await;
+    let backend = build_aws_client(&fixture.endpoint_url);
+    let bucket = "s4-migrate-internal";
+    backend
+        .create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("create bucket");
+
+    // Highly compressible bytes everywhere: if migrate listed any of
+    // the internal keys it WOULD rewrite them, so "unchanged bytes" is
+    // a real assertion, not vacuous.
+    let compressible = Bytes::from(
+        b"dictionary sample line: user=alice op=put\n"
+            .repeat(2_000)
+            .to_vec(),
+    );
+
+    // (1) A train-dict-shaped dictionary object at the bucket root.
+    let dict_key = ".s4dict/0123456789abcdef";
+    backend
+        .put_object()
+        .bucket(bucket)
+        .key(dict_key)
+        .body(compressible.clone().into())
+        .send()
+        .await
+        .expect("put dict");
+
+    // (2) A versioning shadow key, as `service::versioned_shadow_key`
+    // lays them out (`<key>.__s4ver__/<version-id>`).
+    let shadow_key = "data/file.log.__s4ver__/9c1f8c4e-0001";
+    backend
+        .put_object()
+        .bucket(bucket)
+        .key(shadow_key)
+        .body(compressible.clone().into())
+        .send()
+        .await
+        .expect("put shadow");
+
+    // (3) A normal object carrying tags + REDUCED_REDUNDANCY.
+    let tagged_key = "data/tagged.log";
+    backend
+        .put_object()
+        .bucket(bucket)
+        .key(tagged_key)
+        .body(compressible.clone().into())
+        // Tag value with a space exercises the URL-encoding carry-over.
+        .tagging("env=prod&team=s4%20core")
+        .storage_class(aws_sdk_s3::types::StorageClass::ReducedRedundancy)
+        .send()
+        .await
+        .expect("put tagged");
+
+    let dict_etag = head_etag(&backend, bucket, dict_key).await;
+    let shadow_etag = head_etag(&backend, bucket, shadow_key).await;
+
+    let report = run_migrate(
+        &backend,
+        bucket,
+        &MigrateParams {
+            execute: true,
+            ..default_params()
+        },
+    )
+    .await
+    .expect("execute run");
+
+    // Only the customer object was listed; the internal keys were
+    // never even examined.
+    assert_eq!(report.total_objects, 1, "report: {report:?}");
+    assert_eq!(report.migrated, 1);
+    assert_eq!(report.failed, 0, "failures: {:?}", report.failures);
+
+    // (1) Dictionary bytes untouched, byte-for-byte.
+    assert_eq!(head_etag(&backend, bucket, dict_key).await, dict_etag);
+    assert_eq!(
+        get_via(&backend, bucket, dict_key).await,
+        compressible,
+        ".s4dict/<id> must be byte-identical after migrate --execute"
+    );
+    // (2) Shadow key untouched.
+    assert_eq!(head_etag(&backend, bucket, shadow_key).await, shadow_etag);
+    assert_eq!(get_via(&backend, bucket, shadow_key).await, compressible);
+
+    // (3) Tagged object rewritten (shrunk) with tags + storage class.
+    assert!(head_size(&backend, bucket, tagged_key).await < compressible.len() as u64);
+    let mut tags: Vec<(String, String)> = backend
+        .get_object_tagging()
+        .bucket(bucket)
+        .key(tagged_key)
+        .send()
+        .await
+        .expect("get tagging")
+        .tag_set()
+        .iter()
+        .map(|t| (t.key().to_owned(), t.value().to_owned()))
+        .collect();
+    tags.sort();
+    assert_eq!(
+        tags,
+        vec![
+            ("env".to_owned(), "prod".to_owned()),
+            ("team".to_owned(), "s4 core".to_owned()),
+        ],
+        "object tags must survive the rewrite"
+    );
+    let storage_class = backend
+        .head_object()
+        .bucket(bucket)
+        .key(tagged_key)
+        .send()
+        .await
+        .expect("head tagged")
+        .storage_class()
+        .map(|sc| sc.as_str().to_owned());
+    assert_eq!(
+        storage_class.as_deref(),
+        Some("REDUCED_REDUNDANCY"),
+        "storage class must survive the rewrite"
+    );
+
+    // The report tells the operator what is NOT carried over.
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("ACLs and Object Lock")),
+        "ACL / Object Lock non-carry-over note expected: {:?}",
+        report.notes
+    );
+}
+
 /// Versioning-enabled bucket: migrate still works, the report carries
 /// the double-billing warning, and prefix scoping + max-objects
 /// truncation behave like `estimate`.

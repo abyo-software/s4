@@ -24,8 +24,11 @@ classifiers = [
 dependencies = [
     "fsspec>=2023.1.0",
     # PyO3 binding crate (crates/s4-codec-py) — provides the S4F2 frame /
-    # .s4index sidecar decoders and the CPU codecs.
-    "s4-codec>=1.0.0",
+    # .s4index sidecar decoders and the CPU codecs. Floor is 1.1.0: the
+    # binding APIs s4fs uses (SIDECAR_SUFFIX / frame_iter / decode_index /
+    # crc32c / CpuZstdDict) do not exist in the 1.0.0 wheel; they ship
+    # with the next s4-codec release (1.1.0).
+    "s4-codec>=1.1.0,<2",
 ]
 
 [project.optional-dependencies]

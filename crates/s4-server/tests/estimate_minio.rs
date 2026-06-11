@@ -131,13 +131,33 @@ async fn estimate_against_minio_known_mix() {
         .send()
         .await
         .expect("put sidecar");
+    // Other S4-internal keys that MUST be excluded too: a `.s4dict/`
+    // shared dictionary (train-dict output) and a `.__s4ver__/`
+    // versioning shadow key. Both live under `logs/` shapes that would
+    // otherwise change total_objects / the prefix-scoped count below.
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(".s4dict/0123456789abcdef")
+        .body(b"dictionary bytes, must be excluded".to_vec().into())
+        .send()
+        .await
+        .expect("put dict");
+    client
+        .put_object()
+        .bucket(bucket)
+        .key("logs/app-0.log.__s4ver__/9c1f8c4e-0001")
+        .body(log_body.clone().into_bytes().into())
+        .send()
+        .await
+        .expect("put version shadow");
 
     let params = default_params();
     let report = run_estimate(&client, bucket, &params)
         .await
         .expect("estimate");
 
-    // Inventory: 5 objects (sidecar excluded).
+    // Inventory: 5 objects (sidecar / dict / version shadow excluded).
     assert_eq!(report.total_objects, 5, "report: {report:?}");
     assert!(!report.listing_truncated);
     let expected_total = (log_body.len() * 3
@@ -197,7 +217,8 @@ async fn estimate_against_minio_known_mix() {
         "same seed must produce an identical report"
     );
 
-    // Prefix scoping: only the logs.
+    // Prefix scoping: only the logs (the `logs/...__s4ver__/` shadow
+    // key under the same prefix stays excluded).
     let prefixed = EstimateParams {
         prefix: Some("logs/".into()),
         ..default_params()

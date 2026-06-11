@@ -19,7 +19,14 @@
 //! (c) the default dry-run writes nothing (ETags unchanged, no stamp);
 //! (d) `--older-than 30d` skips the just-written objects (`too-recent`);
 //! (e) a gateway-shape passthrough object skips as `unsupported-codec`,
-//!     and a plain (never-migrated) object skips as `not-s4`.
+//!     a plain (never-migrated) object skips as `not-s4`, and a framed
+//!     body without the gateway metadata stamp skips as
+//!     `unstamped-framed` (untouched, hint note present);
+//! (f) object tags and a non-STANDARD storage class survive both the
+//!     migrate seed and the recompact rewrite (MinIO supports
+//!     REDUCED_REDUNDANCY and object tagging; ACL / Object Lock
+//!     retention carry-over is NOT covered — MinIO needs lock-enabled
+//!     buckets at creation and the tools document the non-carry-over).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -152,6 +159,7 @@ fn default_recompact_params() -> RecompactParams {
         target_zstd_level: DEFAULT_TARGET_ZSTD_LEVEL,
         min_gain_percent: DEFAULT_MIN_GAIN_PERCENT,
         older_than: None,
+        assume_unstamped_framed: false,
     }
 }
 
@@ -234,6 +242,38 @@ async fn head_meta(
         .unwrap_or_default()
 }
 
+async fn get_tags(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -> Vec<(String, String)> {
+    let mut tags: Vec<(String, String)> = client
+        .get_object_tagging()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("get tagging")
+        .tag_set()
+        .iter()
+        .map(|t| (t.key().to_owned(), t.value().to_owned()))
+        .collect();
+    tags.sort();
+    tags
+}
+
+async fn head_storage_class(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> Option<String> {
+    client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("head")
+        .storage_class()
+        .map(|sc| sc.as_str().to_owned())
+}
+
 async fn get_via(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -> Bytes {
     client
         .get_object()
@@ -270,6 +310,11 @@ async fn recompact_dry_run_execute_idempotence_and_gateway_readback() {
     // - plain.txt: never migrated → recompact must skip `not-s4`.
     // - pt.bin: raw random bytes + the `s4-codec: passthrough` stamp a
     //   gateway passthrough PUT leaves → skip `unsupported-codec`.
+    // - fake.s4f2: S4F2-prefixed bytes with NO s4-codec metadata stamp
+    //   (backend-written) → skip `unstamped-framed` by default.
+    // small.txt also carries object tags + a REDUCED_REDUNDANCY storage
+    // class so the test proves both survive the migrate seed AND the
+    // recompact rewrite.
     let big_key = "in/big.log";
     let big_body = Bytes::from(varied_log_text(60_000));
     assert!(
@@ -295,6 +340,9 @@ async fn recompact_dry_run_execute_idempotence_and_gateway_readback() {
         .body(small_body.clone().into())
         .content_type("text/plain")
         .metadata("owner", "alice")
+        // Tag value with a space exercises the URL-encoding carry-over.
+        .tagging("env=prod&team=s4%20core")
+        .storage_class(aws_sdk_s3::types::StorageClass::ReducedRedundancy)
         .send()
         .await
         .expect("put small");
@@ -322,6 +370,19 @@ async fn recompact_dry_run_execute_idempotence_and_gateway_readback() {
         .await
         .expect("put passthrough-shape");
 
+    let unstamped_key = "fake.s4f2";
+    let mut unstamped_body = b"S4F2".to_vec();
+    unstamped_body.extend_from_slice(&random_bytes(8 * 1024));
+    let unstamped_body = Bytes::from(unstamped_body);
+    backend
+        .put_object()
+        .bucket(bucket)
+        .key(unstamped_key)
+        .body(unstamped_body.clone().into())
+        .send()
+        .await
+        .expect("put unstamped-framed-shape");
+
     // Frame in/ at zstd-3 (the gateway's latency-first write level).
     let mig = run_migrate(&backend, bucket, &migrate_params_level3("in/"))
         .await
@@ -333,21 +394,48 @@ async fn recompact_dry_run_execute_idempotence_and_gateway_readback() {
     let small_l3_size = head_size(&backend, bucket, small_key).await;
     let etags_after_migrate: HashMap<&str, String> = {
         let mut m = HashMap::new();
-        for k in [big_key, small_key, plain_key, pt_key] {
+        for k in [big_key, small_key, plain_key, pt_key, unstamped_key] {
             m.insert(k, head_etag(&backend, bucket, k).await);
         }
         m
     };
+
+    // The migrate seed must already have carried small.txt's tags and
+    // storage class through its rewrite.
+    let small_tags_after_migrate = get_tags(&backend, bucket, small_key).await;
+    assert_eq!(
+        small_tags_after_migrate,
+        vec![
+            ("env".to_owned(), "prod".to_owned()),
+            ("team".to_owned(), "s4 core".to_owned()),
+        ],
+        "migrate must carry object tags over"
+    );
+    assert_eq!(
+        head_storage_class(&backend, bucket, small_key)
+            .await
+            .as_deref(),
+        Some("REDUCED_REDUNDANCY"),
+        "migrate must carry the storage class over"
+    );
 
     // ---- (c) dry-run (default mode) writes NOTHING ----
     let dry = run_recompact(&backend, bucket, &default_recompact_params())
         .await
         .expect("dry run");
     assert!(dry.dry_run);
-    assert_eq!(dry.total_objects, 4, "report: {dry:?}");
+    assert_eq!(dry.total_objects, 5, "report: {dry:?}");
     assert_eq!(dry.recompacted, 2, "report: {dry:?}"); // big + small (would)
     assert_eq!(dry.skipped_not_s4, 1); // plain.txt
     assert_eq!(dry.skipped_unsupported_codec, 1); // pt.bin
+    assert_eq!(dry.skipped_unstamped_framed, 1); // fake.s4f2
+    assert!(
+        dry.notes
+            .iter()
+            .any(|n| n.contains("--assume-unstamped-framed")),
+        "unstamped-framed hint note expected: {:?}",
+        dry.notes
+    );
     assert_eq!(dry.failed, 0, "failures: {:?}", dry.failures);
     assert!(dry.recompacted_bytes_after < dry.recompacted_bytes_before);
     assert_eq!(dry.recompacted_bytes_before, big_l3_size + small_l3_size);
@@ -384,7 +472,7 @@ async fn recompact_dry_run_execute_idempotence_and_gateway_readback() {
     .await
     .expect("older-than run");
     assert_eq!(aged.recompacted, 0, "report: {aged:?}");
-    assert_eq!(aged.skipped_too_recent, 4);
+    assert_eq!(aged.skipped_too_recent, 5);
     assert_eq!(aged.failed, 0);
     for (k, etag) in &etags_after_migrate {
         assert_eq!(
@@ -407,6 +495,7 @@ async fn recompact_dry_run_execute_idempotence_and_gateway_readback() {
     assert_eq!(report.recompacted, 2, "report: {report:?}");
     assert_eq!(report.skipped_not_s4, 1);
     assert_eq!(report.skipped_unsupported_codec, 1);
+    assert_eq!(report.skipped_unstamped_framed, 1);
     assert_eq!(report.failed, 0, "failures: {:?}", report.failures);
     assert_eq!(report.recompacted_bytes_before, big_l3_size + small_l3_size);
 
@@ -434,6 +523,28 @@ async fn recompact_dry_run_execute_idempotence_and_gateway_readback() {
     assert_eq!(
         head_etag(&backend, bucket, pt_key).await,
         etags_after_migrate[pt_key]
+    );
+    assert_eq!(
+        head_etag(&backend, bucket, unstamped_key).await,
+        etags_after_migrate[unstamped_key],
+        "unstamped-framed object must be untouched without --assume-unstamped-framed"
+    );
+
+    // Tags + storage class survived the recompact rewrite too.
+    assert_eq!(
+        get_tags(&backend, bucket, small_key).await,
+        vec![
+            ("env".to_owned(), "prod".to_owned()),
+            ("team".to_owned(), "s4 core".to_owned()),
+        ],
+        "recompact must carry object tags over"
+    );
+    assert_eq!(
+        head_storage_class(&backend, bucket, small_key)
+            .await
+            .as_deref(),
+        Some("REDUCED_REDUNDANCY"),
+        "recompact must carry the storage class over"
     );
 
     // `s4-zstd-level` stamp + manifest re-stamp + user metadata carry.
@@ -523,6 +634,7 @@ async fn recompact_dry_run_execute_idempotence_and_gateway_readback() {
     assert_eq!(rerun.skipped_already_compacted, 2);
     assert_eq!(rerun.skipped_not_s4, 1);
     assert_eq!(rerun.skipped_unsupported_codec, 1);
+    assert_eq!(rerun.skipped_unstamped_framed, 1);
     assert_eq!(rerun.failed, 0);
     assert_eq!(head_etag(&backend, bucket, big_key).await, etag_after_big);
     assert_eq!(

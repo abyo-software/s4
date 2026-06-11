@@ -19,6 +19,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Optional
 
@@ -83,6 +84,12 @@ def _gateway(*extra: str) -> subprocess.Popen:
             str(GW_PORT),
             "--endpoint-url",
             ENDPOINT,
+            # Pin the dispatcher: with the default `sampling` dispatcher a
+            # GPU-featured binary on a CUDA host would compress >=1MiB
+            # bodies with nvcomp-* — frames s4fs (correctly) refuses. This
+            # suite exercises the CPU codecs, so force the --codec choice.
+            "--dispatcher",
+            "always",
             *extra,
         ],
         env=os.environ | CREDS_ENV,
@@ -163,6 +170,21 @@ def backend():
         finally:
             gw.terminate()
             gw.wait()
+
+        # SSE-S4 keyring run: the stored body is an S4E6 envelope (chunked
+        # AES-256-GCM, default --sse-chunk-size) that s4fs must refuse to
+        # serve — the keyring lives gateway-side only.
+        with tempfile.TemporaryDirectory() as td:
+            keyfile = pathlib.Path(td) / "sse.key"
+            keyfile.write_bytes(os.urandom(32))
+            gw = _gateway("--codec", "cpu-zstd", "--sse-s4-key", str(keyfile))
+            try:
+                _boto(GW_PORT).put_object(
+                    Bucket=BUCKET, Key="secret.bin", Body=b"top secret payload\n" * 2048
+                )
+            finally:
+                gw.terminate()
+                gw.wait()
 
         yield be
     finally:
@@ -297,3 +319,19 @@ def test_write_through_s4fs_refused(s4):
     fs, _ = s4
     with pytest.raises(NotImplementedError, match="read-only"):
         fs.pipe_file(f"{BUCKET}/nope.bin", b"x")
+
+
+def test_sse_object_refused(s4, backend):
+    """An object PUT through an SSE-S4 (keyring) gateway is stored as an
+    S4E* ciphertext envelope — s4fs must refuse it loudly, never return
+    ciphertext, for both full and range reads."""
+    fs, _ = s4
+    body = backend.get_object(Bucket=BUCKET, Key="secret.bin")["Body"].read()
+    assert body[:4] in (b"S4E2", b"S4E5", b"S4E6"), "fixture should be SSE-encrypted on disk"
+    with pytest.raises(NotImplementedError, match="does not decrypt SSE"):
+        fs.cat_file(f"{BUCKET}/secret.bin")
+    with pytest.raises(NotImplementedError, match="does not decrypt SSE"):
+        fs.cat_file(f"{BUCKET}/secret.bin", start=10, end=200)
+    with pytest.raises(NotImplementedError, match="does not decrypt SSE"):
+        with fs.open(f"{BUCKET}/secret.bin", "rb") as f:
+            f.read()

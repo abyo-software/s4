@@ -56,13 +56,23 @@ Any underlying fsspec filesystem can be injected instead of s3fs:
 - **GPU frames are refused loudly.** `nvcomp-*` / `dietgpu-ans` frames raise
   `NotImplementedError` (decode them through the gateway); s4fs never
   returns silently-wrong bytes.
-- **SSE-encrypted objects are not decrypted** (the keyring lives in the
-  gateway).
+- **SSE-encrypted objects are refused loudly.** Reads raise
+  `NotImplementedError` (the keyring / KMS / SSE-C key lives in the
+  gateway — read encrypted objects through the gateway). Detection is
+  threefold: the `s4-encrypted` object metadata stamp, the sidecar's v3
+  SSE binding, and the `S4E1`–`S4E6` envelope magic in the body; s4fs
+  never returns ciphertext as if it were data.
 - Exact-size resolution in `ls`/`info` may cost one extra backend request
   per object (sidecar GET or metadata HEAD); results are cached per
   filesystem instance.
 - Range reads on framed objects without a usable sidecar fall back to a
   full-object read (with a warning when the object is multi-frame).
+  Legacy v1 sidecars (no source ETag/size binding) are treated as
+  unusable — they cannot be tied to the live object.
+- `open()` refuses framed objects whose original size is inexact (no
+  usable sidecar, no `s4-original-size` metadata) instead of silently
+  truncating buffered reads at the compressed size; opt back in with
+  `S4FileSystem(allow_inexact_open=True)`. `cat_file()` is unaffected.
 
 ## Tests
 

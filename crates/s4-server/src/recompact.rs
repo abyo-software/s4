@@ -16,6 +16,13 @@
 //!    `s4 migrate` first" hint); `passthrough` / `cpu-gzip` /
 //!    `nvcomp-*` / `cpu-zstd-dict` stamps are skipped
 //!    (`unsupported-codec` — this tool is cpu-zstd → cpu-zstd only).
+//!    Framed objects **without** the `s4-codec` metadata stamp are
+//!    skipped too (`unstamped-framed`): the gateway and `s4 migrate`
+//!    always stamp, so an unstamped S4F2 prefix means something else
+//!    wrote the bytes (or stripped the metadata) and silently
+//!    "promoting" it could mangle a foreign format. Pass
+//!    `--assume-unstamped-framed` to opt in to the pre-v1.0.1
+//!    behaviour of treating them as gateway frames.
 //! 2. An object already stamped `s4-zstd-level >= target` is skipped
 //!    (`already-compacted`) — the idempotency core: a re-run resumes
 //!    automatically with no checkpoint file.
@@ -70,6 +77,17 @@
 //! - **Versioned buckets work but double-bill**: the overwrite PUT
 //!   leaves the previous version in place. The report warns when
 //!   `GetBucketVersioning` says `Enabled`.
+//! - **Storage class and object tags are carried over** on the rewrite
+//!   PUT (the GET's storage class is re-sent unless it is
+//!   absent/STANDARD; tags come from `GetObjectTagging`). **ACLs and
+//!   Object Lock retention/legal-hold are NOT carried over** — the
+//!   overwrite PUT resets them to the bucket defaults. Buckets that
+//!   rely on per-object ACLs or Object Lock must not be recompacted
+//!   with this tool; the report repeats this in `notes`.
+//! - **Internal keys are never touched**: `.s4index` sidecars,
+//!   `.s4dict/` shared dictionaries and `.__s4ver__/` versioning
+//!   shadow keys are excluded from the listing — rewriting a shadow
+//!   key would break the version-restore path.
 //! - **Multipart-written objects are rewritten as single-PUT framed
 //!   objects** (padding frames dropped, `s4-multipart` flag dropped) —
 //!   byte-identical on GET, but the multipart ETag shape is lost (any
@@ -81,7 +99,7 @@ use std::time::Duration;
 use aws_sdk_s3::Client;
 use bytes::{Bytes, BytesMut};
 use s4_codec::cpu_zstd::CpuZstd;
-use s4_codec::index::{SIDECAR_SUFFIX, build_index_from_body, encode_index, sidecar_key};
+use s4_codec::index::{build_index_from_body, encode_index, sidecar_key};
 use s4_codec::multipart::FrameIter;
 use s4_codec::passthrough::Passthrough;
 use s4_codec::{ChunkManifest, CodecKind, CodecRegistry};
@@ -146,6 +164,12 @@ pub enum SkipReason {
     /// than `cpu-zstd` — passthrough / gzip / nvcomp-* / cpu-zstd-dict
     /// are out of scope for this tool.
     UnsupportedCodec,
+    /// Body carries the `S4F2` / `S4P1` magic but no `s4-codec`
+    /// metadata stamp — a backend-written framed object without
+    /// gateway metadata. Skipped by default (the bytes may be a
+    /// foreign format that merely shares the prefix); pass
+    /// `--assume-unstamped-framed` to recompact it anyway.
+    UnstampedFramed,
     /// Re-framing at the target level did not shrink the stored bytes
     /// by at least `--min-gain-percent`.
     InsufficientGain,
@@ -185,6 +209,10 @@ pub struct RecompactParams {
     /// Only rewrite objects whose `LastModified` is at least this old.
     /// `None` = no age filter.
     pub older_than: Option<Duration>,
+    /// Treat S4F2/S4P1-framed objects with **no** `s4-codec` metadata
+    /// stamp as gateway frames and recompact them (`false` = skip them
+    /// as `unstamped-framed`, the safe default — see [`SkipReason`]).
+    pub assume_unstamped_framed: bool,
 }
 
 /// One per-object hard failure (the object was left as-is unless the
@@ -208,8 +236,8 @@ pub struct RecompactReport {
     pub min_gain_percent: f64,
     /// `--older-than` cutoff in seconds (`null` = no age filter).
     pub older_than_secs: Option<u64>,
-    /// Objects listed (after `.s4index` / `.s4dict/` exclusion, before
-    /// any skip).
+    /// Objects listed (after `.s4index` / `.s4dict/` / `.__s4ver__/`
+    /// exclusion, before any skip).
     pub total_objects: u64,
     pub total_bytes: u64,
     /// `true` when listing stopped at `max_objects` with more keys
@@ -227,6 +255,9 @@ pub struct RecompactReport {
     pub skipped_not_s4: u64,
     pub skipped_already_compacted: u64,
     pub skipped_unsupported_codec: u64,
+    /// Framed body without the gateway's `s4-codec` stamp, skipped
+    /// because `--assume-unstamped-framed` was not passed.
+    pub skipped_unstamped_framed: u64,
     pub skipped_insufficient_gain: u64,
     pub skipped_too_large: u64,
     pub skipped_etag_raced: u64,
@@ -319,11 +350,16 @@ fn is_already_compacted(meta_level: Option<&str>, target_level: i32) -> bool {
 /// the codec stamp is checked **before** the frame magic so a
 /// gateway-written passthrough object (raw body, `s4-codec:
 /// passthrough`) classifies as `UnsupportedCodec`, not `NotS4`.
+/// A framed body with **no** codec stamp at all is `UnstampedFramed`
+/// unless `assume_unstamped_framed` opts in — the gateway and migrate
+/// always stamp, so unstamped S4F2 bytes were written by something
+/// else and must not be silently "promoted".
 fn classify_probe(
     meta_codec: Option<&str>,
     meta_level: Option<&str>,
     body_prefix: &[u8],
     target_level: i32,
+    assume_unstamped_framed: bool,
 ) -> Option<SkipReason> {
     if let Some(codec) = meta_codec
         && codec != CodecKind::CpuZstd.as_str()
@@ -335,6 +371,9 @@ fn classify_probe(
         // bodies (cpu-zstd stamp, no framing) — recompact only handles
         // framed objects.
         return Some(SkipReason::NotS4);
+    }
+    if meta_codec.is_none() && !assume_unstamped_framed {
+        return Some(SkipReason::UnstampedFramed);
     }
     if is_already_compacted(meta_level, target_level) {
         return Some(SkipReason::AlreadyCompacted);
@@ -369,10 +408,11 @@ struct Inventory {
     truncated: bool,
 }
 
-/// Paginate `ListObjectsV2`, skipping `.s4index` sidecars and
-/// `.s4dict/` dictionary objects, stopping at `max_objects` collected
-/// keys. Same pagination shape as `migrate::list_inventory`, plus the
-/// `LastModified` capture the `--older-than` filter needs.
+/// Paginate `ListObjectsV2`, skipping internal keys (`.s4index`
+/// sidecars, `.s4dict/` dictionaries, `.__s4ver__/` version shadows),
+/// stopping at `max_objects` collected keys. Same pagination shape as
+/// `migrate::list_inventory`, plus the `LastModified` capture the
+/// `--older-than` filter needs.
 async fn list_inventory(
     client: &Client,
     bucket: &str,
@@ -398,7 +438,7 @@ async fn list_inventory(
         })?;
         for obj in resp.contents() {
             let Some(k) = obj.key() else { continue };
-            if k.ends_with(SIDECAR_SUFFIX) || crate::dict::is_dict_key(k) {
+            if crate::migrate::is_internal_key(k) {
                 continue;
             }
             if let Some(cap) = max_objects
@@ -558,6 +598,7 @@ async fn recompact_one(
         probe_level.as_deref(),
         &head_bytes,
         params.target_zstd_level,
+        params.assume_unstamped_framed,
     ) {
         return ObjectOutcome::Skipped(reason);
     }
@@ -578,12 +619,27 @@ async fn recompact_one(
             };
         }
     };
+    // Size gate BEFORE buffering: when the response declares its
+    // Content-Length, an over-cap stored body is skipped without
+    // reading it (the listing snapshot may have raced a grow). Unknown
+    // length falls through to the post-collect check below, as before.
+    if let Some(len) = resp.content_length().and_then(|l| u64::try_from(l).ok())
+        && len > params.max_body_bytes
+    {
+        return ObjectOutcome::Skipped(SkipReason::TooLarge);
+    }
     let source_etag = resp.e_tag().map(normalize_etag);
     let content_type = resp.content_type().map(str::to_owned);
     let cache_control = resp.cache_control().map(str::to_owned);
     let content_disposition = resp.content_disposition().map(str::to_owned);
     let content_encoding = resp.content_encoding().map(str::to_owned);
     let content_language = resp.content_language().map(str::to_owned);
+    // Carry the storage class over (None / STANDARD are left unset so
+    // the PUT takes the bucket default, same as the original PUT did).
+    let storage_class = resp
+        .storage_class()
+        .filter(|sc| **sc != aws_sdk_s3::types::StorageClass::Standard)
+        .cloned();
     let mut metadata = resp.metadata().cloned().unwrap_or_default();
     let stored = match resp.body.collect().await {
         Ok(b) => b.into_bytes(),
@@ -607,6 +663,7 @@ async fn recompact_one(
         metadata.get(META_ZSTD_LEVEL).map(String::as_str),
         &stored,
         params.target_zstd_level,
+        params.assume_unstamped_framed,
     ) {
         return ObjectOutcome::Skipped(reason);
     }
@@ -708,6 +765,19 @@ async fn recompact_one(
         return ObjectOutcome::Skipped(SkipReason::EtagRaced);
     }
 
+    // Carry object tags over (same policy as migrate). A tagging-read
+    // failure is a hard failure — skipping silently would strip
+    // lifecycle/billing tags on the overwrite; nothing written yet.
+    let tags = match crate::migrate::fetch_tags(client, bucket, &job.key).await {
+        Ok(t) => t,
+        Err(cause) => {
+            return ObjectOutcome::Failed {
+                op: "GetObjectTagging",
+                cause,
+            };
+        }
+    };
+
     // Preserve the user's metadata, re-stamp the manifest keys for the
     // new frames, and add the recompact level stamp. Stale `s4-*`
     // leftovers (including `s4-multipart` — the rewrite is a single
@@ -738,6 +808,12 @@ async fn recompact_one(
         .set_content_disposition(content_disposition)
         .set_content_encoding(content_encoding)
         .set_content_language(content_language)
+        .set_storage_class(storage_class)
+        .set_tagging(if tags.is_empty() {
+            None
+        } else {
+            Some(crate::migrate::encode_tagging(&tags))
+        })
         .send()
         .await
     {
@@ -837,6 +913,7 @@ fn fold_outcome(report: &mut RecompactReport, key: String, outcome: ObjectOutcom
             SkipReason::NotS4 => report.skipped_not_s4 += 1,
             SkipReason::AlreadyCompacted => report.skipped_already_compacted += 1,
             SkipReason::UnsupportedCodec => report.skipped_unsupported_codec += 1,
+            SkipReason::UnstampedFramed => report.skipped_unstamped_framed += 1,
             SkipReason::InsufficientGain => report.skipped_insufficient_gain += 1,
             SkipReason::TooLarge => report.skipped_too_large += 1,
             SkipReason::EtagRaced => report.skipped_etag_raced += 1,
@@ -919,6 +996,7 @@ pub async fn run_recompact(
         skipped_not_s4: 0,
         skipped_already_compacted: 0,
         skipped_unsupported_codec: 0,
+        skipped_unstamped_framed: 0,
         skipped_insufficient_gain: 0,
         skipped_too_large: 0,
         skipped_etag_raced: 0,
@@ -951,6 +1029,13 @@ pub async fn run_recompact(
          and the PUT is silently overwritten"
             .into(),
     );
+    report.notes.push(
+        "storage class and object tags are carried over on each rewrite; ACLs and \
+         Object Lock retention/legal-hold are NOT — the overwrite PUT resets them to \
+         bucket defaults, so do not recompact buckets relying on per-object ACLs or \
+         Object Lock"
+            .into(),
+    );
     if report.versioning_enabled {
         report.notes.push(
             "WARNING: bucket versioning is Enabled — each recompacted object leaves its \
@@ -981,6 +1066,14 @@ pub async fn run_recompact(
             "{} object(s) skipped as not-s4 — they are not S4-framed; run `s4 migrate` \
              first to frame them, then recompact",
             report.skipped_not_s4,
+        ));
+    }
+    if report.skipped_unstamped_framed > 0 {
+        report.notes.push(format!(
+            "{} object(s) skipped as unstamped-framed — S4F2/S4P1-framed bytes without \
+             gateway metadata (backend-written?); pass --assume-unstamped-framed to \
+             recompact them anyway",
+            report.skipped_unstamped_framed,
         ));
     }
     if report.failed > 0 {
@@ -1048,10 +1141,12 @@ pub fn render_human(report: &RecompactReport) -> String {
     let _ = writeln!(
         out,
         "  skipped: {} not-s4, {} already-compacted, {} unsupported-codec, \
-         {} insufficient-gain, {} too-large, {} etag-raced, {} too-recent",
+         {} unstamped-framed, {} insufficient-gain, {} too-large, {} etag-raced, \
+         {} too-recent",
         report.skipped_not_s4,
         report.skipped_already_compacted,
         report.skipped_unsupported_codec,
+        report.skipped_unstamped_framed,
         report.skipped_insufficient_gain,
         report.skipped_too_large,
         report.skipped_etag_raced,
@@ -1159,41 +1254,63 @@ mod tests {
         let s4 = b"S4F2rest".as_slice();
         let raw = b"plain te".as_slice();
         // Candidate: cpu-zstd framed, no level stamp.
-        assert_eq!(classify_probe(Some("cpu-zstd"), None, s4, 19), None);
-        // Candidate: framed but no metadata at all (frames are
-        // self-describing; the per-frame codec check still guards).
-        assert_eq!(classify_probe(None, None, s4, 19), None);
+        assert_eq!(classify_probe(Some("cpu-zstd"), None, s4, 19, false), None);
+        // Framed but no metadata at all: NOT a candidate by default —
+        // the gateway and migrate always stamp, so unstamped S4F2 bytes
+        // were written by something else and must not be promoted.
+        assert_eq!(
+            classify_probe(None, None, s4, 19, false),
+            Some(SkipReason::UnstampedFramed)
+        );
+        // ... unless the operator opts in with --assume-unstamped-framed.
+        assert_eq!(classify_probe(None, None, s4, 19, true), None);
         // Candidate: stamped below target.
-        assert_eq!(classify_probe(Some("cpu-zstd"), Some("3"), s4, 19), None);
+        assert_eq!(
+            classify_probe(Some("cpu-zstd"), Some("3"), s4, 19, false),
+            None
+        );
         // Already at/above target.
         assert_eq!(
-            classify_probe(Some("cpu-zstd"), Some("19"), s4, 19),
+            classify_probe(Some("cpu-zstd"), Some("19"), s4, 19, false),
             Some(SkipReason::AlreadyCompacted)
         );
         // Codec gate fires BEFORE the magic gate: a gateway passthrough
         // object (raw body + stamp) is unsupported-codec, not not-s4.
         assert_eq!(
-            classify_probe(Some("passthrough"), None, raw, 19),
+            classify_probe(Some("passthrough"), None, raw, 19, false),
             Some(SkipReason::UnsupportedCodec)
         );
         for codec in ["cpu-gzip", "nvcomp-zstd", "nvcomp-bitcomp", "cpu-zstd-dict"] {
             assert_eq!(
-                classify_probe(Some(codec), None, s4, 19),
+                classify_probe(Some(codec), None, s4, 19, false),
                 Some(SkipReason::UnsupportedCodec),
                 "{codec} must be unsupported"
             );
         }
-        // Plain object: not-s4.
-        assert_eq!(classify_probe(None, None, raw, 19), Some(SkipReason::NotS4));
+        // Plain object: not-s4 (with or without the opt-in flag — the
+        // flag only widens the framed case, never the unframed one).
+        assert_eq!(
+            classify_probe(None, None, raw, 19, false),
+            Some(SkipReason::NotS4)
+        );
+        assert_eq!(
+            classify_probe(None, None, raw, 19, true),
+            Some(SkipReason::NotS4)
+        );
         // Legacy raw-zstd (cpu-zstd stamp, zstd magic, no framing).
         assert_eq!(
-            classify_probe(Some("cpu-zstd"), None, &[0x28, 0xb5, 0x2f, 0xfd], 19),
+            classify_probe(Some("cpu-zstd"), None, &[0x28, 0xb5, 0x2f, 0xfd], 19, false),
             Some(SkipReason::NotS4)
         );
         // Padding magic counts as framed.
         assert_eq!(
-            classify_probe(Some("cpu-zstd"), None, b"S4P1\0\0\0\0", 19),
+            classify_probe(Some("cpu-zstd"), None, b"S4P1\0\0\0\0", 19, false),
             None
+        );
+        // Unstamped padding magic is gated like unstamped data frames.
+        assert_eq!(
+            classify_probe(None, None, b"S4P1\0\0\0\0", 19, false),
+            Some(SkipReason::UnstampedFramed)
         );
     }
 
@@ -1231,6 +1348,7 @@ mod tests {
             skipped_not_s4: 0,
             skipped_already_compacted: 0,
             skipped_unsupported_codec: 0,
+            skipped_unstamped_framed: 0,
             skipped_insufficient_gain: 0,
             skipped_too_large: 0,
             skipped_etag_raced: 0,
@@ -1265,6 +1383,7 @@ mod tests {
             ("c", SkipReason::NotS4),
             ("d", SkipReason::AlreadyCompacted),
             ("e", SkipReason::UnsupportedCodec),
+            ("e2", SkipReason::UnstampedFramed),
             ("f", SkipReason::InsufficientGain),
             ("g", SkipReason::TooLarge),
             ("h", SkipReason::EtagRaced),
@@ -1287,6 +1406,7 @@ mod tests {
         assert_eq!(report.skipped_not_s4, 1);
         assert_eq!(report.skipped_already_compacted, 1);
         assert_eq!(report.skipped_unsupported_codec, 1);
+        assert_eq!(report.skipped_unstamped_framed, 1);
         assert_eq!(report.skipped_insufficient_gain, 1);
         assert_eq!(report.skipped_too_large, 1);
         assert_eq!(report.skipped_etag_raced, 1);
@@ -1333,6 +1453,7 @@ mod tests {
         assert_eq!(v["skipped_not_s4"], 1);
         assert_eq!(v["skipped_already_compacted"], 0);
         assert_eq!(v["skipped_unsupported_codec"], 1);
+        assert_eq!(v["skipped_unstamped_framed"], 0);
         assert_eq!(v["skipped_insufficient_gain"], 0);
         assert_eq!(v["skipped_too_large"], 0);
         assert_eq!(v["skipped_etag_raced"], 0);
@@ -1352,6 +1473,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(SkipReason::UnsupportedCodec).expect("skip reason"),
             "unsupported-codec"
+        );
+        assert_eq!(
+            serde_json::to_value(SkipReason::UnstampedFramed).expect("skip reason"),
+            "unstamped-framed"
         );
         assert_eq!(
             serde_json::to_value(SkipReason::InsufficientGain).expect("skip reason"),
@@ -1436,6 +1561,7 @@ mod tests {
             target_zstd_level: DEFAULT_TARGET_ZSTD_LEVEL,
             min_gain_percent: DEFAULT_MIN_GAIN_PERCENT,
             older_than: None,
+            assume_unstamped_framed: false,
         };
         let registry = Arc::new(build_registry(&params));
 

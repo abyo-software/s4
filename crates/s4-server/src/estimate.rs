@@ -4,7 +4,9 @@
 //! **before** the gateway is deployed. The tool:
 //!
 //! 1. Lists the bucket (or a prefix) via `ListObjectsV2`, excluding
-//!    `.s4index` sidecars, capped at `max_list_keys`.
+//!    S4-internal keys (`.s4index` sidecars, `.s4dict/` shared
+//!    dictionaries, `.__s4ver__/` versioning shadow keys — counting
+//!    those would skew the projection), capped at `max_list_keys`.
 //! 2. Stratifies objects by file extension (`.log`, `.json`, … or
 //!    `"(none)"`), then draws up to `samples_per_stratum` objects per
 //!    stratum, **size-weighted without replacement**, from a seeded
@@ -42,6 +44,16 @@
 //!   measures the head of the object, which can compress differently
 //!   from the tail (e.g. a sorted column store). The report carries a
 //!   fixed note about this.
+//! - **Single-stream measurement bias**: each sample is compressed as
+//!   one continuous zstd stream, but the real server resets the
+//!   stream at every 4 MiB chunk boundary
+//!   (`DEFAULT_S4F2_CHUNK_SIZE`), losing cross-chunk history. Ratios
+//!   measured on up-to-8-MiB single-stream samples are therefore
+//!   slightly **optimistic** versus what the gateway will store. The
+//!   report carries a fixed note about this too.
+//! - **Sample races**: an object deleted between the listing and its
+//!   sample GET (404 / NoSuchKey) is skipped — like the empty-body
+//!   race — and counted in a report note instead of aborting the run.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -53,7 +65,6 @@ use rand::{Rng, SeedableRng};
 use s4_codec::cpu_gzip::CpuGzip;
 use s4_codec::cpu_zstd::CpuZstd;
 use s4_codec::dispatcher::{AlwaysDispatcher, SamplingDispatcher};
-use s4_codec::index::SIDECAR_SUFFIX;
 use s4_codec::multipart::FRAME_HEADER_BYTES;
 use s4_codec::passthrough::Passthrough;
 use s4_codec::{CodecDispatcher, CodecKind, CodecRegistry};
@@ -335,9 +346,10 @@ struct Inventory {
     truncated: bool,
 }
 
-/// Paginate `ListObjectsV2`, skipping `.s4index` sidecars, stopping at
-/// `max_list_keys` collected objects. Same pagination shape as
-/// `repair::sweep_orphan_sidecars`.
+/// Paginate `ListObjectsV2`, skipping internal keys (`.s4index`
+/// sidecars, `.s4dict/` dictionaries, `.__s4ver__/` version shadows),
+/// stopping at `max_list_keys` collected objects. Same pagination
+/// shape as `repair::sweep_orphan_sidecars`.
 async fn list_inventory(
     client: &Client,
     bucket: &str,
@@ -363,7 +375,7 @@ async fn list_inventory(
         })?;
         for obj in resp.contents() {
             let Some(k) = obj.key() else { continue };
-            if k.ends_with(SIDECAR_SUFFIX) {
+            if crate::migrate::is_internal_key(k) {
                 continue;
             }
             if objects.len() >= max_list_keys {
@@ -425,6 +437,31 @@ struct SampleMeasurement {
     gpu_proxy: bool,
 }
 
+/// One sample's fate. The two skip arms are benign mid-run races (the
+/// bucket changed between the listing and the GET); neither aborts
+/// the whole estimate.
+enum SampleOutcome {
+    Measured(SampleMeasurement),
+    /// 404 / NoSuchKey: the listed object was deleted before its
+    /// sample GET. Counted in a report note.
+    Missing,
+    /// Listed size said > 0 but the body came back empty (raced
+    /// overwrite). Skipped rather than divide by zero.
+    Empty,
+}
+
+/// `true` when a sample GET failed because the object no longer exists
+/// (deleted between the listing and the GET): the modeled `NoSuchKey`
+/// service error, or any raw HTTP 404 (covers backends that 404
+/// without the modeled code). Split out of [`measure_one`] so the
+/// classification is unit-testable without a network.
+fn is_missing_object_error(
+    service_error: Option<&aws_sdk_s3::operation::get_object::GetObjectError>,
+    http_status: Option<u16>,
+) -> bool {
+    service_error.is_some_and(|e| e.is_no_such_key()) || http_status == Some(404)
+}
+
 /// GET (optionally Range-limited) + dispatch + compress one sample.
 async fn measure_one(
     client: &Client,
@@ -433,17 +470,28 @@ async fn measure_one(
     dispatcher: &Arc<dyn CodecDispatcher>,
     registry: &CodecRegistry,
     max_sample_bytes: u64,
-) -> Result<Option<SampleMeasurement>, EstimateError> {
+) -> Result<SampleOutcome, EstimateError> {
     let mut req = client.get_object().bucket(bucket).key(&obj.key);
     if obj.size > max_sample_bytes {
         req = req.range(format!("bytes=0-{}", max_sample_bytes - 1));
     }
-    let resp = req.send().await.map_err(|e| EstimateError::Backend {
-        op: "GetObject",
-        bucket: bucket.into(),
-        key: obj.key.clone(),
-        cause: format!("{e}"),
-    })?;
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            // A listed object deleted mid-run is a benign race, not a
+            // reason to abort the whole estimate.
+            let status = e.raw_response().map(|r| r.status().as_u16());
+            if is_missing_object_error(e.as_service_error(), status) {
+                return Ok(SampleOutcome::Missing);
+            }
+            return Err(EstimateError::Backend {
+                op: "GetObject",
+                bucket: bucket.into(),
+                key: obj.key.clone(),
+                cause: format!("{e}"),
+            });
+        }
+    };
     let body = resp
         .body
         .collect()
@@ -456,9 +504,7 @@ async fn measure_one(
         })?
         .into_bytes();
     if body.is_empty() {
-        // Listed size said > 0 but the body came back empty (raced
-        // overwrite). Skip the sample rather than divide by zero.
-        return Ok(None);
+        return Ok(SampleOutcome::Empty);
     }
     let sample_len = body.len().min(DISPATCH_SAMPLE_BYTES);
     // Same call shape as the server PUT path: prefix sample + the full
@@ -476,7 +522,7 @@ async fn measure_one(
             key: obj.key.clone(),
             cause: format!("{e}"),
         })?;
-    Ok(Some(SampleMeasurement {
+    Ok(SampleOutcome::Measured(SampleMeasurement {
         full_size: obj.size,
         bytes_read: body.len() as u64,
         framed_bytes: compressed.len() as u64 + FRAME_HEADER_BYTES as u64,
@@ -519,6 +565,7 @@ pub async fn run_estimate(
     let mut sampled_objects: u64 = 0;
     let mut sampled_bytes_read: u64 = 0;
     let mut sampled_full_bytes: u64 = 0;
+    let mut samples_missing: u64 = 0;
     let mut proxied_codecs: BTreeMap<String, u64> = BTreeMap::new();
 
     for (stratum, indices) in &strata {
@@ -531,7 +578,7 @@ pub async fn run_estimate(
         let mut stratum_read: u64 = 0;
         for &pos in &chosen {
             let obj = &inventory.objects[indices[pos]];
-            let Some(m) = measure_one(
+            let m = match measure_one(
                 client,
                 bucket,
                 obj,
@@ -540,8 +587,13 @@ pub async fn run_estimate(
                 max_sample_bytes,
             )
             .await?
-            else {
-                continue;
+            {
+                SampleOutcome::Measured(m) => m,
+                SampleOutcome::Missing => {
+                    samples_missing += 1;
+                    continue;
+                }
+                SampleOutcome::Empty => continue,
             };
             sampled_objects += 1;
             sampled_bytes_read += m.bytes_read;
@@ -623,6 +675,18 @@ pub async fn run_estimate(
          bytes only; the whole-object ratio can differ from the prefix ratio"
             .into(),
     );
+    notes.push(
+        "samples are compressed as one continuous stream, but the running server resets \
+         the zstd stream every 4 MiB chunk — measured ratios are slightly optimistic \
+         versus what the gateway will store"
+            .into(),
+    );
+    if samples_missing > 0 {
+        notes.push(format!(
+            "{samples_missing} sampled object(s) returned 404/NoSuchKey mid-run (deleted \
+             between the listing and the sample GET) and were skipped"
+        ));
+    }
     if inventory.truncated {
         notes.push(format!(
             "listing truncated at --max-list-keys={}: totals and projections cover only \
@@ -833,6 +897,27 @@ mod tests {
         // (90 bytes @ 0.1) + (10 bytes @ 0.9) -> 0.18.
         let r = weighted_mean_ratio(&[(90, 0.1), (10, 0.9)]);
         assert!((r - 0.18).abs() < 1e-12, "got {r}");
+    }
+
+    #[test]
+    fn missing_object_error_classification() {
+        use aws_sdk_s3::operation::get_object::GetObjectError;
+        use aws_sdk_s3::types::error::NoSuchKey;
+
+        // Modeled NoSuchKey → missing, regardless of the status hint.
+        let no_such_key = GetObjectError::NoSuchKey(NoSuchKey::builder().build());
+        assert!(is_missing_object_error(Some(&no_such_key), None));
+        assert!(is_missing_object_error(Some(&no_such_key), Some(404)));
+        // Raw 404 without a modeled code (e.g. some backends on ranged
+        // GETs) → missing.
+        assert!(is_missing_object_error(None, Some(404)));
+        // Anything else aborts the run as a real backend error.
+        let invalid_state = GetObjectError::InvalidObjectState(
+            aws_sdk_s3::types::error::InvalidObjectState::builder().build(),
+        );
+        assert!(!is_missing_object_error(Some(&invalid_state), Some(403)));
+        assert!(!is_missing_object_error(None, Some(500)));
+        assert!(!is_missing_object_error(None, None));
     }
 
     #[test]

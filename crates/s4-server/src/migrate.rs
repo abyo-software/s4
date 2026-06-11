@@ -25,6 +25,9 @@
 //! 5. Multi-frame results get the same `<key>.s4index` sidecar the
 //!    gateway writes (ETag + size binding stamped from the PUT
 //!    response), so Range GETs keep the partial-fetch fast path.
+//!    Single-frame results delete any stale multi-frame sidecar a
+//!    previous shape of the object left behind (HEAD-then-DELETE,
+//!    same policy as `s4 recompact`).
 //!
 //! ## Dry-run by default
 //!
@@ -49,6 +52,17 @@
 //! - **Versioned buckets work but double-bill**: the overwrite PUT
 //!   leaves the old (uncompressed) version in place. The report warns
 //!   when `GetBucketVersioning` says `Enabled`.
+//! - **Storage class and object tags are carried over** on the rewrite
+//!   PUT (the GET's storage class is re-sent unless it is
+//!   absent/STANDARD; tags come from `GetObjectTagging`). **ACLs and
+//!   Object Lock retention/legal-hold are NOT carried over** — the
+//!   overwrite PUT resets them to the bucket defaults. Buckets that
+//!   rely on per-object ACLs or Object Lock must not be migrated with
+//!   this tool; the report repeats this in `notes`.
+//! - **Internal keys are never touched**: `.s4index` sidecars,
+//!   `.s4dict/` shared dictionaries and `.__s4ver__/` versioning
+//!   shadow keys are excluded from the listing — re-compressing any of
+//!   them would corrupt dictionary GETs or version restores.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -121,8 +135,12 @@ pub enum SkipReason {
     /// The ETag changed between the GET and the pre-PUT HEAD —
     /// a concurrent writer won; nothing was overwritten.
     EtagRaced,
-    /// The mandatory decompress-roundtrip byte comparison failed;
-    /// nothing was written.
+    /// Deprecated since v1.0.1: a roundtrip-verify failure on bytes we
+    /// just framed ourselves is a bug, so it is now reported as a hard
+    /// failure (`failures[].op == "verify"`, exit 1) — same policy as
+    /// `recompact`. The variant is kept (the enum is `#[non_exhaustive]`
+    /// and the `skipped_verify_failed` JSON field stays, always `0`) so
+    /// downstream JSON consumers keep parsing.
     VerifyFailed,
 }
 
@@ -191,7 +209,8 @@ pub struct MigrateReport {
     pub prefix: Option<String>,
     /// `true` = nothing was written (default mode).
     pub dry_run: bool,
-    /// Objects listed (after `.s4index` exclusion, before any skip).
+    /// Objects listed (after `.s4index` / `.s4dict/` / `.__s4ver__/`
+    /// exclusion, before any skip).
     pub total_objects: u64,
     pub total_bytes: u64,
     /// `true` when listing stopped at `max_objects` with more keys
@@ -264,6 +283,25 @@ pub(crate) fn normalize_etag(s: &str) -> String {
     s.trim_matches('"').to_owned()
 }
 
+/// `true` for `.__s4ver__/` versioning shadow keys — the backend-side
+/// storage the gateway uses for non-current versions on
+/// versioning-Enabled buckets (`service::versioned_shadow_key`). The
+/// offline tools must exclude them exactly like the gateway's listing
+/// filter does: rewriting a shadow key would break the version-restore
+/// path, and counting one would skew the estimate. `pub(crate)` for
+/// `estimate` / `recompact`, which apply the same exclusion.
+pub(crate) fn is_versioning_shadow_key(key: &str) -> bool {
+    key.contains(".__s4ver__/")
+}
+
+/// `true` for keys the offline tools (estimate / migrate / recompact)
+/// must never list as work items: `.s4index` sidecars, `.s4dict/`
+/// shared dictionaries, and `.__s4ver__/` versioning shadow keys.
+/// `pub(crate)` for `estimate` / `recompact`.
+pub(crate) fn is_internal_key(key: &str) -> bool {
+    key.ends_with(SIDECAR_SUFFIX) || crate::dict::is_dict_key(key) || is_versioning_shadow_key(key)
+}
+
 #[derive(Debug, Clone)]
 struct ObjectJob {
     key: String,
@@ -275,8 +313,9 @@ struct Inventory {
     truncated: bool,
 }
 
-/// Paginate `ListObjectsV2`, skipping `.s4index` sidecars, stopping at
-/// `max_objects` collected keys. Same pagination shape as
+/// Paginate `ListObjectsV2`, skipping internal keys (`.s4index`
+/// sidecars, `.s4dict/` dictionaries, `.__s4ver__/` version shadows),
+/// stopping at `max_objects` collected keys. Same pagination shape as
 /// `estimate::list_inventory` / `repair::sweep_orphan_sidecars`.
 async fn list_inventory(
     client: &Client,
@@ -303,7 +342,7 @@ async fn list_inventory(
         })?;
         for obj in resp.contents() {
             let Some(k) = obj.key() else { continue };
-            if k.ends_with(SIDECAR_SUFFIX) {
+            if is_internal_key(k) {
                 continue;
             }
             if let Some(cap) = max_objects
@@ -330,6 +369,52 @@ async fn list_inventory(
         }
     }
     Ok(Inventory { objects, truncated })
+}
+
+/// URL-encode one `key=value` tag set as the `x-amz-tagging` PUT header
+/// expects (`k1=v1&k2=v2`, both halves percent-encoded). Uses the same
+/// AWS canonical set the SigV4 path uses (everything but unreserved
+/// characters), which is a superset of what the header needs — safe,
+/// never under-encoded. `pub(crate)` for `recompact`.
+pub(crate) fn encode_tagging(tags: &[(String, String)]) -> String {
+    const ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    tags.iter()
+        .map(|(k, v)| {
+            format!(
+                "{}={}",
+                percent_encoding::utf8_percent_encode(k, ENCODE_SET),
+                percent_encoding::utf8_percent_encode(v, ENCODE_SET),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// `GetObjectTagging` → the object's tag set as `(key, value)` pairs.
+/// Carried over verbatim on the rewrite PUT so retro-compression does
+/// not silently strip lifecycle/billing tags. `pub(crate)` for
+/// `recompact` (same carry-over).
+pub(crate) async fn fetch_tags(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let resp = client
+        .get_object_tagging()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(|e| format!("{e}"))?;
+    Ok(resp
+        .tag_set()
+        .iter()
+        .map(|t| (t.key().to_owned(), t.value().to_owned()))
+        .collect())
 }
 
 /// `GetBucketVersioning` → `Ok(true)` iff the bucket reports `Enabled`.
@@ -513,12 +598,27 @@ async fn migrate_one(
             };
         }
     };
+    // Size gate BEFORE buffering: when the response declares its
+    // Content-Length, an over-cap body is skipped without reading it
+    // (the listing snapshot may have raced a grow). Unknown length
+    // falls through to the post-collect check below, as before.
+    if let Some(len) = resp.content_length().and_then(|l| u64::try_from(l).ok())
+        && len > params.max_body_bytes
+    {
+        return ObjectOutcome::Skipped(SkipReason::TooLarge);
+    }
     let source_etag = resp.e_tag().map(normalize_etag);
     let content_type = resp.content_type().map(str::to_owned);
     let cache_control = resp.cache_control().map(str::to_owned);
     let content_disposition = resp.content_disposition().map(str::to_owned);
     let content_encoding = resp.content_encoding().map(str::to_owned);
     let content_language = resp.content_language().map(str::to_owned);
+    // Carry the storage class over (None / STANDARD are left unset so
+    // the PUT takes the bucket default, same as the original PUT did).
+    let storage_class = resp
+        .storage_class()
+        .filter(|sc| **sc != aws_sdk_s3::types::StorageClass::Standard)
+        .cloned();
     let mut metadata = resp.metadata().cloned().unwrap_or_default();
     let body = match resp.body.collect().await {
         Ok(b) => b.into_bytes(),
@@ -575,9 +675,15 @@ async fn migrate_one(
     }
 
     // Mandatory roundtrip verify — runs in dry-run too, so the dry-run
-    // counts are exactly what `--execute` would write.
+    // counts are exactly what `--execute` would write. A failure here
+    // means we mis-framed bytes we just produced: that is a bug,
+    // surfaced loudly as a hard failure (exit 1), not a skip — same
+    // policy as `recompact`.
     if !verify_roundtrip(registry, framed.clone(), &body).await {
-        return ObjectOutcome::Skipped(SkipReason::VerifyFailed);
+        return ObjectOutcome::Failed {
+            op: "verify",
+            cause: "roundtrip verify failed on freshly framed bytes (bug — nothing written)".into(),
+        };
     }
 
     let outcome = ObjectOutcome::Migrated {
@@ -611,6 +717,19 @@ async fn migrate_one(
         return ObjectOutcome::Skipped(SkipReason::EtagRaced);
     }
 
+    // Carry object tags over. A tagging-read failure is a hard failure
+    // (skipping silently would strip lifecycle/billing tags on the
+    // overwrite); nothing has been written yet at this point.
+    let tags = match fetch_tags(client, bucket, &job.key).await {
+        Ok(t) => t,
+        Err(cause) => {
+            return ObjectOutcome::Failed {
+                op: "GetObjectTagging",
+                cause,
+            };
+        }
+    };
+
     // Stamp the exact metadata contract the gateway PUT path writes
     // (`write_manifest` + the framed flag), preserving the user's own
     // metadata. Pre-existing `s4-*` keys are dropped — they could only
@@ -639,6 +758,12 @@ async fn migrate_one(
         .set_content_disposition(content_disposition)
         .set_content_encoding(content_encoding)
         .set_content_language(content_language)
+        .set_storage_class(storage_class)
+        .set_tagging(if tags.is_empty() {
+            None
+        } else {
+            Some(encode_tagging(&tags))
+        })
         .send()
         .await
     {
@@ -680,7 +805,43 @@ async fn migrate_one(
                 };
             }
         }
-        Ok(_) => {} // single frame: no sidecar by design (gateway parity)
+        Ok(_) => {
+            // Single frame: no sidecar by design (gateway parity). Remove
+            // a stale multi-frame one if the object's previous shape had
+            // left it behind (e.g. migrated multi-frame, overwritten by a
+            // direct plain PUT, now re-migrated single-frame). The
+            // existence HEAD keeps versioned buckets from accumulating
+            // delete markers for never-existing sidecar keys. NOTE on the
+            // concurrent-writer race: a writer landing between our PUT
+            // and this DELETE could have written a fresh sidecar that we
+            // now remove — that is perf-only (the gateway falls back to a
+            // full-read on a missing sidecar), never a correctness loss.
+            let sidecar = sidecar_key(&job.key);
+            let exists = client
+                .head_object()
+                .bucket(bucket)
+                .key(&sidecar)
+                .send()
+                .await
+                .is_ok();
+            if exists
+                && let Err(e) = client
+                    .delete_object()
+                    .bucket(bucket)
+                    .key(&sidecar)
+                    .send()
+                    .await
+            {
+                return ObjectOutcome::Failed {
+                    op: "DeleteObject(sidecar)",
+                    cause: format!(
+                        "object migrated but its now-stale sidecar could not be deleted \
+                         (the gateway ignores it via the ETag binding; clean up with \
+                         `s4 sweep-orphan-sidecars`): {e}"
+                    ),
+                };
+            }
+        }
         Err(e) => {
             // We just framed these bytes ourselves; an unparseable body
             // here is a bug, not an operator condition. Surface loudly.
@@ -824,6 +985,13 @@ pub async fn run_migrate(
         "conflict safety: the source ETag is re-checked via HEAD immediately before each \
          overwrite, but S3 has no compare-and-swap — a writer landing between the HEAD \
          and the PUT is silently overwritten"
+            .into(),
+    );
+    report.notes.push(
+        "storage class and object tags are carried over on each rewrite; ACLs and \
+         Object Lock retention/legal-hold are NOT — the overwrite PUT resets them to \
+         bucket defaults, so do not migrate buckets relying on per-object ACLs or \
+         Object Lock"
             .into(),
     );
     if report.versioning_enabled {
@@ -1013,6 +1181,47 @@ mod tests {
     fn etag_normalization() {
         assert_eq!(normalize_etag("\"abc-1\""), "abc-1");
         assert_eq!(normalize_etag("abc-1"), "abc-1");
+    }
+
+    #[test]
+    fn internal_keys_are_excluded_from_listings() {
+        // Sidecars.
+        assert!(is_internal_key("data/file.bin.s4index"));
+        // Shared dictionaries (bucket-root `.s4dict/<id>` only).
+        assert!(is_internal_key(".s4dict/0123456789abcdef"));
+        assert!(
+            !is_internal_key("data/.s4dict/x"),
+            "dict prefix is root-anchored"
+        );
+        // Versioning shadow keys, at any depth.
+        assert!(is_internal_key("file.txt.__s4ver__/v123"));
+        assert!(is_internal_key("a/b/file.txt.__s4ver__/919b51b1-x"));
+        assert!(is_versioning_shadow_key("k.__s4ver__/v1"));
+        assert!(
+            !is_versioning_shadow_key("k.__s4ver__"),
+            "needs the directory slash"
+        );
+        // Regular customer keys pass.
+        assert!(!is_internal_key("logs/app.log"));
+        assert!(!is_internal_key("weird.__s4ver_not_quite/x"));
+    }
+
+    #[test]
+    fn tagging_header_encoding() {
+        assert_eq!(encode_tagging(&[]), "");
+        assert_eq!(encode_tagging(&[("env".into(), "prod".into())]), "env=prod");
+        assert_eq!(
+            encode_tagging(&[
+                ("env".into(), "prod".into()),
+                ("team".into(), "s4 core".into()),
+            ]),
+            "env=prod&team=s4%20core"
+        );
+        // Reserved characters in both halves are percent-encoded.
+        assert_eq!(
+            encode_tagging(&[("k&=".into(), "v+%/ü".into())]),
+            "k%26%3D=v%2B%25%2F%C3%BC"
+        );
     }
 
     fn empty_report() -> MigrateReport {

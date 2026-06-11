@@ -571,6 +571,23 @@ mod imp {
                     continue;
                 }
                 let sizes = &inner.h_comp_sizes[plan.first_chunk..plan.first_chunk + plan.n_chunks];
+                // v1.0.1 audit R1 P3: the per-chunk compressed sizes come
+                // back from the *device* — validate them on the host
+                // before they parameterise any pointer arithmetic. A size
+                // larger than `comp_stride` (the per-chunk slot in the
+                // bulk output buffer) is impossible for a well-behaved
+                // nvCOMP (`sz <= raw_max <= comp_stride`), so treat it as
+                // a corrupt size table and fail the item with a typed
+                // error instead of reading out of the chunk's slot (and,
+                // for the last chunk, past `pinned_out` entirely).
+                if let Some((j, sz)) = sizes.iter().enumerate().find(|(_, sz)| **sz > comp_stride) {
+                    out.push(Err(CodecError::Backend(anyhow::anyhow!(
+                        "nvcomp batched zstd device-reported compressed size {sz} exceeds \
+                         per-chunk stride {comp_stride} at item chunk {j} (corrupt device \
+                         size table?)"
+                    ))));
+                    continue;
+                }
                 let total_comp: usize = sizes.iter().sum();
                 let mut frame: Vec<u8> = Vec::with_capacity(24 + 4 * plan.n_chunks + total_comp);
                 write_header(Algo::Zstd, chunk_size, plan.len, sizes, &mut frame);
@@ -581,7 +598,9 @@ mod imp {
                     let g = plan.first_chunk + j;
                     // SAFETY: `pinned_out` holds `comp_buf_bytes` =
                     // `total_chunks * comp_stride` bytes; chunk `g`'s
-                    // compressed size `sz` <= raw_max <= comp_stride.
+                    // compressed size `sz` was host-validated above to be
+                    // <= comp_stride, so the read stays inside chunk `g`'s
+                    // slot of the bulk output buffer.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             pinned_out.add(g * comp_stride),

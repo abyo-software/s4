@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (audit round 1 — 4 reviewers over v1.0.0..HEAD, 2026-06-11)
+- **P1** `s4 migrate` could rewrite `.s4dict/<id>` dictionary objects as
+  S4F2-framed data, breaking every `cpu-zstd-dict` object in the bucket
+  (lazy fetch fails fingerprint verification). All three bulk tools
+  (`estimate` / `migrate` / `recompact`) now exclude S4-internal keys:
+  `*.s4index`, `.s4dict/`, and `*.__s4ver__/*` versioning shadows.
+- **P1** A client-supplied `x-amz-meta-s4-dict-id` on a plain PUT made
+  the subsequent GET fail 5xx even with `--zstd-dict` unset (default-off
+  behavior regression). The GET dict branch is now gated on the
+  gateway-managed manifest codec (`cpu-zstd-dict`), and `put_object`
+  strips client-supplied `s4-*` metadata keys up front.
+- **P1** (s4fs) SSE-encrypted objects could return AES-GCM ciphertext
+  bytes silently (`passthrough` + SSE). s4fs now refuses with
+  `NotImplementedError` via three layers: `s4-encrypted` metadata,
+  sidecar SSE binding, and `S4E1`–`S4E6` magic sniff.
+- **P1** (s4fs) `<key>.__s4ver__/<version>` shadow objects were not
+  hidden from `ls`/`find`/glob (prefix check instead of infix), so
+  directory dataset scans could silently include stale versions.
+- **P2** `migrate` / `recompact` rewrites dropped the source object's
+  storage class (silent promotion to STANDARD) and object tags; both
+  are now inherited. ACLs / Object Lock retention remain uninherited
+  (stated in report notes).
+- **P2** `migrate` treated a roundtrip-verify failure as a skip
+  (exit 0); it is now a hard failure (exit 1), matching `recompact`.
+  The `skipped_verify_failed` JSON field remains (always 0) for shape
+  compatibility.
+- **P2** Cross-bucket CopyObject of a dict-compressed object now
+  propagates `.s4dict/<id>` to the destination bucket (idempotent,
+  content-addressed); previously the copy succeeded but every GET on
+  the destination failed 5xx.
+- **P2** `.s4dict/` joined the reserved-key guard: gateway PUT / DELETE
+  are rejected with `InvalidObjectName` (reads still allowed) so a
+  bucket-wide dictionary can't be destroyed through the data path.
+- **P2** (s4fs) `info()` no longer trusts a stale sidecar for object
+  size (staleness-checked first), and binding-less legacy v1 sidecars
+  are no longer used for size or partial range reads.
+- **P2** (s4fs) dependency floor corrected to `s4-codec>=1.1.0,<2` —
+  the binding APIs s4fs imports don't exist in the 1.0.0 wheel.
+- **P3** `estimate` no longer aborts the whole run when a sampled
+  object 404s mid-run (skip + note); module/report now disclose the
+  single-stream measurement bias vs the server's 4 MiB chunking.
+- **P3** `migrate` / `recompact` enforce `--max-body-bytes` from the
+  GET `Content-Length` before buffering; `migrate` now also cleans up a
+  stale multi-frame sidecar when its rewrite comes out single-frame.
+- **P3** `recompact` no longer auto-promotes backend-written framed
+  objects that lack gateway metadata (`unstamped-framed` skip; opt back
+  in with `--assume-unstamped-framed`).
+- **P3** Dict hardening: `DictCache` is bucket-scoped, `train-dict`
+  stamps `s4-dict-sha256` (full-digest verification when present), and
+  lazy fetch caps dictionaries at 1 MiB. (s4fs) `open()` on a framed
+  object with inexact size raises instead of silently truncating
+  (`allow_inexact_open=True` restores the old clamp).
+- **P3** `nvcomp_batched` validates device-reported chunk sizes on the
+  host before the unsafe copy (typed per-item error instead of a
+  potential OOB read on driver misbehavior).
+
 ### Added
 - **`--gpu-batch-small-puts`** (opt-in, requires the `nvcomp-gpu` build +
   a CUDA-capable GPU at boot — the server refuses to start otherwise) —
@@ -141,10 +197,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `run_train_dict`, …). **Compatibility note:** pre-v1.1 readers fail a
   GET of a `cpu-zstd-dict` object with the existing *unknown codec id*
   error (graceful typed failure, no silent corruption) — roll mixed
-  fleets forward before enabling the flag. Multipart, CopyObject, and
-  `s4-codec-py` / `s4-codec-wasm` native decode are out of scope
-  (follow-ups). Without `--zstd-dict`, PUT/GET behavior is bit-for-bit
-  unchanged.
+  fleets forward before enabling the flag. Multipart parts and
+  `s4-codec-wasm` native decode are out of scope (follow-ups);
+  `s4-codec-py` decodes dict objects via the `CpuZstdDict` binding
+  added in this release, and cross-bucket CopyObject propagates the
+  dictionary (see Fixed). Without `--zstd-dict`, PUT/GET behavior is
+  bit-for-bit unchanged.
 - **`s4fs` — fsspec filesystem for reading S4 objects without the gateway**
   (new pure-Python package [`python/s4fs/`](python/s4fs/), protocol
   `s4://`). pandas / pyarrow / DuckDB / Polars read gateway-written
