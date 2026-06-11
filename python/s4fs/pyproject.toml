@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "s4fs"
-version = "1.1.0"
+version = "1.2.0"
 description = "fsspec adapter for S4 gateway-format objects (S4F2 framed + compressed) directly on the backend — no gateway required. Reads out of the box; gateway-compatible writes opt-in via write_enabled=True."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -28,7 +28,7 @@ dependencies = [
     # binding APIs s4fs uses (SIDECAR_SUFFIX / frame_iter / decode_index /
     # crc32c / CpuZstdDict) do not exist in the 1.0.0 wheel; they ship
     # with the next s4-codec release (1.1.0).
-    "s4-codec>=1.1.0,<2",
+    "s4-codec>=1.2.0,<2",
 ]
 
 [project.optional-dependencies]

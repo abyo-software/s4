@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-06-12
+
+**v1.2 — day-2 operations: prove it, automate it, keep it healthy.**
+Four additive features — the savings ledger + `s4 savings` (measured
+$ saved in production, the counterpart to `s4 estimate`'s prediction),
+`s4 maintain` (policy-driven migrate/recompact/storage-class
+transitions, one-shot or resident), dictionary day-2 ops
+(`s4 dict-status` + restart-less SIGHUP rotation), and opt-in s4fs
+writes (pandas/pyarrow writing gateway-compatible objects without the
+gateway) — hardened by a 3-round dual-reviewer audit (findings
+17 → 4 → 5 doc-trivia; zero P1 across all rounds). The v1.0 freeze
+contract holds: everything below is additive and default-off;
+flag-less behavior is bit-for-bit identical to v1.1.0.
+
 ### Fixed (v1.2 audit round 2 — adversarial verification of the round-1 fix wave)
 - **P2** Replication replicas no longer carry the `s4-ledger` marker
   (they are never ledger-counted, so a gateway-routed delete of a

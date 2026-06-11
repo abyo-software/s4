@@ -12,15 +12,16 @@ type: application
 # 0.2.2: v0.11.0 cut — appVersion bump only, no chart-shape change.
 # 0.2.3: v1.0.0 cut — appVersion bump only, no chart-shape change.
 # 0.2.4: v1.1.0 cut — appVersion bump only, no chart-shape change.
+# 0.2.5: v1.2.0 cut — appVersion bump only, no chart-shape change.
 #        Note: chart's own version stays in 0.2.x. Chart-shape
 #        SemVer is independent of appVersion (Helm convention);
 #        the chart's values.yaml key freeze is the v1.0 contract,
 #        not the chart's own SemVer line, which can stay 0.x as
 #        long as no key shape break is shipped. See README §Stability
 #        for the values.yaml key set that IS frozen.
-version: 0.2.4
+version: 0.2.5
 # appVersion tracks the s4-server release shipped on crates.io / ghcr.io.
-appVersion: "1.1.0"
+appVersion: "1.2.0"
 kubeVersion: ">=1.24.0-0"
 home: https://github.com/abyo-software/s4
 sources:
