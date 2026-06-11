@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781168155630,
+  "lastUpdate": 1781169798993,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -11524,6 +11524,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "2cebafa0c73ce09d2c64723ccc182471de137937",
+          "message": "feat(server): dict 運用自動化 — s4 dict-status + SIGHUP 再起動レス reload\n\nv1.1 dict 機能の ops 成熟化 (v1.2 第 3 弾)。rotation が\n「train-dict → map ファイル書き換え → SIGHUP」で完結する。\n\n- per-prefix metrics: s4_dict_put_total{prefix,outcome} /\n  s4_dict_put_bytes_total{prefix,kind} / s4_dict_reload_total{result}\n- s4 dict-status --metrics-url: /metrics を parse して prefix ごとの\n  win 率・実効圧縮率を表示、--warn-win-rate (0.5) 未満は stale 警告 +\n  exit 1 (cron 監視向け)。gateway 側も rolling 100 判定で WARN\n  (1h/prefix rate-limit)\n- --zstd-dict-map <FILE> (TOML) + SIGHUP reload: 完全な代替 store を\n  構築してから arc-swap で atomic 差し替え (検証失敗時は現行維持の\n  fail-safe)。--zstd-dict との併合、重複 prefix は boot error。\n  in-flight リクエストは取得済み世代を使い続ける (世代混在なし)\n- multipart parts (≥5 MiB) は dict 対象外の旨を docs 明文化\n\ntests: lib 588 (dict 26 本) / dict_ops e2e 2 本 (SIGHUP 無再起動\n反映 + 壊れ map での生存含む) / dict_minio 回帰 / clippy -D warnings\n/ fmt — 全 green (orchestrator 再実行済)。\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-06-11T18:15:30+09:00",
+          "tree_id": "c93c9a0e8c8212355047b3d2c65fd66e355dc830",
+          "url": "https://github.com/abyo-software/s4/commit/2cebafa0c73ce09d2c64723ccc182471de137937"
+        },
+        "date": 1781169797887,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 54987,
+            "range": "± 3754",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 54891,
+            "range": "± 3396",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 368,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2610658,
+            "range": "± 55983",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 42326738,
+            "range": "± 178335",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192542,
+            "range": "± 11204",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 51653484,
+            "range": "± 1217160",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 767733244,
+            "range": "± 1006562",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3079333,
+            "range": "± 32792",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 32495,
+            "range": "± 2589",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 38669,
+            "range": "± 2351",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 381,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 580774,
+            "range": "± 9124",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1591602,
+            "range": "± 34334",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192397,
+            "range": "± 428",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12890564,
+            "range": "± 721898",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27977562,
+            "range": "± 211305",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3173052,
+            "range": "± 46131",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1606492,
+            "range": "± 77769",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2749658,
+            "range": "± 150524",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 383842864,
+            "range": "± 14253248",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 139,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 7966,
+            "range": "± 127",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 822,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13095,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 3077,
+            "range": "± 52",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 23989,
+            "range": "± 392",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 97113,
+            "range": "± 1313",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 638,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4542,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 17667,
+            "range": "± 75",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
             "range": "± 0",
             "unit": "ns/iter"
           }
