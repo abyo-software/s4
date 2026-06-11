@@ -54,7 +54,13 @@
 //!   when `GetBucketVersioning` says `Enabled`.
 //! - **Storage class and object tags are carried over** on the rewrite
 //!   PUT (the GET's storage class is re-sent unless it is
-//!   absent/STANDARD; tags come from `GetObjectTagging`). **ACLs and
+//!   absent/STANDARD; tags come from `GetObjectTagging`). When the
+//!   tagging read fails with an AccessDenied / NotImplemented /
+//!   NotSupported-class error (credential without `s3:GetObjectTagging`,
+//!   backend without tagging), the object is **skipped**
+//!   (`tags-unreadable`) instead of rewritten-with-tags-stripped or
+//!   hard-failed; pass `--no-tags` to opt out of the tagging read and
+//!   rewrite anyway (tags are then NOT preserved). **ACLs and
 //!   Object Lock retention/legal-hold are NOT carried over** — the
 //!   overwrite PUT resets them to the bucket defaults. Buckets that
 //!   rely on per-object ACLs or Object Lock must not be migrated with
@@ -142,6 +148,13 @@ pub enum SkipReason {
     /// and the `skipped_verify_failed` JSON field stays, always `0`) so
     /// downstream JSON consumers keep parsing.
     VerifyFailed,
+    /// `GetObjectTagging` failed with an AccessDenied / NotImplemented /
+    /// NotSupported-class error: the object may carry tags we cannot
+    /// read, so rewriting it would silently strip them. Grant
+    /// `s3:GetObjectTagging` or pass `--no-tags` to rewrite without
+    /// preserving tags. Other tagging errors (transient faults) stay
+    /// hard failures.
+    TagsUnreadable,
 }
 
 /// Knobs for one migrate run. The codec-selection half mirrors the
@@ -178,6 +191,13 @@ pub struct MigrateParams {
     /// dispatcher's *pick* match a GPU gateway; the bytes written are
     /// always CPU (`cpu-zstd`) regardless.
     pub gpu_present: bool,
+    /// `--no-tags`: skip the `GetObjectTagging` read entirely and
+    /// rewrite without carrying tags over. Explicit opt-out for
+    /// credentials/backends where tagging reads are denied or
+    /// unimplemented (objects otherwise skip as `tags-unreadable`).
+    /// WARNING: any existing object tags are NOT preserved on
+    /// rewritten objects.
+    pub no_tags: bool,
 }
 
 /// One `picked → wrote_with` codec pairing and how many migrated
@@ -228,6 +248,13 @@ pub struct MigrateReport {
     pub skipped_too_large: u64,
     pub skipped_etag_raced: u64,
     pub skipped_verify_failed: u64,
+    /// Objects skipped because `GetObjectTagging` failed with an
+    /// AccessDenied / NotImplemented / NotSupported-class error (see
+    /// [`SkipReason::TagsUnreadable`]). Always `0` with `--no-tags`.
+    pub skipped_tags_unreadable: u64,
+    /// `true` when the run was made with `--no-tags` (tags neither read
+    /// nor carried over).
+    pub no_tags: bool,
     pub failed: u64,
     /// Per-key failure details, sorted by key.
     pub failures: Vec<MigrateFailure>,
@@ -290,6 +317,14 @@ pub(crate) fn normalize_etag(s: &str) -> String {
 /// filter does: rewriting a shadow key would break the version-restore
 /// path, and counting one would skew the estimate. `pub(crate)` for
 /// `estimate` / `recompact`, which apply the same exclusion.
+///
+/// Known over-exclusion: this is a plain substring check, so a
+/// *customer* object whose key merely contains the literal
+/// `.__s4ver__/` anywhere is excluded from the offline tools too (it
+/// is never examined, migrated, recompacted, or counted). This is the
+/// same blind spot as the gateway's own listing filter — the
+/// `.__s4ver__/` namespace collision is a known, documented
+/// limitation, not specific to these tools.
 pub(crate) fn is_versioning_shadow_key(key: &str) -> bool {
     key.contains(".__s4ver__/")
 }
@@ -394,27 +429,106 @@ pub(crate) fn encode_tagging(tags: &[(String, String)]) -> String {
         .join("&")
 }
 
+/// How a failed `GetObjectTagging` call is handled. `pub(crate)` for
+/// `recompact` (same skip-vs-fail policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TagErrorClass {
+    /// The backend says the object simply has no tag set (`NoSuchTagSet`
+    /// — AWS returns an empty set instead, but some backends 404 with
+    /// this code). Safe to treat as "no tags": nothing can be lost.
+    NoTags,
+    /// AccessDenied / NotImplemented / NotSupported class: the object
+    /// may carry tags we are not allowed (or able) to read. The caller
+    /// skips the object (`tags-unreadable`) instead of stripping tags
+    /// or hard-failing the whole class.
+    Unreadable,
+    /// Anything else (throttling, 5xx, transport faults): hard failure,
+    /// same as before — a transient error must not be mistaken for
+    /// "this backend has no tagging".
+    Other,
+}
+
+/// Classify a failed `GetObjectTagging` by S3 error code (preferred)
+/// or, when the response carried no modeled code, by raw HTTP status.
+/// Split out of [`fetch_tags`] so the classification is unit-testable
+/// without a network. `pub(crate)` for `recompact`.
+pub(crate) fn classify_tagging_error(
+    code: Option<&str>,
+    http_status: Option<u16>,
+) -> TagErrorClass {
+    match code {
+        Some("NoSuchTagSet") => TagErrorClass::NoTags,
+        Some(
+            "AccessDenied"
+            | "NotImplemented"
+            | "NotSupported"
+            | "MethodNotAllowed"
+            | "OperationNotSupported",
+        ) => TagErrorClass::Unreadable,
+        // Any other modeled code (NoSuchKey, SlowDown, InternalError, …)
+        // is a real per-object failure.
+        Some(_) => TagErrorClass::Other,
+        // Code-less responses: classify by status. 403 = denied,
+        // 405/501 = tagging not implemented on this backend. A raw 404
+        // is deliberately NOT NoTags — without a code it may be
+        // NoSuchKey (concurrently deleted object) and rewriting would
+        // resurrect it.
+        None => match http_status {
+            Some(403 | 405 | 501) => TagErrorClass::Unreadable,
+            _ => TagErrorClass::Other,
+        },
+    }
+}
+
+/// A failed (and not `NoSuchTagSet`) `GetObjectTagging`, pre-classified
+/// for the skip-vs-fail decision. `pub(crate)` for `recompact`.
+#[derive(Debug, Clone)]
+pub(crate) struct TagFetchError {
+    /// `true` = [`TagErrorClass::Unreadable`] (skip as
+    /// `tags-unreadable`); `false` = hard failure.
+    pub unreadable: bool,
+    pub cause: String,
+}
+
 /// `GetObjectTagging` → the object's tag set as `(key, value)` pairs.
 /// Carried over verbatim on the rewrite PUT so retro-compression does
-/// not silently strip lifecycle/billing tags. `pub(crate)` for
-/// `recompact` (same carry-over).
+/// not silently strip lifecycle/billing tags. A `NoSuchTagSet` error
+/// is folded into `Ok(vec![])` (some backends 404 instead of returning
+/// an empty set); other failures come back classified — see
+/// [`TagErrorClass`]. `pub(crate)` for `recompact` (same carry-over).
 pub(crate) async fn fetch_tags(
     client: &Client,
     bucket: &str,
     key: &str,
-) -> Result<Vec<(String, String)>, String> {
-    let resp = client
+) -> Result<Vec<(String, String)>, TagFetchError> {
+    match client
         .get_object_tagging()
         .bucket(bucket)
         .key(key)
         .send()
         .await
-        .map_err(|e| format!("{e}"))?;
-    Ok(resp
-        .tag_set()
-        .iter()
-        .map(|t| (t.key().to_owned(), t.value().to_owned()))
-        .collect())
+    {
+        Ok(resp) => Ok(resp
+            .tag_set()
+            .iter()
+            .map(|t| (t.key().to_owned(), t.value().to_owned()))
+            .collect()),
+        Err(e) => {
+            use aws_sdk_s3::error::ProvideErrorMetadata as _;
+            let code = e.code().map(str::to_owned);
+            let status = e.raw_response().map(|r| r.status().as_u16());
+            match classify_tagging_error(code.as_deref(), status) {
+                TagErrorClass::NoTags => Ok(Vec::new()),
+                class => Err(TagFetchError {
+                    unreadable: class == TagErrorClass::Unreadable,
+                    cause: match code {
+                        Some(c) => format!("{c}: {e}"),
+                        None => format!("{e}"),
+                    },
+                }),
+            }
+        }
+    }
 }
 
 /// `GetBucketVersioning` → `Ok(true)` iff the bucket reports `Enabled`.
@@ -717,16 +831,25 @@ async fn migrate_one(
         return ObjectOutcome::Skipped(SkipReason::EtagRaced);
     }
 
-    // Carry object tags over. A tagging-read failure is a hard failure
-    // (skipping silently would strip lifecycle/billing tags on the
-    // overwrite); nothing has been written yet at this point.
-    let tags = match fetch_tags(client, bucket, &job.key).await {
-        Ok(t) => t,
-        Err(cause) => {
-            return ObjectOutcome::Failed {
-                op: "GetObjectTagging",
-                cause,
-            };
+    // Carry object tags over (unless `--no-tags` opted out). An
+    // AccessDenied / NotImplemented-class tagging-read failure skips
+    // the object (`tags-unreadable`) — rewriting would silently strip
+    // tags we cannot see; any other tagging failure stays a hard
+    // failure. Nothing has been written yet at this point.
+    let tags = if params.no_tags {
+        Vec::new()
+    } else {
+        match fetch_tags(client, bucket, &job.key).await {
+            Ok(t) => t,
+            Err(e) if e.unreadable => {
+                return ObjectOutcome::Skipped(SkipReason::TagsUnreadable);
+            }
+            Err(e) => {
+                return ObjectOutcome::Failed {
+                    op: "GetObjectTagging",
+                    cause: e.cause,
+                };
+            }
         }
     };
 
@@ -882,6 +1005,7 @@ fn fold_outcome(
             SkipReason::TooLarge => report.skipped_too_large += 1,
             SkipReason::EtagRaced => report.skipped_etag_raced += 1,
             SkipReason::VerifyFailed => report.skipped_verify_failed += 1,
+            SkipReason::TagsUnreadable => report.skipped_tags_unreadable += 1,
         },
         ObjectOutcome::Failed { op, cause } => {
             report.failed += 1;
@@ -949,6 +1073,8 @@ pub async fn run_migrate(
         skipped_too_large: 0,
         skipped_etag_raced: 0,
         skipped_verify_failed: 0,
+        skipped_tags_unreadable: 0,
+        no_tags: params.no_tags,
         failed: 0,
         failures: Vec::new(),
         codecs: Vec::new(),
@@ -987,13 +1113,32 @@ pub async fn run_migrate(
          and the PUT is silently overwritten"
             .into(),
     );
-    report.notes.push(
-        "storage class and object tags are carried over on each rewrite; ACLs and \
-         Object Lock retention/legal-hold are NOT — the overwrite PUT resets them to \
-         bucket defaults, so do not migrate buckets relying on per-object ACLs or \
-         Object Lock"
-            .into(),
-    );
+    if params.no_tags {
+        report.notes.push(
+            "--no-tags: GetObjectTagging was not called and object tags are NOT carried \
+             over — any existing tags are absent from rewritten objects. Storage class is \
+             still carried over; ACLs and Object Lock retention/legal-hold are NOT — the \
+             overwrite PUT resets them to bucket defaults"
+                .into(),
+        );
+    } else {
+        report.notes.push(
+            "storage class and object tags are carried over on each rewrite; ACLs and \
+             Object Lock retention/legal-hold are NOT — the overwrite PUT resets them to \
+             bucket defaults, so do not migrate buckets relying on per-object ACLs or \
+             Object Lock"
+                .into(),
+        );
+    }
+    if report.skipped_tags_unreadable > 0 {
+        report.notes.push(format!(
+            "{} object(s) skipped as tags-unreadable — GetObjectTagging failed with an \
+             AccessDenied/NotImplemented/NotSupported-class error, so the rewrite was \
+             withheld rather than silently dropping tags; grant s3:GetObjectTagging or \
+             pass --no-tags to rewrite without preserving tags",
+            report.skipped_tags_unreadable,
+        ));
+    }
     if report.versioning_enabled {
         report.notes.push(
             "WARNING: bucket versioning is Enabled — each migrated object leaves its \
@@ -1102,12 +1247,13 @@ pub fn render_human(report: &MigrateReport) -> String {
     let _ = writeln!(
         out,
         "  skipped: {} already-s4, {} not-compressible, {} too-large, {} etag-raced, \
-         {} verify-failed",
+         {} verify-failed, {} tags-unreadable",
         report.skipped_already_s4,
         report.skipped_not_compressible,
         report.skipped_too_large,
         report.skipped_etag_raced,
         report.skipped_verify_failed,
+        report.skipped_tags_unreadable,
     );
     let _ = writeln!(out, "  failed: {}", report.failed);
     if !report.codecs.is_empty() {
@@ -1241,6 +1387,8 @@ mod tests {
             skipped_too_large: 0,
             skipped_etag_raced: 0,
             skipped_verify_failed: 0,
+            skipped_tags_unreadable: 0,
+            no_tags: false,
             failed: 0,
             failures: Vec::new(),
             codecs: Vec::new(),
@@ -1281,6 +1429,7 @@ mod tests {
             ("e", SkipReason::TooLarge),
             ("f", SkipReason::EtagRaced),
             ("g", SkipReason::VerifyFailed),
+            ("g2", SkipReason::TagsUnreadable),
         ] {
             fold_outcome(
                 &mut report,
@@ -1307,6 +1456,7 @@ mod tests {
         assert_eq!(report.skipped_too_large, 1);
         assert_eq!(report.skipped_etag_raced, 1);
         assert_eq!(report.skipped_verify_failed, 1);
+        assert_eq!(report.skipped_tags_unreadable, 1);
         assert_eq!(report.failed, 1);
         assert_eq!(report.failures[0].key, "h");
         assert_eq!(report.failures[0].op, "PutObject");
@@ -1358,6 +1508,8 @@ mod tests {
         assert_eq!(v["skipped_too_large"], 0);
         assert_eq!(v["skipped_etag_raced"], 0);
         assert_eq!(v["skipped_verify_failed"], 0);
+        assert_eq!(v["skipped_tags_unreadable"], 0);
+        assert_eq!(v["no_tags"], false);
         assert_eq!(v["failed"], 0);
         assert_eq!(v["codecs"][0]["picked"], "nvcomp-zstd");
         assert_eq!(v["codecs"][0]["wrote_with"], "cpu-zstd");
@@ -1372,6 +1524,77 @@ mod tests {
         assert_eq!(
             serde_json::to_value(SkipReason::VerifyFailed).expect("skip reason"),
             "verify-failed"
+        );
+        assert_eq!(
+            serde_json::to_value(SkipReason::TagsUnreadable).expect("skip reason"),
+            "tags-unreadable"
+        );
+    }
+
+    /// Skip-vs-fail classification for GetObjectTagging errors — the
+    /// core of the tags-unreadable fix: permission / not-implemented
+    /// errors must NOT hard-fail the whole migration (regression: a
+    /// credential without s3:GetObjectTagging used to fail every
+    /// object), while transient errors must NOT be mistaken for
+    /// "backend has no tagging".
+    #[test]
+    fn tagging_error_classification() {
+        // Backend says "no tag set on this object" → safe empty set.
+        assert_eq!(
+            classify_tagging_error(Some("NoSuchTagSet"), Some(404)),
+            TagErrorClass::NoTags
+        );
+        // Permission / unimplemented codes → skip as tags-unreadable.
+        for code in [
+            "AccessDenied",
+            "NotImplemented",
+            "NotSupported",
+            "MethodNotAllowed",
+            "OperationNotSupported",
+        ] {
+            assert_eq!(
+                classify_tagging_error(Some(code), None),
+                TagErrorClass::Unreadable,
+                "{code} must classify as unreadable"
+            );
+        }
+        // Code takes precedence over status.
+        assert_eq!(
+            classify_tagging_error(Some("AccessDenied"), Some(403)),
+            TagErrorClass::Unreadable
+        );
+        // Other modeled codes stay hard failures.
+        for code in ["NoSuchKey", "SlowDown", "InternalError", "NoSuchBucket"] {
+            assert_eq!(
+                classify_tagging_error(Some(code), Some(500)),
+                TagErrorClass::Other,
+                "{code} must stay a hard failure"
+            );
+        }
+        // Code-less responses: 403 / 405 / 501 are unreadable-class.
+        assert_eq!(
+            classify_tagging_error(None, Some(403)),
+            TagErrorClass::Unreadable
+        );
+        assert_eq!(
+            classify_tagging_error(None, Some(405)),
+            TagErrorClass::Unreadable
+        );
+        assert_eq!(
+            classify_tagging_error(None, Some(501)),
+            TagErrorClass::Unreadable
+        );
+        // A raw code-less 404 may be NoSuchKey (deleted object) — must
+        // NOT be folded into NoTags, and must NOT be skipped.
+        assert_eq!(
+            classify_tagging_error(None, Some(404)),
+            TagErrorClass::Other
+        );
+        // Transport-level failures (no response at all) stay hard.
+        assert_eq!(classify_tagging_error(None, None), TagErrorClass::Other);
+        assert_eq!(
+            classify_tagging_error(None, Some(500)),
+            TagErrorClass::Other
         );
     }
 
@@ -1411,6 +1634,7 @@ mod tests {
             gpu_min_bytes: SamplingDispatcher::DEFAULT_GPU_MIN_BYTES,
             prefer_columnar_gpu: false,
             gpu_present: false,
+            no_tags: false,
         };
         let registry = Arc::new(build_write_registry(&params));
         // > 1 MiB so pick_chunk_size lands on 4 MiB... actually 2 MiB

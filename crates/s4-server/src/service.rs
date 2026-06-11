@@ -2398,8 +2398,12 @@ impl<B: S3> S4Service<B> {
     /// explicit message (and a `s4_dict_fetch_total{result="err"}` bump)
     /// — NOT a silent passthrough of compressed bytes.
     async fn resolve_dict(&self, bucket: &str, dict_id: &str) -> S3Result<Arc<[u8]>> {
+        // v1.0.1 audit R2 P3: the preload lookup is `(bucket, id)`-keyed
+        // just like the lazy cache below — a dictionary preloaded for one
+        // bucket's `--zstd-dict` prefix must not satisfy GETs against a
+        // different bucket (the 16-hex id is only a 64-bit prefix).
         if let Some(store) = self.zstd_dicts.as_ref()
-            && let Some(dict) = store.get_preloaded(dict_id)
+            && let Some(dict) = store.get_preloaded(bucket, dict_id)
         {
             return Ok(dict);
         }
@@ -2461,28 +2465,14 @@ impl<B: S3> S4Service<B> {
         let bytes = collect_blob(blob, crate::dict::DICT_FETCH_MAX_BYTES)
             .await
             .map_err(|e| fetch_failed(format!("collect dictionary body: {e}")))?;
-        // Fingerprint check: always verify the 16-hex id prefix; when the
-        // object carries the full-SHA-256 metadata stamp, verify the
-        // complete digest too (closes the 64-bit truncation window for
-        // post-v1.0.1 dictionaries; pre-stamp dictionaries keep the
-        // prefix-only check — back-compat).
-        let actual_sha256 = crate::dict::dict_sha256_hex(&bytes);
-        let actual_id = &actual_sha256[..crate::dict::DICT_ID_HEX_LEN];
-        if actual_id != dict_id {
-            return Err(fetch_failed(format!(
-                "fingerprint mismatch: object hashes to {actual_id} (corrupted / tampered \
-                 dictionary object?)"
-            )));
-        }
-        if let Some(claimed) = claimed_sha256
-            && claimed != actual_sha256
-        {
-            return Err(fetch_failed(format!(
-                "full SHA-256 mismatch: object hashes to {actual_sha256} but its \
-                 `{}` metadata claims {claimed} (corrupted / tampered dictionary object?)",
-                crate::dict::DICT_SHA256_META_KEY,
-            )));
-        }
+        // Fingerprint check (shared `verify_dict_bytes` discipline, also
+        // enforced by the boot preload): always verify the 16-hex id
+        // prefix; when the object carries the full-SHA-256 metadata
+        // stamp, verify the complete digest too (closes the 64-bit
+        // truncation window for post-v1.0.1 dictionaries; pre-stamp
+        // dictionaries keep the prefix-only check — back-compat).
+        crate::dict::verify_dict_bytes(dict_id, claimed_sha256.as_deref(), &bytes)
+            .map_err(fetch_failed)?;
         let dict: Arc<[u8]> = Arc::from(bytes.to_vec().into_boxed_slice());
         self.dict_cache
             .insert(bucket.to_owned(), dict_id.to_owned(), Arc::clone(&dict));
@@ -5472,7 +5462,13 @@ impl<B: S3> S3 for S4Service<B> {
             .as_ref()
             .map(|d| d.as_str() == MetadataDirective::REPLACE)
             .unwrap_or(false);
-        if needs_merge && let CopySource::Bucket { bucket, key, .. } = &req.input.copy_source {
+        if needs_merge
+            && let CopySource::Bucket {
+                bucket,
+                key,
+                version_id,
+            } = &req.input.copy_source
+        {
             // v0.8.16 F-8: strip the client-supplied `s4-*` keys
             // *unconditionally* — the v0.8.15 M-2 fix only ran the
             // strip inside the `if let Ok(head) = ...` block, so a
@@ -5490,6 +5486,13 @@ impl<B: S3> S3 for S4Service<B> {
             let head_input = HeadObjectInput {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
+                // v1.0.1 audit R2 P2: pin the probe to the *requested*
+                // source version. Pre-fix the HEAD always saw "latest",
+                // so a `?versionId=`-pinned REPLACE copy merged the
+                // latest version's s4-* manifest (codec / sizes / crc /
+                // dict-id) onto the pinned version's bytes — silent
+                // corruption surfacing as a 5xx on the destination GET.
+                version_id: version_id.as_deref().map(str::to_owned),
                 ..Default::default()
             };
             let head_req = S3Request {
@@ -5558,7 +5561,7 @@ impl<B: S3> S3 for S4Service<B> {
         if let CopySource::Bucket {
             bucket: src_bucket,
             key: src_key,
-            ..
+            version_id: src_version_id,
         } = &req.input.copy_source
             && **src_bucket != *dst_bucket
         {
@@ -5566,6 +5569,13 @@ impl<B: S3> S3 for S4Service<B> {
                 input: HeadObjectInput {
                     bucket: src_bucket.to_string(),
                     key: src_key.to_string(),
+                    // v1.0.1 audit R2 P2: same pinning as the REPLACE
+                    // merge probe above — a `?versionId=` copy whose
+                    // *latest* source version is not dict-compressed
+                    // would otherwise skip the dict propagation (HEAD
+                    // sees no `s4-dict-id`), leaving the destination
+                    // object with a dangling dictionary reference.
+                    version_id: src_version_id.as_deref().map(str::to_owned),
                     ..Default::default()
                 },
                 method: http::Method::HEAD,
@@ -5755,6 +5765,16 @@ impl<B: S3> S3 for S4Service<B> {
         self.check_not_reserved_key(&mp_key, ReservedKeyMode::Mutating)?;
         self.enforce_policy(&req, "s3:PutObject", &mp_bucket, Some(&mp_key))?;
         self.enforce_rate_limit(&req, &mp_bucket)?;
+        // v1.0.1 audit R2 P2: same reserved-namespace strip as the PUT
+        // path (R1 P1). Pre-fix, Create only *overwrote* `s4-multipart` /
+        // `s4-codec` below, so a client-supplied
+        // `x-amz-meta-s4-encrypted: aes-256-gcm` (or `s4-dict-id`, ...)
+        // survived onto the completed object — and a flag-less GET then
+        // took the decrypt / dictionary path on an object the gateway
+        // never encrypted → 5xx (the same freeze violation put_object
+        // closed, re-opened through the multipart wire path). The
+        // gateway re-stamps its own `s4-*` keys right below.
+        strip_reserved_client_metadata(&mut req.input.metadata);
         // Multipart object は per-part 圧縮 + frame 形式で書く。GET 時に
         // frame parse を起動するため、object metadata に flag を立てる。
         // codec は dispatcher の default kind を採用 (per-part 別 codec は Phase 2)。
@@ -9493,5 +9513,184 @@ mod tests {
         )
         .expect_err("mixed announce with checksum entry must still fail closed");
         assert_eq!(err.code().as_str(), "BadDigest");
+    }
+
+    // ---- v1.0.1 audit R2 P2 handler-path tests ------------------------
+    //
+    // A minimal recording backend: captures the exact inputs the gateway
+    // forwards so the tests can assert on what reaches the backend wire
+    // (the load-bearing surface for the metadata-strip and the
+    // versioned-HEAD-probe fixes). State lives behind an `Arc` so the
+    // test keeps a handle after handing the backend to `S4Service`.
+    #[derive(Default)]
+    struct RecordingState {
+        /// Metadata of every `CreateMultipartUpload` forwarded.
+        mp_metadata: std::sync::Mutex<Vec<Option<Metadata>>>,
+        /// `(bucket, key, version_id)` of every `HeadObject` forwarded.
+        head_probes: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingBackend {
+        state: Arc<RecordingState>,
+    }
+
+    #[async_trait::async_trait]
+    impl S3 for RecordingBackend {
+        async fn create_multipart_upload(
+            &self,
+            req: S3Request<CreateMultipartUploadInput>,
+        ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+            self.state
+                .mp_metadata
+                .lock()
+                .expect("lock")
+                .push(req.input.metadata.clone());
+            Ok(S3Response::new(CreateMultipartUploadOutput {
+                upload_id: Some("upload-1".into()),
+                ..Default::default()
+            }))
+        }
+
+        async fn head_object(
+            &self,
+            req: S3Request<HeadObjectInput>,
+        ) -> S3Result<S3Response<HeadObjectOutput>> {
+            self.state.head_probes.lock().expect("lock").push((
+                req.input.bucket.clone(),
+                req.input.key.clone(),
+                req.input.version_id.clone(),
+            ));
+            // Plain compressed object: enough metadata for the REPLACE
+            // merge to run, no `s4-dict-id` so the cross-bucket dict
+            // propagation probe stops after the HEAD.
+            let mut meta = Metadata::new();
+            meta.insert(META_CODEC.into(), "cpu-zstd".into());
+            Ok(S3Response::new(HeadObjectOutput {
+                metadata: Some(meta),
+                ..Default::default()
+            }))
+        }
+
+        async fn copy_object(
+            &self,
+            _req: S3Request<CopyObjectInput>,
+        ) -> S3Result<S3Response<CopyObjectOutput>> {
+            Ok(S3Response::new(CopyObjectOutput::default()))
+        }
+    }
+
+    fn recording_service() -> (S4Service<RecordingBackend>, Arc<RecordingState>) {
+        let backend = RecordingBackend::default();
+        let state = Arc::clone(&backend.state);
+        let svc = S4Service::new(
+            backend,
+            Arc::new(CodecRegistry::new(CodecKind::CpuZstd)),
+            Arc::new(s4_codec::dispatcher::AlwaysDispatcher(CodecKind::CpuZstd)),
+        );
+        (svc, state)
+    }
+
+    fn synthetic_req<T>(input: T, method: http::Method) -> S3Request<T> {
+        S3Request {
+            input,
+            method,
+            uri: http::Uri::from_static("/"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    /// v1.0.1 audit R2 P2: client-supplied `s4-*` metadata on
+    /// CreateMultipartUpload must be stripped before the backend forward
+    /// — pre-fix, only `s4-multipart` / `s4-codec` were overwritten, so a
+    /// forged `s4-encrypted: aes-256-gcm` survived to the completed
+    /// object and a flag-less GET 5xx'd in the decrypt path (same freeze
+    /// violation the put_object strip closed, multipart wire edition).
+    #[tokio::test]
+    async fn create_multipart_strips_reserved_client_metadata() {
+        let (svc, state) = recording_service();
+        let mut builder = CreateMultipartUploadInput::builder();
+        builder.set_bucket("bkt".to_owned());
+        builder.set_key("obj.bin".to_owned());
+        let mut meta = Metadata::new();
+        meta.insert("s4-encrypted".into(), "aes-256-gcm".into());
+        meta.insert("s4-dict-id".into(), "0123456789abcdef".into());
+        meta.insert("S4-Original-Size".into(), "1".into());
+        meta.insert("app-team".into(), "kept".into());
+        builder.set_metadata(Some(meta));
+        let input = builder.build().expect("input");
+        svc.create_multipart_upload(synthetic_req(input, http::Method::POST))
+            .await
+            .expect("create_multipart_upload");
+
+        let recorded = state.mp_metadata.lock().expect("lock");
+        assert_eq!(recorded.len(), 1, "exactly one backend forward");
+        let meta = recorded[0].as_ref().expect("metadata reaches the backend");
+        assert!(
+            !meta.contains_key("s4-encrypted"),
+            "forged s4-encrypted must be stripped, got {meta:?}"
+        );
+        assert!(
+            !meta.contains_key("s4-dict-id"),
+            "forged s4-dict-id must be stripped, got {meta:?}"
+        );
+        assert!(
+            !meta.contains_key("S4-Original-Size"),
+            "strip must be case-insensitive, got {meta:?}"
+        );
+        assert_eq!(
+            meta.get("app-team").map(String::as_str),
+            Some("kept"),
+            "non-reserved client metadata must survive"
+        );
+        // The gateway's own stamps are re-applied after the strip.
+        assert_eq!(meta.get(META_MULTIPART).map(String::as_str), Some("true"));
+        assert_eq!(meta.get(META_CODEC).map(String::as_str), Some("cpu-zstd"));
+    }
+
+    /// v1.0.1 audit R2 P2: both copy_object source HEAD probes (REPLACE
+    /// metadata merge + cross-bucket dict propagation) must carry the
+    /// `?versionId=` of the copy source — pre-fix they probed "latest",
+    /// merging the wrong version's s4-* manifest / missing the pinned
+    /// version's dictionary.
+    #[tokio::test]
+    async fn copy_object_head_probes_honor_pinned_source_version() {
+        let (svc, state) = recording_service();
+        let mut builder = CopyObjectInput::builder();
+        builder.set_bucket("dst-bkt".to_owned());
+        builder.set_key("dst.bin".to_owned());
+        builder.set_copy_source(CopySource::Bucket {
+            bucket: "src-bkt".to_owned().into_boxed_str(),
+            key: "src.bin".to_owned().into_boxed_str(),
+            version_id: Some("vid-123".to_owned().into_boxed_str()),
+        });
+        builder.set_metadata_directive(Some(MetadataDirective::from_static(
+            MetadataDirective::REPLACE,
+        )));
+        let input = builder.build().expect("input");
+        svc.copy_object(synthetic_req(input, http::Method::PUT))
+            .await
+            .expect("copy_object");
+
+        let probes = state.head_probes.lock().expect("lock");
+        assert_eq!(
+            probes.len(),
+            2,
+            "REPLACE merge + cross-bucket dict probes must both run, got {probes:?}"
+        );
+        for (bucket, key, version_id) in probes.iter() {
+            assert_eq!(bucket, "src-bkt");
+            assert_eq!(key, "src.bin");
+            assert_eq!(
+                version_id.as_deref(),
+                Some("vid-123"),
+                "HEAD probe must pin the requested source version"
+            );
+        }
     }
 }

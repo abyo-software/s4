@@ -50,11 +50,22 @@ pub const DICT_ID_HEX_LEN: usize = 16;
 /// the cache at 16 MiB even against oversized backend blobs.
 pub const DICT_CACHE_CAPACITY: usize = 16;
 
-/// Hard cap on the size of a lazily-fetched `.s4dict/<id>` object
-/// (GET-side `resolve_dict`). Trained dictionaries default to ≤ ~110 KiB
-/// ([`DEFAULT_MAX_DICT_BYTES`]); 1 MiB leaves ~9x headroom for operators
-/// who trained with a larger `--max-dict-bytes` while keeping the
-/// worst-case lazy-cache footprint at `16 slots x 1 MiB = 16 MiB`.
+/// **Single source of truth for the dictionary size contract** (1 MiB).
+///
+/// Every component that handles dictionary bytes enforces this same cap,
+/// so a dictionary that exists at all is readable everywhere:
+///
+/// - `train-dict` refuses `--max-dict-bytes` above the cap
+///   ([`TrainDictError::MaxDictBytesOverCap`]) — an over-cap dictionary
+///   could be written but never read back by a flag-less gateway;
+/// - boot preload ([`DictStore::new`], `--zstd-dict`) refuses an over-cap
+///   `.s4dict/<id>` object with a typed boot error;
+/// - the GET-side lazy fetch (`resolve_dict`) hard-caps the `.s4dict/`
+///   body it will collect, bounding the worst-case lazy-LRU footprint at
+///   `16 slots x 1 MiB = 16 MiB` even against hostile oversized blobs.
+///
+/// Trained dictionaries default to ≤ ~110 KiB ([`DEFAULT_MAX_DICT_BYTES`]);
+/// 1 MiB leaves ~9x headroom for operators who train larger.
 pub const DICT_FETCH_MAX_BYTES: usize = 1024 * 1024;
 
 /// Backend metadata key carrying the **full** SHA-256 hex (64 chars) of a
@@ -103,6 +114,40 @@ pub fn dict_id_of(dict_bytes: &[u8]) -> String {
     let mut s = dict_sha256_hex(dict_bytes);
     s.truncate(DICT_ID_HEX_LEN);
     s
+}
+
+/// Shared fingerprint discipline for dictionary bytes — used by the boot
+/// preload ([`DictStore::new`]) and the gateway's GET-side lazy fetch:
+///
+/// 1. the bytes' SHA-256 must start with the 16-hex content-addressed
+///    `dict_id` (always checked);
+/// 2. when the `.s4dict/<id>` object carries the full-SHA-256 metadata
+///    stamp ([`DICT_SHA256_META_KEY`]), the complete digest must match
+///    too (closes the 64-bit truncation window; dictionaries trained
+///    before v1.0.1 lack the stamp and keep the prefix-only check).
+pub fn verify_dict_bytes(
+    dict_id: &str,
+    claimed_sha256: Option<&str>,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let actual_sha256 = dict_sha256_hex(bytes);
+    let actual_id = &actual_sha256[..DICT_ID_HEX_LEN];
+    if actual_id != dict_id {
+        return Err(format!(
+            "fingerprint mismatch for id {dict_id}: bytes hash to {actual_id} \
+             (corrupted / tampered `.s4dict/{dict_id}`?)"
+        ));
+    }
+    if let Some(claimed) = claimed_sha256
+        && claimed != actual_sha256
+    {
+        return Err(format!(
+            "full SHA-256 mismatch for id {dict_id}: bytes hash to {actual_sha256} but \
+             `{DICT_SHA256_META_KEY}` metadata claims {claimed} (corrupted / tampered \
+             `.s4dict/{dict_id}`?)"
+        ));
+    }
+    Ok(())
 }
 
 /// Validate a dict-id: exactly 16 lowercase hex chars. Anything else is
@@ -173,8 +218,14 @@ pub struct DictStore {
     /// `(combined-prefix, dict-id)` sorted by prefix length descending so
     /// the first match is the longest match.
     entries: Vec<(String, String)>,
-    /// dict-id → dictionary bytes (fingerprint-verified at load).
-    dicts: HashMap<String, Arc<[u8]>>,
+    /// `(bucket, dict-id)` → dictionary bytes (fingerprint-verified at
+    /// load). Bucket-scoped for the same containment reason as
+    /// [`DictCache`] (v1.0.1 audit R2 P3): the id is only a 64-bit
+    /// SHA-256 prefix, so an id-keyed map would let one bucket's entry
+    /// satisfy preload lookups for *every* bucket on the gateway. The
+    /// `--zstd-dict` flag shape (`<bucket>/<prefix>=<id>`) makes the
+    /// bucket known at boot.
+    dicts: HashMap<(String, String), Arc<[u8]>>,
     /// PUT-side body-size ceiling for the dict path (`--zstd-dict-max-bytes`).
     max_object_bytes: usize,
     /// zstd level used for the dict compressor (server `--zstd-level`).
@@ -184,35 +235,48 @@ pub struct DictStore {
 impl DictStore {
     /// Assemble a store from parsed entries + already-fetched dict bytes.
     /// Verifies every dictionary's fingerprint against its configured id
-    /// and rejects duplicates-with-different-ids for the same prefix.
+    /// (shared [`verify_dict_bytes`] discipline), enforces the
+    /// [`DICT_FETCH_MAX_BYTES`] size contract (an over-cap dictionary
+    /// would be writable at boot but unreadable by a flag-less gateway's
+    /// lazy fetch — fail loudly at boot instead), and rejects
+    /// duplicates-with-different-ids for the same prefix.
     pub fn new(
         entries: Vec<DictConfigEntry>,
         dict_bytes: HashMap<String, Vec<u8>>,
         max_object_bytes: usize,
         level: i32,
     ) -> Result<Self, String> {
-        let mut dicts: HashMap<String, Arc<[u8]>> = HashMap::new();
+        let mut verified: HashMap<String, Arc<[u8]>> = HashMap::new();
         for (id, bytes) in dict_bytes {
-            let actual = dict_id_of(&bytes);
-            if actual != id {
+            // v1.0.1 audit R2 P3: same 1 MiB cap the lazy fetch enforces.
+            // Accepting a bigger dictionary here would mint objects that
+            // become unreadable the moment the operator drops the
+            // `--zstd-dict` flag (lazy fetch refuses the oversized blob).
+            if bytes.len() > DICT_FETCH_MAX_BYTES {
                 return Err(format!(
-                    "dictionary fingerprint mismatch for id {id}: backend object hashes to \
-                     {actual} (corrupted / tampered `.s4dict/{id}`?)"
+                    "dictionary {id} is {} bytes, over the {DICT_FETCH_MAX_BYTES}-byte \
+                     dictionary cap — a flag-less gateway's lazy `.s4dict/` fetch would \
+                     refuse it; retrain with `--max-dict-bytes` ≤ {DICT_FETCH_MAX_BYTES}",
+                    bytes.len()
                 ));
             }
+            verify_dict_bytes(&id, None, &bytes).map_err(|e| format!("dictionary {e}"))?;
             if bytes.is_empty() {
                 return Err(format!("dictionary {id} is empty"));
             }
-            dicts.insert(id, Arc::from(bytes.into_boxed_slice()));
+            verified.insert(id, Arc::from(bytes.into_boxed_slice()));
         }
+        let mut dicts: HashMap<(String, String), Arc<[u8]>> = HashMap::new();
         let mut prefixes: Vec<(String, String)> = Vec::with_capacity(entries.len());
         for e in entries {
-            if !dicts.contains_key(&e.dict_id) {
+            let Some(bytes) = verified.get(&e.dict_id) else {
                 return Err(format!(
                     "no dictionary bytes loaded for id {} (prefix {:?})",
                     e.dict_id, e.prefix
                 ));
-            }
+            };
+            // v1.0.1 audit R2 P3: bucket-scoped key — see the field doc.
+            dicts.insert((e.bucket.clone(), e.dict_id.clone()), Arc::clone(bytes));
             if let Some((_, existing)) = prefixes.iter().find(|(p, _)| *p == e.prefix) {
                 if *existing != e.dict_id {
                     return Err(format!(
@@ -247,17 +311,25 @@ impl DictStore {
                 continue; // bucket name was only a prefix of the entry's bucket
             };
             if key.starts_with(key_prefix) {
-                let dict = self.dicts.get(dict_id)?;
+                // The entry's bucket is exactly the `bucket` argument
+                // (it matched above), so the bucket-scoped key is
+                // `(bucket, dict_id)`.
+                let dict = self.dicts.get(&(bucket.to_owned(), dict_id.clone()))?;
                 return Some((dict_id.clone(), Arc::clone(dict)));
             }
         }
         None
     }
 
-    /// Preloaded dictionary bytes by id (GET-side fast path before any
-    /// LRU / backend fetch).
-    pub fn get_preloaded(&self, dict_id: &str) -> Option<Arc<[u8]>> {
-        self.dicts.get(dict_id).map(Arc::clone)
+    /// Preloaded dictionary bytes by `(bucket, id)` (GET-side fast path
+    /// before any LRU / backend fetch). Bucket-scoped since v1.0.1 audit
+    /// R2 P3 — a dictionary preloaded for one bucket's prefix must not
+    /// satisfy GETs against a different bucket (the 16-hex id is only a
+    /// 64-bit SHA-256 prefix; see the `dicts` field doc).
+    pub fn get_preloaded(&self, bucket: &str, dict_id: &str) -> Option<Arc<[u8]>> {
+        self.dicts
+            .get(&(bucket.to_owned(), dict_id.to_owned()))
+            .map(Arc::clone)
     }
 
     pub fn max_object_bytes(&self) -> usize {
@@ -383,6 +455,13 @@ pub enum TrainDictError {
     #[error("zstd dictionary training failed: {0}")]
     Training(String),
     #[error(
+        "--max-dict-bytes {requested} exceeds the {cap}-byte dictionary cap — a dictionary \
+         this large could be trained and written, but every reader enforces the same cap \
+         (gateway boot preload AND the flag-less gateway's lazy `.s4dict/` fetch), so the \
+         objects it compresses would become unreadable; pass --max-dict-bytes ≤ {cap}"
+    )]
+    MaxDictBytesOverCap { requested: usize, cap: usize },
+    #[error(
         "`.s4dict/{dict_id}` already exists with DIFFERENT bytes — dictionary objects are \
          immutable; this should be impossible for a content-addressed id (backend corruption?)"
     )]
@@ -396,7 +475,10 @@ pub struct TrainDictParams {
     pub prefix: String,
     /// Stop after sampling this many objects.
     pub max_samples: usize,
-    /// Dictionary output size cap.
+    /// Dictionary output size cap. Must be ≤ [`DICT_FETCH_MAX_BYTES`]
+    /// (the gateway-wide dictionary size contract) — larger values are
+    /// refused with [`TrainDictError::MaxDictBytesOverCap`] before any
+    /// backend traffic.
     pub max_dict_bytes: usize,
     /// Refuse to train below this many usable samples.
     pub min_samples: usize,
@@ -439,6 +521,17 @@ pub async fn run_train_dict(
     bucket: &str,
     params: &TrainDictParams,
 ) -> Result<TrainDictReport, TrainDictError> {
+    // v1.0.1 audit R2 P3: enforce the single dictionary size contract
+    // ([`DICT_FETCH_MAX_BYTES`]) at the *writer* — pre-fix, train-dict
+    // accepted any `--max-dict-bytes`, boot preload accepted any size,
+    // but the lazy fetch refused > 1 MiB, so an over-cap dictionary
+    // worked only until the operator dropped the `--zstd-dict` flag.
+    if params.max_dict_bytes > DICT_FETCH_MAX_BYTES {
+        return Err(TrainDictError::MaxDictBytesOverCap {
+            requested: params.max_dict_bytes,
+            cap: DICT_FETCH_MAX_BYTES,
+        });
+    }
     let backend_err = |op: &'static str, key: &str| {
         let bucket = bucket.to_owned();
         let key = key.to_owned();
@@ -770,6 +863,114 @@ mod tests {
         cache.insert("bucket-b".to_owned(), id.to_owned(), Arc::clone(&dict_b));
         assert_eq!(cache.get("bucket-a", id).as_deref(), Some(dict_a.as_ref()));
         assert_eq!(cache.get("bucket-b", id).as_deref(), Some(dict_b.as_ref()));
+    }
+
+    /// v1.0.1 audit R2 P3: the preload map is `(bucket, dict-id)`-keyed.
+    /// A dictionary configured for bucket A must not satisfy a preload
+    /// lookup against bucket B, even for the same 16-hex id — the id is
+    /// only a 64-bit SHA-256 prefix, so cross-bucket sharing would let a
+    /// prefix-collision forgery in one bucket serve every other bucket.
+    /// (Equal-id-different-bytes can't be fabricated in a test, so we pin
+    /// the key separation itself.)
+    #[test]
+    fn preload_is_bucket_scoped() {
+        let dict_a = fake_dict(1);
+        let dict_b = fake_dict(2);
+        let id_a = dict_id_of(&dict_a);
+        let id_b = dict_id_of(&dict_b);
+        let store = store_with(&[
+            ("bucket-a/logs/", dict_a.clone()),
+            ("bucket-b/logs/", dict_b.clone()),
+        ]);
+        assert_eq!(
+            store.get_preloaded("bucket-a", &id_a).as_deref(),
+            Some(dict_a.as_slice())
+        );
+        assert_eq!(
+            store.get_preloaded("bucket-b", &id_b).as_deref(),
+            Some(dict_b.as_slice())
+        );
+        assert!(
+            store.get_preloaded("bucket-b", &id_a).is_none(),
+            "bucket B must not see bucket A's preloaded dictionary"
+        );
+        assert!(
+            store.get_preloaded("bucket-a", &id_b).is_none(),
+            "bucket A must not see bucket B's preloaded dictionary"
+        );
+        assert!(store.get_preloaded("bucket-c", &id_a).is_none());
+    }
+
+    /// v1.0.1 audit R2 P3: boot preload enforces the same 1 MiB cap the
+    /// lazy GET-side fetch does — an over-cap dictionary accepted at boot
+    /// would mint objects a flag-less gateway can never read.
+    #[test]
+    fn store_rejects_oversized_dictionary() {
+        let bytes = vec![0xabu8; DICT_FETCH_MAX_BYTES + 1];
+        let id = dict_id_of(&bytes);
+        let cfg = vec![parse_zstd_dict_flag(&format!("b/p={id}")).expect("parse")];
+        let mut dicts = HashMap::new();
+        dicts.insert(id, bytes);
+        let err =
+            DictStore::new(cfg, dicts, DEFAULT_DICT_MAX_OBJECT_BYTES, 3).expect_err("must reject");
+        assert!(err.contains("over the"), "{err}");
+        assert!(err.contains("retrain"), "{err}");
+        // Exactly-at-cap is fine (boundary).
+        let bytes = vec![0xcdu8; DICT_FETCH_MAX_BYTES];
+        let id = dict_id_of(&bytes);
+        let cfg = vec![parse_zstd_dict_flag(&format!("b/p={id}")).expect("parse")];
+        let mut dicts = HashMap::new();
+        dicts.insert(id, bytes);
+        DictStore::new(cfg, dicts, DEFAULT_DICT_MAX_OBJECT_BYTES, 3).expect("at-cap is accepted");
+    }
+
+    /// v1.0.1 audit R2 P3: `train-dict` refuses `--max-dict-bytes` over
+    /// the cap with a typed error, before any backend traffic (the test
+    /// client points at nothing routable — reaching the backend would
+    /// fail differently).
+    #[tokio::test]
+    async fn train_dict_rejects_max_dict_bytes_over_cap() {
+        let conf = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .build();
+        let client = Client::from_conf(conf);
+        let params = TrainDictParams {
+            prefix: String::new(),
+            max_samples: DEFAULT_TRAIN_MAX_SAMPLES,
+            max_dict_bytes: DICT_FETCH_MAX_BYTES + 1,
+            min_samples: DEFAULT_TRAIN_MIN_SAMPLES,
+            sample_max_bytes: DEFAULT_TRAIN_SAMPLE_MAX_BYTES,
+            zstd_level: 3,
+        };
+        let err = run_train_dict(&client, "bkt", &params)
+            .await
+            .expect_err("over-cap --max-dict-bytes must be refused");
+        match err {
+            TrainDictError::MaxDictBytesOverCap { requested, cap } => {
+                assert_eq!(requested, DICT_FETCH_MAX_BYTES + 1);
+                assert_eq!(cap, DICT_FETCH_MAX_BYTES);
+            }
+            other => panic!("expected MaxDictBytesOverCap, got {other:?}"),
+        }
+    }
+
+    /// Shared fingerprint helper: prefix check always, full-SHA-256 check
+    /// only when a claim is present (back-compat for pre-v1.0.1 dicts).
+    #[test]
+    fn verify_dict_bytes_discipline() {
+        let bytes = fake_dict(7);
+        let id = dict_id_of(&bytes);
+        let full = dict_sha256_hex(&bytes);
+        verify_dict_bytes(&id, None, &bytes).expect("prefix-only check passes");
+        verify_dict_bytes(&id, Some(&full), &bytes).expect("full claim matches");
+        let err = verify_dict_bytes("0123456789abcdef", None, &bytes)
+            .expect_err("wrong id must be refused");
+        assert!(err.contains("fingerprint mismatch"), "{err}");
+        let wrong_claim = format!("{}{}", id, "0".repeat(64 - DICT_ID_HEX_LEN));
+        let err = verify_dict_bytes(&id, Some(&wrong_claim), &bytes)
+            .expect_err("prefix matches but full claim differs — must be refused");
+        assert!(err.contains("full SHA-256 mismatch"), "{err}");
     }
 
     #[test]

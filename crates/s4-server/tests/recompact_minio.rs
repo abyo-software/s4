@@ -146,6 +146,7 @@ fn migrate_params_level3(prefix: &str) -> MigrateParams {
         gpu_min_bytes: SamplingDispatcher::DEFAULT_GPU_MIN_BYTES,
         prefer_columnar_gpu: false,
         gpu_present: false,
+        no_tags: false,
     }
 }
 
@@ -160,6 +161,7 @@ fn default_recompact_params() -> RecompactParams {
         min_gain_percent: DEFAULT_MIN_GAIN_PERCENT,
         older_than: None,
         assume_unstamped_framed: false,
+        no_tags: false,
     }
 }
 

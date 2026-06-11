@@ -79,7 +79,13 @@
 //!   `GetBucketVersioning` says `Enabled`.
 //! - **Storage class and object tags are carried over** on the rewrite
 //!   PUT (the GET's storage class is re-sent unless it is
-//!   absent/STANDARD; tags come from `GetObjectTagging`). **ACLs and
+//!   absent/STANDARD; tags come from `GetObjectTagging`). When the
+//!   tagging read fails with an AccessDenied / NotImplemented /
+//!   NotSupported-class error (credential without `s3:GetObjectTagging`,
+//!   backend without tagging), the object is **skipped**
+//!   (`tags-unreadable`) instead of rewritten-with-tags-stripped or
+//!   hard-failed; pass `--no-tags` to opt out of the tagging read and
+//!   rewrite anyway (tags are then NOT preserved). **ACLs and
 //!   Object Lock retention/legal-hold are NOT carried over** — the
 //!   overwrite PUT resets them to the bucket defaults. Buckets that
 //!   rely on per-object ACLs or Object Lock must not be recompacted
@@ -181,6 +187,13 @@ pub enum SkipReason {
     /// `LastModified` is newer than the `--older-than` cutoff (or
     /// unknown, which is treated conservatively as new).
     TooRecent,
+    /// `GetObjectTagging` failed with an AccessDenied / NotImplemented /
+    /// NotSupported-class error: the object may carry tags we cannot
+    /// read, so rewriting it would silently strip them. Grant
+    /// `s3:GetObjectTagging` or pass `--no-tags` to rewrite without
+    /// preserving tags. Other tagging errors (transient faults) stay
+    /// hard failures. Same policy as `migrate`.
+    TagsUnreadable,
 }
 
 /// Knobs for one recompact run.
@@ -213,6 +226,13 @@ pub struct RecompactParams {
     /// stamp as gateway frames and recompact them (`false` = skip them
     /// as `unstamped-framed`, the safe default — see [`SkipReason`]).
     pub assume_unstamped_framed: bool,
+    /// `--no-tags`: skip the `GetObjectTagging` read entirely and
+    /// rewrite without carrying tags over. Explicit opt-out for
+    /// credentials/backends where tagging reads are denied or
+    /// unimplemented (objects otherwise skip as `tags-unreadable`).
+    /// WARNING: any existing object tags are NOT preserved on
+    /// rewritten objects. Same policy as `migrate`.
+    pub no_tags: bool,
 }
 
 /// One per-object hard failure (the object was left as-is unless the
@@ -262,6 +282,13 @@ pub struct RecompactReport {
     pub skipped_too_large: u64,
     pub skipped_etag_raced: u64,
     pub skipped_too_recent: u64,
+    /// Objects skipped because `GetObjectTagging` failed with an
+    /// AccessDenied / NotImplemented / NotSupported-class error (see
+    /// [`SkipReason::TagsUnreadable`]). Always `0` with `--no-tags`.
+    pub skipped_tags_unreadable: u64,
+    /// `true` when the run was made with `--no-tags` (tags neither read
+    /// nor carried over).
+    pub no_tags: bool,
     pub failed: u64,
     /// Per-key failure details, sorted by key.
     pub failures: Vec<RecompactFailure>,
@@ -765,16 +792,25 @@ async fn recompact_one(
         return ObjectOutcome::Skipped(SkipReason::EtagRaced);
     }
 
-    // Carry object tags over (same policy as migrate). A tagging-read
-    // failure is a hard failure — skipping silently would strip
-    // lifecycle/billing tags on the overwrite; nothing written yet.
-    let tags = match crate::migrate::fetch_tags(client, bucket, &job.key).await {
-        Ok(t) => t,
-        Err(cause) => {
-            return ObjectOutcome::Failed {
-                op: "GetObjectTagging",
-                cause,
-            };
+    // Carry object tags over (same policy as migrate, unless
+    // `--no-tags` opted out). An AccessDenied / NotImplemented-class
+    // tagging-read failure skips the object (`tags-unreadable`) —
+    // rewriting would silently strip tags we cannot see; any other
+    // tagging failure stays a hard failure. Nothing written yet.
+    let tags = if params.no_tags {
+        Vec::new()
+    } else {
+        match crate::migrate::fetch_tags(client, bucket, &job.key).await {
+            Ok(t) => t,
+            Err(e) if e.unreadable => {
+                return ObjectOutcome::Skipped(SkipReason::TagsUnreadable);
+            }
+            Err(e) => {
+                return ObjectOutcome::Failed {
+                    op: "GetObjectTagging",
+                    cause: e.cause,
+                };
+            }
         }
     };
 
@@ -918,6 +954,7 @@ fn fold_outcome(report: &mut RecompactReport, key: String, outcome: ObjectOutcom
             SkipReason::TooLarge => report.skipped_too_large += 1,
             SkipReason::EtagRaced => report.skipped_etag_raced += 1,
             SkipReason::TooRecent => report.skipped_too_recent += 1,
+            SkipReason::TagsUnreadable => report.skipped_tags_unreadable += 1,
         },
         ObjectOutcome::Failed { op, cause } => {
             report.failed += 1;
@@ -1001,6 +1038,8 @@ pub async fn run_recompact(
         skipped_too_large: 0,
         skipped_etag_raced: 0,
         skipped_too_recent: 0,
+        skipped_tags_unreadable: 0,
+        no_tags: params.no_tags,
         failed: 0,
         failures: Vec::new(),
         versioning_enabled: versioning,
@@ -1029,13 +1068,32 @@ pub async fn run_recompact(
          and the PUT is silently overwritten"
             .into(),
     );
-    report.notes.push(
-        "storage class and object tags are carried over on each rewrite; ACLs and \
-         Object Lock retention/legal-hold are NOT — the overwrite PUT resets them to \
-         bucket defaults, so do not recompact buckets relying on per-object ACLs or \
-         Object Lock"
-            .into(),
-    );
+    if params.no_tags {
+        report.notes.push(
+            "--no-tags: GetObjectTagging was not called and object tags are NOT carried \
+             over — any existing tags are absent from rewritten objects. Storage class is \
+             still carried over; ACLs and Object Lock retention/legal-hold are NOT — the \
+             overwrite PUT resets them to bucket defaults"
+                .into(),
+        );
+    } else {
+        report.notes.push(
+            "storage class and object tags are carried over on each rewrite; ACLs and \
+             Object Lock retention/legal-hold are NOT — the overwrite PUT resets them to \
+             bucket defaults, so do not recompact buckets relying on per-object ACLs or \
+             Object Lock"
+                .into(),
+        );
+    }
+    if report.skipped_tags_unreadable > 0 {
+        report.notes.push(format!(
+            "{} object(s) skipped as tags-unreadable — GetObjectTagging failed with an \
+             AccessDenied/NotImplemented/NotSupported-class error, so the rewrite was \
+             withheld rather than silently dropping tags; grant s3:GetObjectTagging or \
+             pass --no-tags to rewrite without preserving tags",
+            report.skipped_tags_unreadable,
+        ));
+    }
     if report.versioning_enabled {
         report.notes.push(
             "WARNING: bucket versioning is Enabled — each recompacted object leaves its \
@@ -1142,7 +1200,7 @@ pub fn render_human(report: &RecompactReport) -> String {
         out,
         "  skipped: {} not-s4, {} already-compacted, {} unsupported-codec, \
          {} unstamped-framed, {} insufficient-gain, {} too-large, {} etag-raced, \
-         {} too-recent",
+         {} too-recent, {} tags-unreadable",
         report.skipped_not_s4,
         report.skipped_already_compacted,
         report.skipped_unsupported_codec,
@@ -1151,6 +1209,7 @@ pub fn render_human(report: &RecompactReport) -> String {
         report.skipped_too_large,
         report.skipped_etag_raced,
         report.skipped_too_recent,
+        report.skipped_tags_unreadable,
     );
     let _ = writeln!(out, "  failed: {}", report.failed);
     if !report.failures.is_empty() {
@@ -1353,6 +1412,8 @@ mod tests {
             skipped_too_large: 0,
             skipped_etag_raced: 0,
             skipped_too_recent: 0,
+            skipped_tags_unreadable: 0,
+            no_tags: false,
             failed: 0,
             failures: Vec::new(),
             versioning_enabled: false,
@@ -1388,6 +1449,7 @@ mod tests {
             ("g", SkipReason::TooLarge),
             ("h", SkipReason::EtagRaced),
             ("i", SkipReason::TooRecent),
+            ("i2", SkipReason::TagsUnreadable),
         ] {
             fold_outcome(&mut report, key.into(), ObjectOutcome::Skipped(reason));
         }
@@ -1411,6 +1473,7 @@ mod tests {
         assert_eq!(report.skipped_too_large, 1);
         assert_eq!(report.skipped_etag_raced, 1);
         assert_eq!(report.skipped_too_recent, 1);
+        assert_eq!(report.skipped_tags_unreadable, 1);
         assert_eq!(report.failed, 1);
         assert_eq!(report.failures[0].key, "j");
         assert_eq!(report.failures[0].op, "PutObject");
@@ -1458,6 +1521,8 @@ mod tests {
         assert_eq!(v["skipped_too_large"], 0);
         assert_eq!(v["skipped_etag_raced"], 0);
         assert_eq!(v["skipped_too_recent"], 1);
+        assert_eq!(v["skipped_tags_unreadable"], 0);
+        assert_eq!(v["no_tags"], false);
         assert_eq!(v["failed"], 0);
         assert_eq!(v["versioning_enabled"], true);
         assert!(v["notes"].as_array().is_some_and(|a| !a.is_empty()));
@@ -1485,6 +1550,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(SkipReason::TooRecent).expect("skip reason"),
             "too-recent"
+        );
+        assert_eq!(
+            serde_json::to_value(SkipReason::TagsUnreadable).expect("skip reason"),
+            "tags-unreadable"
         );
     }
 
@@ -1562,6 +1631,7 @@ mod tests {
             min_gain_percent: DEFAULT_MIN_GAIN_PERCENT,
             older_than: None,
             assume_unstamped_framed: false,
+            no_tags: false,
         };
         let registry = Arc::new(build_registry(&params));
 

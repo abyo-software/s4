@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (audit round 2 — adversarial verification of the round-1 fix wave)
+- **P2** `CreateMultipartUpload` now strips client-supplied `s4-*`
+  metadata like `put_object` does — a forged `x-amz-meta-s4-encrypted`
+  could otherwise survive onto a completed multipart object and 5xx a
+  flag-less GET (multipart re-open of the round-1 PUT fix).
+- **P2** `migrate` / `recompact` no longer hard-fail every object when
+  `GetObjectTagging` is denied or unimplemented: such objects skip as
+  `tags-unreadable` (data is never rewritten tag-less), `NoSuchTagSet`
+  counts as "no tags", and a new `--no-tags` flag opts out of tag
+  inheritance entirely. Transient tagging errors still fail hard.
+- **P2** Version-pinned CopyObject (`?versionId=`) probes the *pinned*
+  source version — not the latest — for both the REPLACE metadata merge
+  and cross-bucket dictionary propagation.
+- **P3** Dictionary size cap (1 MiB) is now one consistent contract:
+  `train-dict --max-dict-bytes` and `--zstd-dict` boot preload reject
+  what a flag-less gateway's lazy fetch would refuse.
+- **P3** Boot-preloaded dictionaries are bucket-scoped, fetched per
+  `(bucket, id)` with `s4-dict-sha256` verification, and the server
+  refuses to boot when one dict-id resolves to different bytes across
+  buckets (16-hex prefix collision).
+- **P3** `s4 estimate` excludes already-S4 objects (gateway metadata or
+  `S4F2`/`S4P1`/`S4E*` magic) from sampling so re-estimating a
+  gateway-operated bucket doesn't measure framed/encrypted bytes as if
+  they were compressible plaintext (`already_s4` count + note).
+- **P3** (s4fs) the sidecar staleness check reuses a cached live-info
+  snapshot instead of issuing a second backend HEAD per `info()`.
+
 ### Fixed (audit round 1 — 4 reviewers over v1.0.0..HEAD, 2026-06-11)
 - **P1** `s4 migrate` could rewrite `.s4dict/<id>` dictionary objects as
   S4F2-framed data, breaking every `cpu-zstd-dict` object in the bucket

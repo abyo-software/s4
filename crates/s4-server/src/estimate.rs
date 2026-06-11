@@ -54,8 +54,18 @@
 //! - **Sample races**: an object deleted between the listing and its
 //!   sample GET (404 / NoSuchKey) is skipped — like the empty-body
 //!   race — and counted in a report note instead of aborting the run.
+//! - **Already-S4 objects are excluded from the measurement**: on a
+//!   bucket the gateway has already been writing to, sampled bodies
+//!   that carry the `s4-codec` / `s4-encrypted` metadata stamp or
+//!   start with the `S4F2`/`S4P1` frame magic or an `S4E*` SSE magic
+//!   are framed/encrypted (≈ incompressible) bytes — measuring them
+//!   would drag the stratum ratio toward 1.0 and produce a garbage
+//!   estimate. They are counted per stratum (`already_s4`) and in a
+//!   report note instead. Their **listed bytes still count toward the
+//!   totals and projections** (we only know already-S4 status for the
+//!   sampled subset), which the note discloses.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use aws_sdk_s3::Client;
@@ -93,6 +103,11 @@ pub const DEFAULT_PRICE_PER_GB_MONTH: f64 = 0.023;
 /// PUT path (`service.rs` private `SAMPLE_BYTES = 4096`) so the estimate
 /// picks the same codec the gateway would pick at runtime.
 const DISPATCH_SAMPLE_BYTES: usize = 4096;
+
+/// Metadata key the gateway stamps on SSE-S4 encrypted objects — the
+/// literal `"s4-encrypted"` written by `service.rs` (which has no
+/// exported constant for it; keep in sync).
+const META_ENCRYPTED: &str = "s4-encrypted";
 
 /// Bytes per GB for the $/month conversion. AWS bills storage in
 /// binary gigabytes (GiB) despite the "GB" label, so we use 2³⁰.
@@ -195,6 +210,11 @@ pub struct StratumReport {
     pub bytes: u64,
     /// Objects actually sampled (GET + compressed).
     pub sampled: u64,
+    /// Drawn samples excluded because the object is already S4-managed
+    /// (framed or encrypted by the gateway / `s4 migrate`) — already
+    /// compressed bytes that must not contaminate `ratio`. See the
+    /// `already S4-managed` report note.
+    pub already_s4: u64,
     /// Bytes actually fetched and compressed across the samples
     /// (post Range-GET cap).
     pub sampled_bytes_read: u64,
@@ -335,6 +355,26 @@ fn measurement_kind(pick: CodecKind) -> (CodecKind, bool) {
     }
 }
 
+/// `true` when the sample GET's metadata marks the object as already
+/// S4-managed: the `s4-codec` manifest stamp (framed / legacy raw-zstd
+/// / passthrough gateway writes) or the `s4-encrypted` SSE stamp.
+/// Same metadata-first policy as `migrate`'s already-S4 probe.
+fn is_already_s4_metadata(metadata: Option<&HashMap<String, String>>) -> bool {
+    metadata.is_some_and(|m| {
+        m.contains_key(crate::service::META_CODEC) || m.contains_key(META_ENCRYPTED)
+    })
+}
+
+/// `true` when the sampled body bytes themselves are S4-managed output:
+/// an `S4F2`/`S4P1` frame stream ([`crate::migrate::is_s4_frame_prefix`])
+/// or an `S4E1`..`S4E6` SSE-S4 ciphertext ([`crate::sse::looks_encrypted`]
+/// — length-gated at the 36-byte minimum header, so a < 36-byte sample
+/// can only be caught via the metadata stamp). Covers objects whose
+/// metadata was stripped (e.g. a backend-side copy).
+fn is_already_s4_body(body_prefix: &[u8]) -> bool {
+    crate::migrate::is_s4_frame_prefix(body_prefix) || crate::sse::looks_encrypted(body_prefix)
+}
+
 #[derive(Debug, Clone)]
 struct ListedObject {
     key: String,
@@ -448,6 +488,12 @@ enum SampleOutcome {
     /// Listed size said > 0 but the body came back empty (raced
     /// overwrite). Skipped rather than divide by zero.
     Empty,
+    /// The object is already S4-managed (`s4-codec` / `s4-encrypted`
+    /// metadata, or `S4F2`/`S4P1`/`S4E*` body magic): it is already
+    /// compressed/encrypted gateway output, so measuring it would
+    /// poison the stratum ratio. Counted per stratum and disclosed in
+    /// a report note.
+    AlreadyS4,
 }
 
 /// `true` when a sample GET failed because the object no longer exists
@@ -492,6 +538,12 @@ async fn measure_one(
             });
         }
     };
+    // Already-S4 gate, metadata first (covers every gateway-written
+    // shape, including ones whose body magic a short Range GET would
+    // miss) — see the module docs.
+    if is_already_s4_metadata(resp.metadata()) {
+        return Ok(SampleOutcome::AlreadyS4);
+    }
     let body = resp
         .body
         .collect()
@@ -505,6 +557,11 @@ async fn measure_one(
         .into_bytes();
     if body.is_empty() {
         return Ok(SampleOutcome::Empty);
+    }
+    // Body-magic gate: S4F2/S4P1 frames or S4E* ciphertext written by
+    // the gateway but with the metadata stamp stripped (backend copy).
+    if is_already_s4_body(&body) {
+        return Ok(SampleOutcome::AlreadyS4);
     }
     let sample_len = body.len().min(DISPATCH_SAMPLE_BYTES);
     // Same call shape as the server PUT path: prefix sample + the full
@@ -566,6 +623,7 @@ pub async fn run_estimate(
     let mut sampled_bytes_read: u64 = 0;
     let mut sampled_full_bytes: u64 = 0;
     let mut samples_missing: u64 = 0;
+    let mut samples_already_s4: u64 = 0;
     let mut proxied_codecs: BTreeMap<String, u64> = BTreeMap::new();
 
     for (stratum, indices) in &strata {
@@ -576,6 +634,7 @@ pub async fn run_estimate(
         let mut measurements: Vec<WeightedRatio> = Vec::with_capacity(chosen.len());
         let mut codec_counts: BTreeMap<String, (u64, String)> = BTreeMap::new();
         let mut stratum_read: u64 = 0;
+        let mut stratum_already_s4: u64 = 0;
         for &pos in &chosen {
             let obj = &inventory.objects[indices[pos]];
             let m = match measure_one(
@@ -594,6 +653,11 @@ pub async fn run_estimate(
                     continue;
                 }
                 SampleOutcome::Empty => continue,
+                SampleOutcome::AlreadyS4 => {
+                    samples_already_s4 += 1;
+                    stratum_already_s4 += 1;
+                    continue;
+                }
             };
             sampled_objects += 1;
             sampled_bytes_read += m.bytes_read;
@@ -624,6 +688,7 @@ pub async fn run_estimate(
             objects: indices.len() as u64,
             bytes: stratum_bytes,
             sampled: measurements.len() as u64,
+            already_s4: stratum_already_s4,
             sampled_bytes_read: stratum_read,
             codecs: codec_counts
                 .into_iter()
@@ -685,6 +750,15 @@ pub async fn run_estimate(
         notes.push(format!(
             "{samples_missing} sampled object(s) returned 404/NoSuchKey mid-run (deleted \
              between the listing and the sample GET) and were skipped"
+        ));
+    }
+    if samples_already_s4 > 0 {
+        notes.push(format!(
+            "{samples_already_s4} sampled object(s) are already S4-managed (s4-codec/\
+             s4-encrypted metadata or S4F2/S4P1/S4E* magic) and were excluded from the \
+             measurement — objects already compressed/encrypted by S4 are not part of \
+             this estimate's savings; their listed bytes still count toward the totals \
+             and projections (see per-stratum `already_s4`)"
         ));
     }
     if inventory.truncated {
@@ -780,7 +854,7 @@ pub fn render_human(report: &EstimateReport) -> String {
         "stratum", "objects", "bytes", "sampled", "ratio", "projected",
     );
     for s in &report.strata {
-        let codecs = s
+        let mut codecs = s
             .codecs
             .iter()
             .map(|c| {
@@ -792,6 +866,12 @@ pub fn render_human(report: &EstimateReport) -> String {
             })
             .collect::<Vec<_>>()
             .join(", ");
+        if s.already_s4 > 0 {
+            if !codecs.is_empty() {
+                codecs.push_str(", ");
+            }
+            codecs.push_str(&format!("already-s4\u{d7}{} (excluded)", s.already_s4));
+        }
         let _ = writeln!(
             out,
             "  {:<12} {:>8} {:>12} {:>8} {:>7.3} {:>14}  {}",
@@ -920,6 +1000,49 @@ mod tests {
         assert!(!is_missing_object_error(None, None));
     }
 
+    /// Already-S4 sample classification — the core of the "gateway-run
+    /// bucket produces garbage ratios" fix: framed / encrypted gateway
+    /// output must be recognized via metadata OR body magic and
+    /// excluded from the measurement.
+    #[test]
+    fn already_s4_sample_classification() {
+        // Metadata stamps (any value counts; the key is the signal).
+        let mut meta = HashMap::new();
+        meta.insert("s4-codec".to_owned(), "cpu-zstd".to_owned());
+        assert!(is_already_s4_metadata(Some(&meta)));
+        let mut meta = HashMap::new();
+        meta.insert("s4-encrypted".to_owned(), "aes-256-gcm".to_owned());
+        assert!(is_already_s4_metadata(Some(&meta)));
+        // User metadata without the stamps does not trigger.
+        let mut meta = HashMap::new();
+        meta.insert("owner".to_owned(), "alice".to_owned());
+        assert!(!is_already_s4_metadata(Some(&meta)));
+        assert!(!is_already_s4_metadata(None));
+
+        // Frame magic (reused from migrate::is_s4_frame_prefix).
+        assert!(is_already_s4_body(b"S4F2rest-of-frame"));
+        assert!(is_already_s4_body(b"S4P1\0\0\0\0"));
+        // SSE magic — looks_encrypted is length-gated at the 36-byte
+        // minimum header, so pad past it.
+        for magic in [b"S4E1", b"S4E2", b"S4E3", b"S4E4", b"S4E5", b"S4E6"] {
+            let mut body = magic.to_vec();
+            body.extend_from_slice(&[0u8; 40]);
+            assert!(
+                is_already_s4_body(&body),
+                "{} body must classify as already-s4",
+                String::from_utf8_lossy(magic)
+            );
+        }
+        // A too-short S4E* body is NOT caught by the magic (metadata
+        // stamp covers gateway-written ones) — documented gate.
+        assert!(!is_already_s4_body(b"S4E2 too short"));
+        // Plain customer bytes pass through to measurement.
+        assert!(!is_already_s4_body(b"plain text log line"));
+        assert!(!is_already_s4_body(b""));
+        // zstd magic alone is not S4 management.
+        assert!(!is_already_s4_body(&[0x28, 0xb5, 0x2f, 0xfd]));
+    }
+
     #[test]
     fn measurement_kind_proxies_gpu_only() {
         assert_eq!(
@@ -960,6 +1083,7 @@ mod tests {
                 objects: 2,
                 bytes: 1000,
                 sampled: 1,
+                already_s4: 0,
                 sampled_bytes_read: 600,
                 codecs: vec![CodecPicks {
                     codec: "cpu-zstd".into(),
@@ -998,6 +1122,7 @@ mod tests {
         assert_eq!(s["objects"], 2);
         assert_eq!(s["bytes"], 1000);
         assert_eq!(s["sampled"], 1);
+        assert_eq!(s["already_s4"], 0);
         assert_eq!(s["ratio"], 0.5);
         assert_eq!(s["projected_bytes"], 500);
         assert_eq!(s["codecs"][0]["codec"], "cpu-zstd");

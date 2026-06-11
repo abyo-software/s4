@@ -981,6 +981,15 @@ struct MigrateArgs {
     #[clap(long, value_name = "BYTES", default_value_t = DEFAULT_REPAIR_BODY_BYTES_CLI)]
     max_body_bytes: u64,
 
+    /// Skip the GetObjectTagging read and rewrite WITHOUT carrying
+    /// object tags over — any existing tags are NOT preserved on
+    /// rewritten objects. Explicit opt-out for credentials lacking
+    /// `s3:GetObjectTagging` or backends without tagging support,
+    /// where objects otherwise skip as `tags-unreadable`. Only use
+    /// when you know the objects carry no tags you need.
+    #[clap(long, default_value_t = false)]
+    no_tags: bool,
+
     /// Output format.
     #[clap(long, value_enum, default_value = "table")]
     format: MigrateFormat,
@@ -1071,6 +1080,15 @@ struct RecompactArgs {
     /// matches `migrate --max-body-bytes`.
     #[clap(long, value_name = "BYTES", default_value_t = DEFAULT_REPAIR_BODY_BYTES_CLI)]
     max_body_bytes: u64,
+
+    /// Skip the GetObjectTagging read and rewrite WITHOUT carrying
+    /// object tags over — any existing tags are NOT preserved on
+    /// rewritten objects. Explicit opt-out for credentials lacking
+    /// `s3:GetObjectTagging` or backends without tagging support,
+    /// where objects otherwise skip as `tags-unreadable`. Only use
+    /// when you know the objects carry no tags you need.
+    #[clap(long, default_value_t = false)]
+    no_tags: bool,
 
     /// Output format.
     #[clap(long, value_enum, default_value = "table")]
@@ -1639,8 +1657,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         }
         let mut dict_bytes: std::collections::HashMap<String, Vec<u8>> =
             std::collections::HashMap::new();
+        // v1.0.1 audit R2 P3 residual: fetch per (bucket, id) — not deduped
+        // by id alone — verify the full `s4-dict-sha256` stamp when present
+        // (same `verify_dict_bytes` discipline as the lazy fetch), and
+        // refuse to boot when the same dict-id resolves to different bytes
+        // in two buckets (64-bit prefix collision; silently picking one
+        // would decode the other bucket's objects with the wrong dict).
+        let mut fetched: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
         for entry in &entries {
-            if dict_bytes.contains_key(&entry.dict_id) {
+            if !fetched.insert((entry.bucket.clone(), entry.dict_id.clone())) {
                 continue;
             }
             let dict_key = s4_server::dict::dict_object_key(&entry.dict_id);
@@ -1657,6 +1683,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
                         entry.prefix, entry.bucket
                     )
                 })?;
+            let claimed_sha = resp
+                .metadata()
+                .and_then(|m| m.get(s4_server::dict::DICT_SHA256_META_KEY))
+                .cloned();
             let body = resp
                 .body
                 .collect()
@@ -1668,7 +1698,29 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
                     )
                 })?
                 .into_bytes();
-            dict_bytes.insert(entry.dict_id.clone(), body.to_vec());
+            s4_server::dict::verify_dict_bytes(&entry.dict_id, claimed_sha.as_deref(), &body)
+                .map_err(|e| {
+                    format!(
+                        "--zstd-dict {:?}: {}/{dict_key}: {e}",
+                        entry.prefix, entry.bucket
+                    )
+                })?;
+            match dict_bytes.entry(entry.dict_id.clone()) {
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    if existing.get().as_slice() != body.as_ref() {
+                        return Err(format!(
+                            "--zstd-dict: dictionary id {} resolves to different bytes in \
+                             different buckets (16-hex prefix collision) — retrain one of \
+                             them so the ids diverge",
+                            entry.dict_id
+                        )
+                        .into());
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(body.to_vec());
+                }
+            }
         }
         let store = s4_server::dict::DictStore::new(
             entries,
@@ -2790,6 +2842,7 @@ async fn run_migrate_cmd(
         gpu_min_bytes: opt.gpu_min_bytes,
         prefer_columnar_gpu: opt.prefer_columnar_gpu,
         gpu_present,
+        no_tags: args.no_tags,
     };
     let report = s4_server::migrate::run_migrate(&client, &bucket, &params)
         .await
@@ -2842,6 +2895,7 @@ async fn run_recompact_cmd(
         min_gain_percent: args.min_gain_percent,
         older_than: args.older_than,
         assume_unstamped_framed: args.assume_unstamped_framed,
+        no_tags: args.no_tags,
     };
     let report = s4_server::recompact::run_recompact(&client, &bucket, &params)
         .await

@@ -163,6 +163,11 @@ class S4FileSystem(AbstractFileSystem):
         self._meta_cache: Dict[str, Dict[str, str]] = {}
         # (bucket, dict_id) -> dictionary bytes (fingerprint-verified)
         self._zstd_dict_cache: Dict[Tuple[str, str], bytes] = {}
+        # path -> live underlying info() snapshot used by the sidecar
+        # staleness check (audit R2: avoids a second backend HEAD per
+        # info()/cat_file on framed objects). Invalidated with the
+        # other caches below.
+        self._live_info_cache: Dict[str, Dict[str, Any]] = {}
 
     # -- internal helpers --------------------------------------------------
 
@@ -388,10 +393,13 @@ class S4FileSystem(AbstractFileSystem):
         scs = idx.get("source_compressed_size")
         if etag is None and scs is None:
             return False  # unbound v1 sidecar — full-read fallback
-        try:
-            info = self.fs.info(path)
-        except FileNotFoundError:
-            return False
+        info = self._live_info_cache.get(path)
+        if info is None:
+            try:
+                info = dict(self.fs.info(path))
+            except FileNotFoundError:
+                return False
+            self._live_info_cache[path] = info
         live_etag = _strip_etag(info.get("ETag") or info.get("etag"))
         if etag and live_etag and etag != live_etag:
             return False
@@ -561,10 +569,12 @@ class S4FileSystem(AbstractFileSystem):
         if path is None:
             self._index_cache.clear()
             self._meta_cache.clear()
+            self._live_info_cache.clear()
         else:
             path = self._strip_protocol(path)
             self._index_cache.pop(path, None)
             self._meta_cache.pop(path, None)
+            self._live_info_cache.pop(path, None)
         if hasattr(self.fs, "invalidate_cache"):
             self.fs.invalidate_cache(path)
 

@@ -240,3 +240,124 @@ async fn estimate_against_minio_known_mix() {
     assert_eq!(none.total_objects, 0);
     assert!(none.notes.iter().any(|n| n == "no objects found"));
 }
+
+/// v1.1 audit round-2: a bucket the gateway has already been writing to
+/// contains framed (`S4F2`) / encrypted (`S4E*`) / metadata-stamped
+/// objects. Those are already-compressed bytes — measuring them would
+/// drag the stratum ratio toward 1.0 and produce a garbage estimate.
+/// They must be excluded from the measurement, counted per stratum
+/// (`already_s4`), and disclosed in a note, while plain objects in the
+/// same stratum keep their honest ratio.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn estimate_excludes_already_s4_objects() {
+    let fixture = start_minio().await;
+    let client = build_aws_client(&fixture.endpoint_url).await;
+    let bucket = "s4-estimate-already-s4";
+    client
+        .create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("create bucket");
+
+    // Two plain, highly compressible logs — the only objects that may
+    // contribute to the .log ratio.
+    let log_body =
+        "level=info msg=\"request handled\" path=/api/v1/items status=200\n".repeat(2048);
+    for i in 0..2 {
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(format!("logs/plain-{i}.log"))
+            .body(log_body.clone().into_bytes().into())
+            .send()
+            .await
+            .expect("put plain log");
+    }
+
+    // High-entropy filler for the already-S4 shapes: if any of them
+    // leaked into the measurement its ~1.0 ratio would blow the
+    // size-weighted stratum mean — the < 0.10 assertion below is a
+    // real discriminator, not vacuous.
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut noise = Vec::with_capacity(64 * 1024);
+    while noise.len() < 64 * 1024 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        noise.extend_from_slice(&x.to_le_bytes());
+    }
+
+    // (1) Framed body magic, NO metadata (e.g. backend-side copy that
+    // stripped the stamp): caught by the S4F2 prefix.
+    let mut framed = b"S4F2".to_vec();
+    framed.extend_from_slice(&noise);
+    client
+        .put_object()
+        .bucket(bucket)
+        .key("logs/framed.log")
+        .body(framed.into())
+        .send()
+        .await
+        .expect("put framed");
+    // (2) `s4-codec` metadata stamp with a non-magic body (gateway
+    // passthrough / legacy raw-zstd shape): caught by the metadata.
+    client
+        .put_object()
+        .bucket(bucket)
+        .key("logs/stamped.log")
+        .body(noise.clone().into())
+        .metadata("s4-codec", "passthrough")
+        .send()
+        .await
+        .expect("put stamped");
+    // (3) SSE-S4 ciphertext shape: S4E2 magic + `s4-encrypted` stamp
+    // (either alone suffices).
+    let mut encrypted = b"S4E2".to_vec();
+    encrypted.extend_from_slice(&noise);
+    client
+        .put_object()
+        .bucket(bucket)
+        .key("logs/encrypted.log")
+        .body(encrypted.into())
+        .metadata("s4-encrypted", "aes-256-gcm")
+        .send()
+        .await
+        .expect("put encrypted");
+
+    let report = run_estimate(&client, bucket, &default_params())
+        .await
+        .expect("estimate");
+
+    // All 5 objects are listed (exclusion is from the measurement, not
+    // the inventory), all 5 are drawn (samples_per_stratum = 8 >= 5),
+    // but only the 2 plain logs are measured.
+    assert_eq!(report.total_objects, 5, "report: {report:?}");
+    assert_eq!(report.sampled_objects, 2);
+    let log_stratum = report
+        .strata
+        .iter()
+        .find(|s| s.stratum == ".log")
+        .expect(".log stratum");
+    assert_eq!(log_stratum.objects, 5);
+    assert_eq!(log_stratum.sampled, 2);
+    assert_eq!(log_stratum.already_s4, 3);
+    // The honest part: the ratio comes from the plain logs only — the
+    // three already-S4 noise bodies (ratio ~1.0, 3x the plain bytes)
+    // must not have contaminated it.
+    assert!(
+        log_stratum.ratio < 0.10,
+        "already-s4 samples leaked into the ratio: {}",
+        log_stratum.ratio
+    );
+    // Disclosure note present and counts match.
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.starts_with("3 sampled object(s) are already S4-managed")),
+        "already-s4 note expected: {:?}",
+        report.notes
+    );
+}

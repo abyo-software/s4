@@ -34,6 +34,13 @@
 //!     `.s4dict/<id>` (with its full-SHA-256 metadata stamp) into the
 //!     destination bucket, so the copy stays readable after the source
 //!     bucket is gone (idempotent re-copy included).
+//!
+//! v1.0.1 audit R2 addition (separate test,
+//! `dict_e2e_versioned_copy_pins_source_version`):
+//! (j) on a MinIO-versioned source bucket, a `?versionId=`-pinned
+//!     CopyObject probes the *pinned* version for both the
+//!     REPLACE-directive metadata merge and the cross-bucket dictionary
+//!     propagation (pre-fix both probed "latest").
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -566,4 +573,240 @@ async fn dict_e2e_train_compress_get_and_external_decode() {
         .expect("second cross-bucket copy (idempotent dict propagation)");
 
     let _ = gw3_stop.send(());
+}
+
+/// v1.0.1 audit R2 P2: CopyObject's two source HEAD probes (the
+/// REPLACE-directive metadata merge and the cross-bucket dictionary
+/// propagation) must honor a `?versionId=`-pinned copy source. Pre-fix
+/// both probed "latest" — this test makes "latest" maximally wrong (a raw
+/// backend-direct overwrite with no `s4-*` metadata at all) and pins the
+/// copy to the older, dict-compressed version:
+///
+/// - cross-bucket COPY-directive copy: the pinned version's
+///   `.s4dict/<id>` must travel to the destination bucket (pre-fix: the
+///   probe saw the raw latest, found no `s4-dict-id`, skipped
+///   propagation → dangling dict reference, destination GET 5xx);
+/// - REPLACE-directive copy: the destination must carry the *pinned*
+///   version's s4-* manifest (pre-fix: the merge read latest's metadata
+///   — here none — so the destination lost its codec markers and a GET
+///   returned compressed bytes instead of the original body).
+#[tokio::test]
+#[ignore = "requires Docker (MinIO testcontainer); run with --ignored"]
+async fn dict_e2e_versioned_copy_pins_source_version() {
+    const SRC: &str = "verbkt";
+    const DST: &str = "verbkt2";
+    const KEY: &str = "events/v/pinned.json";
+
+    let minio = start_minio().await;
+    let backend = build_aws_client(&minio.endpoint_url);
+    backend
+        .create_bucket()
+        .bucket(SRC)
+        .send()
+        .await
+        .expect("create src bucket");
+    backend
+        .create_bucket()
+        .bucket(DST)
+        .send()
+        .await
+        .expect("create dst bucket");
+    backend
+        .put_bucket_versioning()
+        .bucket(SRC)
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("enable MinIO versioning on the source bucket");
+
+    // Train a dictionary on the source bucket (backend-direct, same
+    // corpus shape as the main e2e).
+    for i in 0..80u32 {
+        backend
+            .put_object()
+            .bucket(SRC)
+            .key(format!("events/train/{i:04}.json"))
+            .body(aws_sdk_s3::primitives::ByteStream::from(json_event(i, "t")))
+            .send()
+            .await
+            .expect("seed train object");
+    }
+    let params = TrainDictParams {
+        prefix: "events/".to_owned(),
+        max_samples: 1000,
+        max_dict_bytes: 112_640,
+        min_samples: 8,
+        sample_max_bytes: 64 * 1024,
+        zstd_level: CpuZstd::DEFAULT_LEVEL,
+    };
+    let report = run_train_dict(&backend, SRC, &params)
+        .await
+        .expect("train-dict");
+    let dict_key = dict_object_key(&report.dict_id);
+    let dict_bytes = backend
+        .get_object()
+        .bucket(SRC)
+        .key(&dict_key)
+        .send()
+        .await
+        .expect("GET trained dict")
+        .body
+        .collect()
+        .await
+        .expect("collect dict")
+        .into_bytes()
+        .to_vec();
+
+    // Gateway with the dict mapping attached.
+    let entry =
+        parse_zstd_dict_flag(&format!("{SRC}/events/={}", report.dict_id)).expect("flag parse");
+    let mut loaded = HashMap::new();
+    loaded.insert(report.dict_id.clone(), dict_bytes);
+    let store = Arc::new(
+        DictStore::new(
+            vec![entry],
+            loaded,
+            DEFAULT_DICT_MAX_OBJECT_BYTES,
+            CpuZstd::DEFAULT_LEVEL,
+        )
+        .expect("store"),
+    );
+    let (gw_url, gw_stop) = spawn_s4_server(&minio.endpoint_url, Some(store)).await;
+    let gw = build_aws_client(&gw_url);
+
+    // Version A through the gateway: dict-compressed, `s4-dict-id` stamped.
+    let body_a = json_event(777_777, "vA");
+    let put_a = gw
+        .put_object()
+        .bucket(SRC)
+        .key(KEY)
+        .body(aws_sdk_s3::primitives::ByteStream::from(body_a.clone()))
+        .send()
+        .await
+        .expect("PUT version A via gateway");
+    let vid_a = put_a
+        .version_id()
+        .expect("versioned MinIO bucket must mint a version id")
+        .to_owned();
+    let head_a = backend
+        .head_object()
+        .bucket(SRC)
+        .key(KEY)
+        .version_id(&vid_a)
+        .send()
+        .await
+        .expect("backend HEAD version A");
+    assert_eq!(
+        head_a
+            .metadata()
+            .and_then(|m| m.get("s4-dict-id"))
+            .map(String::as_str),
+        Some(report.dict_id.as_str()),
+        "precondition: version A must be dict-compressed"
+    );
+
+    // Version B straight on the backend: raw bytes, NO s4-* metadata —
+    // the worst case for a probe that incorrectly reads "latest".
+    let body_b = b"latest version is a raw backend-direct overwrite".to_vec();
+    backend
+        .put_object()
+        .bucket(SRC)
+        .key(KEY)
+        .body(aws_sdk_s3::primitives::ByteStream::from(body_b))
+        .send()
+        .await
+        .expect("PUT version B backend-direct");
+
+    // ---- cross-bucket COPY-directive copy pinned to version A ----------
+    gw.copy_object()
+        .copy_source(format!("{SRC}/{KEY}?versionId={vid_a}"))
+        .bucket(DST)
+        .key("copied/pinned.json")
+        .send()
+        .await
+        .expect("pinned cross-bucket copy");
+    backend
+        .head_object()
+        .bucket(DST)
+        .key(&dict_key)
+        .send()
+        .await
+        .expect(
+            "pinned version's dictionary must travel to the destination bucket \
+             (pre-fix the probe saw the raw latest version and skipped propagation)",
+        );
+    // The copied object round-trips through a flag-less gateway (lazy
+    // `.s4dict/` fetch resolves from DST itself).
+    let (plain_url, plain_stop) = spawn_s4_server(&minio.endpoint_url, None).await;
+    let plain = build_aws_client(&plain_url);
+    let copied = plain
+        .get_object()
+        .bucket(DST)
+        .key("copied/pinned.json")
+        .send()
+        .await
+        .expect("GET copied object via flag-less gateway")
+        .body
+        .collect()
+        .await
+        .expect("collect copied object")
+        .into_bytes();
+    assert_eq!(
+        copied.as_ref(),
+        body_a.as_slice(),
+        "pinned copy must carry version A's bytes and stay readable"
+    );
+
+    // ---- REPLACE-directive copy pinned to version A ---------------------
+    gw.copy_object()
+        .copy_source(format!("{SRC}/{KEY}?versionId={vid_a}"))
+        .bucket(DST)
+        .key("replaced/pinned.json")
+        .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+        .metadata("app-team", "checkout")
+        .send()
+        .await
+        .expect("pinned REPLACE-directive copy");
+    let head = backend
+        .head_object()
+        .bucket(DST)
+        .key("replaced/pinned.json")
+        .send()
+        .await
+        .expect("backend HEAD REPLACE destination");
+    let meta = head.metadata().expect("metadata");
+    assert_eq!(
+        meta.get("s4-dict-id").map(String::as_str),
+        Some(report.dict_id.as_str()),
+        "REPLACE merge must propagate the PINNED version's s4-* manifest, got {meta:?}"
+    );
+    assert_eq!(
+        meta.get("app-team").map(String::as_str),
+        Some("checkout"),
+        "client REPLACE metadata must survive the merge"
+    );
+    let replaced = plain
+        .get_object()
+        .bucket(DST)
+        .key("replaced/pinned.json")
+        .send()
+        .await
+        .expect("GET REPLACE destination via flag-less gateway")
+        .body
+        .collect()
+        .await
+        .expect("collect REPLACE destination")
+        .into_bytes();
+    assert_eq!(
+        replaced.as_ref(),
+        body_a.as_slice(),
+        "REPLACE destination must decode with version A's manifest"
+    );
+
+    let _ = plain_stop.send(());
+    let _ = gw_stop.send(());
 }

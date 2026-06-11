@@ -131,6 +131,7 @@ fn default_params() -> MigrateParams {
         gpu_min_bytes: SamplingDispatcher::DEFAULT_GPU_MIN_BYTES,
         prefer_columnar_gpu: false,
         gpu_present: false,
+        no_tags: false,
     }
 }
 
