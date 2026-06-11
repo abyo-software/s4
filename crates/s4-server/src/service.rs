@@ -41,7 +41,7 @@ use s4_codec::multipart::{
 };
 use s4_codec::{ChunkManifest, CodecDispatcher, CodecKind, CodecRegistry, CompressTelemetry};
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::blob::{
     bytes_to_blob, chain_sample_with_rest, collect_blob, collect_with_sample, peek_sample,
@@ -636,14 +636,28 @@ pub struct S4Service<B: S3> {
     /// `false` matches the v0.8.16 behaviour.
     allow_legacy_reserved_key_reads: bool,
     /// v1.1 `--zstd-dict`: optional prefix→dictionary store for the PUT
-    /// side. `None` (default) leaves every PUT bit-for-bit on the
-    /// pre-dict path; `Some(...)` makes small cpu-zstd PUTs whose key
+    /// side. An empty [`crate::dict::SharedDictStore`] (default — `load`
+    /// returns `None`) leaves every PUT bit-for-bit on the pre-dict
+    /// path; a populated one makes small cpu-zstd PUTs whose key
     /// longest-prefix-matches a configured prefix try `cpu-zstd-dict`
     /// (falling back to plain cpu-zstd when the dictionary doesn't
     /// actually shrink the body). Built in `main.rs` from the repeated
-    /// `--zstd-dict <bucket>/<prefix>=<dict-id>` flags; every dictionary
-    /// is fetched from the backend at boot.
-    zstd_dicts: Option<Arc<crate::dict::DictStore>>,
+    /// `--zstd-dict <bucket>/<prefix>=<dict-id>` flags and/or the
+    /// `--zstd-dict-map <FILE>` TOML; every dictionary is fetched from
+    /// the backend at boot.
+    ///
+    /// v1.3 dict ops: the holder is reload-capable — the
+    /// `--zstd-dict-map` SIGHUP handler swaps a fully-built replacement
+    /// store in atomically (RCU; no lock on the request path). Each
+    /// request `load`s the store once and keeps that generation for its
+    /// lifetime.
+    zstd_dicts: Arc<crate::dict::SharedDictStore>,
+    /// v1.3 dict ops: rolling per-prefix win-rate monitor for the dict
+    /// PUT branch. When a configured prefix's last 100 dict-vs-plain
+    /// decisions fall below a 0.5 win rate, the gateway WARNs (at most
+    /// once per prefix per hour) that the dictionary looks stale.
+    /// Inert (never touched) when no dict store is configured.
+    dict_win_tracker: crate::dict::DictWinTracker,
     /// v1.1 `--zstd-dict` GET resilience: small LRU of lazily-fetched
     /// dictionaries. Always present (no flag needed) so objects stamped
     /// with `s4-dict-id` stay readable on a gateway that never loaded —
@@ -780,7 +794,10 @@ impl<B: S3> S4Service<B> {
             // (no behaviour change without the flag); the GET-side lazy
             // cache is always live but only consulted for objects that
             // carry the `s4-dict-id` metadata stamp.
-            zstd_dicts: None,
+            zstd_dicts: Arc::new(crate::dict::SharedDictStore::default()),
+            // v1.3 dict ops: win-rate monitor — inert until a dict
+            // store is attached AND a PUT takes the dict branch.
+            dict_win_tracker: crate::dict::DictWinTracker::default(),
             dict_cache: Arc::new(crate::dict::DictCache::default()),
             // v1.2 `--gpu-batch-small-puts`: off by default — no GPU
             // batch aggregator, zero behaviour change.
@@ -829,7 +846,22 @@ impl<B: S3> S4Service<B> {
     /// unset (default), PUT behaviour is bit-for-bit unchanged.
     #[must_use]
     pub fn with_zstd_dicts(mut self, store: Arc<crate::dict::DictStore>) -> Self {
-        self.zstd_dicts = Some(store);
+        self.zstd_dicts = Arc::new(crate::dict::SharedDictStore::new(Some(store)));
+        self
+    }
+
+    /// v1.3 dict ops (`--zstd-dict-map` + SIGHUP): attach a
+    /// **reload-capable** shared dictionary store. Same PUT/GET
+    /// semantics as [`Self::with_zstd_dicts`], but the caller keeps a
+    /// handle to the [`crate::dict::SharedDictStore`] and may
+    /// [`crate::dict::SharedDictStore::swap`] in a fully-built
+    /// replacement at any time (the SIGHUP map-reload path in
+    /// `main.rs`). Requests pick up the new generation on their next
+    /// store load; in-flight requests finish on the generation they
+    /// started with.
+    #[must_use]
+    pub fn with_shared_zstd_dicts(mut self, shared: Arc<crate::dict::SharedDictStore>) -> Self {
+        self.zstd_dicts = shared;
         self
     }
 
@@ -2562,7 +2594,7 @@ impl<B: S3> S4Service<B> {
         // just like the lazy cache below — a dictionary preloaded for one
         // bucket's `--zstd-dict` prefix must not satisfy GETs against a
         // different bucket (the 16-hex id is only a 64-bit prefix).
-        if let Some(store) = self.zstd_dicts.as_ref()
+        if let Some(store) = self.zstd_dicts.load()
             && let Some(dict) = store.get_preloaded(bucket, dict_id)
         {
             return Ok(dict);
@@ -2798,13 +2830,22 @@ impl<B: S3> S4Service<B> {
     /// `used_dict == false` is the fallback shape: a normal `cpu-zstd`
     /// framed object, indistinguishable from a non-dict PUT, and no
     /// `s4-dict-id` stamp.
+    ///
+    /// v1.3 dict ops: `matched_prefix` is the configured
+    /// `<bucket>/<key-prefix>` that routed this PUT here — both
+    /// compression results are measured anyway, so the per-prefix
+    /// win/loss + byte counters (`s4_dict_put_total` /
+    /// `s4_dict_put_bytes_total`) cost nothing extra, and the rolling
+    /// win-rate monitor WARNs when the dictionary stops paying off.
     async fn compress_small_with_dict(
         &self,
         bytes: bytes::Bytes,
         dict: Arc<[u8]>,
         level: i32,
+        matched_prefix: &str,
     ) -> S3Result<(bytes::Bytes, ChunkManifest, bool)> {
         use s4_codec::Codec as _;
+        let original_len = bytes.len() as u64;
         let dict_codec = s4_codec::cpu_zstd_dict::CpuZstdDict::new(dict, level)
             .map_err(internal("build cpu-zstd-dict codec"))?;
         let (dict_payload, dict_manifest) = dict_codec
@@ -2817,6 +2858,30 @@ impl<B: S3> S4Service<B> {
             .await
             .map_err(internal("cpu-zstd compress (dict comparison)"))?;
         let used_dict = crate::dict::dict_wins(dict_payload.len(), plain_payload.len());
+        // v1.3 dict ops: per-prefix decision + byte-volume counters.
+        // Recorded ONLY on this path — a gateway without a dict store
+        // never registers these series. Cardinality is bounded by the
+        // operator-configured prefix count.
+        crate::metrics::record_dict_put(
+            matched_prefix,
+            used_dict,
+            original_len,
+            dict_payload.len() as u64,
+            plain_payload.len() as u64,
+        );
+        if let Some(win_rate) = self.dict_win_tracker.record(matched_prefix, used_dict) {
+            warn!(
+                prefix = matched_prefix,
+                win_rate,
+                window = crate::dict::DICT_WIN_RATE_WINDOW,
+                "S4 dict win rate fell below {} over the last {} dict-path PUTs — the \
+                 dictionary may be stale for this prefix's current workload; consider \
+                 retraining (s4 train-dict) and rotating the mapping (--zstd-dict-map \
+                 + SIGHUP reloads without a restart)",
+                crate::dict::DICT_WIN_RATE_WARN_THRESHOLD,
+                crate::dict::DICT_WIN_RATE_WINDOW,
+            );
+        }
         let (payload, chunk_manifest) = if used_dict {
             (dict_payload, dict_manifest)
         } else {
@@ -3467,20 +3532,26 @@ impl<B: S3> S3 for S4Service<B> {
             // path — we refuse to buffer blind). With no `--zstd-dict`
             // flag, `dict_candidate` is always `None` and every PUT is
             // bit-for-bit on the pre-dict path.
-            let dict_candidate = if kind == CodecKind::CpuZstd {
-                self.zstd_dicts.as_ref().and_then(|store| {
-                    let fits = total_size_hint
-                        .map(|n| n <= store.max_object_bytes() as u64)
-                        .unwrap_or(false);
-                    if fits {
-                        store.lookup(&put_bucket, &put_key)
-                    } else {
-                        None
-                    }
-                })
+            //
+            // v1.3 dict ops: the store is `load`ed ONCE per PUT — this
+            // request keeps the same generation across the candidate
+            // lookup and the level / ceiling reads below, so a SIGHUP
+            // map reload mid-request can never mix two configurations.
+            let dict_store = if kind == CodecKind::CpuZstd {
+                self.zstd_dicts.load()
             } else {
                 None
             };
+            let dict_candidate = dict_store.as_ref().and_then(|store| {
+                let fits = total_size_hint
+                    .map(|n| n <= store.max_object_bytes() as u64)
+                    .unwrap_or(false);
+                if fits {
+                    store.lookup_with_prefix(&put_bucket, &put_key)
+                } else {
+                    None
+                }
+            });
             let mut stamped_dict_id: Option<String> = None;
             // v1.2 `--gpu-batch-small-puts`: small-PUT GPU batch window.
             // Eligible only when (a) the aggregator is wired (flag on +
@@ -3500,7 +3571,9 @@ impl<B: S3> S3 for S4Service<B> {
                 None
             };
             let use_framed = supports_streaming_compress(kind) && kind != CodecKind::Passthrough;
-            let (compressed, manifest, is_framed) = if let Some((dict_id, dict)) = dict_candidate {
+            let (compressed, manifest, is_framed) = if let Some((dict_prefix, dict_id, dict)) =
+                dict_candidate
+            {
                 // Bodies on this path are ≤ --zstd-dict-max-bytes
                 // (default 1 MiB), so buffering + compress-both-ways is
                 // an acceptable cost for the 2-5× ratio win on
@@ -3538,8 +3611,7 @@ impl<B: S3> S3 for S4Service<B> {
                         &computed,
                     )?;
                 }
-                let dict_level = self
-                    .zstd_dicts
+                let dict_level = dict_store
                     .as_ref()
                     .map(|s| s.level())
                     .unwrap_or(s4_codec::cpu_zstd::CpuZstd::DEFAULT_LEVEL);
@@ -3552,14 +3624,13 @@ impl<B: S3> S3 for S4Service<B> {
                     "S4 put_object: compressing (buffered, dict vs plain cpu-zstd)"
                 );
                 if bytes.len()
-                    <= self
-                        .zstd_dicts
+                    <= dict_store
                         .as_ref()
                         .map(|s| s.max_object_bytes())
                         .unwrap_or(crate::dict::DEFAULT_DICT_MAX_OBJECT_BYTES)
                 {
                     let (body, manifest, used_dict) = self
-                        .compress_small_with_dict(bytes, dict, dict_level)
+                        .compress_small_with_dict(bytes, dict, dict_level, &dict_prefix)
                         .await?;
                     if used_dict {
                         stamped_dict_id = Some(dict_id);

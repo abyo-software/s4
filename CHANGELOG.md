@@ -8,6 +8,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Per-prefix dictionary metrics**: the `--zstd-dict` PUT branch now
+  exports `s4_dict_put_total{prefix,outcome="win"|"loss"}` and
+  `s4_dict_put_bytes_total{prefix,kind="original"|"dict"|"plain"}` —
+  both compression results were already measured per PUT, so the byte
+  counters are exact on wins and losses alike. Cardinality is bounded
+  by the configured prefix count; with no dict configuration the
+  series are never registered (default behaviour bit-for-bit
+  unchanged). The gateway also self-monitors: a prefix whose rolling
+  win rate over its last 100 dict-path PUTs drops below 0.5 logs a
+  stale-dictionary WARN, at most once per prefix per hour.
+- **`s4 dict-status --metrics-url <URL> [--warn-win-rate 0.5]
+  [--format table|json]`**: scrapes a running gateway's `/metrics`
+  (built-in minimal Prometheus text parser, no new dependencies) and
+  reports per-prefix dictionary win rate, effective compression ratio
+  (dict bytes / original bytes) and lazy `s4_dict_fetch_total` error
+  counts. Prefixes below the win-rate threshold get a "dictionary may
+  be stale; consider retraining (s4 train-dict)" warning and the
+  command exits 1 — cron-able drift monitoring.
+- **`--zstd-dict-map <FILE>` + SIGHUP reload**: TOML `[mappings]`
+  table (`"<bucket>/<prefix>" = "<dict-id>"`) as the reloadable twin
+  of repeated `--zstd-dict` flags — identical validation, boot-time
+  fetch + fingerprint verification and 1 MiB dictionary cap; a prefix
+  configured in both places is a boot error. On SIGHUP the file is
+  re-read, new dictionaries are fetched + verified (already-loaded
+  ones are reused), and the store is swapped atomically (arc-swap RCU
+  — in-flight requests finish on the generation they started with),
+  so rotation is `s4 train-dict` → edit map → `kill -HUP`, no gateway
+  restart. A failed reload keeps the current mappings live (ERROR log
+  + `s4_dict_reload_total{result="err"}`; success bumps
+  `result="ok"`). Without the flag, SIGHUP does not touch dictionary
+  configuration. New library surface:
+  `S4Service::with_shared_zstd_dicts`,
+  `dict::{SharedDictStore, DictWinTracker, parse_zstd_dict_map,
+  merge_dict_entries, build_dict_status, parse_prom_sample}`.
+- **Docs**: README "Operating dictionaries" section (dict-status /
+  rotation runbook), plus an explicit note that multipart uploads are
+  out of the dictionary path **by design** — parts never consult the
+  dict store, and S3's 5 MiB minimum part size sits far above the
+  small-object ceiling (default 1 MiB `--zstd-dict-max-bytes`).
+- **E2E**: `tests/dict_ops_minio.rs` (Docker-gated, real `s4` binary)
+  — win/loss counters on `/metrics`, `dict-status` exit codes 0/1
+  with the retrain warning, map-file boot, SIGHUP rotation picking up
+  a new prefix without a restart, and the fail-safe on a broken map
+  (previous store keeps serving).
 - **`s4 maintain --policy <FILE> [--execute] [--interval <DUR>]
   [--format table|json]`**: policy-driven bucket maintenance. A TOML
   file of `[[rule]]` entries (unique `name`, `bucket`, optional

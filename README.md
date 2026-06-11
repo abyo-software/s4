@@ -1540,9 +1540,75 @@ Mechanics and operational notes:
   forging them (e.g. a stray `s4-dict-id`) must not change GET behavior.
 - **Scope-outs (follow-ups)**: `s4-codec-wasm` doesn't decode
   `cpu-zstd-dict` natively yet (`s4-codec-py` does, via the
-  `CpuZstdDict` binding — s4fs uses it); multipart parts never use
-  dictionaries; re-training (schema drift) requires a new flag value +
-  gateway restart.
+  `CpuZstdDict` binding — s4fs uses it). Multipart uploads are out of
+  scope **by design**, not as a follow-up: parts never consult the
+  dictionary store, and S3's 5 MiB minimum part size sits far above the
+  small-object ceiling (`--zstd-dict-max-bytes`, default 1 MiB) the
+  feature targets — the two size ranges never intersect. Re-training
+  for schema drift no longer needs a restart — see the next section.
+
+#### Operating dictionaries (`s4 dict-status` + `--zstd-dict-map` + SIGHUP)
+
+Day-2 operations for the feature above: drift monitoring and
+restart-less rotation.
+
+- **Per-prefix health metrics**: the dict PUT branch exports
+  `s4_dict_put_total{prefix,outcome="win"|"loss"}` and
+  `s4_dict_put_bytes_total{prefix,kind="original"|"dict"|"plain"}` —
+  both compression results are measured per PUT anyway, so the byte
+  counters are exact whether the dictionary won or lost. Cardinality is
+  bounded by the configured prefix count; without dict configuration
+  the series are never registered. The gateway also self-monitors: when
+  a prefix's rolling win rate over its last 100 dict-path PUTs drops
+  below 0.5, it WARNs (at most once per prefix per hour) that the
+  dictionary looks stale. SIGHUP map reloads are counted as
+  `s4_dict_reload_total{result="ok"|"err"}`.
+- **`s4 dict-status --metrics-url <URL>`** scrapes `/metrics` and
+  reports per-prefix win rate / effective compression ratio / lazy
+  fetch errors; any prefix below `--warn-win-rate` (default 0.5) gets a
+  warning and the command exits 1, so a cron job catches drift
+  unattended (`--format json` for machines). Measured output (minio E2E
+  `dict_ops_minio.rs`: 30 matching JSON PUTs under `events/`, then
+  random bodies under a deliberately mismatched `rand/` mapping):
+
+  ```console
+  $ s4 dict-status --metrics-url http://127.0.0.1:8014/metrics
+  PREFIX                                      WIN   LOSS  WIN-RATE   ORIGINAL-BYTES     DICT-BYTES  DICT-RATIO
+  dictops/events/                              30      0    100.0%             7440           1689       22.7%
+  dictops/rand/                                 0     16      0.0%             6400           6608      103.2%  STALE
+  lazy dict fetches: ok=0 err=0
+  WARN prefix "dictops/rand/": win rate 0.00 over 16 dict-path PUT(s) is below 0.50 — dictionary may be stale; consider retraining (s4 train-dict)
+  $ echo $?
+  1
+  ```
+
+- **Restart-less rotation** (`--zstd-dict-map <FILE>` + SIGHUP): the
+  TOML file is the reloadable twin of repeated `--zstd-dict` flags —
+  same validation, same boot-time fetch + fingerprint verification,
+  same 1 MiB dictionary cap (a prefix configured in both places is a
+  boot error):
+
+  ```toml
+  # dict-map.toml
+  [mappings]
+  "mybucket/events/" = "0123456789abcdef"
+  ```
+
+  ```bash
+  s4 --endpoint-url https://s3.example.com --zstd-dict-map dict-map.toml
+  # rotate without a restart:
+  s4 train-dict mybucket/events/ --endpoint-url https://s3.example.com  # → new dict-id
+  $EDITOR dict-map.toml                                                 # point the prefix at it
+  kill -HUP <pid>             # fetch + verify + atomic store swap
+  ```
+
+  A failed reload (unreadable file, bad TOML, missing `.s4dict/`
+  object, fingerprint mismatch) keeps the **current** mappings live —
+  ERROR log + `s4_dict_reload_total{result="err"}`, never a
+  half-applied swap. In-flight requests finish on the generation they
+  started with. Without `--zstd-dict-map`, SIGHUP does not touch
+  dictionary configuration (the TLS cert reload on SIGHUP is
+  independent and unchanged).
 
 ## Production Features
 

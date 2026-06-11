@@ -789,6 +789,22 @@ struct Opt {
     #[clap(long, value_name = "BYTES", default_value_t = s4_server::dict::DEFAULT_DICT_MAX_OBJECT_BYTES)]
     zstd_dict_max_bytes: usize,
 
+    /// v1.3: TOML file of prefix→dictionary mappings — the reloadable
+    /// twin of the repeated `--zstd-dict` flag. Shape: a `[mappings]`
+    /// table of `"<bucket>/<key-prefix>" = "<dict-id>"` pairs, with the
+    /// exact validation, boot-time fetch + fingerprint verification and
+    /// 1 MiB dictionary cap the flag enforces. May be combined with
+    /// `--zstd-dict` (a prefix in both places is a boot error). The
+    /// file is re-read on SIGHUP: new/changed dictionaries are fetched
+    /// from the backend, verified, and the whole store is swapped
+    /// atomically — rotation is `s4 train-dict` → edit this file →
+    /// `kill -HUP <pid>`, no gateway restart. A failed reload keeps the
+    /// current mappings live (ERROR log +
+    /// `s4_dict_reload_total{result="err"}`). Without this flag, SIGHUP
+    /// does not touch dictionary config (TLS cert reload still applies).
+    #[clap(long, value_name = "FILE")]
+    zstd_dict_map: Option<std::path::PathBuf>,
+
     /// v0.5 #31: optional subcommand. When omitted, runs the gateway
     /// (existing v0.4 behaviour). Available subcommands:
     /// `verify-audit-log <FILE> --hmac-key <SPEC>` walks an audit-log
@@ -933,6 +949,19 @@ enum Cmd {
     /// backend (not an S4 gateway, which would decompress bodies and
     /// hide `.s4dict/`).
     TrainDict(TrainDictArgs),
+
+    /// v1.3: scrape a running gateway's Prometheus `/metrics` endpoint
+    /// and report per-prefix shared-dictionary health: win rate
+    /// (`s4_dict_put_total{outcome}`), effective compression ratio
+    /// (`s4_dict_put_bytes_total{kind}` — dict bytes / original bytes)
+    /// and lazy GET-side fetch errors (`s4_dict_fetch_total`). Prefixes
+    /// whose win rate falls below `--warn-win-rate` (default 0.5) get a
+    /// "dictionary may be stale; consider retraining (s4 train-dict)"
+    /// warning AND the command exits 1 — cron it for unattended drift
+    /// monitoring. Exit 0 when every prefix is healthy (including a
+    /// gateway with no dict traffic yet). Talks HTTP to the gateway's
+    /// `/metrics` only — no S3 traffic, no `--endpoint-url` needed.
+    DictStatus(DictStatusArgs),
 }
 
 /// v1.1: `s4 estimate` output format.
@@ -1331,6 +1360,33 @@ struct TrainDictArgs {
     /// targets small objects, and big bodies skew ZDICT training.
     #[clap(long, value_name = "BYTES", default_value_t = s4_server::dict::DEFAULT_TRAIN_SAMPLE_MAX_BYTES)]
     sample_max_bytes: u64,
+}
+
+/// v1.3: `s4 dict-status` output format (same Table/Json shape as
+/// `s4 estimate`).
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DictStatusFormat {
+    /// Human-readable table + warnings (default).
+    Table,
+    /// Structured JSON (`s4_server::dict::DictStatusReport` serde shape).
+    Json,
+}
+
+#[derive(Debug, Args)]
+struct DictStatusArgs {
+    /// URL of the gateway's Prometheus text endpoint, e.g.
+    /// `http://127.0.0.1:8014/metrics`.
+    #[clap(long, value_name = "URL")]
+    metrics_url: String,
+
+    /// Flag a prefix as stale (warning + exit 1) when its dictionary
+    /// win rate — `win / (win + loss)` from `s4_dict_put_total` — falls
+    /// below this fraction. Must be within [0, 1].
+    #[clap(long, value_name = "RATE", default_value_t = s4_server::dict::DEFAULT_DICT_STATUS_WARN_WIN_RATE)]
+    warn_win_rate: f64,
+
+    #[clap(long, value_enum, default_value_t = DictStatusFormat::Table)]
+    format: DictStatusFormat,
 }
 
 #[derive(Debug, Args)]
@@ -1775,100 +1831,130 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
              has been moved off the reserved suffix (v0.8.17 G-4)."
         );
     }
-    // v1.1 `--zstd-dict`: parse the prefix→dict-id mappings, fetch every
-    // dictionary from the backend (missing dict = boot error so a typo'd
-    // id can't silently disable the feature), fingerprint-verify, and
-    // attach the store. No flag → no store → PUT path bit-for-bit
+    // v1.1 `--zstd-dict` / v1.3 `--zstd-dict-map`: parse the
+    // prefix→dict-id mappings from both sources, fetch every dictionary
+    // from the backend (missing dict = boot error so a typo'd id can't
+    // silently disable the feature), fingerprint-verify, and attach the
+    // store. No flag and no map file → no store → PUT path bit-for-bit
     // unchanged.
-    if !opt.zstd_dict.is_empty() {
-        let mut entries = Vec::with_capacity(opt.zstd_dict.len());
+    {
+        let mut flag_entries = Vec::with_capacity(opt.zstd_dict.len());
         for spec in &opt.zstd_dict {
-            entries.push(
+            flag_entries.push(
                 s4_server::dict::parse_zstd_dict_flag(spec)
                     .map_err(|e| format!("--zstd-dict {spec:?}: {e}"))?,
             );
         }
-        let mut dict_bytes: std::collections::HashMap<String, Vec<u8>> =
-            std::collections::HashMap::new();
-        // v1.0.1 audit R2 P3 residual: fetch per (bucket, id) — not deduped
-        // by id alone — verify the full `s4-dict-sha256` stamp when present
-        // (same `verify_dict_bytes` discipline as the lazy fetch), and
-        // refuse to boot when the same dict-id resolves to different bytes
-        // in two buckets (64-bit prefix collision; silently picking one
-        // would decode the other bucket's objects with the wrong dict).
-        let mut fetched: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::new();
-        for entry in &entries {
-            if !fetched.insert((entry.bucket.clone(), entry.dict_id.clone())) {
-                continue;
+        let map_entries = match opt.zstd_dict_map.as_ref() {
+            Some(path) => {
+                let content = std::fs::read_to_string(path)
+                    .map_err(|e| format!("--zstd-dict-map {}: {e}", path.display()))?;
+                s4_server::dict::parse_zstd_dict_map(&content)
+                    .map_err(|e| format!("--zstd-dict-map {}: {e}", path.display()))?
             }
-            let dict_key = s4_server::dict::dict_object_key(&entry.dict_id);
-            let resp = dict_client
-                .get_object()
-                .bucket(&entry.bucket)
-                .key(&dict_key)
-                .send()
-                .await
-                .map_err(|e| {
-                    format!(
-                        "--zstd-dict {:?}: failed to fetch dictionary {}/{dict_key} from the \
-                         backend (run `s4 train-dict` first?): {e}",
-                        entry.prefix, entry.bucket
-                    )
-                })?;
-            let claimed_sha = resp
-                .metadata()
-                .and_then(|m| m.get(s4_server::dict::DICT_SHA256_META_KEY))
-                .cloned();
-            let body = resp
-                .body
-                .collect()
-                .await
-                .map_err(|e| {
-                    format!(
-                        "--zstd-dict {:?}: failed to read dictionary body {}/{dict_key}: {e}",
-                        entry.prefix, entry.bucket
-                    )
-                })?
-                .into_bytes();
-            s4_server::dict::verify_dict_bytes(&entry.dict_id, claimed_sha.as_deref(), &body)
-                .map_err(|e| {
-                    format!(
-                        "--zstd-dict {:?}: {}/{dict_key}: {e}",
-                        entry.prefix, entry.bucket
-                    )
-                })?;
-            match dict_bytes.entry(entry.dict_id.clone()) {
-                std::collections::hash_map::Entry::Occupied(existing) => {
-                    if existing.get().as_slice() != body.as_ref() {
-                        return Err(format!(
-                            "--zstd-dict: dictionary id {} resolves to different bytes in \
-                             different buckets (16-hex prefix collision) — retrain one of \
-                             them so the ids diverge",
-                            entry.dict_id
+            None => Vec::new(),
+        };
+        // The SIGHUP reload re-merges the (immutable) flag entries with
+        // the re-read map file, so keep a copy aside before the merge.
+        // Only consumed inside the `#[cfg(unix)]` reload task below —
+        // non-unix builds (no tokio signal support) drop it unused.
+        #[cfg_attr(not(unix), allow(unused_variables))]
+        let static_flag_entries = flag_entries.clone();
+        let entries = s4_server::dict::merge_dict_entries(flag_entries, map_entries)
+            .map_err(|e| format!("--zstd-dict / --zstd-dict-map: {e}"))?;
+        // A present-but-empty map file still attaches the (empty) shared
+        // store + SIGHUP handler, so mappings can be added later without
+        // a restart.
+        if !entries.is_empty() || opt.zstd_dict_map.is_some() {
+            let dict_bytes = fetch_dict_bytes(&dict_client, &entries, None).await?;
+            let store = s4_server::dict::DictStore::new(
+                entries,
+                dict_bytes,
+                opt.zstd_dict_max_bytes,
+                opt.zstd_level,
+            )
+            .map_err(|e| format!("--zstd-dict: {e}"))?;
+            info!(
+                mappings = ?store.entries(),
+                max_object_bytes = opt.zstd_dict_max_bytes,
+                map_file = ?opt.zstd_dict_map,
+                "S4 zstd dictionaries loaded (v1.1 --zstd-dict / v1.3 --zstd-dict-map) — \
+                 small cpu-zstd PUTs under the configured prefixes compress with the \
+                 trained dictionary when it wins"
+            );
+            let shared = std::sync::Arc::new(s4_server::dict::SharedDictStore::new(Some(
+                std::sync::Arc::new(store),
+            )));
+            s4 = s4.with_shared_zstd_dicts(std::sync::Arc::clone(&shared));
+
+            // v1.3: SIGHUP map reload — only wired when `--zstd-dict-map`
+            // is set (without it, SIGHUP never touches dictionary config;
+            // the TLS cert reload handler is independent). Same per-signal
+            // task shape as the TLS SIGHUP handler above `run_server`.
+            // Unix-only, like the SIGUSR1 dump-back handler.
+            #[cfg(unix)]
+            if let Some(map_path) = opt.zstd_dict_map.clone() {
+                let shared_for_reload = std::sync::Arc::clone(&shared);
+                let reload_client = dict_client.clone();
+                let max_object_bytes = opt.zstd_dict_max_bytes;
+                let zstd_level = opt.zstd_level;
+                tokio::spawn(async move {
+                    use tokio::signal::unix::{SignalKind, signal};
+                    let mut hup = match signal(SignalKind::hangup()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(
+                                "could not install SIGHUP dict-map reload handler: {e}; \
+                                 dictionary rotation requires a gateway restart until then"
+                            );
+                            return;
+                        }
+                    };
+                    tracing::info!(
+                        map = %map_path.display(),
+                        "S4 SIGHUP dict-map reload handler installed (v1.3 \
+                         --zstd-dict-map): `s4 train-dict` → edit the map file → \
+                         `kill -HUP <pid>` rotates dictionaries without a restart"
+                    );
+                    while hup.recv().await.is_some() {
+                        let current = shared_for_reload.load();
+                        match reload_dict_map(
+                            &reload_client,
+                            &map_path,
+                            &static_flag_entries,
+                            max_object_bytes,
+                            zstd_level,
+                            current.as_deref(),
                         )
-                        .into());
+                        .await
+                        {
+                            Ok(store) => {
+                                tracing::info!(
+                                    mappings = ?store.entries(),
+                                    map = %map_path.display(),
+                                    "S4 dict-map reload succeeded — new dictionary \
+                                     store swapped in atomically (in-flight requests \
+                                     finish on the previous generation)"
+                                );
+                                shared_for_reload.swap(std::sync::Arc::new(store));
+                                s4_server::metrics::record_dict_reload("ok");
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    map = %map_path.display(),
+                                    error = %e,
+                                    "S4 dict-map reload FAILED — keeping the current \
+                                     dictionary store live (fail-safe: no partial \
+                                     swap); fix the map file / backend object and \
+                                     send SIGHUP again"
+                                );
+                                s4_server::metrics::record_dict_reload("err");
+                            }
+                        }
                     }
-                }
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(body.to_vec());
-                }
+                });
             }
         }
-        let store = s4_server::dict::DictStore::new(
-            entries,
-            dict_bytes,
-            opt.zstd_dict_max_bytes,
-            opt.zstd_level,
-        )
-        .map_err(|e| format!("--zstd-dict: {e}"))?;
-        info!(
-            mappings = ?store.entries(),
-            max_object_bytes = opt.zstd_dict_max_bytes,
-            "S4 zstd dictionaries loaded (v1.1 --zstd-dict) — small cpu-zstd PUTs under the \
-             configured prefixes compress with the trained dictionary when it wins"
-        );
-        s4 = s4.with_zstd_dicts(std::sync::Arc::new(store));
     }
     // v0.8.19 D-1: wire --max-body-bytes (the cap the threat model
     // already documents). Pre-D-1 the only way to change the cap
@@ -2812,6 +2898,7 @@ async fn run_subcommand(
         Cmd::Recompact(args) => run_recompact_cmd(opt, args).await,
         Cmd::Maintain(args) => run_maintain_cmd(opt, args).await,
         Cmd::TrainDict(args) => run_train_dict_cmd(opt, args).await,
+        Cmd::DictStatus(args) => run_dict_status_cmd(args).await,
         Cmd::VerifyAuditLog(args) => {
             let key = s4_server::audit_log::AuditHmacKey::from_str(&args.hmac_key)
                 .map_err(|e| format!("--hmac-key: {e}"))?;
@@ -3353,6 +3440,220 @@ async fn run_train_dict_cmd(
     println!("start the gateway with:");
     println!("  {}", report.gateway_flag);
     Ok(())
+}
+
+/// v1.1 `--zstd-dict` / v1.3 `--zstd-dict-map`: fetch + fingerprint-
+/// verify every dictionary an entry list references, keyed by dict-id.
+///
+/// v1.0.1 audit R2 P3 residual (moved here verbatim from the boot block
+/// when v1.3 made it reusable for SIGHUP reloads): fetch per
+/// `(bucket, id)` — not deduped by id alone — verify the full
+/// `s4-dict-sha256` stamp when present (same `verify_dict_bytes`
+/// discipline as the lazy fetch), and refuse when the same dict-id
+/// resolves to different bytes in two buckets (64-bit prefix collision;
+/// silently picking one would decode the other bucket's objects with
+/// the wrong dict).
+///
+/// `reuse` (SIGHUP reload only) supplies the currently-live store:
+/// mappings whose `(bucket, id)` it already preloaded skip the backend
+/// round-trip — those bytes were verified when *they* were loaded, and
+/// re-verifying a content-addressed immutable object buys nothing.
+async fn fetch_dict_bytes(
+    client: &aws_sdk_s3::Client,
+    entries: &[s4_server::dict::DictConfigEntry],
+    reuse: Option<&s4_server::dict::DictStore>,
+) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
+    let mut dict_bytes: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+    let mut fetched: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for entry in entries {
+        if !fetched.insert((entry.bucket.clone(), entry.dict_id.clone())) {
+            continue;
+        }
+        let dict_key = s4_server::dict::dict_object_key(&entry.dict_id);
+        let body: Vec<u8> = if let Some(bytes) =
+            reuse.and_then(|store| store.get_preloaded(&entry.bucket, &entry.dict_id))
+        {
+            bytes.to_vec()
+        } else {
+            let resp = client
+                .get_object()
+                .bucket(&entry.bucket)
+                .key(&dict_key)
+                .send()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "mapping {:?}: failed to fetch dictionary {}/{dict_key} from the \
+                         backend (run `s4 train-dict` first?): {e}",
+                        entry.prefix, entry.bucket
+                    )
+                })?;
+            let claimed_sha = resp
+                .metadata()
+                .and_then(|m| m.get(s4_server::dict::DICT_SHA256_META_KEY))
+                .cloned();
+            let body = resp
+                .body
+                .collect()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "mapping {:?}: failed to read dictionary body {}/{dict_key}: {e}",
+                        entry.prefix, entry.bucket
+                    )
+                })?
+                .into_bytes();
+            s4_server::dict::verify_dict_bytes(&entry.dict_id, claimed_sha.as_deref(), &body)
+                .map_err(|e| {
+                    format!(
+                        "mapping {:?}: {}/{dict_key}: {e}",
+                        entry.prefix, entry.bucket
+                    )
+                })?;
+            body.to_vec()
+        };
+        match dict_bytes.entry(entry.dict_id.clone()) {
+            std::collections::hash_map::Entry::Occupied(existing) => {
+                if existing.get().as_slice() != body.as_slice() {
+                    return Err(format!(
+                        "dictionary id {} resolves to different bytes in different \
+                         buckets (16-hex prefix collision) — retrain one of them so \
+                         the ids diverge",
+                        entry.dict_id
+                    ));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(body);
+            }
+        }
+    }
+    Ok(dict_bytes)
+}
+
+/// v1.3: one SIGHUP-triggered `--zstd-dict-map` reload. Re-reads +
+/// re-parses the map file, re-merges it with the (immutable)
+/// `--zstd-dict` flag entries, fetches + verifies any dictionaries the
+/// currently-live store doesn't already hold, and builds a **complete**
+/// replacement store off to the side. Every failure path returns `Err`
+/// *before* the caller swaps — the live store is never touched by a
+/// failed reload (fail-safe: old config or new config, never a mix).
+async fn reload_dict_map(
+    client: &aws_sdk_s3::Client,
+    map_path: &std::path::Path,
+    flag_entries: &[s4_server::dict::DictConfigEntry],
+    max_object_bytes: usize,
+    zstd_level: i32,
+    current: Option<&s4_server::dict::DictStore>,
+) -> Result<s4_server::dict::DictStore, String> {
+    let content = std::fs::read_to_string(map_path)
+        .map_err(|e| format!("read {}: {e}", map_path.display()))?;
+    let map_entries = s4_server::dict::parse_zstd_dict_map(&content)
+        .map_err(|e| format!("parse {}: {e}", map_path.display()))?;
+    let entries = s4_server::dict::merge_dict_entries(flag_entries.to_vec(), map_entries)?;
+    let dict_bytes = fetch_dict_bytes(client, &entries, current).await?;
+    s4_server::dict::DictStore::new(entries, dict_bytes, max_object_bytes, zstd_level)
+}
+
+/// v1.3: `s4 dict-status --metrics-url <URL> [--warn-win-rate 0.5]
+/// [--format table|json]`. One HTTP GET of the gateway's `/metrics`,
+/// parsed with the minimal Prometheus-text parser in
+/// `s4_server::dict` — per-prefix win rate, effective compression
+/// ratio, lazy-fetch error count. Exit 1 when any prefix trips the
+/// win-rate threshold (cron-able stale-dictionary monitor).
+async fn run_dict_status_cmd(
+    args: &DictStatusArgs,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    if !(0.0..=1.0).contains(&args.warn_win_rate) {
+        return Err(format!(
+            "--warn-win-rate must be within [0, 1], got {}",
+            args.warn_win_rate
+        )
+        .into());
+    }
+    let resp = reqwest::get(&args.metrics_url)
+        .await
+        .map_err(|e| format!("GET {}: {e}", args.metrics_url))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!(
+            "GET {} returned {status} — is this the gateway's /metrics endpoint?",
+            args.metrics_url
+        )
+        .into());
+    }
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("read {} body: {e}", args.metrics_url))?;
+    let report = s4_server::dict::build_dict_status(&text, args.warn_win_rate);
+    match args.format {
+        DictStatusFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report)
+                    .map_err(|e| format!("serialize report: {e}"))?
+            );
+        }
+        DictStatusFormat::Table => {
+            if report.prefixes.is_empty() {
+                println!(
+                    "no dict PUT traffic recorded yet (s4_dict_put_total absent) — \
+                     either the gateway runs without --zstd-dict / --zstd-dict-map, \
+                     or no PUT has matched a configured prefix since boot"
+                );
+            } else {
+                println!(
+                    "{:<40} {:>6} {:>6} {:>9} {:>16} {:>14} {:>11}",
+                    "PREFIX",
+                    "WIN",
+                    "LOSS",
+                    "WIN-RATE",
+                    "ORIGINAL-BYTES",
+                    "DICT-BYTES",
+                    "DICT-RATIO"
+                );
+                for p in &report.prefixes {
+                    println!(
+                        "{:<40} {:>6} {:>6} {:>8.1}% {:>16} {:>14} {:>10.1}%{}",
+                        p.prefix,
+                        p.wins,
+                        p.losses,
+                        p.win_rate * 100.0,
+                        p.original_bytes,
+                        p.dict_bytes,
+                        p.dict_ratio * 100.0,
+                        if p.stale { "  STALE" } else { "" },
+                    );
+                }
+            }
+            println!(
+                "lazy dict fetches: ok={} err={}",
+                report.dict_fetch_ok, report.dict_fetch_err
+            );
+            if report.dict_fetch_err > 0 {
+                println!(
+                    "note: err > 0 means GETs of dict-compressed objects failed \
+                     (missing / corrupted `.s4dict/` object) — informational only, \
+                     does not affect the exit code"
+                );
+            }
+        }
+    }
+    for w in &report.warnings {
+        eprintln!("WARN {w}");
+    }
+    if report.warnings.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "dict-status: {} prefix(es) below the {:.2} win-rate threshold",
+            report.warnings.len(),
+            args.warn_win_rate
+        )
+        .into())
+    }
 }
 
 async fn run_verify_sidecar(

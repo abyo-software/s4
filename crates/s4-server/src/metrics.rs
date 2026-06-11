@@ -224,6 +224,38 @@ pub mod names {
     /// `--zstd-dict` flag); any `err` rate means dict-compressed
     /// objects are currently unreadable.
     pub const DICT_FETCH_TOTAL: &str = "s4_dict_fetch_total";
+    /// v1.3 dict ops: bumped once per PUT that took the `--zstd-dict`
+    /// compare-both-ways path. Labels: `prefix` (= the configured
+    /// `<bucket>/<key-prefix>` that longest-prefix-matched the PUT) and
+    /// `outcome` (= `"win"` — the dictionary beat plain cpu-zstd and the
+    /// object was stored as `cpu-zstd-dict`; `"loss"` — plain cpu-zstd
+    /// was equal-or-smaller and the object fell back to the dict-less
+    /// shape). Cardinality bounded by (#configured prefixes × 2) — the
+    /// operator controls the prefix set. Never recorded when no dict
+    /// store is configured (the path doesn't exist then). `s4
+    /// dict-status` derives the per-prefix win rate from this counter; a
+    /// sustained `loss` rate means the workload drifted away from the
+    /// trained dictionary (retrain with `s4 train-dict`).
+    pub const DICT_PUT_TOTAL: &str = "s4_dict_put_total";
+    /// v1.3 dict ops: byte volumes behind [`DICT_PUT_TOTAL`] — the dict
+    /// path compresses every eligible body BOTH ways, so all three sizes
+    /// are known per PUT regardless of the outcome. Labels: `prefix`
+    /// (same as [`DICT_PUT_TOTAL`]) and `kind` (= `"original"` — logical
+    /// input bytes; `"dict"` — dictionary-compressed payload bytes;
+    /// `"plain"` — plain cpu-zstd payload bytes for the same inputs).
+    /// Cardinality bounded by (#configured prefixes × 3). `dict / original`
+    /// is the effective dict compression ratio; `dict / plain` shows how
+    /// much the dictionary is actually buying over the fallback.
+    pub const DICT_PUT_BYTES_TOTAL: &str = "s4_dict_put_bytes_total";
+    /// v1.3 dict ops: bumped once per SIGHUP-triggered `--zstd-dict-map`
+    /// reload attempt. Labels: `result` (= `"ok"` — the new store was
+    /// built, verified, and atomically swapped in; `"err"` — the map
+    /// file re-read / parse / dictionary fetch / verification failed and
+    /// the **previous store stayed live**). Cardinality 2. Operators
+    /// alert on `rate(s4_dict_reload_total{result="err"}) > 0` — a
+    /// failed rotation is invisible otherwise (the gateway keeps serving
+    /// on the old mappings by design).
+    pub const DICT_RELOAD_TOTAL: &str = "s4_dict_reload_total";
     /// v1.2 `--gpu-batch-small-puts`: bumped once per small PUT that was
     /// considered for batched GPU compression. Labels: `result`
     /// (= `"batched"` — the body was compressed by the nvCOMP batch
@@ -283,6 +315,56 @@ pub fn record_gpu_batch(result: &'static str) {
 /// GET that needed the dictionary failed with 5xx).
 pub fn record_dict_fetch(result: &'static str) {
     metrics::counter!(names::DICT_FETCH_TOTAL, "result" => result).increment(1);
+}
+
+/// v1.3 dict ops: record one PUT-side dictionary decision for `prefix`
+/// (the configured `<bucket>/<key-prefix>` that matched). Bumps
+/// [`names::DICT_PUT_TOTAL`] with the win/loss outcome and all three
+/// [`names::DICT_PUT_BYTES_TOTAL`] kinds — both compression results are
+/// computed per PUT on this path, so the byte counters are exact whether
+/// the dictionary won or lost. Only ever called from the dict branch:
+/// with no `--zstd-dict` / `--zstd-dict-map` configuration these series
+/// are never registered.
+pub fn record_dict_put(
+    prefix: &str,
+    win: bool,
+    original_bytes: u64,
+    dict_bytes: u64,
+    plain_bytes: u64,
+) {
+    let outcome = if win { "win" } else { "loss" };
+    metrics::counter!(
+        names::DICT_PUT_TOTAL,
+        "prefix" => prefix.to_owned(),
+        "outcome" => outcome,
+    )
+    .increment(1);
+    metrics::counter!(
+        names::DICT_PUT_BYTES_TOTAL,
+        "prefix" => prefix.to_owned(),
+        "kind" => "original",
+    )
+    .increment(original_bytes);
+    metrics::counter!(
+        names::DICT_PUT_BYTES_TOTAL,
+        "prefix" => prefix.to_owned(),
+        "kind" => "dict",
+    )
+    .increment(dict_bytes);
+    metrics::counter!(
+        names::DICT_PUT_BYTES_TOTAL,
+        "prefix" => prefix.to_owned(),
+        "kind" => "plain",
+    )
+    .increment(plain_bytes);
+}
+
+/// v1.3 dict ops: bump the SIGHUP `--zstd-dict-map` reload counter.
+/// `result` is `"ok"` (new store atomically swapped in) or `"err"`
+/// (reload failed; the previous store stayed live). See
+/// [`names::DICT_RELOAD_TOTAL`].
+pub fn record_dict_reload(result: &'static str) {
+    metrics::counter!(names::DICT_RELOAD_TOTAL, "result" => result).increment(1);
 }
 
 /// v0.8.5 #86 (audit M-3): bump the SIGUSR1 snapshot dump-back counter.
@@ -679,6 +761,14 @@ mod tests {
         record_acme_renewal("err");
         record_acme_renewal_timeout();
 
+        // v1.3 dict ops: per-prefix PUT decision counters + the SIGHUP
+        // reload counter (the dict-status parse side is pinned against
+        // this same recorder's render in `dict::tests`).
+        record_dict_put("metricsbkt/events/", true, 1000, 200, 600);
+        record_dict_put("metricsbkt/events/", false, 1000, 700, 600);
+        record_dict_reload("ok");
+        record_dict_reload("err");
+
         // v1.2 savings ledger gauges (set-not-increment semantics; the
         // second call must overwrite the first in the rendered output).
         record_ledger_bucket(
@@ -782,6 +872,30 @@ mod tests {
             "ledger gauge must reflect the latest set() in: {rendered}"
         );
         assert!(rendered.contains("s4_ledger_objects{bucket=\"ledgerbkt\"} 7"));
+
+        // v1.3 dict ops: per-prefix PUT counters carry prefix + outcome /
+        // kind labels; the reload counter carries both result labels.
+        assert!(
+            rendered.contains("s4_dict_put_total"),
+            "missing dict PUT counter in: {rendered}"
+        );
+        assert!(rendered.contains("prefix=\"metricsbkt/events/\""));
+        assert!(rendered.contains("outcome=\"win\""));
+        assert!(rendered.contains("outcome=\"loss\""));
+        assert!(
+            rendered.contains("s4_dict_put_bytes_total"),
+            "missing dict PUT bytes counter in: {rendered}"
+        );
+        for kind in ["original", "dict", "plain"] {
+            assert!(
+                rendered.contains(&format!("kind=\"{kind}\"")),
+                "missing kind={kind} label in: {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("s4_dict_reload_total"),
+            "missing dict reload counter in: {rendered}"
+        );
     }
 
     /// v0.8 #55: throughput gauge math. 10 MiB in 10 ms ≈ 1.05 GB/s

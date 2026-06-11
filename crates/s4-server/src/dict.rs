@@ -28,9 +28,31 @@
 //!
 //! `.s4dict/` keys are hidden from listings (same treatment as
 //! `.s4index` sidecars / `.__s4ver__/` shadow versions).
+//!
+//! ## Operations (v1.3 dict ops)
+//!
+//! - **Per-prefix metrics**: the PUT-side dict branch records
+//!   `s4_dict_put_total{prefix,outcome}` and
+//!   `s4_dict_put_bytes_total{prefix,kind}` (both compression results are
+//!   measured per PUT anyway, so the loss side costs nothing extra);
+//!   `s4 dict-status --metrics-url <URL>` scrapes them and flags
+//!   stale-looking dictionaries (win rate below `--warn-win-rate`).
+//! - **Restart-less rotation** (`--zstd-dict-map <FILE>` + `SIGHUP`):
+//!   a TOML `[mappings]` table carries the same prefix→dict-id mappings
+//!   as repeated `--zstd-dict` flags; on `SIGHUP` the file is re-read,
+//!   new dictionaries are fetched + verified, and the gateway's
+//!   [`SharedDictStore`] is swapped atomically. A failed reload keeps
+//!   the current store (fail-safe — never a half-applied swap).
+//! - **Multipart is out of scope by design**: multipart parts only ever
+//!   take the streaming per-part frame path (the dict store is consulted
+//!   exclusively by single-object PUT), and S3's 5 MiB minimum part size
+//!   ([`s4_codec::multipart::S3_MULTIPART_MIN_PART_BYTES`]) sits far
+//!   above the small-object ceiling (`--zstd-dict-max-bytes`, default
+//!   1 MiB) the feature targets — the two size ranges never intersect.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use aws_sdk_s3::Client;
 use serde::Serialize;
@@ -191,6 +213,13 @@ pub fn parse_zstd_dict_flag(spec: &str) -> Result<DictConfigEntry, String> {
     let (prefix, dict_id) = spec
         .rsplit_once('=')
         .ok_or_else(|| format!("expected '<bucket>/<key-prefix>=<dict-id>', got {spec:?}"))?;
+    entry_from_parts(prefix, dict_id)
+}
+
+/// Shared validation for one `<bucket>/<key-prefix>` → `<dict-id>` pair —
+/// used by both the `--zstd-dict` flag parser and the `--zstd-dict-map`
+/// TOML loader so the two configuration surfaces enforce identical rules.
+fn entry_from_parts(prefix: &str, dict_id: &str) -> Result<DictConfigEntry, String> {
     if !is_valid_dict_id(dict_id) {
         return Err(format!(
             "dict-id must be exactly {DICT_ID_HEX_LEN} lowercase hex chars, got {dict_id:?}"
@@ -200,13 +229,208 @@ pub fn parse_zstd_dict_flag(spec: &str) -> Result<DictConfigEntry, String> {
         .split_once('/')
         .ok_or_else(|| format!("prefix must be '<bucket>/<key-prefix>', got {prefix:?}"))?;
     if bucket.is_empty() {
-        return Err(format!("empty bucket in {spec:?}"));
+        return Err(format!("empty bucket in {prefix:?}"));
     }
     Ok(DictConfigEntry {
         prefix: prefix.to_owned(),
         bucket: bucket.to_owned(),
         dict_id: dict_id.to_owned(),
     })
+}
+
+/// Serde shape of a `--zstd-dict-map <FILE>`:
+///
+/// ```toml
+/// [mappings]
+/// "mybucket/events/" = "0123456789abcdef"
+/// "mybucket/logs/app1/" = "fedcba9876543210"
+/// ```
+///
+/// Unknown top-level keys are rejected (a typo'd table name must not
+/// silently configure nothing).
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DictMapFile {
+    /// `"<bucket>/<key-prefix>" = "<dict-id>"` pairs. `BTreeMap` for a
+    /// deterministic entry order (error messages, boot logging). TOML
+    /// itself rejects duplicate keys, so duplicate prefixes *within* the
+    /// file fail at parse time.
+    #[serde(default)]
+    mappings: std::collections::BTreeMap<String, String>,
+}
+
+/// Parse the contents of a `--zstd-dict-map` TOML file into the same
+/// [`DictConfigEntry`] list the repeated `--zstd-dict` flag produces.
+/// Validation is identical to the flag parser (16-hex id, non-empty
+/// bucket); duplicate prefixes are a TOML parse error by construction.
+pub fn parse_zstd_dict_map(content: &str) -> Result<Vec<DictConfigEntry>, String> {
+    let parsed: DictMapFile = toml::from_str(content).map_err(|e| format!("invalid TOML: {e}"))?;
+    let mut out = Vec::with_capacity(parsed.mappings.len());
+    for (prefix, dict_id) in &parsed.mappings {
+        out.push(
+            entry_from_parts(prefix, dict_id).map_err(|e| format!("mapping {prefix:?}: {e}"))?,
+        );
+    }
+    Ok(out)
+}
+
+/// Merge `--zstd-dict` flag entries with `--zstd-dict-map` file entries.
+/// A prefix configured through **both** sources is an error — even with
+/// the same dict-id — because a SIGHUP reload would otherwise leave it
+/// ambiguous which source owns the mapping going forward.
+pub fn merge_dict_entries(
+    flag_entries: Vec<DictConfigEntry>,
+    map_entries: Vec<DictConfigEntry>,
+) -> Result<Vec<DictConfigEntry>, String> {
+    let mut merged = flag_entries;
+    for e in map_entries {
+        if merged.iter().any(|f| f.prefix == e.prefix) {
+            return Err(format!(
+                "prefix {:?} is configured in both --zstd-dict and --zstd-dict-map — \
+                 keep it in exactly one place (the map file is the SIGHUP-reloadable \
+                 source; prefer it for mappings that rotate)",
+                e.prefix
+            ));
+        }
+        merged.push(e);
+    }
+    Ok(merged)
+}
+
+/// v1.3 dict ops: reload-capable holder for the gateway's [`DictStore`].
+///
+/// The service reads the current generation with [`SharedDictStore::load`]
+/// once per PUT / dict-GET; the `--zstd-dict-map` SIGHUP handler in
+/// `main.rs` builds a **complete** replacement store off to the side and
+/// installs it with [`SharedDictStore::swap`] (RCU via `arc-swap` — no
+/// lock on the request path, in-flight requests keep the generation they
+/// loaded). A failed reload never calls `swap`, so the gateway always
+/// runs either the old config or the new one, never a half-applied mix.
+#[derive(Debug, Default)]
+pub struct SharedDictStore {
+    inner: arc_swap::ArcSwapOption<DictStore>,
+}
+
+impl SharedDictStore {
+    /// Wrap an initial store (`None` = dict feature off; every PUT stays
+    /// on the pre-dict path until a `swap` installs one).
+    pub fn new(store: Option<Arc<DictStore>>) -> Self {
+        Self {
+            inner: arc_swap::ArcSwapOption::new(store),
+        }
+    }
+
+    /// Current store generation. Cheap (lock-free read) — called once
+    /// per request that might touch the dict path.
+    pub fn load(&self) -> Option<Arc<DictStore>> {
+        self.inner.load_full()
+    }
+
+    /// Atomically install a new store generation (SIGHUP reload success
+    /// path). Readers that already `load`ed keep the old `Arc` until
+    /// they drop it.
+    pub fn swap(&self, store: Arc<DictStore>) {
+        self.inner.store(Some(store));
+    }
+}
+
+/// Rolling-window length for the gateway-side per-prefix win-rate
+/// monitor: the last 100 dict-path PUT decisions per prefix.
+pub const DICT_WIN_RATE_WINDOW: usize = 100;
+
+/// A full window whose win rate falls below this fraction triggers the
+/// stale-dictionary WARN log (and the matching `s4 dict-status` default).
+pub const DICT_WIN_RATE_WARN_THRESHOLD: f64 = 0.5;
+
+/// Per-prefix WARN rate limit — at most one stale-dictionary log line
+/// per prefix per hour, however many PUTs flow.
+pub const DICT_WIN_RATE_WARN_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// v1.3 dict ops: gateway-side rolling win-rate monitor. The PUT-side
+/// dict branch feeds every win/loss decision in; when a prefix's last
+/// [`DICT_WIN_RATE_WINDOW`] decisions drop below
+/// [`DICT_WIN_RATE_WARN_THRESHOLD`], [`DictWinTracker::record`] returns
+/// the rate so the caller can emit a WARN (rate-limited per prefix by
+/// [`DICT_WIN_RATE_WARN_INTERVAL`]). Judgement only starts on a **full**
+/// window — a cold prefix's first few losses must not page anyone.
+#[derive(Debug)]
+pub struct DictWinTracker {
+    window: usize,
+    inner: Mutex<HashMap<String, PrefixWinWindow>>,
+}
+
+#[derive(Debug)]
+struct PrefixWinWindow {
+    /// Most-recent decision at the back.
+    recent: VecDeque<bool>,
+    /// Count of `true` entries in `recent` (kept in sync incrementally).
+    wins: usize,
+    last_warn: Option<Instant>,
+}
+
+impl Default for DictWinTracker {
+    fn default() -> Self {
+        Self::with_window(DICT_WIN_RATE_WINDOW)
+    }
+}
+
+impl DictWinTracker {
+    /// Window-size override for tests; production uses
+    /// [`DICT_WIN_RATE_WINDOW`] via `Default`.
+    pub fn with_window(window: usize) -> Self {
+        Self {
+            window: window.max(1),
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record one dict-vs-plain PUT decision for `prefix`. Returns
+    /// `Some(win_rate)` exactly when the caller should WARN: the window
+    /// is full, the rate is below [`DICT_WIN_RATE_WARN_THRESHOLD`], and
+    /// the per-prefix rate limit has elapsed.
+    pub fn record(&self, prefix: &str, win: bool) -> Option<f64> {
+        self.record_at(prefix, win, Instant::now())
+    }
+
+    fn record_at(&self, prefix: &str, win: bool, now: Instant) -> Option<f64> {
+        // Poisoned lock: degrade to monitoring-off (the dict path itself
+        // is unaffected; same posture as DictCache).
+        let mut inner = self.inner.lock().ok()?;
+        let w = inner
+            .entry(prefix.to_owned())
+            .or_insert_with(|| PrefixWinWindow {
+                recent: VecDeque::with_capacity(self.window),
+                wins: 0,
+                last_warn: None,
+            });
+        if w.recent.len() >= self.window
+            && let Some(oldest) = w.recent.pop_front()
+            && oldest
+        {
+            w.wins = w.wins.saturating_sub(1);
+        }
+        w.recent.push_back(win);
+        if win {
+            w.wins += 1;
+        }
+        if w.recent.len() < self.window {
+            return None;
+        }
+        let rate = w.wins as f64 / w.recent.len() as f64;
+        if rate >= DICT_WIN_RATE_WARN_THRESHOLD {
+            return None;
+        }
+        let due = match w.last_warn {
+            None => true,
+            Some(t) => now.duration_since(t) >= DICT_WIN_RATE_WARN_INTERVAL,
+        };
+        if due {
+            w.last_warn = Some(now);
+            Some(rate)
+        } else {
+            None
+        }
+    }
 }
 
 /// Boot-time dictionary store: configured prefix→dict mappings plus the
@@ -301,6 +525,19 @@ impl DictStore {
     /// Longest-prefix match of `<bucket>/<key>` against the configured
     /// prefixes. Returns `(dict_id, dict_bytes)` on hit.
     pub fn lookup(&self, bucket: &str, key: &str) -> Option<(String, Arc<[u8]>)> {
+        self.lookup_with_prefix(bucket, key)
+            .map(|(_prefix, dict_id, dict)| (dict_id, dict))
+    }
+
+    /// [`Self::lookup`] that also returns the **matched configured
+    /// prefix** (the combined `<bucket>/<key-prefix>` form) — the label
+    /// the per-prefix dict metrics are keyed by, so a PUT's win/loss is
+    /// attributed to the mapping that routed it (v1.3 dict ops).
+    pub fn lookup_with_prefix(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Option<(String, String, Arc<[u8]>)> {
         // Avoid allocating the combined string per PUT: match the bucket
         // part and the key part separately against each entry.
         for (prefix, dict_id) in &self.entries {
@@ -315,7 +552,7 @@ impl DictStore {
                 // (it matched above), so the bucket-scoped key is
                 // `(bucket, dict_id)`.
                 let dict = self.dicts.get(&(bucket.to_owned(), dict_id.clone()))?;
-                return Some((dict_id.clone(), Arc::clone(dict)));
+                return Some((prefix.clone(), dict_id.clone(), Arc::clone(dict)));
             }
         }
         None
@@ -423,6 +660,244 @@ impl DictCache {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.lock().map(|i| i.map.len()).unwrap_or(0)
+    }
+}
+
+// ===========================================================================
+// `s4 dict-status` — /metrics scrape → per-prefix dictionary health
+// ===========================================================================
+
+/// Default `s4 dict-status --warn-win-rate` (mirrors the gateway-side
+/// [`DICT_WIN_RATE_WARN_THRESHOLD`]).
+pub const DEFAULT_DICT_STATUS_WARN_WIN_RATE: f64 = 0.5;
+
+/// One parsed Prometheus text-format sample:
+/// `(metric_name, labels, value)`.
+pub type PromSample = (String, Vec<(String, String)>, f64);
+
+/// Parse one Prometheus **text-format sample line** into
+/// `(metric_name, labels, value)`. Comment (`# …`) and blank lines, and
+/// anything that doesn't parse, return `None`.
+///
+/// Deliberately minimal — NOT a general OpenMetrics parser. It handles
+/// exactly the line shape `metrics-exporter-prometheus` renders for the
+/// counters `dict-status` consumes (`name{l1="v1",l2="v2"} value` /
+/// `name value`), including the three escape sequences the text format
+/// defines for label values (`\\`, `\"`, `\n`). Kept dependency-free on
+/// purpose; unit-tested against a fixture captured from the real
+/// recorder's `render()` output.
+pub fn parse_prom_sample(line: &str) -> Option<PromSample> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] != b'{' && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let name = &line[..i];
+    if name.is_empty() {
+        return None;
+    }
+    let mut labels: Vec<(String, String)> = Vec::new();
+    if i < bytes.len() && bytes[i] == b'{' {
+        i += 1;
+        loop {
+            while i < bytes.len() && (bytes[i] == b',' || bytes[i].is_ascii_whitespace()) {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                return None; // unterminated label set
+            }
+            if bytes[i] == b'}' {
+                i += 1;
+                break;
+            }
+            let lname_start = i;
+            while i < bytes.len() && bytes[i] != b'=' {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                return None;
+            }
+            let lname = line[lname_start..i].trim().to_owned();
+            i += 1; // consume '='
+            if i >= bytes.len() || bytes[i] != b'"' {
+                return None;
+            }
+            i += 1; // consume opening '"'
+            let mut value = String::new();
+            loop {
+                if i >= bytes.len() {
+                    return None; // unterminated label value
+                }
+                match bytes[i] {
+                    b'\\' => {
+                        i += 1;
+                        match bytes.get(i) {
+                            Some(b'\\') => value.push('\\'),
+                            Some(b'"') => value.push('"'),
+                            Some(b'n') => value.push('\n'),
+                            Some(&other) => {
+                                value.push('\\');
+                                value.push(other as char);
+                            }
+                            None => return None,
+                        }
+                        i += 1;
+                    }
+                    b'"' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => {
+                        // Advance by whole chars so multi-byte UTF-8 label
+                        // values (S3 keys are arbitrary Unicode) survive.
+                        let ch = line[i..].chars().next()?;
+                        value.push(ch);
+                        i += ch.len_utf8();
+                    }
+                }
+            }
+            labels.push((lname, value));
+        }
+    }
+    let value: f64 = line[i..].split_ascii_whitespace().next()?.parse().ok()?;
+    Some((name.to_owned(), labels, value))
+}
+
+fn label_value<'a>(labels: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    labels
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v.as_str())
+}
+
+/// Per-prefix slice of an `s4 dict-status` report.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DictPrefixStatus {
+    /// Configured `<bucket>/<key-prefix>` the metrics are labelled with.
+    pub prefix: String,
+    /// `s4_dict_put_total{outcome="win"}`.
+    pub wins: u64,
+    /// `s4_dict_put_total{outcome="loss"}`.
+    pub losses: u64,
+    /// `wins / (wins + losses)`; `0.0` when no decisions were recorded.
+    pub win_rate: f64,
+    /// `s4_dict_put_bytes_total{kind="original"}` — logical input bytes.
+    pub original_bytes: u64,
+    /// `s4_dict_put_bytes_total{kind="dict"}` — dict-compressed payload
+    /// bytes (measured on every PUT, win or loss).
+    pub dict_bytes: u64,
+    /// `s4_dict_put_bytes_total{kind="plain"}` — plain cpu-zstd payload
+    /// bytes for the same inputs (the per-PUT comparison baseline).
+    pub plain_bytes: u64,
+    /// Effective dict compression ratio: `dict_bytes / original_bytes`
+    /// (lower is better); `0.0` when no bytes were recorded.
+    pub dict_ratio: f64,
+    /// `true` when this prefix tripped the `--warn-win-rate` threshold.
+    pub stale: bool,
+}
+
+/// `s4 dict-status` report — built purely from one `/metrics` scrape.
+#[derive(Debug, Clone, Serialize)]
+pub struct DictStatusReport {
+    /// Per-prefix health, sorted by prefix.
+    pub prefixes: Vec<DictPrefixStatus>,
+    /// `s4_dict_fetch_total{result="ok"}` — lazy GET-side fetches.
+    pub dict_fetch_ok: u64,
+    /// `s4_dict_fetch_total{result="err"}` — any non-zero value means
+    /// dict-compressed objects failed GETs.
+    pub dict_fetch_err: u64,
+    /// The threshold the `stale` flags were judged against.
+    pub warn_win_rate: f64,
+    /// One human-readable line per stale prefix. Non-empty ⇒ the CLI
+    /// exits 1 (cron-able).
+    pub warnings: Vec<String>,
+}
+
+/// Build a [`DictStatusReport`] from raw Prometheus text. Lines other
+/// than the three dict metric families are ignored. A prefix is flagged
+/// stale when it has at least one recorded decision and its win rate is
+/// strictly below `warn_win_rate`.
+pub fn build_dict_status(metrics_text: &str, warn_win_rate: f64) -> DictStatusReport {
+    let mut acc: std::collections::BTreeMap<String, DictPrefixStatus> =
+        std::collections::BTreeMap::new();
+    let mut dict_fetch_ok = 0u64;
+    let mut dict_fetch_err = 0u64;
+    for line in metrics_text.lines() {
+        let Some((name, labels, value)) = parse_prom_sample(line) else {
+            continue;
+        };
+        // Counters render as non-negative integers; clamp defensively.
+        let v = if value.is_finite() && value > 0.0 {
+            value as u64
+        } else {
+            0
+        };
+        match name.as_str() {
+            n if n == crate::metrics::names::DICT_PUT_TOTAL => {
+                let Some(prefix) = label_value(&labels, "prefix") else {
+                    continue;
+                };
+                let e = acc.entry(prefix.to_owned()).or_default();
+                e.prefix = prefix.to_owned();
+                match label_value(&labels, "outcome") {
+                    Some("win") => e.wins += v,
+                    Some("loss") => e.losses += v,
+                    _ => {}
+                }
+            }
+            n if n == crate::metrics::names::DICT_PUT_BYTES_TOTAL => {
+                let Some(prefix) = label_value(&labels, "prefix") else {
+                    continue;
+                };
+                let e = acc.entry(prefix.to_owned()).or_default();
+                e.prefix = prefix.to_owned();
+                match label_value(&labels, "kind") {
+                    Some("original") => e.original_bytes += v,
+                    Some("dict") => e.dict_bytes += v,
+                    Some("plain") => e.plain_bytes += v,
+                    _ => {}
+                }
+            }
+            n if n == crate::metrics::names::DICT_FETCH_TOTAL => {
+                match label_value(&labels, "result") {
+                    Some("ok") => dict_fetch_ok += v,
+                    Some("err") => dict_fetch_err += v,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut warnings = Vec::new();
+    let mut prefixes: Vec<DictPrefixStatus> = acc.into_values().collect();
+    for p in &mut prefixes {
+        let decisions = p.wins + p.losses;
+        if decisions > 0 {
+            p.win_rate = p.wins as f64 / decisions as f64;
+        }
+        if p.original_bytes > 0 {
+            p.dict_ratio = p.dict_bytes as f64 / p.original_bytes as f64;
+        }
+        if decisions > 0 && p.win_rate < warn_win_rate {
+            p.stale = true;
+            warnings.push(format!(
+                "prefix {:?}: win rate {:.2} over {decisions} dict-path PUT(s) is below \
+                 {warn_win_rate:.2} — dictionary may be stale; consider retraining \
+                 (s4 train-dict)",
+                p.prefix, p.win_rate
+            ));
+        }
+    }
+    DictStatusReport {
+        prefixes,
+        dict_fetch_ok,
+        dict_fetch_err,
+        warn_win_rate,
+        warnings,
     }
 }
 
@@ -994,6 +1469,275 @@ mod tests {
             "only bucket-root .s4dict/ is reserved"
         );
         assert!(!is_dict_key("regular/key.json"));
+    }
+
+    // =======================================================================
+    // v1.3 dict ops
+    // =======================================================================
+
+    #[test]
+    fn lookup_with_prefix_returns_matched_prefix() {
+        let d_short = fake_dict(1);
+        let d_long = fake_dict(2);
+        let store = store_with(&[("bkt/logs/", d_short), ("bkt/logs/app1/", d_long.clone())]);
+        let (prefix, id, _) = store
+            .lookup_with_prefix("bkt", "logs/app1/x.json")
+            .expect("hit");
+        assert_eq!(prefix, "bkt/logs/app1/");
+        assert_eq!(id, dict_id_of(&d_long));
+        assert!(store.lookup_with_prefix("bkt", "images/x.png").is_none());
+    }
+
+    #[test]
+    fn map_file_parses_and_validates_like_the_flag() {
+        let entries = parse_zstd_dict_map(
+            r#"
+[mappings]
+"bkt/logs/" = "0123456789abcdef"
+"bkt/events/v2/" = "fedcba9876543210"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(entries.len(), 2);
+        // BTreeMap order: "bkt/events/v2/" sorts before "bkt/logs/".
+        assert_eq!(entries[0].prefix, "bkt/events/v2/");
+        assert_eq!(entries[0].bucket, "bkt");
+        assert_eq!(entries[0].dict_id, "fedcba9876543210");
+        assert_eq!(entries[1].prefix, "bkt/logs/");
+
+        // Empty file / empty table → zero entries, not an error.
+        assert!(parse_zstd_dict_map("").expect("empty ok").is_empty());
+        assert!(
+            parse_zstd_dict_map("[mappings]\n")
+                .expect("empty table ok")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn map_file_rejects_bad_shapes() {
+        // Invalid dict-id (same rule as the flag parser).
+        let err = parse_zstd_dict_map("[mappings]\n\"bkt/logs/\" = \"BADID\"\n")
+            .expect_err("bad id must be rejected");
+        assert!(err.contains("lowercase hex"), "{err}");
+        // Missing bucket separator.
+        let err = parse_zstd_dict_map("[mappings]\n\"nobucket\" = \"0123456789abcdef\"\n")
+            .expect_err("prefix without '/' must be rejected");
+        assert!(err.contains("bucket"), "{err}");
+        // Duplicate prefix = TOML duplicate key = parse error.
+        let err = parse_zstd_dict_map(
+            "[mappings]\n\"bkt/a/\" = \"0123456789abcdef\"\n\"bkt/a/\" = \"fedcba9876543210\"\n",
+        )
+        .expect_err("duplicate prefix must be rejected");
+        assert!(err.contains("invalid TOML"), "{err}");
+        // Typo'd table name must not silently configure nothing.
+        let err = parse_zstd_dict_map("[mapping]\n\"bkt/a/\" = \"0123456789abcdef\"\n")
+            .expect_err("unknown table must be rejected");
+        assert!(err.contains("invalid TOML"), "{err}");
+        // Not TOML at all.
+        assert!(parse_zstd_dict_map("{json: true}").is_err());
+    }
+
+    #[test]
+    fn merge_rejects_prefix_in_both_sources() {
+        let flag = vec![parse_zstd_dict_flag("bkt/a/=0123456789abcdef").expect("parse")];
+        let map = vec![parse_zstd_dict_flag("bkt/b/=0123456789abcdef").expect("parse")];
+        let merged = merge_dict_entries(flag.clone(), map).expect("disjoint merge");
+        assert_eq!(merged.len(), 2);
+
+        // Same prefix in both — error even with the same id.
+        let map_dup = vec![parse_zstd_dict_flag("bkt/a/=0123456789abcdef").expect("parse")];
+        let err = merge_dict_entries(flag, map_dup).expect_err("dup prefix must be rejected");
+        assert!(
+            err.contains("both --zstd-dict and --zstd-dict-map"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn shared_store_swaps_atomically() {
+        let shared = SharedDictStore::default();
+        assert!(shared.load().is_none(), "default = dict feature off");
+        let d1 = fake_dict(1);
+        let store1 = Arc::new(store_with(&[("bkt/a/", d1.clone())]));
+        let shared = SharedDictStore::new(Some(Arc::clone(&store1)));
+        let gen1 = shared.load().expect("gen1");
+        assert!(gen1.lookup("bkt", "a/x").is_some());
+        // Swap in a store with a different prefix; old guard still works.
+        let d2 = fake_dict(2);
+        let store2 = Arc::new(store_with(&[("bkt/b/", d2)]));
+        shared.swap(store2);
+        let gen2 = shared.load().expect("gen2");
+        assert!(gen2.lookup("bkt", "a/x").is_none());
+        assert!(gen2.lookup("bkt", "b/x").is_some());
+        assert!(
+            gen1.lookup("bkt", "a/x").is_some(),
+            "in-flight readers keep the generation they loaded"
+        );
+    }
+
+    #[test]
+    fn win_tracker_judges_only_full_windows() {
+        let t = DictWinTracker::with_window(4);
+        // 3 losses: window not full yet → never warns.
+        assert!(t.record("p", false).is_none());
+        assert!(t.record("p", false).is_none());
+        assert!(t.record("p", false).is_none());
+        // 4th decision fills the window at rate 0.0 → warn fires once.
+        let rate = t.record("p", false).expect("full window below 0.5");
+        assert!(rate.abs() < f64::EPSILON, "rate {rate}");
+        // Still below threshold but inside the 1-hour rate limit → quiet.
+        assert!(t.record("p", false).is_none());
+        // A different prefix has its own window + rate limit.
+        for _ in 0..3 {
+            assert!(t.record("q", false).is_none());
+        }
+        assert!(t.record("q", false).is_some());
+    }
+
+    #[test]
+    fn win_tracker_rolls_the_window_and_rate_limits() {
+        let t = DictWinTracker::with_window(4);
+        let start = Instant::now();
+        // 4 wins: rate 1.0, no warn.
+        for _ in 0..4 {
+            assert!(t.record_at("p", true, start).is_none());
+        }
+        // 2 losses: rolling rate 2/4 = 0.5 — NOT below the threshold.
+        assert!(t.record_at("p", false, start).is_none());
+        assert!(t.record_at("p", false, start).is_none());
+        // 3rd loss: 1/4 = 0.25 < 0.5 → warn.
+        let rate = t.record_at("p", false, start).expect("warn at 0.25");
+        assert!((rate - 0.25).abs() < f64::EPSILON);
+        // Rate-limited within the hour even though still below threshold.
+        assert!(
+            t.record_at("p", false, start + Duration::from_secs(60))
+                .is_none()
+        );
+        // After the interval elapses the warn fires again.
+        assert!(
+            t.record_at("p", false, start + DICT_WIN_RATE_WARN_INTERVAL)
+                .is_some()
+        );
+        // Recovery: wins refill the window above the threshold → quiet.
+        for i in 0..4 {
+            assert!(
+                t.record_at(
+                    "p",
+                    true,
+                    start + DICT_WIN_RATE_WARN_INTERVAL + Duration::from_secs(1 + i)
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn prom_sample_parser_shapes() {
+        // No labels.
+        let (name, labels, v) = parse_prom_sample("s4_dict_fetch_total 3").expect("parse");
+        assert_eq!(name, "s4_dict_fetch_total");
+        assert!(labels.is_empty());
+        assert!((v - 3.0).abs() < f64::EPSILON);
+        // Labels, '/' and '=' inside values, trailing whitespace.
+        let (name, labels, v) =
+            parse_prom_sample("s4_dict_put_total{prefix=\"bkt/k=v/\",outcome=\"win\"} 41 ")
+                .expect("parse");
+        assert_eq!(name, "s4_dict_put_total");
+        assert_eq!(
+            labels,
+            vec![
+                ("prefix".to_owned(), "bkt/k=v/".to_owned()),
+                ("outcome".to_owned(), "win".to_owned())
+            ]
+        );
+        assert!((v - 41.0).abs() < f64::EPSILON);
+        // Escapes in label values.
+        let (_, labels, _) = parse_prom_sample(r#"m{p="a\"b\\c\nd"} 1"#).expect("escapes parse");
+        assert_eq!(labels[0].1, "a\"b\\c\nd");
+        // Comments / blank / garbage → None.
+        assert!(parse_prom_sample("# TYPE s4_dict_put_total counter").is_none());
+        assert!(parse_prom_sample("").is_none());
+        assert!(parse_prom_sample("name{unterminated=\"x").is_none());
+        assert!(parse_prom_sample("name{} not-a-number").is_none());
+        // Float values (histograms etc.) parse fine.
+        let (_, _, v) = parse_prom_sample("m 0.0001").expect("float");
+        assert!((v - 0.0001).abs() < 1e-12);
+    }
+
+    /// The parser MUST understand what the real recorder renders — fixture
+    /// captured live: drive the shared in-process Prometheus recorder with
+    /// `record_dict_put` / `record_dict_fetch`, then feed `render()` output
+    /// straight into `build_dict_status`.
+    #[test]
+    fn dict_status_from_real_recorder_render() {
+        let handle = crate::metrics::test_metrics_handle();
+        // Healthy prefix: 3 wins, 1 loss (win rate 0.75).
+        for _ in 0..3 {
+            crate::metrics::record_dict_put("statbkt/events/", true, 300, 60, 200);
+        }
+        crate::metrics::record_dict_put("statbkt/events/", false, 300, 210, 200);
+        // Stale prefix: 1 win, 4 losses (win rate 0.2).
+        crate::metrics::record_dict_put("statbkt/blobs/", true, 100, 90, 95);
+        for _ in 0..4 {
+            crate::metrics::record_dict_put("statbkt/blobs/", false, 100, 99, 95);
+        }
+        crate::metrics::record_dict_fetch("ok");
+
+        let rendered = handle.render();
+        let report = build_dict_status(&rendered, DEFAULT_DICT_STATUS_WARN_WIN_RATE);
+        let events = report
+            .prefixes
+            .iter()
+            .find(|p| p.prefix == "statbkt/events/")
+            .expect("events prefix parsed from real render output");
+        assert_eq!(events.wins, 3);
+        assert_eq!(events.losses, 1);
+        assert!((events.win_rate - 0.75).abs() < f64::EPSILON);
+        assert_eq!(events.original_bytes, 1200);
+        assert_eq!(events.dict_bytes, 390);
+        assert_eq!(events.plain_bytes, 800);
+        assert!((events.dict_ratio - 390.0 / 1200.0).abs() < 1e-9);
+        assert!(!events.stale);
+
+        let blobs = report
+            .prefixes
+            .iter()
+            .find(|p| p.prefix == "statbkt/blobs/")
+            .expect("blobs prefix");
+        assert_eq!(blobs.wins, 1);
+        assert_eq!(blobs.losses, 4);
+        assert!(blobs.stale, "win rate 0.2 must trip the 0.5 default");
+        assert!(report.dict_fetch_ok >= 1);
+        let warning = report
+            .warnings
+            .iter()
+            .find(|w| w.contains("statbkt/blobs/"))
+            .expect("stale prefix must produce a warning line");
+        assert!(
+            warning.contains("dictionary may be stale; consider retraining (s4 train-dict)"),
+            "{warning}"
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.contains("statbkt/events/")),
+            "healthy prefix must not warn: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn dict_status_empty_scrape_is_quiet() {
+        let report = build_dict_status(
+            "# HELP something_else\nsomething_else 5\n",
+            DEFAULT_DICT_STATUS_WARN_WIN_RATE,
+        );
+        assert!(report.prefixes.is_empty());
+        assert!(report.warnings.is_empty());
+        assert_eq!(report.dict_fetch_ok, 0);
+        assert_eq!(report.dict_fetch_err, 0);
     }
 
     #[test]
