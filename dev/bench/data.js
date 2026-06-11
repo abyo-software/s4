@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781165826382,
+  "lastUpdate": 1781168155630,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -11281,6 +11281,232 @@ window.BENCHMARK_DATA = {
             "name": "decode_index/4096f",
             "value": 19237,
             "range": "± 103",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "c4fe92a89de6691edb7a64ced4711bfef0b5dbb9",
+          "message": "feat(cli): s4 maintain — policy 駆動バケットメンテナンス (migrate/recompact/transition の統合実行)\n\n宣言的 TOML policy ([[rule]] name/bucket/prefix/action/older-than +\naction 別パラメータ) を 1 コマンドで直列実行。dry-run default /\n--execute / --interval <DUR> 常駐 (SIGTERM graceful、実行中 rule は\n完走)。migrate・recompact は library 再利用、transition (storage\nclass 変更) を新規実装。\n\n- transition: MinIO が同 key COPY directive を拒否するため HEAD +\n  REPLACE で metadata 再送 (AWS/MinIO 両対応)。sidecar は本体随伴で\n  同クラスへ + 中断 run の drift 再整列。ETag race guard / internal\n  key 除外 / versioning 警告は migrate と同じ規律\n- policy validation は全エラー一括報告 (deny_unknown_fields、action\n  非適用キー拒否、rule 名重複拒否)\n- 前任 agent (セッション上限中断) の additive 準備編集を継承 +\n  compile bug 1 件修正\n\ntests: lib 578 (policy/順序/transition 選別 14 本) / maintain e2e 2 本\n(3-rule dry-run→execute→冪等 + --interval 1s 子プロセス SIGTERM) /\nmigrate・recompact e2e 回帰 / clippy -D warnings / fmt — 全 green\n(orchestrator 再実行済)。\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-06-11T17:48:30+09:00",
+          "tree_id": "57ee8055ccddddc677e5690facfdb53242e2ff0e",
+          "url": "https://github.com/abyo-software/s4/commit/c4fe92a89de6691edb7a64ced4711bfef0b5dbb9"
+        },
+        "date": 1781168155010,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 55664,
+            "range": "± 6582",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 44637,
+            "range": "± 3818",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 387,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2147158,
+            "range": "± 57348",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 28604692,
+            "range": "± 102143",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 152256,
+            "range": "± 2357",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 51962301,
+            "range": "± 417034",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 505483666,
+            "range": "± 1110950",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 2474368,
+            "range": "± 28012",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 25683,
+            "range": "± 1841",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 31935,
+            "range": "± 2811",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 395,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 522270,
+            "range": "± 5677",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1399966,
+            "range": "± 43585",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 152328,
+            "range": "± 1395",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 13056575,
+            "range": "± 336453",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 26868195,
+            "range": "± 288425",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 2464351,
+            "range": "± 10470",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1368598,
+            "range": "± 22661",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2309062,
+            "range": "± 6899",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 400990582,
+            "range": "± 5610153",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 116,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 5858,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 940,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 14846,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2459,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 18991,
+            "range": "± 50",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 75659,
+            "range": "± 152",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 556,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4535,
+            "range": "± 37",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19309,
+            "range": "± 94",
             "unit": "ns/iter"
           },
           {
