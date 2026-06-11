@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781114213763,
+  "lastUpdate": 1781144664885,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -9925,6 +9925,232 @@ window.BENCHMARK_DATA = {
             "name": "decode_index/4096f",
             "value": 19143,
             "range": "± 531",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "e75925bca95d872bf5b55a1d02d71fed2b1c5eb4",
+          "message": "fix(audit-r1): round-1 監査 fix wave — P1×4 / P2×8 / P3×8 closure\n\n4 レビュアー (Claude×3 + Codex) による v1.0.0..HEAD 監査。Codex と\nClaude が独立に同一 P1 2 件を発見 (dual-reviewer の再実証)。\n\nP1: migrate の .s4dict 再圧縮破壊 / client 供給 s4-dict-id での\nflag 無指定 GET 5xx (freeze 違反) / s4fs の SSE 暗号文無音返却 /\ns4fs の .__s4ver__ shadow 混入。\nP2: storage class + tags の rewrite 喪失 / migrate verify 失敗 exit 0 /\ncross-bucket copy の dict 不伝播 / .s4dict reserved-key guard /\ns4fs stale·v1 sidecar 信頼 / s4fs 依存 floor。\nP3: estimate 404 abort / max-body-bytes 後置 / unstamped-framed 昇格 /\ndict cache bucket scope + full-sha 検証 + lazy cap 1 MiB /\nnvcomp_batched device size 検証 / inexact open truncate 他。\n\n詳細は CHANGELOG [Unreleased] Fixed 節。\n\ngates: lib 545 / codec 90 / minio e2e 4 系統 (estimate 1, migrate 3,\nrecompact 1, dict 1) / python unit 72 + e2e 9 (SSE 実 gateway 検証含む)\n/ GPU 実機 5 / clippy -D warnings / fmt — 全 green (orchestrator 再実行済)。\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-06-11T11:16:22+09:00",
+          "tree_id": "ec4b4194916e34a60c5fa46f6e917358bf2098ac",
+          "url": "https://github.com/abyo-software/s4/commit/e75925bca95d872bf5b55a1d02d71fed2b1c5eb4"
+        },
+        "date": 1781144663933,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 48460,
+            "range": "± 2190",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 55706,
+            "range": "± 1059",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 429,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2257638,
+            "range": "± 30299",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50661338,
+            "range": "± 304131",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201335,
+            "range": "± 242",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 51188299,
+            "range": "± 1067129",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 924070260,
+            "range": "± 1927542",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3223238,
+            "range": "± 14830",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 27344,
+            "range": "± 12362",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 32817,
+            "range": "± 1069",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 421,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 576990,
+            "range": "± 2768",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1641652,
+            "range": "± 20436",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201208,
+            "range": "± 241",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12220507,
+            "range": "± 78164",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 28747189,
+            "range": "± 1455579",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3245670,
+            "range": "± 27360",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1452691,
+            "range": "± 32539",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2158221,
+            "range": "± 18549",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 322144528,
+            "range": "± 3310455",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 136,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 35258,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 961,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 14479,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2932,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 21368,
+            "range": "± 1538",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 90850,
+            "range": "± 1006",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 632,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 5224,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 20735,
+            "range": "± 29",
             "unit": "ns/iter"
           },
           {
