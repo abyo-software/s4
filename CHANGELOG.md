@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (v1.2 audit round 1 — 4 reviewers over v1.1.0..HEAD, 2026-06-12)
+- **P2** The savings ledger no longer subtracts objects it never added:
+  gateway writes made with the ledger enabled stamp an unforgeable
+  internal `s4-ledger` metadata marker, and deletes/overwrites of
+  unmarked objects (backend-direct, `s4fs`-written, `migrate` /
+  `recompact` output) skip subtraction with a per-bucket
+  `skipped_unaccounted` tally + report note. Ratio and $/month floor at
+  0 with a drift note. Previously a migrate-baked bucket could report
+  negative savings after gateway-routed deletes (incl. lifecycle
+  expiry).
+- **P2** `s4 maintain` transition copies are pinned with
+  `x-amz-copy-source-if-match`: a concurrent overwrite between the
+  attribute HEAD and the CopyObject now makes the backend refuse with
+  412 (counted `etag-raced`) instead of stamping the old object's
+  `s4-*` manifest onto the new bytes (which made the key unreadable
+  through the gateway until the next rewrite).
+- **P2** `CompleteMultipartUpload` no longer runs the ledger's
+  frame-scan accounting when the ledger flag is off (CPU-only
+  regression on large multiparts; output bytes were unaffected).
+- **P2** (s4fs) a sidecar PUT failure after a successful body write now
+  raises a typed `S4SidecarWriteError` *and* still invalidates the
+  per-path caches (`try/finally`), so same-instance reads see the new
+  object; previously stale caches could serve the old manifest against
+  the new body.
+- **P2** The README SemVer freeze table now states the Python binding
+  contract as a guaranteed-minimum set plus CHANGELOG-recorded additive
+  exports (it still claimed "exactly" the v1.0 names while v1.1/v1.2
+  shipped additive helpers).
+- **P3** Maintain transition re-sends `Expires` /
+  `WebsiteRedirectLocation`; report notes now state precisely what a
+  REPLACE-directive class copy changes (backend-SSE re-encryption under
+  the bucket default, multipart→single-part checksum/ETag change with
+  sidecar full-read fallback). Resident `s4 maintain` no longer risks
+  sleeping out a full `--interval` when SIGTERM lands in the
+  flag-check gap (`notify_one` permit).
+- **P3** `s4 dict-status`: 10 s HTTP timeout (was unbounded), the
+  Prometheus text parser no longer panics on multibyte escape
+  sequences in third-party output, and the cumulative-counter semantics
+  (post-rotation STALE persistence, removed-prefix series lingering)
+  are documented. `s4 savings` against a missing state file now says so
+  in a note instead of silently reporting zeros.
+- **P3** Ledger internals: Prometheus gauges are stamped inside the
+  write lock (no transient reordering), SIGUSR1 dumps route through the
+  ledger's own `flush()` (no `.tmp` race with the event flush), and
+  `.s4dict/` propagation objects are explicitly excluded from
+  accounting (internal keys are never ledger-counted; documented
+  contract). (s4-codec-py) `encode_s4_object` passthrough CRC32C now
+  releases the GIL.
+
 ### Added
 - **s4fs write support (opt-in)**: `S4FileSystem(write_enabled=True)`
   (or `storage_options={"write_enabled": True}` through fsspec/pandas)

@@ -22,9 +22,19 @@ Reads work out of the box; writes are opt-in via ``write_enabled=True``
 
 from fsspec import register_implementation
 
-from s4fs.core import S4File, S4FileSystem, S4MetadataUnsupportedError
+from s4fs.core import (
+    S4File,
+    S4FileSystem,
+    S4MetadataUnsupportedError,
+    S4SidecarWriteError,
+)
 
-__all__ = ["S4File", "S4FileSystem", "S4MetadataUnsupportedError"]
+__all__ = [
+    "S4File",
+    "S4FileSystem",
+    "S4MetadataUnsupportedError",
+    "S4SidecarWriteError",
+]
 
 # Single source of truth is pyproject.toml; a hardcoded string here
 # shipped 1.1.0 wheels reporting __version__ == "1.0.0" (post-release

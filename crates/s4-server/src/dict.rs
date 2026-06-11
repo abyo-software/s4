@@ -353,6 +353,15 @@ pub const DICT_WIN_RATE_WARN_INTERVAL: Duration = Duration::from_secs(3600);
 /// the rate so the caller can emit a WARN (rate-limited per prefix by
 /// [`DICT_WIN_RATE_WARN_INTERVAL`]). Judgement only starts on a **full**
 /// window — a cold prefix's first few losses must not page anyone.
+///
+/// **Rotation caveat**: the window is NOT cleared on a SIGHUP dict-map
+/// reload — the tracker is owned privately by the service while the
+/// reload handler only swaps the [`SharedDictStore`], so the first
+/// post-rotation WARN judgement can still include up to
+/// [`DICT_WIN_RATE_WINDOW`] pre-rotation decisions. Worst case that is
+/// one spurious WARN (rate-limited to one per prefix per hour) right
+/// after a rotation that actually fixed the dictionary; the window
+/// flushes itself after [`DICT_WIN_RATE_WINDOW`] new PUTs.
 #[derive(Debug)]
 pub struct DictWinTracker {
     window: usize,
@@ -735,17 +744,27 @@ pub fn parse_prom_sample(line: &str) -> Option<PromSample> {
                 match bytes[i] {
                     b'\\' => {
                         i += 1;
-                        match bytes.get(i) {
-                            Some(b'\\') => value.push('\\'),
-                            Some(b'"') => value.push('"'),
-                            Some(b'n') => value.push('\n'),
-                            Some(&other) => {
+                        // Read the escaped character as a whole char, not a
+                        // byte: `\` followed by a multi-byte UTF-8 char (a
+                        // malformed-but-possible `\é`) would otherwise leave
+                        // `i` mid-codepoint and panic on the next
+                        // `line[i..]` slice (v1.2 audit R1 P3). `\` is
+                        // ASCII, so `i` is a char boundary here; an empty
+                        // remainder (dangling trailing `\`) yields `None`.
+                        let ch = line[i..].chars().next()?;
+                        match ch {
+                            // The three escapes the Prometheus text format
+                            // defines for label values.
+                            '\\' => value.push('\\'),
+                            '"' => value.push('"'),
+                            'n' => value.push('\n'),
+                            // Anything else is not an escape — copy raw.
+                            other => {
                                 value.push('\\');
-                                value.push(other as char);
+                                value.push(other);
                             }
-                            None => return None,
                         }
-                        i += 1;
+                        i += ch.len_utf8();
                     }
                     b'"' => {
                         i += 1;
@@ -821,6 +840,22 @@ pub struct DictStatusReport {
 /// than the three dict metric families are ignored. A prefix is flagged
 /// stale when it has at least one recorded decision and its win rate is
 /// strictly below `warn_win_rate`.
+///
+/// **Lifetime-counter caveat** (v1.2 audit R1 P3): the inputs are
+/// monotonic Prometheus counters, so every number here is cumulative
+/// **since gateway start** — not a rolling window like the gateway's
+/// own [`DictWinTracker`] WARN log. Two consequences operators must
+/// know:
+///
+/// - After rotating a dictionary (SIGHUP map reload), the historical
+///   losses stay in the counters; a prefix flagged STALE keeps tripping
+///   the threshold until enough post-rotation wins accumulate to pull
+///   the lifetime rate back over `warn_win_rate` (or the gateway is
+///   restarted, which resets the counters).
+/// - A prefix **removed** from the map keeps its already-recorded
+///   series in `/metrics` until the gateway restarts — it still shows
+///   up (and can still read STALE) here even though no new PUT will
+///   ever match it.
 pub fn build_dict_status(metrics_text: &str, warn_win_rate: f64) -> DictStatusReport {
     let mut acc: std::collections::BTreeMap<String, DictPrefixStatus> =
         std::collections::BTreeMap::new();
@@ -1655,6 +1690,22 @@ mod tests {
         // Escapes in label values.
         let (_, labels, _) = parse_prom_sample(r#"m{p="a\"b\\c\nd"} 1"#).expect("escapes parse");
         assert_eq!(labels[0].1, "a\"b\\c\nd");
+        // Backslash followed by a NON-escape ASCII char copies raw.
+        let (_, labels, _) = parse_prom_sample(r#"m{p="a\tb"} 1"#).expect("raw escape parse");
+        assert_eq!(labels[0].1, "a\\tb");
+        // v1.2 audit R1 P3: backslash followed by a multi-byte UTF-8 char
+        // must not panic on a char-boundary slice — copied raw instead.
+        let (_, labels, _) = parse_prom_sample("m{p=\"a\\éb\"} 1").expect("multibyte escape");
+        assert_eq!(labels[0].1, "a\\éb");
+        let (_, labels, _) = parse_prom_sample("m{p=\"\\日本\"} 2").expect("cjk escape");
+        assert_eq!(labels[0].1, "\\日本");
+        // Multi-byte chars *not* behind a backslash still parse (regression
+        // guard for the pre-existing chars()-based plain path).
+        let (_, labels, _) = parse_prom_sample("m{p=\"ログ/日本語/\"} 7").expect("plain utf8");
+        assert_eq!(labels[0].1, "ログ/日本語/");
+        // Dangling trailing backslash inside an (unterminated) value → None,
+        // same contract as before.
+        assert!(parse_prom_sample("m{p=\"x\\").is_none());
         // Comments / blank / garbage → None.
         assert!(parse_prom_sample("# TYPE s4_dict_put_total counter").is_none());
         assert!(parse_prom_sample("").is_none());

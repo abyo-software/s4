@@ -121,7 +121,7 @@ release with migration guidance, not a v1.x patch.
 | **`s4_server::service::S4Service` shape** | The `S4Service<B>` struct itself, its `S4Service::new(backend, registry, dispatcher)` constructor (signature: `pub fn new(backend: B, registry: Arc<CodecRegistry>, dispatcher: Arc<dyn CodecDispatcher>) -> Self`), and its builder API are frozen. The builder API is the long-form `S4Service::new(...).with_<knob>(value)...` chain — every `pub fn with_*` currently visible on `S4Service` (e.g. `with_sse_key`, `with_sse_keyring`, `with_sse_chunk_size`, `with_secure_transport`, `with_trust_x_forwarded_for`, `with_max_body_bytes`, `with_sigv4a_gate`, `with_kms_backend`, `with_replication`, `with_replication_max_concurrent`, `with_versioning`, `with_object_lock`, `with_mfa_delete`, `with_cors`, `with_lifecycle`, `with_inventory`, `with_notifications`, `with_tagging`, `with_policy`, `with_access_log`, `with_rate_limits`, `with_compliance_strict`, `with_allow_legacy_reserved_key_reads`) is locked to its current `fn(self, …) -> Self` signature; renames or signature changes ship under v2.0. **Adding** a new `with_<knob>` builder is additive (ships in a minor). The `SharedService` newtype at `s4_server::service_arc::SharedService` (the externally-supported "wrap an `S4Service` for clone-able shared use" path), `SigV4aGate` + `SigV4aGateError`, `resolve_range`, the `DEFAULT_MAX_BODY_BYTES` + `DEFAULT_REPLICATION_MAX_CONCURRENT` constants, and the wrapping pattern (`Arc<S4Service>` is the supported handle shape) are frozen. Implementation internals behind `S4Service` (request routing, multipart state, etc.) remain refactorable as long as the listed surface stays bit-equivalent at the call site. **Important caveat on builder parameter types**: 13 of the listed `with_*` builders take `Arc<ManagerType>` parameters whose `ManagerType` lives in an unfrozen module (e.g. `with_tagging(Arc<tagging::TagManager>)`, `with_inventory(Arc<inventory::InventoryManager>)`, `with_replication(Arc<replication::ReplicationManager>)`, …). The **builder signature** is frozen — calling `with_tagging` with an `Arc<TagManager>` is contract-stable; but the **`TagManager` constructor / fields / behavior** are NOT frozen because `s4_server::tagging` is not in the freeze list (see §"Modules NOT in the freeze list" below). Library consumers who construct + inject these managers should pin a precise `=1.x.y` and treat the manager module surface as a manual-integration step across minors. |
 | **`s4_server::sse` public surface** | Types: `SseKey`, `SseKeyring`, `SharedSseKey` (= `Arc<SseKey>`, parameter type of `S4Service::with_sse_key`), `SharedSseKeyring` (= `Arc<SseKeyring>`), `SseError`, `SseSource<'a>`, `S4E6Header<'a>` (return type of `parse_s4e6_header`). Functions: `compute_key_md5`, `encrypt`, `decrypt`, `encrypt_v2`, `parse_s4e6_header`, `peek_magic`. Constants: `SSE_C_ALGORITHM`, `ALGO_AES_256_GCM`, `SSE_MAGIC_V5`, `S4E5_HEADER_BYTES`, `S4E6_HEADER_BYTES`. New SSE envelopes (e.g. provisional `S4E7` chunked-KMS) ship as **additive** symbols and do not break the v1.x contract. |
 | **`s4_server::streaming` public surface** | `DEFAULT_S4F2_CHUNK_SIZE` constant, `streaming_compress_to_frames` + `streaming_compress_to_frames_with` functions. These functions accept `s3s::dto::StreamingBlob` parameters; that type is governed by the `s3s 0.13` row (see "HTTP API surface" below). |
-| **`s4-codec` codec trait + format constants** | `Codec` trait shape, `CodecKind` enum (all `#[non_exhaustive]`), `CodecError`, `IndexError`, `FrameError`, `GpuSelectError`, `CompareOp`. Constants: `index::{SIDECAR_SUFFIX, MAX_FRAMES, MAX_ETAG_BYTES, ENTRY_BYTES, HEADER_FIXED_V1, HEADER_FIXED_V2, INDEX_VERSION, INDEX_VERSION_V1, INDEX_VERSION_V2}`. Items: `index::{FrameIndex, encode_index, decode_index, FrameIndexEntry, SseChunkBinding, RangePlan, EncryptedRangePlan}` (`FrameIndex` and the latter four are all `pub struct`s; their public field sets + inherent method signatures are frozen at v1.0; field additions / removals / renames are v2.0 territory, same rule as the public structs in `s4_server::repair`), `multipart::FrameHeader` layout. Python (`s4-codec-py`) and WASM (`s4-codec-wasm`) bindings are versioned in lockstep with `s4-codec`; their binding-specific public APIs are frozen. The Python module `s4_codec` exports exactly these names: classes `CpuZstd` + `CpuGzip` (Python-side names per the `#[pyclass(name = "…")]` attributes; the underlying Rust types are `PyCpuZstd` / `PyCpuGzip`), function `gpu_available()`, attribute `__version__`, and the exception classes `S4Error`, `S4CrcMismatchError`, `S4SizeMismatchError`, `S4CodecMismatchError`, `S4UnregisteredCodecError`, `S4ManifestSizeExceedsLimitError`, `S4ManifestSizeMismatchError`, `S4BackendError`, `S4IoError` (full hierarchy in `crates/s4-codec-py/src/lib.rs:52-60`). The WASM module exports exactly these names: `decompressFramed`, `decompressSingle`, `supportedCodecs`, `supportedFrameMagic`. The bindings do NOT re-export the full Rust surface — only the names listed above are part of the v1.0 contract for each binding. |
+| **`s4-codec` codec trait + format constants** | `Codec` trait shape, `CodecKind` enum (all `#[non_exhaustive]`), `CodecError`, `IndexError`, `FrameError`, `GpuSelectError`, `CompareOp`. Constants: `index::{SIDECAR_SUFFIX, MAX_FRAMES, MAX_ETAG_BYTES, ENTRY_BYTES, HEADER_FIXED_V1, HEADER_FIXED_V2, INDEX_VERSION, INDEX_VERSION_V1, INDEX_VERSION_V2}`. Items: `index::{FrameIndex, encode_index, decode_index, FrameIndexEntry, SseChunkBinding, RangePlan, EncryptedRangePlan}` (`FrameIndex` and the latter four are all `pub struct`s; their public field sets + inherent method signatures are frozen at v1.0; field additions / removals / renames are v2.0 territory, same rule as the public structs in `s4_server::repair`), `multipart::FrameHeader` layout. Python (`s4-codec-py`) and WASM (`s4-codec-wasm`) bindings are versioned in lockstep with `s4-codec`; their binding-specific public APIs are frozen. The Python module `s4_codec` froze this **guaranteed minimum** export set at v1.0 (additive exports ship in minor releases and join the frozen set once shipped — examples: the v1.1 read helpers `CpuZstdDict` / `read_frame` / `frame_iter` / `decode_index` / `crc32c` + format constants + `S4FrameError` / `S4IndexError`, and the v1.2 write helpers `encode_s4_object` / `bind_index` / `pick_chunk_size`): classes `CpuZstd` + `CpuGzip` (Python-side names per the `#[pyclass(name = "…")]` attributes; the underlying Rust types are `PyCpuZstd` / `PyCpuGzip`), function `gpu_available()`, attribute `__version__`, and the exception classes `S4Error`, `S4CrcMismatchError`, `S4SizeMismatchError`, `S4CodecMismatchError`, `S4UnregisteredCodecError`, `S4ManifestSizeExceedsLimitError`, `S4ManifestSizeMismatchError`, `S4BackendError`, `S4IoError` (full hierarchy in `crates/s4-codec-py/src/lib.rs:52-60`). The WASM module exports exactly these names: `decompressFramed`, `decompressSingle`, `supportedCodecs`, `supportedFrameMagic`. The bindings do NOT re-export the full Rust surface — the contract for each binding is the names listed above plus the additively shipped minor-release exports recorded in the CHANGELOG. |
 | **`s4-config`** | The `CompressionMode` enum + `BackendConfig` struct field set + `S4Config` struct field set are frozen (the same `pub use s4_config as config` re-export inside `s4-server` makes these reachable through `s4_server::config::*`). The `S4Config::from_toml` stub is **NOT frozen** — it currently returns `bail!("toml loading not implemented yet")` and the eventual real implementation may change its error / return shape in any v1.x minor. |
 | **HTTP API surface** | S3 wire compatibility — the [`s3s 0.13`](https://crates.io/crates/s3s/0.13.0) trait set S4 implements. PUT / GET / Range GET / multipart / SigV4 / SigV4a / `x-amz-checksum-*` / `x-amz-server-side-encryption-*` headers all preserved. **`s3s` is itself pre-1.0**; our v1.x contract is that we will continue to track the `s3s 0.13` trait surface that S4 currently implements, accepting backward-compatible additions in `s3s` minors. A `s3s` major bump (0.14, 1.0) that breaks our trait impls would itself trigger a v2.0 of S4 with a clear migration in `docs/migration/`. |
 | **Container image tags + Helm chart `values.yaml` keys** | `ghcr.io/abyo-software/s4:<major>.<minor>.<patch>` + `:<major>.<minor>` + `:latest` floating tag rules; GPU build sibling tags `:<major>.<minor>.<patch>-gpu`. The complete top-level `values.yaml` key set is frozen: `replicas`, `image.{repository, tag, pullPolicy, pullSecrets}`, `nameOverride`, `fullnameOverride`, `serviceAccount.{create, annotations, name}`, `backend.{endpointUrl, region}`, `codec`, `zstdLevel`, `dispatcher`, `logFormat`, `otlpEndpoint`, `gpu.{enabled, count, nodeSelector, runtimeClassName}`, `tls.{enabled, cert, key, existingSecret, certKey, keyKey}`, `policy.{json, existingConfigMap}`, `service.{type, port, annotations}`, `ingress.{enabled, className, annotations, hosts, tls}`, `resources.{requests, limits}`, `podAnnotations`, `podLabels`, `podSecurityContext`, `securityContext`, `nodeSelector`, `tolerations`, `affinity`, `extraEnv`, `extraVolumes`, `extraVolumeMounts`, `probes.{liveness, readiness}`. **Default values** may shift in a minor release (e.g. a probe tuning change to reduce flake); the **key shape** (key names + structure) is v2.0 territory. |
@@ -390,7 +390,10 @@ byte-for-byte. Read-only by default; pass `write_enabled=True` to also
 *write* gateway-compatible S4 objects directly to the backend (S4F2
 framed `cpu-zstd` body + manifest metadata + ETag-bound sidecar — gateway
 GET / Range GET and `s4 verify-sidecar` accept the result; append, SSE,
-dictionaries and gateway versioning still go through the gateway). GPU
+dictionaries and gateway versioning still go through the gateway; a
+sidecar PUT that fails after the body landed raises a typed
+`S4SidecarWriteError` — the object stays fully readable and
+`s4 repair-sidecar` restores the Range fast-path). GPU
 (`nvcomp-*`) frames and SSE-encrypted objects raise `NotImplementedError`
 rather than decode wrong (SSE detection is triple-layered: `s4-encrypted`
 metadata, sidecar SSE binding, and `S4E1`–`S4E6` magic-byte sniff).
@@ -1096,10 +1099,16 @@ they bound what the numbers mean):
   replicas and aborted-multipart part bytes are likewise not counted.
 - Overwrite / DELETE subtraction adds **one best-effort HEAD probe per
   write-shaped request** (plus a sidecar HEAD where relevant) — this
-  extra backend traffic exists *only* when the flag is set. Objects
-  without S4 metadata (written before S4, or backend-direct) subtract
-  as `original = stored = size`, i.e. they contribute zero claimed
-  savings.
+  extra backend traffic exists *only* when the flag is set.
+- **Only ledger-accounted objects are ever subtracted** (audit round 1):
+  gateway writes made while the ledger is enabled carry an internal
+  `s4-ledger` metadata marker (client-supplied copies are stripped, so
+  it can't be forged), and deletes/overwrites of objects *without* the
+  marker — backend-direct, `s4fs`-written, `migrate`/`recompact` output,
+  pre-ledger writes — skip subtraction and are tallied per bucket as
+  `skipped_unaccounted` with a report note. This is what keeps a
+  migrate-baked bucket's ratio from going negative; ratio and $/month
+  additionally floor at 0 with a drift note if counters ever disagree.
 - State-file durability matches the other `--*-state-file` managers
   plus an event-driven flush (atomic tmp+rename on every mutation;
   SIGUSR1 re-dumps it too) — a crash loses at most the in-flight
@@ -1383,12 +1392,25 @@ run is realigned), so the pair never splits the way a size- or
 suffix-filtered lifecycle rule can. Sidecars are never transitioned on
 their own. Skip taxonomy follows the house style:
 `already-target-class` (the idempotency core), `too-recent`,
-`etag-raced` (pre-copy HEAD guard), `too-large` (single `CopyObject`
-caps at 5 GiB).
+`etag-raced`, `too-large` (single `CopyObject` caps at 5 GiB). The
+copy itself is pinned with `x-amz-copy-source-if-match` (audit round
+1), so a concurrent overwrite makes the backend refuse atomically
+(counted as `etag-raced`) instead of stamping stale metadata onto new
+bytes. `Expires` / `WebsiteRedirectLocation` are re-sent alongside
+content headers and user metadata; caveats that remain (stated in the
+report notes): a backend-SSE original is re-encrypted under the bucket
+default key, and a multipart-uploaded original becomes single-part
+(backend recomputes the checksum, the ETag changes, and an existing
+sidecar's ETag binding falls back to full-read until the next rewrite).
 
 Example run against MinIO (the `maintain_minio` e2e seed shape: two
-plain text logs under `app/`, one zstd-3-framed log under `archive/`;
-output verbatim, per-rule note blocks elided for space):
+plain text logs under `app/`, one zstd-3-framed log under `archive/`).
+The capture used the policy above **minus the `older-than` gates and
+with `storage-class = "REDUCED_REDUNDANCY"`** — freshly seeded demo
+objects would all skip as `too-recent` under the age gates, and
+`REDUCED_REDUNDANCY` is the only non-STANDARD class MinIO accepts
+(keep `GLACIER_IR` for AWS). Output verbatim, per-rule note blocks
+elided for space:
 
 ```
 S4 maintain — execute
@@ -1570,11 +1592,17 @@ restart-less rotation.
   below 0.5, it WARNs (at most once per prefix per hour) that the
   dictionary looks stale. SIGHUP map reloads are counted as
   `s4_dict_reload_total{result="ok"|"err"}`.
-- **`s4 dict-status --metrics-url <URL>`** scrapes `/metrics` and
-  reports per-prefix win rate / effective compression ratio / lazy
-  fetch errors; any prefix below `--warn-win-rate` (default 0.5) gets a
-  warning and the command exits 1, so a cron job catches drift
-  unattended (`--format json` for machines). Measured output (minio E2E
+- **`s4 dict-status --metrics-url <URL>`** scrapes `/metrics` (plain
+  HTTP GET, no auth headers, 10 s timeout — front an authenticated
+  metrics endpoint yourself if you need one) and reports per-prefix win
+  rate / effective compression ratio / lazy fetch errors; any prefix
+  below `--warn-win-rate` (default 0.5) gets a warning and the command
+  exits 1, so a cron job catches drift unattended (`--format json` for
+  machines; a failed scrape also exits 1 — distinguish via stderr).
+  Note the counters are **cumulative since gateway start**: right after
+  a rotation fixes a stale dictionary, the prefix keeps reporting STALE
+  until new wins outweigh the accumulated losses, and a prefix removed
+  from the map keeps its last series until the gateway restarts. Measured output (minio E2E
   `dict_ops_minio.rs`: 30 matching JSON PUTs under `events/`, then
   random bodies under a deliberately mismatched `rand/` mapping):
 

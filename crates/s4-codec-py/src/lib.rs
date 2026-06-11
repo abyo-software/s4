@@ -620,7 +620,10 @@ fn encode_s4_object<'py>(
         // it as a raw blob with manifest metadata and NO `s4-framed` flag
         // (see service.rs "Passthrough buys nothing…" comment). Mirror that.
         "passthrough" => {
-            let crc = ::crc32c::crc32c(&input);
+            // CRC32C is the only real work on this path, but it still
+            // scans the whole body — release the GIL for it like the
+            // cpu-zstd branch does (audit v1.2-R1 P3).
+            let crc = py.allow_threads(|| ::crc32c::crc32c(&input));
             let len = input.len() as u64;
             let manifest = ChunkManifest {
                 codec: CodecKind::Passthrough,

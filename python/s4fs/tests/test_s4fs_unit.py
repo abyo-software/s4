@@ -657,11 +657,70 @@ def test_write_refused_on_metadata_less_fs():
 
 
 def test_write_to_reserved_keys_rejected():
-    fs, _ = _writable()
+    fs, stub = _writable()
     with pytest.raises(ValueError, match="reserved"):
         fs.pipe_file(f"{BUCKET}/x.s4index", b"data")
     with pytest.raises(ValueError, match="reserved"):
         fs.pipe_file(f"{BUCKET}/.s4dict/0123456789abcdef", b"data")
+    # Version-shadow keys carry the marker as an *infix* after the user
+    # key (`<key>.__s4ver__/<version-id>`, service.rs is_version_shadow_key);
+    # writing one directly would corrupt the gateway's version chain.
+    with pytest.raises(ValueError, match="reserved"):
+        fs.pipe_file(f"{BUCKET}/data/file.parquet.__s4ver__/v123", b"data")
+    assert not any(".__s4ver__" in k for k in stub.files), "no shadow key may land"
+
+
+def test_sidecar_put_failure_invalidates_cache_and_raises_typed_error():
+    """Body + metadata PUT succeed, then the multi-frame sidecar PUT
+    fails: the same instance MUST drop its caches for the path (else a
+    self-read decodes the new body with the old manifest / old sidecar /
+    old live-info) and the error must say the object is intact and point
+    at `s4 repair-sidecar` (audit v1.2-R1 P2)."""
+    from s4fs import S4SidecarWriteError
+
+    fs, stub = _writable(write_zstd_level=1)
+    path = f"{BUCKET}/sidecar-fail.bin"
+    data1 = datagen.multi_frame_body()
+    fs.pipe_file(path, data1)
+    # Warm every per-path cache on this instance (info -> live/meta,
+    # ranged read -> decoded sidecar index).
+    assert fs.cat_file(path, start=10, end=900) == data1[10:900]
+    assert fs.info(path)["size"] == len(data1)
+    assert path in fs._index_cache and path in fs._live_info_cache
+
+    real_pipe_file = stub.pipe_file
+
+    def failing_pipe_file(p, value, **kwargs):
+        if p.endswith(".s4index"):
+            raise OSError("injected: backend rejected the sidecar PUT")
+        return real_pipe_file(p, value, **kwargs)
+
+    stub.pipe_file = failing_pipe_file
+    data2 = b"OVERWRITTEN-" + data1  # still > 4 MiB => still multi-frame
+    with pytest.raises(S4SidecarWriteError, match="repair-sidecar") as exc_info:
+        fs.pipe_file(path, data2)
+    # (b) message: object intact + recovery path; original cause chained.
+    msg = str(exc_info.value)
+    assert "intact and fully readable" in msg
+    assert isinstance(exc_info.value.__cause__, OSError)
+    # (a) caches invalidated despite the raise — nothing stale survives.
+    assert path not in fs._index_cache
+    assert path not in fs._meta_cache
+    assert path not in fs._live_info_cache
+    # The new body + metadata landed; the lingering sidecar is the OLD one
+    # (bound to the old ETag, so readers reject it)…
+    assert stub.meta[path]["s4-original-size"] == str(len(data2))
+    stale = s4_codec.decode_index(stub.files[path + ".s4index"])
+    assert stale["source_etag"] != stub.etags[path].strip('"')
+    # …and a SAME-INSTANCE read sees the new content (the bug was serving
+    # the new body through the old cached manifest/sidecar).
+    stub.pipe_file = real_pipe_file
+    assert fs.cat_file(path) == data2
+    assert fs.info(path)["size"] == len(data2)
+    # Ranged read: the stale sidecar fails its ETag binding, so s4fs
+    # warns and falls back to a (correct) full-object decode.
+    with pytest.warns(UserWarning, match="without a usable"):
+        assert fs.cat_file(path, start=0, end=12) == b"OVERWRITTEN-"
 
 
 def test_append_mode_rejected():

@@ -29,7 +29,15 @@
 //! (e) framed-then-transitioned objects still decompress byte-for-byte
 //!     through a real in-process S4 gateway;
 //! (f) `--interval 1s` resident mode (child `s4` process) completes at
-//!     least two cycles and exits 0 on SIGTERM.
+//!     least two cycles and exits 0 on SIGTERM — and its transition
+//!     rule preserves Expires + user metadata through the REPLACE copy
+//!     (v1.2 audit R1 P3; WebsiteRedirectLocation is asserted
+//!     pre==post because MinIO drops it at PUT time — the re-send
+//!     itself is unit-tested in `maintain.rs`);
+//! (g) MinIO refuses a stale `x-amz-copy-source-if-match` pin with
+//!     412 PreconditionFailed and the refused copy is a no-op — the
+//!     guard `copy_to_class` pins every transition copy with
+//!     (v1.2 audit R1 P2).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -480,6 +488,50 @@ async fn maintain_dry_run_execute_idempotence_and_gateway_readback() {
         "STANDARD"
     );
 
+    // ---- (g) v1.2 audit R1 P2: MinIO honours x-amz-copy-source-if-match
+    // on the same-key REPLACE copy the transition action issues — a
+    // stale ETag pin is refused with 412 PreconditionFailed and changes
+    // nothing. This is the guard `copy_to_class` relies on to never
+    // stamp pre-overwrite metadata onto racing new bytes (the race
+    // itself cannot be interleaved deterministically here; the request
+    // shape — if-match always pinned to the fresh HEAD's ETag — is
+    // locked down by unit tests in `maintain.rs`). ----
+    let stale_err = backend
+        .copy_object()
+        .bucket(BUCKET)
+        .key(small_key)
+        .copy_source(format!("{BUCKET}/{small_key}"))
+        .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+        .storage_class(aws_sdk_s3::types::StorageClass::Standard)
+        .copy_source_if_match("\"00000000000000000000000000000000\"")
+        .send()
+        .await
+        .expect_err("a stale copy-source-if-match pin must be refused");
+    {
+        use aws_sdk_s3::error::ProvideErrorMetadata as _;
+        let code = stale_err.code().map(str::to_owned);
+        let status = stale_err.raw_response().map(|r| r.status().as_u16());
+        assert!(
+            code.as_deref() == Some("PreconditionFailed") || status == Some(412),
+            "expected 412/PreconditionFailed, got code={code:?} status={status:?} \
+             err={stale_err}"
+        );
+    }
+    // The refused copy really was a no-op: class and s4-* stamps intact.
+    assert_eq!(
+        head_storage_class(&backend, BUCKET, small_key).await,
+        "REDUCED_REDUNDANCY",
+        "412-refused copy must not change the storage class"
+    );
+    assert_eq!(
+        head_meta(&backend, BUCKET, small_key)
+            .await
+            .get("s4-codec")
+            .map(String::as_str),
+        Some("cpu-zstd"),
+        "412-refused REPLACE copy must not strip the s4-* metadata"
+    );
+
     // ---- (e) gateway readback: framed + transitioned objects still
     // decompress byte-for-byte on the production GET path ----
     let (gateway_url, gateway_shutdown) = spawn_s4_server(&fixture.endpoint_url).await;
@@ -549,6 +601,44 @@ async fn maintain_interval_resident_mode_sigterm() {
         Bytes::from(varied_log_text(200)),
     )
     .await;
+    // v1.2 audit R1 P3: an object carrying Expires +
+    // WebsiteRedirectLocation — the transition's REPLACE copy must
+    // re-send both (this rule is transition-only, so no other action
+    // touches the attributes first). The post-transition assertions
+    // compare against this pre-transition HEAD because backends differ
+    // in what they persist: MinIO surfaces Expires but drops
+    // WebsiteRedirectLocation on PUT (verified live), so the redirect
+    // check is "whatever HEAD surfaced before must survive" while the
+    // re-send of both attributes is locked down by the
+    // `class_copy_pins_etag_and_resends_attributes` unit test.
+    let b_expires = aws_sdk_s3::primitives::DateTime::from_secs(1_893_456_000); // 2030-01-01T12:00:00Z
+    backend
+        .put_object()
+        .bucket(bucket)
+        .key("logs/b.txt")
+        .body(Bytes::from(varied_log_text(50)).into())
+        .content_type("text/plain")
+        .expires(b_expires)
+        .website_redirect_location("/elsewhere")
+        .metadata("origin", "e2e")
+        .send()
+        .await
+        .expect("put logs/b.txt with Expires + WebsiteRedirectLocation");
+    let b_head_before = backend
+        .head_object()
+        .bucket(bucket)
+        .key("logs/b.txt")
+        .send()
+        .await
+        .expect("head logs/b.txt pre-transition");
+    #[allow(deprecated)] // expires(): the parsed accessor is what the copy re-sends
+    let b_expires_before = b_head_before.expires().copied();
+    assert_eq!(
+        b_expires_before,
+        Some(b_expires),
+        "MinIO must surface Expires on HEAD for this check to mean anything (raw: {:?})",
+        b_head_before.expires_string()
+    );
 
     let dir = tempfile::tempdir().expect("tempdir");
     let policy_path = dir.path().join("s4-maintain.toml");
@@ -637,5 +727,46 @@ storage-class = "REDUCED_REDUNDANCY"
             .map(|sc| sc.as_str().to_owned())
             .unwrap_or_else(|| "STANDARD".to_owned()),
         "REDUCED_REDUNDANCY"
+    );
+
+    // v1.2 audit R1 P3: the REPLACE copy re-sent Expires +
+    // WebsiteRedirectLocation (+ user metadata) along with the class
+    // change.
+    let b_head = backend
+        .head_object()
+        .bucket(bucket)
+        .key("logs/b.txt")
+        .send()
+        .await
+        .expect("head logs/b.txt");
+    assert_eq!(
+        b_head.storage_class().map(|sc| sc.as_str()),
+        Some("REDUCED_REDUNDANCY"),
+        "logs/b.txt must be transitioned too"
+    );
+    // Backend-faithful redirect check: MinIO drops the attribute at PUT
+    // time (pre-transition HEAD already reads None), so "survives the
+    // copy" means post == pre — on AWS-shaped backends that is
+    // Some("/elsewhere") == Some("/elsewhere").
+    assert_eq!(
+        b_head.website_redirect_location(),
+        b_head_before.website_redirect_location(),
+        "WebsiteRedirectLocation surfaced before the transition must survive it"
+    );
+    #[allow(deprecated)] // expires(): the parsed accessor is what the copy re-sends
+    let b_expires_after = b_head.expires().copied();
+    assert_eq!(
+        b_expires_after,
+        Some(b_expires),
+        "Expires must survive the transition copy (raw: {:?})",
+        b_head.expires_string()
+    );
+    assert_eq!(
+        b_head
+            .metadata()
+            .and_then(|m| m.get("origin"))
+            .map(String::as_str),
+        Some("e2e"),
+        "user metadata must survive the transition copy"
     );
 }

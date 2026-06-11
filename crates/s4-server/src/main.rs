@@ -959,8 +959,19 @@ enum Cmd {
     /// "dictionary may be stale; consider retraining (s4 train-dict)"
     /// warning AND the command exits 1 — cron it for unattended drift
     /// monitoring. Exit 0 when every prefix is healthy (including a
-    /// gateway with no dict traffic yet). Talks HTTP to the gateway's
-    /// `/metrics` only — no S3 traffic, no `--endpoint-url` needed.
+    /// gateway with no dict traffic yet). The scrape is a plain HTTP
+    /// GET (10s timeout, no auth headers — a `/metrics` behind an
+    /// authenticating proxy is not reachable from here); a failed
+    /// scrape also exits 1, the same code as a stale prefix —
+    /// distinguish the two by stderr (scrape failures print a `GET …`
+    /// error, staleness prints `WARN prefix …` lines). All numbers are
+    /// cumulative counters since gateway start: right after a
+    /// dictionary rotation the old losses still dominate, so a prefix
+    /// can read STALE until enough post-rotation wins accumulate (or
+    /// the gateway restarts), and a prefix removed from the map keeps
+    /// its series until the gateway restarts. Talks HTTP to the
+    /// gateway's `/metrics` only — no S3 traffic, no `--endpoint-url`
+    /// needed.
     DictStatus(DictStatusArgs),
 }
 
@@ -1381,7 +1392,9 @@ struct DictStatusArgs {
 
     /// Flag a prefix as stale (warning + exit 1) when its dictionary
     /// win rate — `win / (win + loss)` from `s4_dict_put_total` — falls
-    /// below this fraction. Must be within [0, 1].
+    /// below this fraction. Must be within [0, 1]. The counters are
+    /// cumulative since gateway start, so a freshly rotated dictionary
+    /// digs itself out of STALE only as new wins accumulate.
     #[clap(long, value_name = "RATE", default_value_t = s4_server::dict::DEFAULT_DICT_STATUS_WARN_WIN_RATE)]
     warn_win_rate: f64,
 
@@ -2817,7 +2830,30 @@ where
     dump_one!("tagging", s4.tag_manager(), tagging);
     dump_one!("replication", s4.replication_manager(), replication);
     dump_one!("lifecycle", s4.lifecycle_manager(), lifecycle);
-    dump_one!("savings_ledger", s4.savings_ledger(), savings_ledger);
+    // v1.2 audit R1 P3: the ledger flushes through its own `flush_lock`
+    // (monotonic render + atomic write) — routing the SIGUSR1 dump through
+    // `SavingsLedger::flush` instead of the generic `to_json` +
+    // `atomic_write` path avoids a concurrent event-flush racing the same
+    // `<path>.tmp` and regressing the file to an older snapshot.
+    if let (Some(ledger), true) = (s4.savings_ledger(), paths.savings_ledger.is_some()) {
+        let success = match ledger.flush() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    manager = "savings_ledger",
+                    error = %e,
+                    "S4 SIGUSR1: savings ledger flush failed"
+                );
+                false
+            }
+        };
+        s4_server::metrics::record_sigusr1_dump("savings_ledger", success);
+        if success {
+            ok += 1;
+        } else {
+            err += 1;
+        }
+    }
     (ok, err)
 }
 
@@ -3276,7 +3312,14 @@ async fn run_maintain_cmd(
                 let _ = tokio::signal::ctrl_c().await;
             }
             shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
-            notify.notify_waiters();
+            // v1.2 audit R1 P3: `notify_one` (not `notify_waiters`)
+            // because it stores a permit when no task is parked yet —
+            // a signal landing between the resident loop's flag check
+            // and its `notified()` registration would otherwise be
+            // silently dropped and the loop would sleep out the full
+            // interval. There is exactly one waiter (the resident
+            // loop), so one permit is always enough.
+            notify.notify_one();
         });
     }
 
@@ -3382,7 +3425,17 @@ async fn run_maintain_cmd(
             return Ok(());
         }
         tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(interval) => {
+                // Belt-and-braces re-check: the permit-storing
+                // `notify_one` above already closes the
+                // check-then-register gap, but a flag flip that
+                // somehow lost its wakeup must still exit here
+                // rather than burn another full cycle.
+                if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                    info!(cycle, "maintain: shutdown signal received during sleep — exiting");
+                    return Ok(());
+                }
+            }
             _ = notify.notified() => {
                 info!(cycle, "maintain: shutdown signal received during sleep — exiting");
                 return Ok(());
@@ -3572,7 +3625,17 @@ async fn run_dict_status_cmd(
         )
         .into());
     }
-    let resp = reqwest::get(&args.metrics_url)
+    // v1.2 audit R1 P3: bounded scrape — a gateway wedged mid-response
+    // (or a blackholed address) must fail the cron job within 10s, not
+    // hang it forever. `timeout()` covers the whole request including
+    // body read; connect failures surface through the same path.
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("build HTTP client: {e}"))?;
+    let resp = http
+        .get(&args.metrics_url)
+        .send()
         .await
         .map_err(|e| format!("GET {}: {e}", args.metrics_url))?;
     let status = resp.status();

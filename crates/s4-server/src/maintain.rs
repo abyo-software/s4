@@ -67,12 +67,21 @@
 //!   `DEEP_ARCHIVE` without a prior restore (the server-side copy
 //!   fails with `InvalidObjectState`; the object is left as-is and
 //!   counted as failed).
-//! - The copy preserves user metadata, Content-* attributes and tags,
-//!   but the **ETag can change** for multipart-uploaded or
-//!   SSE-encrypted originals; that invalidates the sidecar's ETag
-//!   binding until the
-//!   next gateway write, so Range GETs fall back to full reads
-//!   (perf-only, never a correctness loss).
+//! - The copy preserves user metadata, Content-* attributes, Expires,
+//!   WebsiteRedirectLocation and tags, but **not backend-managed SSE**
+//!   (the destination is re-encrypted under the bucket's default
+//!   encryption — a per-object SSE-KMS key choice is lost, SSE-C
+//!   sources fail the copy), and a **multipart original's composite
+//!   full-object checksum and ETag change** (the single-op copy is
+//!   single-part; the backend recomputes); the ETag change invalidates
+//!   the sidecar's ETag binding until the next gateway write, so Range
+//!   GETs fall back to full reads (perf-only, never a correctness
+//!   loss).
+//! - Every copy is pinned with `x-amz-copy-source-if-match` to the
+//!   generation a fresh `HeadObject` described, so a concurrent
+//!   overwrite can never get stale metadata stamped onto its new bytes
+//!   — the backend answers 412 and the object is counted as
+//!   `skipped_etag_raced`.
 //! - Versioned buckets double-bill on every rewrite/copy, exactly like
 //!   `migrate` / `recompact` — the per-rule reports warn.
 
@@ -509,6 +518,11 @@ pub struct TransitionReport {
     pub transitioned_sidecars: u64,
     pub skipped_already_target_class: u64,
     pub skipped_too_recent: u64,
+    /// Overwritten after the listing snapshot (pre-copy guard HEAD
+    /// mismatch) **or** between the guard HEAD and the copy itself
+    /// (`x-amz-copy-source-if-match` answered 412) — either way the
+    /// object became hot again and is left alone; the next run sees it
+    /// fresh.
     pub skipped_etag_raced: u64,
     /// Over [`MAX_COPY_OBJECT_BYTES`] — a single server-side CopyObject
     /// cannot move them.
@@ -658,32 +672,43 @@ async fn list_transition_inventory(
     Ok(TransitionInventory { mains, sidecars })
 }
 
-/// Same-bucket same-key server-side copy that only changes the storage
-/// class. The body never travels through this process.
-///
-/// Directive choice: `MetadataDirective: REPLACE`, re-sending the user
-/// metadata (including the `s4-*` manifest stamps) and the
-/// Content-Type / Cache-Control / Content-* attributes captured from a
-/// fresh `HeadObject` — byte-identical to what `COPY` would keep.
-/// `COPY` itself is not usable here: AWS accepts a same-key copy when
-/// the storage class changes, but MinIO (and kin) reject any same-key
-/// copy whose metadata directive is not `REPLACE`. The tagging
-/// directive is left at its default (`COPY`), so object tags ride
-/// along server-side either way.
-async fn copy_to_class(
+/// How one [`copy_to_class`] attempt failed.
+#[derive(Debug)]
+enum CopyClassError {
+    /// The backend rejected the copy with `412 PreconditionFailed`: the
+    /// object was overwritten between our attribute `HeadObject` and the
+    /// `CopyObject` (v1.2 audit R1 P2). The new bytes are hot again and
+    /// carry their own correct metadata — leaving them alone is the
+    /// right outcome, so callers count this as `skipped_etag_raced`,
+    /// not as a failure.
+    Raced,
+    /// Anything else — surfaced in the report's `failures`.
+    Other(String),
+}
+
+/// `true` when a `CopyObject` error is the backend telling us the
+/// `x-amz-copy-source-if-match` precondition failed (HTTP 412 /
+/// error code `PreconditionFailed`). Same belt-and-braces shape as
+/// `repair.rs`'s if-match handling: the modeled error code when the
+/// backend sends one, the raw HTTP status otherwise, and a message
+/// substring as the last resort for proxies that mangle both.
+fn copy_error_is_precondition(code: Option<&str>, status: Option<u16>, msg: &str) -> bool {
+    code == Some("PreconditionFailed") || status == Some(412) || msg.contains("PreconditionFailed")
+}
+
+/// Build the storage-class `CopyObject` request from a fresh
+/// `HeadObject` snapshot. Split from [`copy_to_class`] so a unit test
+/// can assert the request shape (notably that
+/// `x-amz-copy-source-if-match` is pinned to the HEAD's ETag) without a
+/// backend.
+fn build_class_copy(
     client: &Client,
     bucket: &str,
     key: &str,
     target_class: &str,
-) -> Result<(), String> {
-    let head = client
-        .head_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .map_err(|e| format!("HeadObject(pre-copy attributes): {e}"))?;
-    client
+    head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+) -> aws_sdk_s3::operation::copy_object::builders::CopyObjectFluentBuilder {
+    let mut req = client
         .copy_object()
         .bucket(bucket)
         .key(key)
@@ -695,11 +720,89 @@ async fn copy_to_class(
         .set_content_disposition(head.content_disposition().map(str::to_owned))
         .set_content_encoding(head.content_encoding().map(str::to_owned))
         .set_content_language(head.content_language().map(str::to_owned))
-        .storage_class(aws_sdk_s3::types::StorageClass::from(target_class))
+        .set_website_redirect_location(head.website_redirect_location().map(str::to_owned))
+        .storage_class(aws_sdk_s3::types::StorageClass::from(target_class));
+    // `HeadObjectOutput::expires` is deprecated in favour of the raw
+    // `expires_string`, but `CopyObjectInput` only accepts the parsed
+    // `DateTime` — the parsed accessor is the only loss-free way to
+    // round-trip the attribute.
+    #[allow(deprecated)]
+    {
+        req = req.set_expires(head.expires().copied());
+    }
+    // v1.2 audit R1 P2: pin the copy to the exact bytes the HEAD above
+    // described. Without it, a PUT racing between the HEAD and the
+    // REPLACE-directive copy would get the *old* metadata stamped onto
+    // the *new* bytes (e.g. an `s4-codec` stamp on a plaintext body —
+    // unreadable through the gateway). A HEAD without an ETag (no known
+    // backend does this) degrades to the unguarded pre-v1.2 behaviour.
+    if let Some(etag) = head.e_tag() {
+        req = req.copy_source_if_match(etag);
+    }
+    req
+}
+
+/// Same-bucket same-key server-side copy that only changes the storage
+/// class. The body never travels through this process.
+///
+/// Directive choice: `MetadataDirective: REPLACE`, re-sending the user
+/// metadata (including the `s4-*` manifest stamps) and the
+/// Content-Type / Cache-Control / Content-* / Expires /
+/// WebsiteRedirectLocation attributes captured from a fresh
+/// `HeadObject` — byte-identical to what `COPY` would keep. `COPY`
+/// itself is not usable here: AWS accepts a same-key copy when the
+/// storage class changes, but MinIO (and kin) reject any same-key copy
+/// whose metadata directive is not `REPLACE`. The tagging directive is
+/// left at its default (`COPY`), so object tags ride along server-side
+/// either way.
+///
+/// What the REPLACE copy does **not** preserve:
+///
+/// - **Backend-managed SSE**: no encryption headers are re-sent, so the
+///   destination is written under the **bucket's default** encryption
+///   config. A source encrypted with a per-object SSE-KMS key loses
+///   that key choice (re-encrypted with the bucket default); an SSE-C
+///   source fails the copy outright (we do not hold the key).
+/// - **Full-object checksums of multipart originals**: the single-op
+///   copy produces a single-part destination, so a multipart original's
+///   composite (checksum-of-parts) value is replaced by a backend-
+///   computed full-object value — consumers pinning the old composite
+///   value (or the old multipart ETag) will mismatch.
+///
+/// The copy itself is pinned to the HEADed generation via
+/// `x-amz-copy-source-if-match` (see [`build_class_copy`]); a 412 maps
+/// to [`CopyClassError::Raced`].
+async fn copy_to_class(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    target_class: &str,
+) -> Result<(), CopyClassError> {
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(|e| CopyClassError::Other(format!("HeadObject(pre-copy attributes): {e}")))?;
+    build_class_copy(client, bucket, key, target_class, &head)
         .send()
         .await
         .map(|_| ())
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| {
+            use aws_sdk_s3::error::ProvideErrorMetadata as _;
+            let code = e.code().map(str::to_owned);
+            let status = e.raw_response().map(|r| r.status().as_u16());
+            let msg = format!("{e}");
+            if copy_error_is_precondition(code.as_deref(), status, &msg) {
+                CopyClassError::Raced
+            } else {
+                CopyClassError::Other(match code {
+                    Some(c) => format!("{c}: {msg}"),
+                    None => msg,
+                })
+            }
+        })
 }
 
 /// Run one transition rule. Writes nothing unless `execute`. Listing /
@@ -777,7 +880,11 @@ pub(crate) async fn run_transition(
                     if execute {
                         match copy_to_class(client, bucket, &sc.key, target).await {
                             Ok(()) => report.transitioned_sidecars += 1,
-                            Err(cause) => {
+                            // Sidecar overwritten mid-copy ⇒ a gateway
+                            // write is in flight; its PUT settles the
+                            // pair's classes, ours would fight it.
+                            Err(CopyClassError::Raced) => report.skipped_etag_raced += 1,
+                            Err(CopyClassError::Other(cause)) => {
                                 report.failed += 1;
                                 report.failures.push(TransitionFailure {
                                     key: sc.key.clone(),
@@ -849,7 +956,16 @@ pub(crate) async fn run_transition(
 
         match copy_to_class(client, bucket, &main.key, target).await {
             Ok(()) => report.transitioned += 1,
-            Err(cause) => {
+            // 412 from the if-match pin: overwritten between our HEAD
+            // and the copy — the object became hot again, exactly the
+            // population the guard HEAD above already skips. Leave the
+            // sidecar alone too: the in-flight gateway write settles
+            // the pair.
+            Err(CopyClassError::Raced) => {
+                report.skipped_etag_raced += 1;
+                continue;
+            }
+            Err(CopyClassError::Other(cause)) => {
                 report.failed += 1;
                 report.failures.push(TransitionFailure {
                     key: main.key.clone(),
@@ -862,7 +978,8 @@ pub(crate) async fn run_transition(
         if let Some(sc) = lagging_sidecar {
             match copy_to_class(client, bucket, &sc.key, target).await {
                 Ok(()) => report.transitioned_sidecars += 1,
-                Err(cause) => {
+                Err(CopyClassError::Raced) => report.skipped_etag_raced += 1,
+                Err(CopyClassError::Other(cause)) => {
                     report.failed += 1;
                     report.failures.push(TransitionFailure {
                         key: sc.key.clone(),
@@ -893,11 +1010,16 @@ pub(crate) async fn run_transition(
     }
     report.notes.push(
         "each transition is a same-key server-side CopyObject (MetadataDirective REPLACE \
-         re-sending the HEAD-captured user metadata + Content-* attributes — required by \
-         backends that reject same-key COPY-directive copies): metadata, tags and \
-         Content-Type ride along, but system attributes HEAD does not surface are not \
-         re-sent, and the ETag can change for multipart-uploaded or SSE-encrypted \
-         originals — that invalidates the sidecar's ETag binding until the next gateway \
+         re-sending the HEAD-captured user metadata + Content-* / Expires / \
+         WebsiteRedirectLocation attributes — required by backends that reject same-key \
+         COPY-directive copies), pinned with x-amz-copy-source-if-match to the HEADed \
+         generation (a racing overwrite is counted as etag-raced, never stamped over): \
+         metadata, tags and Content-Type ride along, but no encryption headers are \
+         re-sent — a backend-SSE original is re-encrypted under the bucket's default \
+         encryption (a per-object SSE-KMS key choice is lost; SSE-C originals fail the \
+         copy), and a multipart original becomes single-part, so its composite \
+         full-object checksum is replaced by a backend-computed one and its ETag changes \
+         — the ETag change invalidates the sidecar's ETag binding until the next gateway \
          write, so Range GETs fall back to full reads (perf-only)"
             .into(),
     );
@@ -1652,5 +1774,119 @@ older-than = "soon"
         assert_eq!(effective_class(None), "STANDARD");
         assert_eq!(effective_class(Some("")), "STANDARD");
         assert_eq!(effective_class(Some("GLACIER")), "GLACIER");
+    }
+
+    /// Offline client good enough to *build* requests (nothing is sent).
+    fn offline_client() -> Client {
+        Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .build(),
+        )
+    }
+
+    /// v1.2 audit R1 P2 + P3: the storage-class copy must pin the
+    /// source generation with `x-amz-copy-source-if-match` and re-send
+    /// every HEAD-surfaced attribute (now including Expires and
+    /// WebsiteRedirectLocation) under the REPLACE directive.
+    #[test]
+    fn class_copy_pins_etag_and_resends_attributes() {
+        let client = offline_client();
+        #[allow(deprecated)] // expires: only parsed-DateTime round-trips into CopyObjectInput
+        let head = aws_sdk_s3::operation::head_object::HeadObjectOutput::builder()
+            .e_tag("\"d41d8cd98f00b204e9800998ecf8427e\"")
+            .content_type("text/plain")
+            .cache_control("max-age=60")
+            .content_disposition("attachment")
+            .content_encoding("gzip")
+            .content_language("en")
+            .website_redirect_location("/elsewhere")
+            .expires(aws_sdk_s3::primitives::DateTime::from_secs(1_700_000_000))
+            .metadata("s4-codec", "cpu-zstd")
+            .build();
+        let req = build_class_copy(&client, "bkt", "logs/a.log", "GLACIER_IR", &head);
+        let input = req.as_input();
+        assert_eq!(
+            input.get_copy_source_if_match().as_deref(),
+            Some("\"d41d8cd98f00b204e9800998ecf8427e\""),
+            "copy must be pinned to the HEADed ETag"
+        );
+        assert_eq!(input.get_bucket().as_deref(), Some("bkt"));
+        assert_eq!(input.get_key().as_deref(), Some("logs/a.log"));
+        assert_eq!(input.get_copy_source().as_deref(), Some("bkt/logs/a.log"));
+        assert_eq!(
+            input.get_metadata_directive(),
+            &Some(aws_sdk_s3::types::MetadataDirective::Replace)
+        );
+        assert_eq!(input.get_content_type().as_deref(), Some("text/plain"));
+        assert_eq!(input.get_cache_control().as_deref(), Some("max-age=60"));
+        assert_eq!(
+            input.get_content_disposition().as_deref(),
+            Some("attachment")
+        );
+        assert_eq!(input.get_content_encoding().as_deref(), Some("gzip"));
+        assert_eq!(input.get_content_language().as_deref(), Some("en"));
+        assert_eq!(
+            input.get_website_redirect_location().as_deref(),
+            Some("/elsewhere"),
+            "WebsiteRedirectLocation must survive the REPLACE copy"
+        );
+        #[allow(deprecated)]
+        let expires = *input.get_expires();
+        assert_eq!(
+            expires,
+            Some(aws_sdk_s3::primitives::DateTime::from_secs(1_700_000_000)),
+            "Expires must survive the REPLACE copy"
+        );
+        assert_eq!(
+            input
+                .get_metadata()
+                .as_ref()
+                .and_then(|m| m.get("s4-codec"))
+                .map(String::as_str),
+            Some("cpu-zstd"),
+            "user metadata (s4-* stamps) must ride along"
+        );
+        assert_eq!(
+            input.get_storage_class(),
+            &Some(aws_sdk_s3::types::StorageClass::GlacierIr)
+        );
+    }
+
+    /// A HEAD without an ETag (no known backend) degrades to the
+    /// unguarded copy instead of sending an empty if-match.
+    #[test]
+    fn class_copy_without_etag_sends_no_if_match() {
+        let client = offline_client();
+        let head = aws_sdk_s3::operation::head_object::HeadObjectOutput::builder().build();
+        let req = build_class_copy(&client, "bkt", "k", "STANDARD_IA", &head);
+        assert_eq!(req.as_input().get_copy_source_if_match(), &None);
+    }
+
+    #[test]
+    fn precondition_classifier_matches_all_three_shapes() {
+        // Modeled error code (AWS, MinIO both send it).
+        assert!(copy_error_is_precondition(
+            Some("PreconditionFailed"),
+            None,
+            ""
+        ));
+        // Raw HTTP status only.
+        assert!(copy_error_is_precondition(None, Some(412), "opaque"));
+        // Message substring as last resort.
+        assert!(copy_error_is_precondition(
+            None,
+            None,
+            "service error: PreconditionFailed: At least one of the pre-conditions you \
+             specified did not hold"
+        ));
+        // Everything else stays a hard failure.
+        assert!(!copy_error_is_precondition(
+            Some("NoSuchKey"),
+            Some(404),
+            "NoSuchKey"
+        ));
+        assert!(!copy_error_is_precondition(None, None, "timeout"));
     }
 }

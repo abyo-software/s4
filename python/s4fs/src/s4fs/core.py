@@ -88,6 +88,15 @@ _METADATA_UNSUPPORTED_MSG = (
 )
 
 
+_SIDECAR_WRITE_FAILED_MSG = (
+    "wrote {path!r} (body + metadata stamp landed; the object is intact "
+    "and fully readable) but the .s4index sidecar PUT failed. Ranged "
+    "reads lose the sidecar fast-path and fall back to full-body decode "
+    "until the sidecar is regenerated — run `s4 repair-sidecar` for this "
+    "key to restore it"
+)
+
+
 class S4MetadataUnsupportedError(NotImplementedError):
     """Writing was refused because the underlying filesystem cannot stamp
     S3 user metadata.
@@ -102,6 +111,23 @@ class S4MetadataUnsupportedError(NotImplementedError):
     with the object body, rather than producing objects that silently
     read back wrong through the gateway.
     """
+
+
+class S4SidecarWriteError(OSError):
+    """The object body (+ metadata manifest stamp) was PUT successfully,
+    but the multi-frame ``.s4index`` sidecar PUT that follows it failed.
+
+    The object itself is **intact and fully readable** — the gateway and
+    s4fs both decode from the body + metadata manifest alone. What is
+    lost is the sidecar Range fast-path: ranged reads fall back to
+    fetching and decoding the full body. Recoverable without rewriting
+    the object: run ``s4 repair-sidecar <bucket>/<key>`` against the
+    backend to regenerate and re-bind the sidecar (a stale sidecar from
+    a previous version, if any, is rejected by readers on its ETag
+    binding, so it cannot corrupt reads in the meantime).
+    """
+
+
 _SSE_MSG = (
     "s4fs does not decrypt SSE objects; read through the gateway "
     "(the encryption keyring / KMS / SSE-C key never leaves the gateway)"
@@ -751,6 +777,11 @@ class S4FileSystem(AbstractFileSystem):
         gateway instead): append, SSE encryption, zstd-dictionary
         compression, gateway versioning (a gateway-side version chain is
         not advanced by a direct backend overwrite).
+
+        Raises :class:`S4SidecarWriteError` when the body (+ metadata)
+        PUT succeeded but the sidecar PUT failed: the object is intact
+        and readable, only the Range fast-path is lost until
+        ``s4 repair-sidecar`` regenerates the sidecar.
         """
         self._check_write_enabled()
         if self._hidden(path):
@@ -762,30 +793,43 @@ class S4FileSystem(AbstractFileSystem):
             data, codec=self.write_codec, level=self.write_zstd_level
         )
         resp = self._metadata_pipe(path, enc["body"], enc["metadata"])
-        sidecar_path = path + SIDECAR_SUFFIX
-        if enc["sidecar"] is not None:
-            # The gateway stamps the sidecar's version binding from the
-            # backend PUT response's ETag (service.rs write_sidecar); we
-            # do the same so gateway Range GET trusts the sidecar and
-            # `s4 verify-sidecar` reports OK instead of LegacyV1.
-            etag = self._backend_etag(path, resp)
-            bound = s4_codec.bind_index(
-                enc["sidecar"],
-                source_compressed_size=len(enc["body"]),
-                source_etag=etag,
-            )
-            self.fs.pipe_file(sidecar_path, bound)
-        else:
-            # Single-frame body: no sidecar is written (gateway policy),
-            # but a stale one from a previous multi-frame overwrite would
-            # linger. Readers reject it on the ETag binding, so this is
-            # hygiene, not correctness — best effort.
-            try:
-                if self.fs.exists(sidecar_path):
-                    self.fs.rm_file(sidecar_path)
-            except Exception:  # noqa: BLE001 — cleanup is best-effort
-                pass
-        self.invalidate_cache(path)
+        # The body + metadata PUT above is durable from here on: whatever
+        # happens to the sidecar below, this instance's caches for ``path``
+        # (decoded-index / metadata-manifest / live-info) describe the OLD
+        # object, and a same-instance read would decode the NEW body with
+        # them. try/finally guarantees the invalidation even when the
+        # sidecar PUT raises (audit v1.2-R1 P2).
+        try:
+            sidecar_path = path + SIDECAR_SUFFIX
+            if enc["sidecar"] is not None:
+                # The gateway stamps the sidecar's version binding from the
+                # backend PUT response's ETag (service.rs write_sidecar); we
+                # do the same so gateway Range GET trusts the sidecar and
+                # `s4 verify-sidecar` reports OK instead of LegacyV1.
+                etag = self._backend_etag(path, resp)
+                bound = s4_codec.bind_index(
+                    enc["sidecar"],
+                    source_compressed_size=len(enc["body"]),
+                    source_etag=etag,
+                )
+                try:
+                    self.fs.pipe_file(sidecar_path, bound)
+                except Exception as exc:  # noqa: BLE001 — re-typed below
+                    raise S4SidecarWriteError(
+                        _SIDECAR_WRITE_FAILED_MSG.format(path=path)
+                    ) from exc
+            else:
+                # Single-frame body: no sidecar is written (gateway policy),
+                # but a stale one from a previous multi-frame overwrite would
+                # linger. Readers reject it on the ETag binding, so this is
+                # hygiene, not correctness — best effort.
+                try:
+                    if self.fs.exists(sidecar_path):
+                        self.fs.rm_file(sidecar_path)
+                except Exception:  # noqa: BLE001 — cleanup is best-effort
+                    pass
+        finally:
+            self.invalidate_cache(path)
 
     def pipe_file(self, path: str, value: bytes, **kwargs: Any) -> None:
         self._write_object(self._strip_protocol(path), bytes(value))

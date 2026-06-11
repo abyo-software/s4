@@ -34,12 +34,33 @@
 //!   here.
 //! - Cross-bucket replication replicas (written by the detached
 //!   dispatcher, not the S3 handler path) are not counted.
-//! - DELETE / overwrite subtraction relies on a HEAD probe of the
-//!   to-be-removed object (`s4-original-size` metadata, falling back to
-//!   the sidecar for multipart objects, falling back to
-//!   `original = stored` for objects without S4 metadata). Probes are
-//!   best-effort: a raced probe leaves the counters slightly stale
+//! - **DELETE / overwrite subtraction is marker-gated (v1.2 audit R1
+//!   P2)**: every write the gateway *adds* to the ledger is stamped
+//!   with the internal `s4-ledger: 1` object metadata (clients cannot
+//!   forge it — the PUT/Create paths strip all client-supplied `s4-*`
+//!   keys first). The DELETE / overwrite HEAD probe subtracts **only
+//!   objects that carry the marker**. Objects without it (backend-
+//!   direct PUTs, `s4fs` writes, `s4 migrate` / `s4 recompact` output,
+//!   or gateway writes from before the marker was introduced) are
+//!   never subtracted — they were never added, and an asymmetric
+//!   subtraction would drive the bucket's ratio/$ negative or
+//!   meaningless. Each skipped removal is tallied per bucket in
+//!   [`LedgerSnapshot::skipped_unaccounted`] and disclosed as a report
+//!   note.
+//! - For marker-carrying objects the probe resolves `original_bytes`
+//!   from `s4-original-size` metadata, falling back to the sidecar for
+//!   multipart objects, falling back to `original = stored`. Probes
+//!   are best-effort: a raced probe leaves the counters slightly stale
 //!   rather than failing the client's request.
+//! - Internal S4 objects (`.s4dict/<id>` dictionaries, `<key>.s4index`
+//!   sidecars) are **excluded from the ledger as standalone objects**:
+//!   sidecar bytes are folded into their main object's stored-bytes
+//!   delta (add and subtract symmetrically), and dictionary objects —
+//!   including the cross-bucket CopyObject `.s4dict` propagation PUT —
+//!   are deliberately not counted at all (they are operator-managed
+//!   shared assets, not client data; counting them on copy-in but
+//!   never on backend-direct `train-dict` write would be asymmetric).
+//!   The probe refuses internal keys outright as defence-in-depth.
 //!
 //! These caveats are repeated as fixed notes in the `s4 savings` report
 //! ([`SavingsReport::notes`]) and in the README so the numbers are
@@ -58,6 +79,14 @@
 //! Crash tolerance is therefore "at most the in-flight event is lost",
 //! which is at least as strong as the existing state files (restart /
 //! SIGUSR1 to persist) without inventing a new durability mechanism.
+//!
+//! **SIGUSR1 contract (v1.2 audit R1 P3)**: the `main.rs` SIGUSR1
+//! dump walk MUST call [`SavingsLedger::flush`] for this manager
+//! instead of rendering [`SavingsLedger::to_json`] and writing the
+//! file itself. `flush` takes the same `flush_lock` the event-driven
+//! writes take, so a dump can never interleave with (or be clobbered
+//! by) a concurrent PUT-triggered flush; a bypassing writer could
+//! persist an older snapshot over a newer one.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -88,6 +117,15 @@ pub struct LedgerSnapshot {
     /// Per-bucket cumulative totals. `BTreeMap` for deterministic
     /// serialization + report ordering.
     pub buckets: BTreeMap<String, BucketTotals>,
+    /// v1.2 audit R1 P2: per-bucket count of gateway-observed removals
+    /// / overwrites of objects that carry **no** `s4-ledger` marker
+    /// (backend-direct / `s4fs` / `migrate` / `recompact` / pre-marker
+    /// writes). Those objects were never added to the counters, so
+    /// their removal is *not* subtracted — this tally discloses how
+    /// many such events the report's numbers exclude. Additive field:
+    /// `#[serde(default)]` keeps pre-v1.2 state files loading clean.
+    #[serde(default)]
+    pub skipped_unaccounted: BTreeMap<String, u64>,
 }
 
 impl LedgerSnapshot {
@@ -113,6 +151,13 @@ impl LedgerSnapshot {
             g.objects = g.objects.saturating_add(t.objects);
         }
         g
+    }
+
+    /// Sum of [`Self::skipped_unaccounted`] across buckets.
+    pub fn total_skipped_unaccounted(&self) -> u64 {
+        self.skipped_unaccounted
+            .values()
+            .fold(0u64, |acc, n| acc.saturating_add(*n))
     }
 }
 
@@ -172,37 +217,61 @@ impl SavingsLedger {
         stored_delta: i64,
         objects_delta: i64,
     ) {
-        let updated = {
+        {
             let mut guard =
                 crate::lock_recovery::recover_write(&self.inner, "savings_ledger.buckets");
             let t = guard.buckets.entry(bucket.to_owned()).or_default();
             t.original_bytes = add_clamped(t.original_bytes, original_delta);
             t.stored_bytes = add_clamped(t.stored_bytes, stored_delta);
             t.objects = add_clamped(t.objects, objects_delta);
-            *t
-        };
-        crate::metrics::record_ledger_bucket(bucket, &updated);
-        self.flush();
+            // v1.2 audit R1 P3: stamp the Prometheus gauges *inside*
+            // the write lock. Stamping after release let two racing
+            // mutations publish their gauge sets in the opposite order
+            // of their counter commits, leaving /metrics on the older
+            // value until the next event.
+            crate::metrics::record_ledger_bucket(bucket, t);
+        }
+        self.flush_best_effort();
+    }
+
+    /// v1.2 audit R1 P2: tally one removal / overwrite of an object
+    /// that carries no `s4-ledger` marker (so its bytes were never
+    /// added and are deliberately not subtracted). Persisted with the
+    /// snapshot and surfaced as a report note.
+    pub fn record_skipped_unaccounted(&self, bucket: &str) {
+        {
+            let mut guard =
+                crate::lock_recovery::recover_write(&self.inner, "savings_ledger.buckets");
+            let n = guard
+                .skipped_unaccounted
+                .entry(bucket.to_owned())
+                .or_default();
+            *n = n.saturating_add(1);
+        }
+        self.flush_best_effort();
     }
 
     /// Render + atomically write the snapshot to the state-file path.
     /// Serialized via `flush_lock`; render happens inside the lock so
     /// flushes are monotonic (a newer snapshot can never be clobbered
     /// by a slower, older writer).
-    fn flush(&self) {
+    ///
+    /// v1.2 audit R1 P3: public so the `main.rs` SIGUSR1 dump walk can
+    /// persist this manager **through the same lock** the event-driven
+    /// flushes take — the SIGUSR1 handler must call this instead of
+    /// `to_json()` + its own file write, otherwise a dump racing a PUT
+    /// flush can overwrite a newer snapshot with an older render.
+    pub fn flush(&self) -> std::io::Result<()> {
         let _guard = crate::lock_recovery::recover_mutex(&self.flush_lock, "savings_ledger.flush");
-        let json = match self.to_json() {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::warn!(
-                    path = %self.path.display(),
-                    error = %e,
-                    "S4 savings ledger: snapshot serialize failed; state file left stale"
-                );
-                return;
-            }
-        };
-        if let Err(e) = atomic_write(&self.path, &json) {
+        let json = self.to_json().map_err(std::io::Error::other)?;
+        atomic_write(&self.path, &json)
+    }
+
+    /// Event-driven flush wrapper: an I/O / serialize error is logged
+    /// (WARN) and the in-memory counters keep serving — same
+    /// degradation posture as a failed SIGUSR1 dump.
+    fn flush_best_effort(&self) {
+        if let Err(e) = self.flush() {
             tracing::warn!(
                 path = %self.path.display(),
                 error = %e,
@@ -290,11 +359,19 @@ pub struct BucketSavings {
     pub original_bytes: u64,
     pub stored_bytes: u64,
     /// `1 - stored/original` (0.0 when `original_bytes == 0`).
+    /// v1.2 audit R1: floored at 0.0 — `stored > original` (counter
+    /// drift or negative compression gain) renders as 0% saved with a
+    /// drift note, never as a negative percentage.
     pub savings_ratio: f64,
     /// `(original - stored) / GiB × price` — what the bucket would
     /// additionally cost per month if the same logical bytes were
-    /// stored uncompressed.
+    /// stored uncompressed. Floored at 0.0 (same drift rule as
+    /// [`Self::savings_ratio`]).
     pub monthly_savings_usd: f64,
+    /// v1.2 audit R1 P2: removals / overwrites of non-ledger-managed
+    /// objects (no `s4-ledger` marker) observed in this bucket and
+    /// deliberately not subtracted from the counters.
+    pub skipped_unaccounted: u64,
 }
 
 /// Full result of one `s4 savings` run. Serializes to the
@@ -306,25 +383,33 @@ pub struct SavingsReport {
     pub total_objects: u64,
     pub total_original_bytes: u64,
     pub total_stored_bytes: u64,
-    /// `1 - total_stored/total_original` (0.0 when nothing recorded).
+    /// `1 - total_stored/total_original` (0.0 when nothing recorded;
+    /// floored at 0.0 on drift — see [`BucketSavings::savings_ratio`]).
     pub total_savings_ratio: f64,
     pub price_per_gb_month: f64,
     pub total_monthly_savings_usd: f64,
+    /// v1.2 audit R1 P2: sum of [`BucketSavings::skipped_unaccounted`].
+    pub total_skipped_unaccounted: u64,
     /// Fixed honesty notes — always read these before quoting the
     /// numbers anywhere.
     pub notes: Vec<String>,
 }
 
+/// v1.2 audit R1: floored at 0.0 — a `stored > original` bucket
+/// (counter drift from probe races, or honest negative compression
+/// gain on incompressible data) must never render a negative
+/// percentage / negative dollar figure; the clamp is disclosed via a
+/// dedicated drift note in [`build_savings_report`].
 fn savings_ratio(original: u64, stored: u64) -> f64 {
     if original == 0 {
         0.0
     } else {
-        1.0 - (stored as f64 / original as f64)
+        (1.0 - (stored as f64 / original as f64)).max(0.0)
     }
 }
 
 fn monthly_savings_usd(original: u64, stored: u64, price_per_gb_month: f64) -> f64 {
-    (original as f64 - stored as f64) / BYTES_PER_GB * price_per_gb_month
+    ((original as f64 - stored as f64) / BYTES_PER_GB * price_per_gb_month).max(0.0)
 }
 
 /// Build the report from a (deserialized) snapshot. Pure function so
@@ -345,10 +430,16 @@ pub fn build_savings_report(snapshot: &LedgerSnapshot, price_per_gb_month: f64) 
                 t.stored_bytes,
                 price_per_gb_month,
             ),
+            skipped_unaccounted: snapshot
+                .skipped_unaccounted
+                .get(bucket)
+                .copied()
+                .unwrap_or(0),
         })
         .collect();
     let g = snapshot.global_totals();
-    let notes = vec![
+    let total_skipped = snapshot.total_skipped_unaccounted();
+    let mut notes = vec![
         "the ledger observes gateway-traversing writes only: backend-direct writes, \
          `s4 migrate`, and `s4 recompact` (both backend-direct) are not reflected; \
          `recompact` savings appear only after the gateway next rewrites the object"
@@ -356,14 +447,41 @@ pub fn build_savings_report(snapshot: &LedgerSnapshot, price_per_gb_month: f64) 
         "aborted multipart uploads are never counted (parts are recorded at Complete \
          time only); cross-bucket replication replicas are not counted"
             .to_owned(),
-        "DELETE / overwrite subtraction uses a best-effort HEAD probe of the removed \
-         object — a raced probe leaves the counters slightly stale rather than \
-         failing the request"
+        "DELETE / overwrite subtraction applies only to objects the gateway itself \
+         accounted (internal `s4-ledger` marker); removals of non-ledger-managed \
+         objects are skipped and tallied separately. The HEAD probe is best-effort — \
+         a raced probe leaves the counters slightly stale rather than failing the \
+         request"
             .to_owned(),
         "storage bytes only: request, egress, and (on GPU deployments) compute costs \
          are unchanged by S4"
             .to_owned(),
     ];
+    if total_skipped > 0 {
+        notes.push(format!(
+            "{total_skipped} deletion(s)/overwrite(s) of non-ledger-managed objects \
+             (no `s4-ledger` marker: backend-direct / s4fs / migrate / recompact / \
+             pre-v1.2 writes) were observed and NOT subtracted from these counters"
+        ));
+    }
+    // v1.2 audit R1: disclose every bucket whose raw counters would
+    // have produced a negative ratio/$ (floored to 0 above) — counter
+    // drift or honest negative compression gain, either way the 0% is
+    // a clamp, not a measurement.
+    let drifted: Vec<&str> = snapshot
+        .buckets
+        .iter()
+        .filter(|(_, t)| t.stored_bytes > t.original_bytes)
+        .map(|(b, _)| b.as_str())
+        .collect();
+    if !drifted.is_empty() {
+        notes.push(format!(
+            "bucket(s) {}: stored_bytes exceeds original_bytes — savings ratio and \
+             $/month are floored at 0 (counter drift from probe races / unaccounted \
+             writes, or negative compression gain on incompressible data)",
+            drifted.join(", ")
+        ));
+    }
     SavingsReport {
         buckets,
         total_objects: g.objects,
@@ -376,6 +494,7 @@ pub fn build_savings_report(snapshot: &LedgerSnapshot, price_per_gb_month: f64) 
             g.stored_bytes,
             price_per_gb_month,
         ),
+        total_skipped_unaccounted: total_skipped,
         notes,
     }
 }
@@ -394,18 +513,32 @@ pub fn run_savings(
             cause: e.to_string(),
         }
     })?;
-    let snapshot = match raw {
+    let (snapshot, state_file_missing) = match raw {
         // Missing / empty file = a gateway that has the flag but hasn't
-        // served a write yet — report zeros, not an error.
-        None => LedgerSnapshot::default(),
-        Some(json) => {
+        // served a write yet — report zeros, not an error, but say so
+        // (v1.2 audit R1 P3: a silent all-zero report for a mistyped
+        // path is indistinguishable from "no savings").
+        None => (LedgerSnapshot::default(), true),
+        Some(json) => (
             LedgerSnapshot::from_json(&json).map_err(|e| SavingsError::StateFileParse {
                 path: path.display().to_string(),
                 cause: e.to_string(),
-            })?
-        }
+            })?,
+            false,
+        ),
     };
-    Ok(build_savings_report(&snapshot, price_per_gb_month))
+    let mut report = build_savings_report(&snapshot, price_per_gb_month);
+    if state_file_missing {
+        report.notes.insert(
+            0,
+            format!(
+                "no ledger state found at {} — reporting zeros; check the path and \
+                 that the gateway runs with --savings-ledger-state-file",
+                path.display()
+            ),
+        );
+    }
+    Ok(report)
 }
 
 /// Format a byte count as a short human string (binary units). Same
@@ -546,20 +679,20 @@ mod tests {
         );
     }
 
-    /// Non-S4 object delete (no `s4-*` metadata): the service probes
-    /// `original = stored = Content-Length` and the ledger just sees a
-    /// symmetric subtraction — net savings contribution zero.
+    /// v1.2 audit R1 P2: a removal of a non-ledger-managed object (no
+    /// `s4-ledger` marker) is NOT subtracted — the service calls
+    /// `record_skipped_unaccounted` instead, the tally persists with
+    /// the snapshot, and the report discloses it as a note.
     #[test]
-    fn non_s4_object_delete_is_symmetric() {
+    fn skipped_unaccounted_tally_persists_and_reports() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let ledger = tmp_ledger(&dir);
+        let path = dir.path().join("ledger.json");
+        let ledger = SavingsLedger::attach(LedgerSnapshot::default(), path.clone());
         ledger.apply_delta("a", 1000, 100, 1);
-        // A backend-direct (non-S4) 300-byte object deleted via the
-        // gateway: original == stored == 300 — but it was never added,
-        // so the subtraction clamps stored at 0 only if it would go
-        // negative. Seed it first to model "added as non-S4" symmetry.
-        ledger.apply_delta("a", 300, 300, 1);
-        ledger.apply_delta("a", -300, -300, -1);
+        ledger.record_skipped_unaccounted("a");
+        ledger.record_skipped_unaccounted("a");
+        ledger.record_skipped_unaccounted("b");
+        // Counters untouched by the skips.
         let snap = ledger.snapshot();
         assert_eq!(
             snap.buckets["a"],
@@ -569,6 +702,57 @@ mod tests {
                 objects: 1
             }
         );
+        assert_eq!(snap.skipped_unaccounted["a"], 2);
+        assert_eq!(snap.skipped_unaccounted["b"], 1);
+        assert_eq!(snap.total_skipped_unaccounted(), 3);
+        // Persists through the state file (event-driven flush).
+        let reloaded = LedgerSnapshot::from_json(&std::fs::read_to_string(&path).expect("read"))
+            .expect("parse");
+        assert_eq!(reloaded, snap);
+        // ...and the report carries the per-bucket tally + a note.
+        let report = build_savings_report(&snap, DEFAULT_PRICE_PER_GB_MONTH);
+        assert_eq!(report.total_skipped_unaccounted, 3);
+        let a = report
+            .buckets
+            .iter()
+            .find(|b| b.bucket == "a")
+            .expect("bucket a");
+        assert_eq!(a.skipped_unaccounted, 2);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("NOT subtracted") && n.contains("3 deletion(s)")),
+            "skip disclosure note missing: {:?}",
+            report.notes
+        );
+    }
+
+    /// Pre-v1.2 state files (no `skipped_unaccounted` field) must load
+    /// clean — the field is additive with `#[serde(default)]`.
+    #[test]
+    fn pre_marker_state_file_loads_with_default_skip_tally() {
+        let json = r#"{"buckets":{"a":{"original_bytes":10,"stored_bytes":5,"objects":1}}}"#;
+        let snap = LedgerSnapshot::from_json(json).expect("legacy snapshot parses");
+        assert!(snap.skipped_unaccounted.is_empty());
+        assert_eq!(snap.buckets["a"].objects, 1);
+    }
+
+    /// v1.2 audit R1 P3: `flush()` is the public SIGUSR1 entry point —
+    /// it must persist the exact current snapshot through the same
+    /// lock the event-driven flushes use.
+    #[test]
+    fn public_flush_persists_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.json");
+        let ledger = SavingsLedger::attach(LedgerSnapshot::default(), path.clone());
+        ledger.apply_delta("a", 500, 50, 1);
+        // Wipe the file to prove flush() rewrites it.
+        std::fs::remove_file(&path).expect("remove");
+        ledger.flush().expect("flush");
+        let reloaded = LedgerSnapshot::from_json(&std::fs::read_to_string(&path).expect("read"))
+            .expect("parse");
+        assert_eq!(reloaded, ledger.snapshot());
     }
 
     #[test]
@@ -712,18 +896,79 @@ mod tests {
     }
 
     /// `run_savings` on a missing file reports zeros (gateway booted
-    /// with the flag but no writes yet) instead of erroring.
+    /// with the flag but no writes yet) instead of erroring — and
+    /// (v1.2 audit R1 P3) says so in the first note, so a mistyped
+    /// `--state-file` path is never a silent all-zero report.
     #[test]
-    fn run_savings_missing_file_is_zero_report() {
+    fn run_savings_missing_file_is_zero_report_with_note() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let report = run_savings(
-            &dir.path().join("never-written.json"),
-            DEFAULT_PRICE_PER_GB_MONTH,
-        )
-        .expect("missing file is not an error");
+        let missing = dir.path().join("never-written.json");
+        let report = run_savings(&missing, DEFAULT_PRICE_PER_GB_MONTH)
+            .expect("missing file is not an error");
         assert_eq!(report.total_objects, 0);
         assert_eq!(report.total_original_bytes, 0);
         assert!(report.buckets.is_empty());
+        let first = report.notes.first().expect("notes non-empty");
+        assert!(
+            first.contains("no ledger state found")
+                && first.contains(missing.to_str().expect("utf8"))
+                && first.contains("--savings-ledger-state-file"),
+            "missing-file note must lead the notes: {first}"
+        );
+        // The note also renders in the human table.
+        let txt = render_savings_human(&report);
+        assert!(txt.contains("no ledger state found"));
+    }
+
+    /// v1.2 audit R1: drifted counters (stored > original) floor the
+    /// ratio / $ at zero and add a drift note — never a negative
+    /// percentage or negative dollars.
+    #[test]
+    fn drifted_counters_floor_at_zero_with_note() {
+        let mut snap = LedgerSnapshot::default();
+        snap.buckets.insert(
+            "drifty".into(),
+            BucketTotals {
+                original_bytes: 100,
+                stored_bytes: 250, // stored > original
+                objects: 1,
+            },
+        );
+        let report = build_savings_report(&snap, DEFAULT_PRICE_PER_GB_MONTH);
+        let b = &report.buckets[0];
+        assert_eq!(b.savings_ratio, 0.0, "ratio must be floored, not negative");
+        assert_eq!(
+            b.monthly_savings_usd, 0.0,
+            "$ must be floored, not negative"
+        );
+        assert_eq!(report.total_savings_ratio, 0.0);
+        assert_eq!(report.total_monthly_savings_usd, 0.0);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("drifty") && n.contains("floored at 0")),
+            "drift note missing: {:?}",
+            report.notes
+        );
+        // Healthy snapshots carry no drift note.
+        let mut healthy = LedgerSnapshot::default();
+        healthy.buckets.insert(
+            "ok".into(),
+            BucketTotals {
+                original_bytes: 100,
+                stored_bytes: 50,
+                objects: 1,
+            },
+        );
+        let healthy_report = build_savings_report(&healthy, DEFAULT_PRICE_PER_GB_MONTH);
+        assert!(
+            !healthy_report
+                .notes
+                .iter()
+                .any(|n| n.contains("floored at 0")),
+            "no drift note expected for healthy counters"
+        );
     }
 
     /// `run_savings` on a corrupt file is a typed parse error (the CLI

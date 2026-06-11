@@ -26,6 +26,20 @@
 //! (f) the `s4 savings` CLI (real binary, `--format json` + `table`)
 //!     reports exactly the state file's numbers — gateway running or
 //!     not.
+//!
+//! v1.2 audit R1 additions:
+//! (g) CopyObject accounting — same-bucket copy adds, REPLACE-directive
+//!     overwrite swaps (no double count), copy destinations are
+//!     marker-accounted so their DELETE subtracts symmetrically, and
+//!     cross-bucket copies open the destination bucket's row;
+//! (h) the `s4-ledger` marker gate — a backend-direct ("around the
+//!     gateway") S4-stamped object DELETEd / overwritten through the
+//!     gateway is NEVER subtracted (no negative / nonsense counters
+//!     even with forged `s4-original-size`), the skip is tallied in
+//!     `skipped_unaccounted`, and the `s4 savings` report discloses it;
+//! (i) versioning-Enabled accounting — each stored version adds one
+//!     ledger object, a delete-marker DELETE changes nothing, and a
+//!     specific-version DELETE subtracts exactly that version.
 
 use std::sync::Arc;
 
@@ -86,6 +100,15 @@ async fn spawn_s4_server(
     backend_endpoint: &str,
     ledger: Arc<SavingsLedger>,
 ) -> (String, oneshot::Sender<()>) {
+    spawn_s4_server_with(backend_endpoint, ledger, None).await
+}
+
+/// Variant with an optional VersioningManager for the (i) coverage.
+async fn spawn_s4_server_with(
+    backend_endpoint: &str,
+    ledger: Arc<SavingsLedger>,
+    versioning: Option<Arc<s4_server::versioning::VersioningManager>>,
+) -> (String, oneshot::Sender<()>) {
     let backend_client = build_aws_client(backend_endpoint);
     let proxy = s3s_aws::Proxy::from(backend_client);
     let registry = Arc::new(
@@ -94,7 +117,10 @@ async fn spawn_s4_server(
             .with(Arc::new(CpuZstd::default())),
     );
     let dispatcher = Arc::new(SamplingDispatcher::new(CodecKind::CpuZstd));
-    let s4 = S4Service::new(proxy, registry, dispatcher).with_savings_ledger(ledger);
+    let mut s4 = S4Service::new(proxy, registry, dispatcher).with_savings_ledger(ledger);
+    if let Some(mgr) = versioning {
+        s4 = s4.with_versioning(mgr);
+    }
 
     let mut svc = S3ServiceBuilder::new(s4);
     svc.set_auth(SimpleAuth::from_single(MINIO_USER, MINIO_PASS));
@@ -176,16 +202,7 @@ async fn put_via(client: &aws_sdk_s3::Client, key: &str, body: Vec<u8>) {
 /// sidecars + multipart assemblies) — the measured ground truth the
 /// ledger's `stored_bytes` must equal.
 async fn backend_stored_total(client: &aws_sdk_s3::Client) -> u64 {
-    let resp = client
-        .list_objects_v2()
-        .bucket(BUCKET)
-        .send()
-        .await
-        .expect("backend list");
-    resp.contents()
-        .iter()
-        .map(|o| o.size().and_then(|s| u64::try_from(s).ok()).unwrap_or(0))
-        .sum()
+    stored_total_in(client, BUCKET).await
 }
 
 fn read_snapshot(path: &std::path::Path) -> LedgerSnapshot {
@@ -194,10 +211,40 @@ fn read_snapshot(path: &std::path::Path) -> LedgerSnapshot {
 }
 
 fn bucket_totals(snap: &LedgerSnapshot) -> s4_server::ledger::BucketTotals {
+    totals_in(snap, BUCKET)
+}
+
+fn totals_in(snap: &LedgerSnapshot, bucket: &str) -> s4_server::ledger::BucketTotals {
     snap.buckets
-        .get(BUCKET)
+        .get(bucket)
         .copied()
-        .unwrap_or_else(|| panic!("no ledger entry for bucket {BUCKET}: {snap:?}"))
+        .unwrap_or_else(|| panic!("no ledger entry for bucket {bucket}: {snap:?}"))
+}
+
+async fn put_key(client: &aws_sdk_s3::Client, bucket: &str, key: &str, body: Vec<u8>) {
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(body))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("PUT {bucket}/{key}: {e}"));
+}
+
+/// Sum of ALL backend object sizes in `bucket` (compressed bodies +
+/// sidecars + versioning shadow keys) — the measured ground truth.
+async fn stored_total_in(client: &aws_sdk_s3::Client, bucket: &str) -> u64 {
+    let resp = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("backend list");
+    resp.contents()
+        .iter()
+        .map(|o| o.size().and_then(|s| u64::try_from(s).ok()).unwrap_or(0))
+        .sum()
 }
 
 #[tokio::test]
@@ -421,4 +468,316 @@ async fn ledger_e2e_put_overwrite_multipart_delete_restart_cli() {
     assert!(table.contains("gateway-traversing writes only"));
 
     let _ = gw2_stop.send(());
+}
+
+/// v1.2 audit R1 — (g) CopyObject ledger hooks + (h) the `s4-ledger`
+/// marker gate against backend-direct ("around the gateway") objects.
+#[tokio::test]
+#[ignore = "requires Docker (MinIO testcontainer); run with --ignored"]
+async fn ledger_e2e_copy_hooks_and_unaccounted_marker_gate() {
+    const SRC: &str = "cb-src";
+    const DST: &str = "cb-dst";
+    let minio = start_minio().await;
+    let backend = build_aws_client(&minio.endpoint_url);
+    for b in [SRC, DST] {
+        backend
+            .create_bucket()
+            .bucket(b)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("create bucket {b}: {e}"));
+    }
+    let state_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = state_dir.path().join("savings-ledger.json");
+    let ledger = Arc::new(SavingsLedger::attach(
+        LedgerSnapshot::default(),
+        state_path.clone(),
+    ));
+    let (gw_url, gw_stop) = spawn_s4_server(&minio.endpoint_url, Arc::clone(&ledger)).await;
+    let gw = build_aws_client(&gw_url);
+
+    // Seed: one compressed multi-frame object (body + sidecar).
+    let src_len: u64 = 6 * 1024 * 1024;
+    put_key(
+        &gw,
+        SRC,
+        "logs/orig.log",
+        compressible_body(src_len as usize),
+    )
+    .await;
+    let t = totals_in(&read_snapshot(&state_path), SRC);
+    assert_eq!(t.objects, 1);
+    assert_eq!(t.original_bytes, src_len);
+    assert_eq!(t.stored_bytes, stored_total_in(&backend, SRC).await);
+
+    // (g1) same-bucket copy to a new key: +1 object, original doubles,
+    // stored matches the measured backend bytes (copy carries the body
+    // but not the sidecar — the ledger must agree with what's actually
+    // there, not with an assumption).
+    gw.copy_object()
+        .bucket(SRC)
+        .key("logs/copy.log")
+        .copy_source(format!("{SRC}/logs/orig.log"))
+        .send()
+        .await
+        .expect("same-bucket copy");
+    let t = totals_in(&read_snapshot(&state_path), SRC);
+    assert_eq!(t.objects, 2, "copy to a new key adds one ledger object");
+    assert_eq!(t.original_bytes, 2 * src_len);
+    assert_eq!(t.stored_bytes, stored_total_in(&backend, SRC).await);
+
+    // (g2) REPLACE-directive copy onto the existing destination:
+    // footprint swap (identical bytes), objects unchanged.
+    gw.copy_object()
+        .bucket(SRC)
+        .key("logs/copy.log")
+        .copy_source(format!("{SRC}/logs/orig.log"))
+        .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+        .metadata("note", "replaced")
+        .send()
+        .await
+        .expect("REPLACE copy onto existing key");
+    let t = totals_in(&read_snapshot(&state_path), SRC);
+    assert_eq!(t.objects, 2, "REPLACE overwrite must not double-count");
+    assert_eq!(t.original_bytes, 2 * src_len);
+    assert_eq!(t.stored_bytes, stored_total_in(&backend, SRC).await);
+
+    // (g3) the copy destination is marker-accounted: its DELETE
+    // subtracts symmetrically.
+    gw.delete_object()
+        .bucket(SRC)
+        .key("logs/copy.log")
+        .send()
+        .await
+        .expect("delete copy.log");
+    let t = totals_in(&read_snapshot(&state_path), SRC);
+    assert_eq!(t.objects, 1, "copy destination DELETE must subtract");
+    assert_eq!(t.original_bytes, src_len);
+    assert_eq!(t.stored_bytes, stored_total_in(&backend, SRC).await);
+
+    // (g4) cross-bucket copy opens the destination bucket's row.
+    gw.copy_object()
+        .bucket(DST)
+        .key("replica/orig.log")
+        .copy_source(format!("{SRC}/logs/orig.log"))
+        .send()
+        .await
+        .expect("cross-bucket copy");
+    let snap = read_snapshot(&state_path);
+    let td = totals_in(&snap, DST);
+    assert_eq!(td.objects, 1);
+    assert_eq!(td.original_bytes, src_len);
+    assert_eq!(td.stored_bytes, stored_total_in(&backend, DST).await);
+    // ...without disturbing the source bucket's row.
+    assert_eq!(totals_in(&snap, SRC).objects, 1);
+
+    // (h1) backend-direct S4-stamped object (simulates s4fs / migrate /
+    // recompact output: S4 metadata, NO `s4-ledger` marker — with a
+    // deliberately absurd `s4-original-size` that would crater the
+    // counters if the old asymmetric subtraction were still in place).
+    backend
+        .put_object()
+        .bucket(SRC)
+        .key("rogue/direct.bin")
+        .metadata("s4-original-size", "999999999999")
+        .metadata("s4-codec", "cpu-zstd")
+        .body(aws_sdk_s3::primitives::ByteStream::from(random_body(
+            256 * 1024,
+            0xD1CE,
+        )))
+        .send()
+        .await
+        .expect("backend-direct PUT");
+    let before = totals_in(&read_snapshot(&state_path), SRC);
+    gw.delete_object()
+        .bucket(SRC)
+        .key("rogue/direct.bin")
+        .send()
+        .await
+        .expect("gateway DELETE of backend-direct object");
+    let snap = read_snapshot(&state_path);
+    let after = totals_in(&snap, SRC);
+    assert_eq!(
+        after, before,
+        "DELETE of a non-ledger-managed object must not move the counters"
+    );
+    assert_eq!(
+        snap.skipped_unaccounted.get(SRC).copied().unwrap_or(0),
+        1,
+        "the skipped removal must be tallied"
+    );
+
+    // (h2) gateway overwrite of a backend-direct object: the forged
+    // old footprint is NOT subtracted; the new write is a fresh add.
+    backend
+        .put_object()
+        .bucket(SRC)
+        .key("rogue/overwrite.bin")
+        .metadata("s4-original-size", "888888888888")
+        .body(aws_sdk_s3::primitives::ByteStream::from(random_body(
+            128 * 1024,
+            0xFEED,
+        )))
+        .send()
+        .await
+        .expect("backend-direct PUT (overwrite target)");
+    let ow_len: u64 = 1024 * 1024;
+    put_key(
+        &gw,
+        SRC,
+        "rogue/overwrite.bin",
+        compressible_body(ow_len as usize),
+    )
+    .await;
+    let snap = read_snapshot(&state_path);
+    let t = totals_in(&snap, SRC);
+    assert_eq!(
+        t.objects, 2,
+        "overwrite of an unaccounted object is a fresh add"
+    );
+    assert_eq!(
+        t.original_bytes,
+        src_len + ow_len,
+        "forged old original-size must never be subtracted"
+    );
+    assert_eq!(t.stored_bytes, stored_total_in(&backend, SRC).await);
+    assert_eq!(snap.skipped_unaccounted.get(SRC).copied().unwrap_or(0), 2);
+
+    // (h3) the CLI disclosure: per-bucket + total skip tallies and the
+    // dedicated note.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_s4"))
+        .args([
+            "savings",
+            "--state-file",
+            state_path.to_str().expect("utf8 path"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run s4 savings --format json");
+    assert!(
+        out.status.success(),
+        "s4 savings must exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("CLI JSON output parses");
+    assert_eq!(json["total_skipped_unaccounted"], 2);
+    let src_row = json["buckets"]
+        .as_array()
+        .expect("buckets array")
+        .iter()
+        .find(|b| b["bucket"] == SRC)
+        .expect("src bucket row");
+    assert_eq!(src_row["skipped_unaccounted"], 2);
+    assert!(
+        json["notes"].as_array().is_some_and(|notes| notes
+            .iter()
+            .any(|n| n.as_str().is_some_and(|s| s.contains("NOT subtracted")))),
+        "skip disclosure note missing from CLI output: {json}"
+    );
+    // Ratio / $ sanity: never negative, even with the rogue objects.
+    for row in json["buckets"].as_array().expect("buckets array") {
+        let ratio = row["savings_ratio"].as_f64().expect("ratio f64");
+        let usd = row["monthly_savings_usd"].as_f64().expect("usd f64");
+        assert!(ratio >= 0.0, "negative ratio leaked: {row}");
+        assert!(usd >= 0.0, "negative $ leaked: {row}");
+    }
+
+    let _ = gw_stop.send(());
+}
+
+/// v1.2 audit R1 — (i) versioning-Enabled accounting: every stored
+/// version is one ledger object; a delete-marker DELETE moves nothing;
+/// a specific-version DELETE subtracts exactly that version.
+#[tokio::test]
+#[ignore = "requires Docker (MinIO testcontainer); run with --ignored"]
+async fn ledger_e2e_versioning_enabled_accounting() {
+    const VBKT: &str = "ver-bkt";
+    let minio = start_minio().await;
+    let backend = build_aws_client(&minio.endpoint_url);
+    backend
+        .create_bucket()
+        .bucket(VBKT)
+        .send()
+        .await
+        .expect("create bucket");
+    let state_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = state_dir.path().join("savings-ledger.json");
+    let ledger = Arc::new(SavingsLedger::attach(
+        LedgerSnapshot::default(),
+        state_path.clone(),
+    ));
+    let v_mgr = Arc::new(s4_server::versioning::VersioningManager::new());
+    let (gw_url, gw_stop) =
+        spawn_s4_server_with(&minio.endpoint_url, Arc::clone(&ledger), Some(v_mgr)).await;
+    let gw = build_aws_client(&gw_url);
+    gw.put_bucket_versioning()
+        .bucket(VBKT)
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("enable versioning");
+
+    // Two versions of the same key: each PUT is a pure add (+1 object —
+    // every stored version occupies backend bytes).
+    let v1_len: u64 = 6 * 1024 * 1024;
+    let v2_len: u64 = 5 * 1024 * 1024;
+    put_key(&gw, VBKT, "logs/v.log", compressible_body(v1_len as usize)).await;
+    let v2_resp = gw
+        .put_object()
+        .bucket(VBKT)
+        .key("logs/v.log")
+        .body(aws_sdk_s3::primitives::ByteStream::from(compressible_body(
+            v2_len as usize,
+        )))
+        .send()
+        .await
+        .expect("PUT version 2");
+    let v2_id = v2_resp.version_id().expect("v2 version id").to_owned();
+    let t = totals_in(&read_snapshot(&state_path), VBKT);
+    assert_eq!(t.objects, 2, "each stored version is one ledger object");
+    assert_eq!(t.original_bytes, v1_len + v2_len);
+    assert_eq!(
+        t.stored_bytes,
+        stored_total_in(&backend, VBKT).await,
+        "versioned stored must equal the measured backend bytes (shadow keys + sidecar)"
+    );
+
+    // DELETE without a version id: pushes a delete marker — NO backend
+    // bytes move, NO ledger movement.
+    let del = gw
+        .delete_object()
+        .bucket(VBKT)
+        .key("logs/v.log")
+        .send()
+        .await
+        .expect("delete (marker)");
+    assert_eq!(del.delete_marker(), Some(true), "must be a delete marker");
+    let t_after_marker = totals_in(&read_snapshot(&state_path), VBKT);
+    assert_eq!(
+        t_after_marker, t,
+        "a delete marker must not move the counters"
+    );
+
+    // Specific-version DELETE of v2: subtracts exactly that version's
+    // footprint (v1's bytes and the latest sidecar stay on the backend
+    // — the ledger must agree with the measured remainder).
+    gw.delete_object()
+        .bucket(VBKT)
+        .key("logs/v.log")
+        .version_id(&v2_id)
+        .send()
+        .await
+        .expect("delete specific version v2");
+    let t = totals_in(&read_snapshot(&state_path), VBKT);
+    assert_eq!(t.objects, 1, "specific-version DELETE drops one object");
+    assert_eq!(t.original_bytes, v1_len);
+    assert_eq!(t.stored_bytes, stored_total_in(&backend, VBKT).await);
+
+    let _ = gw_stop.send(());
 }

@@ -706,10 +706,18 @@ enum ReservedKeyMode {
 /// is the backend Content-Length (frames + SSE envelope, NO sidecar —
 /// sidecars are probed separately because their lifecycle differs);
 /// `original_bytes` is the logical pre-compression size.
+///
+/// v1.2 audit R1 P2: `accounted` reports whether the object carries
+/// the gateway's `s4-ledger` marker (= its bytes were added to the
+/// ledger at write time). Subtraction sites must skip `!accounted`
+/// footprints and call `SavingsLedger::record_skipped_unaccounted`
+/// instead — subtracting a never-added object is the asymmetric-
+/// subtraction bug this marker exists to prevent.
 #[derive(Clone, Copy, Debug)]
 struct LedgerFootprint {
     original_bytes: u64,
     stored_bytes: u64,
+    accounted: bool,
 }
 
 impl<B: S3> S4Service<B> {
@@ -2422,12 +2430,25 @@ impl<B: S3> S4Service<B> {
     /// `None` = the object does not exist or the probe failed; callers
     /// treat that as "nothing to subtract" (best-effort, disclosed in
     /// the report notes).
+    ///
+    /// v1.2 audit R1: internal S4 objects (`.s4dict/<id>` dictionaries
+    /// and `<key>.s4index` sidecars) always probe as `None` — they are
+    /// never ledger-accounted as standalone objects (sidecar bytes ride
+    /// in their main object's delta; dictionaries are excluded
+    /// entirely, see the `crate::ledger` module doc). The reserved-key
+    /// guard already blocks client mutations on these keys, so this is
+    /// defence-in-depth for internal call paths. Versioning shadow keys
+    /// (`.__s4ver__/...`) are deliberately NOT skipped: every stored
+    /// version is a ledger object.
     async fn ledger_probe_object(
         &self,
         bucket: &str,
         key: &str,
         version_id: Option<&str>,
     ) -> Option<LedgerFootprint> {
+        if crate::dict::is_dict_key(key) || s4_codec::index::is_reserved_sidecar_key(key) {
+            return None;
+        }
         let uri = safe_object_uri(bucket, key).ok()?;
         let head_input = HeadObjectInput {
             bucket: bucket.into(),
@@ -2452,6 +2473,11 @@ impl<B: S3> S4Service<B> {
             .content_length
             .and_then(|n| u64::try_from(n).ok())?;
         let meta = head.output.metadata.as_ref();
+        // v1.2 audit R1 P2: only gateway-accounted objects (stamped
+        // `s4-ledger: 1` at write time) may be subtracted.
+        let accounted = meta
+            .and_then(|m| m.get(META_LEDGER))
+            .is_some_and(|v| v == META_LEDGER_ACCOUNTED);
         if let Some(original_bytes) = meta
             .and_then(|m| m.get(META_ORIGINAL_SIZE))
             .and_then(|v| v.parse::<u64>().ok())
@@ -2459,6 +2485,7 @@ impl<B: S3> S4Service<B> {
             return Some(LedgerFootprint {
                 original_bytes,
                 stored_bytes,
+                accounted,
             });
         }
         if meta.is_some_and(|m| m.contains_key(META_CODEC))
@@ -2467,11 +2494,13 @@ impl<B: S3> S4Service<B> {
             return Some(LedgerFootprint {
                 original_bytes: idx.total_original_size(),
                 stored_bytes,
+                accounted,
             });
         }
         Some(LedgerFootprint {
             original_bytes: stored_bytes,
             stored_bytes,
+            accounted,
         })
     }
 
@@ -3038,6 +3067,21 @@ pub(crate) const META_DICT_ID: &str = "s4-dict-id";
 /// copies are simply re-examined on the next recompact run and skip as
 /// `insufficient-gain`.
 pub(crate) const META_ZSTD_LEVEL: &str = "s4-zstd-level";
+/// v1.2 audit R1 P2: internal marker stamped on every write the
+/// gateway **adds to the savings ledger** (single PUT, zero-length
+/// PUT, multipart Create→Complete; CopyObject destinations inherit it
+/// from the source via the backend metadata copy / the REPLACE merge).
+/// The DELETE / overwrite ledger probes subtract **only** objects
+/// carrying this marker — objects written around the gateway (backend
+/// direct, `s4fs`, `s4 migrate`, `s4 recompact`) were never added, so
+/// subtracting them would corrupt the bucket's measured ratio.
+/// Clients cannot forge it: `strip_reserved_client_metadata` removes
+/// every client-supplied `s4-*` key before this stamp. Only stamped
+/// when `--savings-ledger-state-file` is configured — flag-off
+/// deployments stay bit-for-bit on pre-ledger metadata.
+pub(crate) const META_LEDGER: &str = "s4-ledger";
+/// Value stored under [`META_LEDGER`].
+pub(crate) const META_LEDGER_ACCOUNTED: &str = "1";
 
 /// v1.0.1 audit R1 P1: remove every client-supplied metadata key in the
 /// gateway-reserved `s4-*` namespace (case-insensitive). The PUT path
@@ -3995,6 +4039,17 @@ impl<B: S3> S3 for S4Service<B> {
             };
 
             write_manifest(&mut req.input.metadata, &manifest);
+            // v1.2 audit R1 P2: this PUT is about to be added to the
+            // savings ledger — stamp the accounting marker so a later
+            // DELETE / overwrite probe knows the subtraction is
+            // symmetric. Ledger-off deployments skip the stamp (flag
+            // absent ⇒ bit-for-bit pre-ledger metadata).
+            if self.savings_ledger.is_some() {
+                req.input
+                    .metadata
+                    .get_or_insert_with(Default::default)
+                    .insert(META_LEDGER.into(), META_LEDGER_ACCOUNTED.into());
+            }
             if is_framed {
                 // v0.2 #4: framed body であることを GET 側に伝える meta flag。
                 req.input
@@ -4398,7 +4453,17 @@ impl<B: S3> S3 for S4Service<B> {
                 // fast-path. `None` keeps the sidecar at v2 layout
                 // (= existing behaviour for non-SSE-S4-chunked PUTs).
                 idx.sse_v3 = sse_binding;
-                if self.savings_ledger.is_some() {
+                // v1.2 audit R1 P2: only subtract the to-be-replaced
+                // sidecar when the bytes it described were themselves
+                // ledger-accounted — an unaccounted main object's
+                // sidecar was never added either. Versioned PUTs skip
+                // the main-object probe, but the user-visible-key
+                // sidecar they replace was written by the gateway for
+                // the (accounted) previous version, so they keep
+                // subtracting it.
+                if self.savings_ledger.is_some()
+                    && (ledger_versioned_put || ledger_old_main.is_some_and(|f| f.accounted))
+                {
                     ledger_sidecar_old =
                         self.ledger_probe_sidecar_bytes(&put_bucket, &put_key).await;
                 }
@@ -4480,19 +4545,29 @@ impl<B: S3> S3 for S4Service<B> {
             // (overwrite = swap, not double-count), add the new body +
             // sidecar bytes. Versioned PUTs skipped the probe, so they
             // are pure adds (every stored version is a ledger object).
+            //
+            // v1.2 audit R1 P2: an existing-but-unaccounted old object
+            // (no `s4-ledger` marker) is NOT subtracted — it was never
+            // added. The overwrite then counts as a fresh object (+1)
+            // and the skipped removal is tallied for the report.
             if let (Some(ledger), true) = (self.savings_ledger.as_ref(), backend_resp.is_ok()) {
                 let stored_new = backend_object_size
                     .unwrap_or(0)
                     .saturating_add(ledger_sidecar_new);
+                let old_accounted = ledger_old_main.is_some_and(|f| f.accounted);
                 let (old_original, old_stored) = ledger_old_main
+                    .filter(|f| f.accounted)
                     .map(|f| (f.original_bytes, f.stored_bytes))
                     .unwrap_or((0, 0));
                 let old_stored = old_stored.saturating_add(ledger_sidecar_old);
+                if ledger_old_main.is_some() && !old_accounted {
+                    ledger.record_skipped_unaccounted(&put_bucket);
+                }
                 ledger.apply_delta(
                     &put_bucket,
                     crate::ledger::signed_delta(original_size, old_original),
                     crate::ledger::signed_delta(stored_new, old_stored),
-                    if ledger_old_main.is_some() { 0 } else { 1 },
+                    if old_accounted { 0 } else { 1 },
                 );
             }
             let _ = (original_size, compressed_size); // mute unused warnings
@@ -4629,19 +4704,34 @@ impl<B: S3> S3 for S4Service<B> {
             } else {
                 None
             };
+        // v1.2 audit R1 P2: zero-length objects are ledger-accounted
+        // (objects + zero bytes) — stamp the marker so their later
+        // DELETE symmetrically drops the object count.
+        if self.savings_ledger.is_some() {
+            req.input
+                .metadata
+                .get_or_insert_with(Default::default)
+                .insert(META_LEDGER.into(), META_LEDGER_ACCOUNTED.into());
+        }
         let mut backend_resp = self.backend.put_object(req).await;
         // v1.2 savings ledger: a zero-length object stores zero bytes —
         // the delta is purely the removal of whatever it replaced (plus
-        // an object-count bump when the key is new).
+        // an object-count bump when the key is new). Unaccounted old
+        // objects are skipped + tallied, same as the body-bearing path.
         if let (Some(ledger), true) = (self.savings_ledger.as_ref(), backend_resp.is_ok()) {
+            let old_accounted = ledger_old_main.is_some_and(|f| f.accounted);
             let (old_original, old_stored) = ledger_old_main
+                .filter(|f| f.accounted)
                 .map(|f| (f.original_bytes, f.stored_bytes))
                 .unwrap_or((0, 0));
+            if ledger_old_main.is_some() && !old_accounted {
+                ledger.record_skipped_unaccounted(&put_bucket);
+            }
             ledger.apply_delta(
                 &put_bucket,
                 crate::ledger::signed_delta(0, old_original),
                 crate::ledger::signed_delta(0, old_stored),
-                if ledger_old_main.is_some() { 0 } else { 1 },
+                if old_accounted { 0 } else { 1 },
             );
         }
         if let (Some(mgr), Some(pv), Ok(resp)) = (
@@ -5515,18 +5605,24 @@ impl<B: S3> S3 for S4Service<B> {
                         };
                         let backend_del = self.backend.delete_object(backend_req).await;
                         // v1.2 savings ledger: subtract only when the
-                        // backend actually dropped the bytes.
+                        // backend actually dropped the bytes — and
+                        // (audit R1 P2) only for ledger-accounted
+                        // versions; unmarked ones are tallied instead.
                         if let (Some(ledger), Some(f), Ok(_)) = (
                             self.savings_ledger.as_ref(),
                             ledger_old,
                             backend_del.as_ref(),
                         ) {
-                            ledger.apply_delta(
-                                &bucket,
-                                crate::ledger::signed_delta(0, f.original_bytes),
-                                crate::ledger::signed_delta(0, f.stored_bytes),
-                                -1,
-                            );
+                            if f.accounted {
+                                ledger.apply_delta(
+                                    &bucket,
+                                    crate::ledger::signed_delta(0, f.original_bytes),
+                                    crate::ledger::signed_delta(0, f.stored_bytes),
+                                    -1,
+                                );
+                            } else {
+                                ledger.record_skipped_unaccounted(&bucket);
+                            }
                         }
                     }
                     let mut output = DeleteObjectOutput {
@@ -5579,17 +5675,23 @@ impl<B: S3> S3 for S4Service<B> {
                         trailing_headers: None,
                     };
                     let backend_del = self.backend.delete_object(backend_req).await;
+                    // v1.2 audit R1 P2: marker-gated, same as the
+                    // specific-version branch above.
                     if let (Some(ledger), Some(f), Ok(_)) = (
                         self.savings_ledger.as_ref(),
                         ledger_old,
                         backend_del.as_ref(),
                     ) {
-                        ledger.apply_delta(
-                            &bucket,
-                            crate::ledger::signed_delta(0, f.original_bytes),
-                            crate::ledger::signed_delta(0, f.stored_bytes),
-                            -1,
-                        );
+                        if f.accounted {
+                            ledger.apply_delta(
+                                &bucket,
+                                crate::ledger::signed_delta(0, f.original_bytes),
+                                crate::ledger::signed_delta(0, f.stored_bytes),
+                                -1,
+                            );
+                        } else {
+                            ledger.record_skipped_unaccounted(&bucket);
+                        }
                     }
                 }
                 let output = DeleteObjectOutput {
@@ -5652,8 +5754,11 @@ impl<B: S3> S3 for S4Service<B> {
             // v1.2 savings ledger: the sidecar's bytes leave the
             // backend with this DELETE — measure them first (HEAD,
             // ledger-on only), subtract only on confirmed removal.
+            // Audit R1 P2: an unaccounted main object's sidecar was
+            // never added either, so it is excluded from subtraction
+            // the same way.
             let ledger_sidecar_bytes: u64 =
-                if self.savings_ledger.is_some() && ledger_old_main.is_some() {
+                if self.savings_ledger.is_some() && ledger_old_main.is_some_and(|f| f.accounted) {
                     self.ledger_probe_sidecar_bytes(&bucket, &key).await
                 } else {
                     0
@@ -5681,14 +5786,22 @@ impl<B: S3> S3 for S4Service<B> {
         }
         // v1.2 savings ledger: one combined subtraction (main object +
         // confirmed sidecar). Skipped entirely when the probe saw no
-        // object (DELETE of a nonexistent key is still 204).
+        // object (DELETE of a nonexistent key is still 204). Audit R1
+        // P2: only ledger-accounted objects (`s4-ledger` marker) are
+        // subtracted — a backend-direct / s4fs / migrate-written
+        // object was never added, so its DELETE is tallied as skipped
+        // and disclosed in the `s4 savings` notes instead.
         if let (Some(ledger), Some(f)) = (self.savings_ledger.as_ref(), ledger_old_main) {
-            ledger.apply_delta(
-                &bucket,
-                crate::ledger::signed_delta(0, f.original_bytes),
-                crate::ledger::signed_delta(0, ledger_removed_stored),
-                -1,
-            );
+            if f.accounted {
+                ledger.apply_delta(
+                    &bucket,
+                    crate::ledger::signed_delta(0, f.original_bytes),
+                    crate::ledger::signed_delta(0, ledger_removed_stored),
+                    -1,
+                );
+            } else {
+                ledger.record_skipped_unaccounted(&bucket);
+            }
         }
         // v0.6 #35: legacy unversioned-bucket hard delete fires the
         // canonical `ObjectRemoved:Delete` event.
@@ -5906,6 +6019,14 @@ impl<B: S3> S3 for S4Service<B> {
                     // destination of a REPLACE-directive copy could not
                     // resolve its dictionary at GET time.
                     META_DICT_ID,
+                    // v1.2 audit R1 P2: the ledger marker mirrors the
+                    // source — a REPLACE copy of an accounted object
+                    // stays accounted (the COPY directive gets this
+                    // for free via the backend metadata copy). The
+                    // ledger commit below conditions its add on the
+                    // same source marker, so destination metadata and
+                    // counters stay in lockstep.
+                    META_LEDGER,
                 ] {
                     if let Some(v) = src_meta.get(key) {
                         dest_meta.insert(key.to_string(), v.clone());
@@ -6025,15 +6146,42 @@ impl<B: S3> S3 for S4Service<B> {
             };
             match new_dst {
                 Some(new) => {
+                    // v1.2 audit R1 P2: marker-gated on both sides.
+                    // The destination inherits the source's marker
+                    // (COPY: backend metadata copy; REPLACE: the merge
+                    // above), so `new.accounted` decides whether the
+                    // copy adds to the ledger, and `old_dst.accounted`
+                    // whether the replaced object is subtracted. A
+                    // copy of an unaccounted source over an accounted
+                    // destination is a pure subtraction (the accounted
+                    // bytes are gone, the new ones were never added).
+                    let new_counts = new.accounted;
+                    let old_counts = old_dst.is_some_and(|f| f.accounted);
+                    if old_dst.is_some() && !old_counts {
+                        ledger.record_skipped_unaccounted(&dst_bucket);
+                    }
+                    let (new_original, new_stored) = if new_counts {
+                        (new.original_bytes, new.stored_bytes)
+                    } else {
+                        (0, 0)
+                    };
                     let (old_original, old_stored) = old_dst
+                        .filter(|f| f.accounted)
                         .map(|f| (f.original_bytes, f.stored_bytes))
                         .unwrap_or((0, 0));
-                    ledger.apply_delta(
-                        &dst_bucket,
-                        crate::ledger::signed_delta(new.original_bytes, old_original),
-                        crate::ledger::signed_delta(new.stored_bytes, old_stored),
-                        if old_dst.is_some() { 0 } else { 1 },
-                    );
+                    let objects_delta = match (new_counts, old_counts) {
+                        (true, true) | (false, false) => 0,
+                        (true, false) => 1,
+                        (false, true) => -1,
+                    };
+                    if new_counts || old_counts {
+                        ledger.apply_delta(
+                            &dst_bucket,
+                            crate::ledger::signed_delta(new_original, old_original),
+                            crate::ledger::signed_delta(new_stored, old_stored),
+                            objects_delta,
+                        );
+                    }
                 }
                 None => {
                     tracing::warn!(
@@ -6229,6 +6377,14 @@ impl<B: S3> S3 for S4Service<B> {
         let meta = req.input.metadata.get_or_insert_with(Default::default);
         meta.insert(META_MULTIPART.into(), "true".into());
         meta.insert(META_CODEC.into(), codec_kind.as_str().into());
+        // v1.2 audit R1 P2: the assembled object will be added to the
+        // savings ledger at Complete time — stamp the accounting
+        // marker now so the backend carries it onto the completed
+        // object (and the SSE / versioning re-PUT path re-reads it via
+        // HEAD). Ledger-off deployments stay bit-for-bit unchanged.
+        if self.savings_ledger.is_some() {
+            meta.insert(META_LEDGER.into(), META_LEDGER_ACCOUNTED.into());
+        }
         // v0.8 #54 BUG-10 fix: take() the SSE request fields off
         // `req.input` so they are NOT forwarded to the backend on
         // CreateMultipartUpload. Same root cause as v0.7 #48 BUG-2/3 on
@@ -6737,12 +6893,26 @@ impl<B: S3> S3 for S4Service<B> {
         // the re-PUT length when SSE / versioning rewrites the bytes
         // below. `None` body (NoSuchKey race) ⇒ the ledger skips this
         // Complete with a WARN — never guess.
-        let ledger_new_original: Option<u64> = assembled_body.as_ref().map(|b| {
-            build_index_from_body(b)
-                .map(|idx| idx.total_original_size())
-                .unwrap_or(b.len() as u64)
-        });
-        let mut ledger_new_stored: Option<u64> = assembled_body.as_ref().map(|b| b.len() as u64);
+        //
+        // v1.2 audit R1 P2 (CPU regression): the frame scan
+        // (`build_index_from_body`) exists ONLY when the ledger flag
+        // is on — flag-off deployments must not pay an O(body) walk
+        // per Complete for counters nobody is keeping.
+        let ledger_on = self.savings_ledger.is_some();
+        let ledger_new_original: Option<u64> = if ledger_on {
+            assembled_body.as_ref().map(|b| {
+                build_index_from_body(b)
+                    .map(|idx| idx.total_original_size())
+                    .unwrap_or(b.len() as u64)
+            })
+        } else {
+            None
+        };
+        let mut ledger_new_stored: Option<u64> = if ledger_on {
+            assembled_body.as_ref().map(|b| b.len() as u64)
+        } else {
+            None
+        };
         let mut ledger_sidecar_old: u64 = 0;
         let mut ledger_sidecar_new: u64 = 0;
         // Sidecar build (existing behaviour, gated on assembled body).
@@ -6821,8 +6991,10 @@ impl<B: S3> S3 for S4Service<B> {
             }
             // v1.2 savings ledger: same sidecar replace accounting as
             // the single-PUT path (probe the to-be-overwritten sidecar
-            // only when one is about to be written).
-            if self.savings_ledger.is_some() {
+            // only when one is about to be written). Audit R1 P2: only
+            // when the replaced main object was itself accounted —
+            // an unaccounted object's sidecar was never added.
+            if self.savings_ledger.is_some() && ledger_old_main.is_some_and(|f| f.accounted) {
                 ledger_sidecar_old = self.ledger_probe_sidecar_bytes(&bucket, &key).await;
             }
             ledger_sidecar_new = self.write_sidecar(&bucket, &key, &index).await;
@@ -6950,6 +7122,13 @@ impl<B: S3> S3 for S4Service<B> {
                         Ok(h) => h.output.metadata.unwrap_or_default(),
                         Err(_) => std::collections::HashMap::new(),
                     };
+                // v1.2 audit R1 P2: the re-PUT object is the one the
+                // ledger accounts — re-stamp the marker in case the
+                // upload was Created before the ledger flag was
+                // enabled (or the HEAD above failed).
+                if self.savings_ledger.is_some() {
+                    new_metadata.insert(META_LEDGER.into(), META_LEDGER_ACCOUNTED.into());
+                }
                 let new_body = match &ctx.sse {
                     crate::multipart_state::MultipartSseMode::SseC { key, key_md5 } => {
                         new_metadata.insert("s4-encrypted".into(), "aes-256-gcm".into());
@@ -7198,15 +7377,22 @@ impl<B: S3> S3 for S4Service<B> {
             match (ledger_new_original, ledger_new_stored) {
                 (Some(new_original), Some(new_stored)) => {
                     let new_stored = new_stored.saturating_add(ledger_sidecar_new);
+                    // v1.2 audit R1 P2: marker-gated old subtraction,
+                    // same contract as the single-PUT overwrite path.
+                    let old_accounted = ledger_old_main.is_some_and(|f| f.accounted);
                     let (old_original, old_stored) = ledger_old_main
+                        .filter(|f| f.accounted)
                         .map(|f| (f.original_bytes, f.stored_bytes))
                         .unwrap_or((0, 0));
                     let old_stored = old_stored.saturating_add(ledger_sidecar_old);
+                    if ledger_old_main.is_some() && !old_accounted {
+                        ledger.record_skipped_unaccounted(&bucket);
+                    }
                     ledger.apply_delta(
                         &bucket,
                         crate::ledger::signed_delta(new_original, old_original),
                         crate::ledger::signed_delta(new_stored, old_stored),
-                        if ledger_old_main.is_some() { 0 } else { 1 },
+                        if old_accounted { 0 } else { 1 },
                     );
                 }
                 _ => {
