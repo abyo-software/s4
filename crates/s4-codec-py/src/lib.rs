@@ -15,7 +15,7 @@
 //!
 //! `s4_codec_rs::Codec` is async. Python callers expect blocking calls. We
 //! resolve this by running each call on a process-wide multi-thread tokio
-//! runtime stashed in a `OnceLock`. `Python::allow_threads` releases the
+//! runtime stashed in a `OnceLock`. `Python::detach` (pyo3 0.26+ name for allow_threads) releases the
 //! GIL across the await so other Python threads can progress while the
 //! blocking compression worker churns.
 
@@ -148,7 +148,7 @@ where
     F: std::future::Future<Output = T> + Send,
     T: Send,
 {
-    py.allow_threads(|| runtime().block_on(fut))
+    py.detach(|| runtime().block_on(fut))
 }
 
 /// CPU zstd codec. Level is clamped to 1..=22 by the underlying crate;
@@ -623,7 +623,7 @@ fn encode_s4_object<'py>(
             // CRC32C is the only real work on this path, but it still
             // scans the whole body — release the GIL for it like the
             // cpu-zstd branch does (audit v1.2-R1 P3).
-            let crc = py.allow_threads(|| ::crc32c::crc32c(&input));
+            let crc = py.detach(|| ::crc32c::crc32c(&input));
             let len = input.len() as u64;
             let manifest = ChunkManifest {
                 codec: CodecKind::Passthrough,
