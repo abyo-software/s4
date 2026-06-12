@@ -116,6 +116,14 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # aws-sdk-sns / aws-sdk-sqs trees.
 aws-sdk-sns = { version = "1", optional = true }
 aws-sdk-sqs = { version = "1", optional = true }
+# v1.3: AWS Marketplace paid-container metering (`RegisterUsage`). NOT
+# feature-gated, unlike aws-sdk-kms / sns / sqs: the Marketplace listing
+# and the free ghcr.io image must be the *same binary* (the only delta is
+# whether the operator passes `--marketplace-product-code`), so the client
+# has to be compiled into the default build. The crate shares the smithy
+# runtime already pulled by aws-sdk-s3, so the marginal dep-tree cost is
+# one service-model crate.
+aws-sdk-marketplacemetering = { version = "1" }
 
 s4-codec = { path = "../s4-codec", version = "1" }
 s4-config = { path = "../s4-config", version = "1" }

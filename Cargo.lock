@@ -461,6 +461,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-marketplacemetering"
+version = "1.101.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8692e5d52b4d55865971a7b78a5a725211bd0b49d41cf4049842927dde3dab97"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.1",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-s3"
 version = "1.129.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4374,6 +4398,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-kms",
+ "aws-sdk-marketplacemetering",
  "aws-sdk-s3",
  "aws-sdk-sns",
  "aws-sdk-sqs",

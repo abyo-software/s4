@@ -285,6 +285,16 @@ pub mod names {
     /// gateway-written objects (versions count on versioning-Enabled
     /// buckets), per bucket. Labels: `bucket`.
     pub const LEDGER_OBJECTS: &str = "s4_ledger_objects";
+    /// v1.3 `--marketplace-product-code`: bumped once per boot-time AWS
+    /// Marketplace `RegisterUsage` **final outcome** (attempt-level
+    /// throttling retries show up in the WARN logs, not here). Labels:
+    /// `result` (= `"ok"` — entitlement confirmed, hourly metering
+    /// started; `"err"` — registration failed and the gateway refused to
+    /// start). Cardinality 2. Never recorded when the flag is off — the
+    /// boot-time registration is the only call site. Note the `err`
+    /// sample is mostly forensic: a failed registration aborts boot, so
+    /// `/metrics` never comes up to be scraped in that process.
+    pub const MARKETPLACE_REGISTER_USAGE_TOTAL: &str = "s4_marketplace_register_usage_total";
 }
 
 /// v1.2 `--savings-ledger-state-file`: stamp the three per-bucket
@@ -308,6 +318,15 @@ pub fn record_ledger_bucket(bucket: &str, totals: &crate::ledger::BucketTotals) 
 /// cpu-zstd framed path). See [`names::GPU_BATCH_TOTAL`].
 pub fn record_gpu_batch(result: &'static str) {
     metrics::counter!(names::GPU_BATCH_TOTAL, "result" => result).increment(1);
+}
+
+/// v1.3 `--marketplace-product-code`: bump the boot-time AWS Marketplace
+/// `RegisterUsage` outcome counter. `result` is `"ok"` (entitlement
+/// confirmed, per-pod hourly metering started) or `"err"` (registration
+/// failed — the gateway refuses to start). See
+/// [`names::MARKETPLACE_REGISTER_USAGE_TOTAL`].
+pub fn record_marketplace_register_usage(result: &'static str) {
+    metrics::counter!(names::MARKETPLACE_REGISTER_USAGE_TOTAL, "result" => result).increment(1);
 }
 
 /// v1.1 `--zstd-dict`: bump the lazy dictionary-fetch counter. `result`

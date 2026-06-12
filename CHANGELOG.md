@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **AWS Marketplace paid-container metering (`--marketplace-product-code
+  <CODE>`, opt-in)** — when set, the gateway calls the AWS Marketplace
+  Metering Service `RegisterUsage` API once at boot (before the backend
+  S3 client is built): success confirms the customer's entitlement and
+  starts per-pod hourly metering on the AWS side; any final failure
+  (`CustomerNotEntitled`, `PlatformNotSupported` — i.e. not on
+  ECS / EKS / Fargate —, invalid product code, retry budget exhausted)
+  aborts boot with a non-zero exit (fail-closed). Only
+  `ThrottlingException` / `InternalServiceErrorException` are retried
+  (exponential backoff, 3 retries, per AWS guidance). New
+  `s4_server::marketplace` module (mockable `MeteringClient` trait,
+  `#[non_exhaustive]` typed errors), new
+  `s4_marketplace_register_usage_total{result}` counter, new
+  `aws-sdk-marketplacemetering` dependency (not feature-gated — the
+  Marketplace and ghcr.io distributions are the same binary; only the
+  flag differs). Response-signature handling is presence-check + a
+  documented future hook: full RS256 JWS verification needs the
+  per-product AWS public key that only exists once the Marketplace
+  listing is published. Helm chart 0.3.0 adds the additive
+  `marketplace.productCode` value (default `""` = flag not rendered,
+  byte-identical manifests to chart 0.2.5) plus IRSA
+  (`aws-marketplace:RegisterUsage`) policy / annotation examples in
+  `values.yaml` and the chart README. Flag absent (default): no
+  Marketplace code runs and behavior is bit-for-bit identical to
+  v1.2.0 (v1.0 freeze contract).
+
 ## [1.2.0] — 2026-06-12
 
 **v1.2 — day-2 operations: prove it, automate it, keep it healthy.**

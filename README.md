@@ -124,7 +124,7 @@ release with migration guidance, not a v1.x patch.
 | **`s4-codec` codec trait + format constants** | `Codec` trait shape, `CodecKind` enum (all `#[non_exhaustive]`), `CodecError`, `IndexError`, `FrameError`, `GpuSelectError`, `CompareOp`. Constants: `index::{SIDECAR_SUFFIX, MAX_FRAMES, MAX_ETAG_BYTES, ENTRY_BYTES, HEADER_FIXED_V1, HEADER_FIXED_V2, INDEX_VERSION, INDEX_VERSION_V1, INDEX_VERSION_V2}`. Items: `index::{FrameIndex, encode_index, decode_index, FrameIndexEntry, SseChunkBinding, RangePlan, EncryptedRangePlan}` (`FrameIndex` and the latter four are all `pub struct`s; their public field sets + inherent method signatures are frozen at v1.0; field additions / removals / renames are v2.0 territory, same rule as the public structs in `s4_server::repair`), `multipart::FrameHeader` layout. Python (`s4-codec-py`) and WASM (`s4-codec-wasm`) bindings are versioned in lockstep with `s4-codec`; their binding-specific public APIs are frozen. The Python module `s4_codec` froze this **guaranteed minimum** export set at v1.0 (additive exports ship in minor releases and join the frozen set once shipped — examples: the v1.1 read helpers `CpuZstdDict` / `read_frame` / `frame_iter` / `decode_index` / `crc32c` + format constants + `S4FrameError` / `S4IndexError`, and the v1.2 write helpers `encode_s4_object` / `bind_index` / `pick_chunk_size`): classes `CpuZstd` + `CpuGzip` (Python-side names per the `#[pyclass(name = "…")]` attributes; the underlying Rust types are `PyCpuZstd` / `PyCpuGzip`), function `gpu_available()`, attribute `__version__`, and the exception classes `S4Error`, `S4CrcMismatchError`, `S4SizeMismatchError`, `S4CodecMismatchError`, `S4UnregisteredCodecError`, `S4ManifestSizeExceedsLimitError`, `S4ManifestSizeMismatchError`, `S4BackendError`, `S4IoError` (full hierarchy in `crates/s4-codec-py/src/lib.rs:52-60`). The WASM module exports exactly these names: `decompressFramed`, `decompressSingle`, `supportedCodecs`, `supportedFrameMagic`. The bindings do NOT re-export the full Rust surface — the contract for each binding is the names listed above plus the additively shipped minor-release exports recorded in the CHANGELOG. |
 | **`s4-config`** | The `CompressionMode` enum + `BackendConfig` struct field set + `S4Config` struct field set are frozen (the same `pub use s4_config as config` re-export inside `s4-server` makes these reachable through `s4_server::config::*`). The `S4Config::from_toml` stub is **NOT frozen** — it currently returns `bail!("toml loading not implemented yet")` and the eventual real implementation may change its error / return shape in any v1.x minor. |
 | **HTTP API surface** | S3 wire compatibility — the [`s3s 0.13`](https://crates.io/crates/s3s/0.13.0) trait set S4 implements. PUT / GET / Range GET / multipart / SigV4 / SigV4a / `x-amz-checksum-*` / `x-amz-server-side-encryption-*` headers all preserved. **`s3s` is itself pre-1.0**; our v1.x contract is that we will continue to track the `s3s 0.13` trait surface that S4 currently implements, accepting backward-compatible additions in `s3s` minors. A `s3s` major bump (0.14, 1.0) that breaks our trait impls would itself trigger a v2.0 of S4 with a clear migration in `docs/migration/`. |
-| **Container image tags + Helm chart `values.yaml` keys** | `ghcr.io/abyo-software/s4:<major>.<minor>.<patch>` + `:<major>.<minor>` + `:latest` floating tag rules; GPU build sibling tags `:<major>.<minor>.<patch>-gpu`. The complete top-level `values.yaml` key set is frozen: `replicas`, `image.{repository, tag, pullPolicy, pullSecrets}`, `nameOverride`, `fullnameOverride`, `serviceAccount.{create, annotations, name}`, `backend.{endpointUrl, region}`, `codec`, `zstdLevel`, `dispatcher`, `logFormat`, `otlpEndpoint`, `gpu.{enabled, count, nodeSelector, runtimeClassName}`, `tls.{enabled, cert, key, existingSecret, certKey, keyKey}`, `policy.{json, existingConfigMap}`, `service.{type, port, annotations}`, `ingress.{enabled, className, annotations, hosts, tls}`, `resources.{requests, limits}`, `podAnnotations`, `podLabels`, `podSecurityContext`, `securityContext`, `nodeSelector`, `tolerations`, `affinity`, `extraEnv`, `extraVolumes`, `extraVolumeMounts`, `probes.{liveness, readiness}`. **Default values** may shift in a minor release (e.g. a probe tuning change to reduce flake); the **key shape** (key names + structure) is v2.0 territory. |
+| **Container image tags + Helm chart `values.yaml` keys** | `ghcr.io/abyo-software/s4:<major>.<minor>.<patch>` + `:<major>.<minor>` + `:latest` floating tag rules; GPU build sibling tags `:<major>.<minor>.<patch>-gpu`. The complete top-level `values.yaml` key set is frozen: `replicas`, `image.{repository, tag, pullPolicy, pullSecrets}`, `nameOverride`, `fullnameOverride`, `serviceAccount.{create, annotations, name}`, `backend.{endpointUrl, region}`, `codec`, `zstdLevel`, `dispatcher`, `logFormat`, `otlpEndpoint`, `gpu.{enabled, count, nodeSelector, runtimeClassName}`, `tls.{enabled, cert, key, existingSecret, certKey, keyKey}`, `policy.{json, existingConfigMap}`, `service.{type, port, annotations}`, `ingress.{enabled, className, annotations, hosts, tls}`, `resources.{requests, limits}`, `podAnnotations`, `podLabels`, `podSecurityContext`, `securityContext`, `nodeSelector`, `tolerations`, `affinity`, `extraEnv`, `extraVolumes`, `extraVolumeMounts`, `probes.{liveness, readiness}`, `marketplace.{productCode}` (additive in chart 0.3.0 / s4 v1.3 — frozen from the release that ships it). **Default values** may shift in a minor release (e.g. a probe tuning change to reduce flake); the **key shape** (key names + structure) is v2.0 territory. |
 
 ### How to read the freeze table — scope of "frozen"
 
@@ -330,6 +330,54 @@ nvCOMP), inline or cert-manager TLS, and bucket-policy ConfigMap. See
 [charts/s4/README.md](charts/s4/README.md) for the full values table and
 [.github/workflows/docker.yml](.github/workflows/docker.yml) for the image
 build / publish pipeline.
+
+### AWS Marketplace (paid container)
+
+For teams that want to run S4 with AWS-billed hourly pricing, S4 can ship
+as a paid AWS Marketplace container product. **The Marketplace image and
+the free ghcr.io image are the same binary** — the only difference is that
+the Marketplace deployment passes `--marketplace-product-code <CODE>` (via
+the chart's `marketplace.productCode` value), which makes each pod
+register itself with the AWS Marketplace Metering Service at boot.
+
+How it works (v1.3, opt-in):
+
+- At startup — before the backend S3 client is even built — the gateway
+  calls the Marketplace `RegisterUsage` API once with your product code.
+  Success confirms your subscription and starts **per-pod, per-hour**
+  metering on the AWS side; charges appear on your regular AWS invoice
+  (AWS measures pod runtime automatically after the one-shot call — the
+  gateway makes no further metering calls).
+- Any final failure — not subscribed (`CustomerNotEntitled`), wrong code,
+  or running outside ECS / EKS / Fargate (`PlatformNotSupported` — plain
+  `docker run` and bare EC2 cannot meter) — aborts boot with a non-zero
+  exit and a typed error, so a non-entitled pod crash-loops instead of
+  serving. Only throttling / internal-service errors are retried
+  (exponential backoff, 3 retries, per AWS guidance).
+- The boot outcome is also exposed as the
+  `s4_marketplace_register_usage_total{result}` counter (see
+  `s4_server::marketplace` for the fail-closed semantics and the honest
+  scope of response-signature checking).
+
+Customer setup on EKS (IRSA):
+
+1. Create an IAM role for the S4 service account whose policy allows
+   `aws-marketplace:RegisterUsage` (see
+   [charts/s4/README.md §AWS Marketplace](charts/s4/README.md#aws-marketplace-paid-container)
+   for the JSON policy document).
+2. Install with the product code from your Marketplace fulfillment page:
+
+   ```bash
+   helm install s4 ./charts/s4 \
+     --set backend.endpointUrl=https://s3.us-east-1.amazonaws.com \
+     --set backend.region=us-east-1 \
+     --set marketplace.productCode=<YOUR_PRODUCT_CODE> \
+     --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::<ACCOUNT_ID>:role/s4-marketplace
+   ```
+
+Without `marketplace.productCode` (the default), no Marketplace code runs
+at all and the gateway behaves bit-for-bit like the free OSS distribution
+it is.
 
 ### Verifying the image / chart locally
 

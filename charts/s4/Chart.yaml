@@ -19,7 +19,14 @@ type: application
 #        not the chart's own SemVer line, which can stay 0.x as
 #        long as no key shape break is shipped. See README §Stability
 #        for the values.yaml key set that IS frozen.
-version: 0.2.5
+# 0.3.0: s4 v1.3 — additive `marketplace.productCode` key (default ""):
+#        wires --marketplace-product-code for AWS Marketplace paid-
+#        container deployments (boot-time RegisterUsage entitlement
+#        check + per-pod hourly metering, EKS/ECS/Fargate + IRSA only).
+#        Minor bump because the values.yaml key set changed
+#        (chart-shape change); the default ("") rendering is
+#        byte-identical to 0.2.5.
+version: 0.3.0
 # appVersion tracks the s4-server release shipped on crates.io / ghcr.io.
 appVersion: "1.2.0"
 kubeVersion: ">=1.24.0-0"

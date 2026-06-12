@@ -47,6 +47,44 @@ backend:
   # SDK code paths require this even when --endpoint-url is explicit.
   region: ""
 
+marketplace:
+  # -- AWS Marketplace paid-container product code (chart 0.3.0, s4 v1.3).
+  # Leave empty (default) for the free ghcr.io deployment — the flag is then
+  # not passed at all and the gateway behaves bit-for-bit like every earlier
+  # release. When set (Marketplace subscribers only), each pod calls the AWS
+  # Marketplace Metering Service `RegisterUsage` once at boot: success
+  # confirms your subscription and starts per-pod hourly metering (billed on
+  # your AWS invoice); failure (not subscribed / wrong code / platform not
+  # supported) makes the pod exit non-zero, so a non-entitled deployment
+  # crash-loops instead of serving.
+  #
+  # Requirements (EKS):
+  #   1. The pod must run on EKS / ECS / Fargate — RegisterUsage is rejected
+  #      with PlatformNotSupported anywhere else (plain docker, bare EC2).
+  #   2. The pod's IAM identity needs `aws-marketplace:RegisterUsage`. On
+  #      EKS use IRSA — attach a policy like this to the pod role:
+  #
+  #        {
+  #          "Version": "2012-10-17",
+  #          "Statement": [
+  #            {
+  #              "Effect": "Allow",
+  #              "Action": ["aws-marketplace:RegisterUsage"],
+  #              "Resource": "*"
+  #            }
+  #          ]
+  #        }
+  #
+  #      and point the chart's ServiceAccount at the role:
+  #
+  #        serviceAccount:
+  #          annotations:
+  #            eks.amazonaws.com/role-arn: arn:aws:iam::<ACCOUNT_ID>:role/s4-marketplace
+  #
+  # The product code itself is shown on the product's AWS Marketplace
+  # listing page / in the fulfillment instructions after subscribing.
+  productCode: ""
+
 # -- Default compression codec. One of: cpu-zstd, nvcomp-zstd, nvcomp-bitcomp,
 # nvcomp-gdeflate, identity. nvcomp-* require gpu.enabled=true and a GPU build
 # of the image (see Dockerfile.gpu).

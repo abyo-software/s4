@@ -14,6 +14,7 @@ pub mod ledger;
 pub mod lifecycle;
 pub mod lock_recovery;
 pub mod maintain;
+pub mod marketplace;
 pub mod metrics;
 pub mod mfa;
 pub mod migrate;

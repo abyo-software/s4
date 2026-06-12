@@ -107,6 +107,51 @@ README's "HTTPS" section):
    ```
 3. **Plain HTTP** (default) — let an Ingress / service mesh terminate.
 
+## AWS Marketplace (paid container)
+
+Subscribers to the paid AWS Marketplace listing run the **same binary** as
+the free ghcr.io image — the only difference is that the Marketplace
+deployment sets `marketplace.productCode`, which makes each pod call the
+AWS Marketplace Metering Service `RegisterUsage` API once at boot. A
+successful call confirms your subscription and starts per-pod hourly
+metering (charges appear on your regular AWS invoice); a failed call
+(not subscribed, wrong code, unsupported platform) makes the pod exit
+non-zero before it ever serves a request.
+
+Requirements:
+
+1. **EKS / ECS / Fargate only.** `RegisterUsage` is rejected with
+   `PlatformNotSupportedException` from plain `docker run` or a direct
+   EC2 launch — the pod logs a clear error and exits.
+2. **IRSA with `aws-marketplace:RegisterUsage`.** Create an IAM role for
+   the service account with this policy:
+
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Action": ["aws-marketplace:RegisterUsage"],
+         "Resource": "*"
+       }
+     ]
+   }
+   ```
+
+3. Install with the product code from your Marketplace fulfillment page:
+
+   ```bash
+   helm install s4 ./charts/s4 \
+     --set backend.endpointUrl=https://s3.us-east-1.amazonaws.com \
+     --set backend.region=us-east-1 \
+     --set marketplace.productCode=<YOUR_PRODUCT_CODE> \
+     --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::<ACCOUNT_ID>:role/s4-marketplace
+   ```
+
+With `marketplace.productCode` left at its default `""`, the flag is not
+rendered at all and the deployment is the unmetered free OSS gateway.
+
 ## Bucket policy
 
 Pass an AWS-style JSON policy:
@@ -129,6 +174,7 @@ checksum annotations roll the deployment when the policy text changes.
 | `image.pullPolicy` | `IfNotPresent` | Standard Kubernetes image pull policy. |
 | `backend.endpointUrl` | `""` (**REQUIRED**) | Real S3 endpoint the gateway forwards to. |
 | `backend.region` | `""` | AWS region (set as `AWS_REGION` env). |
+| `marketplace.productCode` | `""` | AWS Marketplace paid-container product code. Empty = free OSS deployment (no metering code runs). See [AWS Marketplace](#aws-marketplace-paid-container). |
 | `codec` | `cpu-zstd` | Default codec: `cpu-zstd` / `nvcomp-zstd` / `nvcomp-bitcomp` / `nvcomp-gdeflate` / `identity`. |
 | `dispatcher` | `sampling` | `always` (pin to `codec`) or `sampling` (auto-select per object). |
 | `gpu.enabled` | `false` | Request `nvidia.com/gpu` and apply GPU node selector. Requires the GPU build of the image. |

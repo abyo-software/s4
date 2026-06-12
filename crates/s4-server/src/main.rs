@@ -805,6 +805,25 @@ struct Opt {
     #[clap(long, value_name = "FILE")]
     zstd_dict_map: Option<std::path::PathBuf>,
 
+    /// v1.3: AWS Marketplace paid-container product code. When set, the
+    /// gateway calls the AWS Marketplace Metering Service `RegisterUsage`
+    /// API once at boot (before the backend S3 client is built): success
+    /// confirms the customer's entitlement and starts the per-pod hourly
+    /// metering clock on the AWS side; ANY final failure (not entitled,
+    /// platform not supported, invalid product code, retry budget
+    /// exhausted) aborts boot with a non-zero exit — a paid container that
+    /// cannot prove entitlement must not serve. Only Throttling /
+    /// InternalServiceError responses are retried (exponential backoff,
+    /// 3 retries, per the AWS integration guidance). Requires running on
+    /// Amazon ECS / EKS / Fargate with `aws-marketplace:RegisterUsage`
+    /// IAM permission (IRSA / task role); plain `docker run` or a direct
+    /// EC2 launch fails with PlatformNotSupported. Absent (default), no
+    /// Marketplace code runs at all — behavior is bit-for-bit identical
+    /// to a build without the integration (the free ghcr.io image is the
+    /// same binary minus this flag). See `s4_server::marketplace`.
+    #[clap(long, value_name = "CODE")]
+    marketplace_product_code: Option<String>,
+
     /// v0.5 #31: optional subcommand. When omitted, runs the gateway
     /// (existing v0.4 behaviour). Available subcommands:
     /// `verify-audit-log <FILE> --hmac-key <SPEC>` walks an audit-log
@@ -1635,6 +1654,35 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         opt.otlp_endpoint.as_deref(),
         &opt.service_name,
     )?;
+
+    // v1.3: AWS Marketplace paid-container entitlement check + hourly
+    // metering start (`RegisterUsage`). Deliberately the FIRST boot step
+    // after tracing: a non-entitled customer must be refused before any
+    // backend credential resolution / state-file loading happens
+    // (fail-closed, per the AWS Marketplace container integration
+    // requirements). The SDK config here is a separate default-chain load
+    // — NOT the backend `--endpoint-url` config built below — because
+    // RegisterUsage must resolve to the metering endpoint of the region
+    // the pod itself runs in (ECS / EKS inject AWS_REGION; the service
+    // rejects cross-region calls with InvalidRegionException). See
+    // `s4_server::marketplace` module docs.
+    if let Some(product_code) = opt.marketplace_product_code.as_deref() {
+        let metering_conf = aws_config::from_env().load().await;
+        let metering_client = s4_server::marketplace::SdkMeteringClient::new(&metering_conf);
+        let registered = s4_server::marketplace::register_usage(
+            &metering_client,
+            product_code,
+            s4_server::marketplace::RetryPolicy::default(),
+        )
+        .await?;
+        info!(
+            product_code,
+            attempts = registered.attempts,
+            "AWS Marketplace RegisterUsage succeeded — entitlement confirmed, \
+             per-pod hourly metering started (AWS measures runtime automatically \
+             from here; no further metering calls are made)"
+        );
+    }
 
     // v0.8.5 #81 (audit C-1 + H-7): central shutdown signal, fanned out
     // to every background task via `Arc<Notify>::notify_waiters()` from
@@ -4786,6 +4834,39 @@ mod sigusr1_dump_tests {
         assert!(
             paths.savings_ledger.is_none(),
             "savings_ledger default must be None"
+        );
+    }
+
+    /// v1.3 `--marketplace-product-code`: flag parse round-trip. Absent
+    /// (default) the option is `None` — the entire Marketplace
+    /// integration is skipped and boot behavior is bit-for-bit identical
+    /// to pre-v1.3 (freeze contract). Present, the code string passes
+    /// through verbatim (product codes are opaque AWS-issued strings —
+    /// no client-side shape validation; a wrong code is rejected
+    /// server-side as InvalidProductCodeException at boot).
+    #[test]
+    fn marketplace_product_code_flag_parses() {
+        use clap::Parser as _;
+        let default =
+            super::Opt::try_parse_from(["s4-server", "--endpoint-url", "http://127.0.0.1:9000"])
+                .expect("minimal Opt must parse");
+        assert!(
+            default.marketplace_product_code.is_none(),
+            "default must be None (integration fully disabled)"
+        );
+
+        let set = super::Opt::try_parse_from([
+            "s4-server",
+            "--endpoint-url",
+            "http://127.0.0.1:9000",
+            "--marketplace-product-code",
+            "1a2b3c4d5e6f7g8h9i0jEXAMPLE",
+        ])
+        .expect("Opt with --marketplace-product-code must parse");
+        assert_eq!(
+            set.marketplace_product_code.as_deref(),
+            Some("1a2b3c4d5e6f7g8h9i0jEXAMPLE"),
+            "product code must pass through verbatim"
         );
     }
 }

@@ -59,6 +59,9 @@ spec:
             - --zstd-level={{ .Values.zstdLevel }}
             - --dispatcher={{ .Values.dispatcher }}
             - --log-format={{ .Values.logFormat }}
+            {{- if .Values.marketplace.productCode }}
+            - --marketplace-product-code={{ .Values.marketplace.productCode }}
+            {{- end }}
             {{- if .Values.otlpEndpoint }}
             - --otlp-endpoint={{ .Values.otlpEndpoint }}
             - --service-name={{ include "s4.fullname" . }}
