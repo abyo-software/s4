@@ -1,0 +1,157 @@
+================================================================================
+AWS MARKETPLACE LISTING - COPY/PASTE FIELDS (S4 container product)
+================================================================================
+Every value below is plain ASCII only. No em-dash, no en-dash, no curly
+quotes, no Japanese long-vowel mark, no ellipsis character, no arrows. Use a
+straight hyphen "-" everywhere. Verify before pasting with:
+
+    LC_ALL=C grep -nP '[^\x09\x0a\x0d\x20-\x7e]' docs/marketplace/listing-fields.txt
+    (expect: no output)
+
+Paste each block into the matching field in the Marketplace Management Portal
+(Products > Container > your draft > Update product information).
+================================================================================
+
+
+--------------------------------------------------------------------------------
+FIELD: Product title
+--------------------------------------------------------------------------------
+S4 - Squished S3: Transparent S3 Compression Gateway
+
+
+--------------------------------------------------------------------------------
+FIELD: SKU (optional)
+--------------------------------------------------------------------------------
+s4-gateway
+
+
+--------------------------------------------------------------------------------
+FIELD: Short description (one or two sentences)
+--------------------------------------------------------------------------------
+Drop-in S3-compatible gateway that transparently compresses every object (CPU zstd or GPU nvCOMP), cutting S3 storage bytes 50-80 percent for compressible data with zero application changes. Includes pre-deployment savings estimation and measured-savings reporting.
+
+
+--------------------------------------------------------------------------------
+FIELD: Long description (product description)
+--------------------------------------------------------------------------------
+S4 sits between your applications (boto3, aws-sdk, Spark, Trino, DuckDB, or anything that speaks S3) and your real S3 bucket, and transparently compresses each object with a codec chosen per payload: CPU zstd for text and logs, GPU (NVIDIA nvCOMP Bitcomp or zstd) for integer and columnar data, and passthrough for already-compressed inputs.
+
+No application changes are required. S4 keeps the same S3 wire protocol, the same SigV4 authentication, and the same SDK calls. You only change the endpoint URL. Range GET requests stay fast through a sidecar frame index that is compatible with Parquet and ORC readers.
+
+The on-backend format is open, so there is no lock-in. If you stop the gateway, the objects remain readable with the Apache-2.0 s4-codec command-line tool, the s4-codec Python package, or the s4fs fsspec adapter (pandas, pyarrow, and DuckDB can read the data without the gateway).
+
+Operate S4 with built-in day-2 tooling. The "s4 estimate" command projects savings on your existing bucket before you deploy. The "s4 migrate" command retro-compresses objects already in the bucket. The "s4 recompact" command re-compresses cold data at higher levels. The "s4 maintain" command runs policy-driven maintenance. The savings ledger and the "s4 savings" command report the storage bytes and dollars actually saved in production. Prometheus metrics and a Grafana dashboard are included.
+
+This listing is billed per pod per hour. The same software is also available free under the Apache-2.0 license as a public container image; the Marketplace build adds metered billing through your AWS bill and is the supported procurement path for enterprises.
+
+
+--------------------------------------------------------------------------------
+FIELD: Highlight 1 (max 3 highlights)
+--------------------------------------------------------------------------------
+50-80 percent fewer S3 storage bytes for compressible data such as logs, JSON, and columnar files. The reduction is measured, with per-bucket savings reporting built in.
+
+
+--------------------------------------------------------------------------------
+FIELD: Highlight 2
+--------------------------------------------------------------------------------
+Zero application changes. S4 exposes an S3 wire-compatible endpoint (SigV4, multipart, Range GET, server-side encryption). Point your SDK at S4 and keep working.
+
+
+--------------------------------------------------------------------------------
+FIELD: Highlight 3
+--------------------------------------------------------------------------------
+Open format, no lock-in. Objects stay readable without the gateway through Apache-2.0 command-line, Python, and fsspec tooling.
+
+
+--------------------------------------------------------------------------------
+FIELD: Categories (select in the portal dropdown; suggested)
+--------------------------------------------------------------------------------
+Storage
+Migration
+
+
+--------------------------------------------------------------------------------
+FIELD: Search keywords (comma-separated)
+--------------------------------------------------------------------------------
+S3, compression, storage cost reduction, object storage, zstd, GPU, gateway
+
+
+--------------------------------------------------------------------------------
+FIELD: Support description
+--------------------------------------------------------------------------------
+Community support is available through GitHub issues at https://github.com/abyo-software/s4/issues. Marketplace subscribers can email abyo.software@gmail.com for best-effort response within 2 business days. Documentation, an operations runbook, and a threat model are included in the repository.
+
+
+--------------------------------------------------------------------------------
+FIELD: Additional resource 1 (text, then URL)
+--------------------------------------------------------------------------------
+Documentation (README)
+https://github.com/abyo-software/s4#readme
+
+
+--------------------------------------------------------------------------------
+FIELD: Additional resource 2 (text, then URL)
+--------------------------------------------------------------------------------
+Operations runbook
+https://github.com/abyo-software/s4/blob/main/docs/ops/runbook.md
+
+
+--------------------------------------------------------------------------------
+FIELD: Product logo
+--------------------------------------------------------------------------------
+TODO: upload a PNG logo in the portal (required at publish). No text to paste.
+
+
+================================================================================
+DELIVERY OPTION (Helm chart delivery)
+================================================================================
+
+--------------------------------------------------------------------------------
+FIELD: Delivery option title
+--------------------------------------------------------------------------------
+S4 gateway via Helm chart
+
+
+--------------------------------------------------------------------------------
+FIELD: Delivery option description
+--------------------------------------------------------------------------------
+Deploy S4 on Amazon EKS with the provided Helm chart. The chart wires Marketplace metering automatically through the marketplace.productCode value.
+
+
+--------------------------------------------------------------------------------
+FIELD: Usage instructions
+--------------------------------------------------------------------------------
+1. Create an IAM role for the service account (IRSA) that allows the aws-marketplace:RegisterUsage action. The exact policy JSON is in the chart README.
+
+2. Install the chart:
+
+   helm install s4 oci://<marketplace-ecr>/abyo-software/s4-helm \
+     --version <chart-version> \
+     --set backend.endpointUrl=https://s3.<region>.amazonaws.com \
+     --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=<role-arn>
+
+   The marketplace.productCode value is injected by AWS Marketplace.
+
+3. Point your S3 clients at the S4 service endpoint. No application code changes are needed.
+
+S4 calls RegisterUsage once at startup. If the pod is not entitled, the container exits instead of serving traffic.
+
+
+--------------------------------------------------------------------------------
+FIELD: Marketplace service account name
+--------------------------------------------------------------------------------
+s4
+
+
+================================================================================
+PRICING (hourly, per pod)
+================================================================================
+Dimension: per pod per hour.
+Suggested price point: decide at submit time. Comparable infrastructure tools
+list at roughly 0.05 to 0.30 US dollars per pod per hour. Enter the number in
+the portal pricing form; it does not go in any text field above.
+
+Paid-listing prerequisites on the seller account (Management Portal):
+- Tax interview complete.
+- Bank deposit information complete.
+================================================================================
