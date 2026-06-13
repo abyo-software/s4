@@ -79,7 +79,7 @@ S3, compression, storage cost reduction, object storage, zstd, GPU, gateway
 --------------------------------------------------------------------------------
 FIELD: Support description
 --------------------------------------------------------------------------------
-Community support is available through GitHub issues at https://github.com/abyo-software/s4/issues. Marketplace subscribers can email abyo.software@gmail.com for best-effort response within 2 business days. Documentation, an operations runbook, and a threat model are included in the repository.
+Community support is available through GitHub issues at https://github.com/abyo-software/s4/issues. Marketplace subscribers can email aws-support@abyo.net for best-effort response within 2 business days. Documentation, an operations runbook, and a threat model are included in the repository.
 
 
 --------------------------------------------------------------------------------
@@ -158,3 +158,13 @@ Paid-listing prerequisites on the seller account (Management Portal):
 - Tax interview complete.
 - Bank deposit information complete.
 ================================================================================
+
+
+================================================================================
+REFUND POLICY
+================================================================================
+S4 is billed per pod per hour based on metered usage. You can stop all software charges at any time by scaling down or terminating the S4 pods or tasks; you are billed only for the pod-hours you actually run. A free trial is available so you can evaluate the product before incurring software charges.
+
+Because charges are metered hourly and usage is under your control, usage that has already been incurred is generally non-refundable. If you believe you were billed in error, or a product defect prevented normal use, contact us within 30 days of the charge and we will review your request. Where a refund is warranted, it is processed through AWS Marketplace.
+
+Contact: aws-support@abyo.net (abyo software LLC). Please include your AWS account ID, the product name (S4 - Squished S3), and the billing period in question.
