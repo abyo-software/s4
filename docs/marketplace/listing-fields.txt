@@ -99,7 +99,10 @@ https://github.com/abyo-software/s4/blob/main/docs/ops/runbook.md
 --------------------------------------------------------------------------------
 FIELD: Product logo
 --------------------------------------------------------------------------------
-TODO: upload a PNG logo in the portal (required at publish). No text to paste.
+Use assets/marketplace/s4-logo-square.png (640x640, 1:1, white background).
+Upload it in the portal logo field. A 2:1 wide variant is at
+assets/marketplace/s4-logo-wide.png and a transparent-background variant at
+assets/marketplace/s4-logo-square-transparent.png.
 
 
 ================================================================================

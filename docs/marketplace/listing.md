@@ -61,9 +61,10 @@ measured in the repo.
 - **AdditionalResources**:
   - `{"Text": "Documentation (README)", "Url": "https://github.com/abyo-software/s4#readme"}`
   - `{"Text": "Operations runbook", "Url": "https://github.com/abyo-software/s4/blob/main/docs/ops/runbook.md"}`
-- **LogoUrl**: TODO — needs a hosted PNG (Marketplace requirement at
-  publish time). Options: upload via AMMP (gives awsmp-logos S3 URL) or
-  host a public S3 object.
+- **LogoUrl**: `assets/marketplace/s4-logo-square.png` (640x640, 1:1,
+  white background, abyo brand mark + gradient wordmark). Upload via AMMP
+  at publish (gives an awsmp-logos S3 URL). 2:1 wide + transparent
+  variants alongside it.
 
 ## Delivery (Helm delivery option)
 
