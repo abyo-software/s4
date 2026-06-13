@@ -106,65 +106,68 @@ assets/marketplace/s4-logo-square-transparent.png.
 
 
 ================================================================================
-DELIVERY OPTION (Helm chart delivery)
+DELIVERY OPTION + VERSION (portal "Add version" / publish step)
 ================================================================================
+Everything technical is already pushed to the Marketplace ECR repos via API.
+In the portal "Add version" form, select the image and chart below and paste
+the text values. All text here is ASCII-clean (verify with the grep at the top
+of this file). The final Draft -> Limited publish is done by the portal.
+
+--------------------------------------------------------------------------------
+FIELD: Container image (already pushed; select tag 1.2.0)
+--------------------------------------------------------------------------------
+709825985650.dkr.ecr.us-east-1.amazonaws.com/abyo-software/s4:1.2.0
+
+--------------------------------------------------------------------------------
+FIELD: Helm chart URI (already pushed)
+--------------------------------------------------------------------------------
+709825985650.dkr.ecr.us-east-1.amazonaws.com/abyo-software/s4-helm:0.3.1
+
+--------------------------------------------------------------------------------
+FIELD: Version title
+--------------------------------------------------------------------------------
+1.2.0
+
+--------------------------------------------------------------------------------
+FIELD: Release notes (ASCII only - this is where the MockAPI publish failed)
+--------------------------------------------------------------------------------
+S4 v1.2.0. Drop-in S3-compatible compression gateway. Transparent per-object compression (CPU zstd or GPU nvCOMP) cuts S3 storage bytes 50-80 percent for compressible data with zero application changes. Includes pre-deployment savings estimation (s4 estimate), retro-compression (s4 migrate), background recompaction (s4 recompact), policy-driven maintenance (s4 maintain), and measured-savings reporting (s4 savings) with Prometheus metrics and a Grafana dashboard. Billed per pod per hour.
 
 --------------------------------------------------------------------------------
 FIELD: Delivery option title
 --------------------------------------------------------------------------------
 S4 gateway via Helm chart
 
-
 --------------------------------------------------------------------------------
 FIELD: Delivery option description
 --------------------------------------------------------------------------------
-Deploy S4 on Amazon EKS with the provided Helm chart. The chart wires Marketplace metering automatically through the marketplace.productCode value.
+Deploy S4 on Amazon EKS with the provided Helm chart. Metered per-pod billing is wired automatically; set your S3 backend endpoint at install time.
 
+--------------------------------------------------------------------------------
+FIELD: Compatible services
+--------------------------------------------------------------------------------
+EKS
+
+--------------------------------------------------------------------------------
+FIELD: Override parameter (required for paid products)
+--------------------------------------------------------------------------------
+Key: serviceAccount.name
+Default value: ${AWSMP_SERVICE_ACCOUNT}
 
 --------------------------------------------------------------------------------
 FIELD: Usage instructions
 --------------------------------------------------------------------------------
-1. Create an IAM role for the service account (IRSA) that allows the aws-marketplace:RegisterUsage action. The exact policy JSON is in the chart README.
+S4 deploys on Amazon EKS via the provided Helm chart.
 
-2. Install the chart:
+1. Subscribe, then follow the AWS Marketplace launch steps for this product to install the Helm chart on your EKS cluster.
 
-   helm install s4 oci://<marketplace-ecr>/abyo-software/s4-helm \
-     --version <chart-version> \
-     --set backend.endpointUrl=https://s3.<region>.amazonaws.com \
-     --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=<role-arn>
+2. Metered billing is automatic. The chart carries the Marketplace product code and runs under the service account AWS Marketplace provisions with the aws-marketplace:RegisterUsage permission. S4 calls RegisterUsage once at startup; if the pod is not entitled, the container exits instead of serving traffic.
 
-   The marketplace.productCode value is injected by AWS Marketplace.
+3. Set your S3 backend endpoint at install time. Override backend.endpointUrl, for example https://s3.us-east-1.amazonaws.com - use the regional S3 endpoint for the bucket you put behind S4.
 
-3. Point your S3 clients at the S4 service endpoint. No application code changes are needed.
+4. Point your S3 clients (boto3, aws-sdk, Spark, Trino, DuckDB, or anything S3) at the S4 service endpoint. No application code changes are required: same SigV4 auth, multipart, Range GET, and server-side encryption.
 
-S4 calls RegisterUsage once at startup. If the pod is not entitled, the container exits instead of serving traffic.
+5. Billing is per pod per hour through your AWS bill. EKS infrastructure costs are separate and billed by AWS as usual.
 
-
---------------------------------------------------------------------------------
-FIELD: Marketplace service account name
---------------------------------------------------------------------------------
-s4
-
-
-================================================================================
-PRICING (hourly, per pod)
-================================================================================
-Dimension: per pod per hour.
-Suggested price point: decide at submit time. Comparable infrastructure tools
-list at roughly 0.05 to 0.30 US dollars per pod per hour. Enter the number in
-the portal pricing form; it does not go in any text field above.
-
-Paid-listing prerequisites on the seller account (Management Portal):
-- Tax interview complete.
-- Bank deposit information complete.
-================================================================================
-
-
-================================================================================
-REFUND POLICY
-================================================================================
-S4 is billed per pod per hour based on metered usage. You can stop all software charges at any time by scaling down or terminating the S4 pods or tasks; you are billed only for the pod-hours you actually run. A free trial is available so you can evaluate the product before incurring software charges.
-
-Because charges are metered hourly and usage is under your control, usage that has already been incurred is generally non-refundable. If you believe you were billed in error, or a product defect prevented normal use, contact us within 30 days of the charge and we will review your request. Where a refund is warranted, it is processed through AWS Marketplace.
-
-Contact: aws-support@abyo.net (abyo software LLC). Please include your AWS account ID, the product name (S4 - Squished S3), and the billing period in question.
+Documentation: https://github.com/abyo-software/s4#readme
+Operations runbook: https://github.com/abyo-software/s4/blob/main/docs/ops/runbook.md
