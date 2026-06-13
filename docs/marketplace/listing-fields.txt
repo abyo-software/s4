@@ -171,3 +171,13 @@ S4 deploys on Amazon EKS via the provided Helm chart.
 
 Documentation: https://github.com/abyo-software/s4#readme
 Operations runbook: https://github.com/abyo-software/s4/blob/main/docs/ops/runbook.md
+
+
+================================================================================
+REFUND POLICY
+================================================================================
+S4 is billed per pod per hour based on metered usage. You can stop all software charges at any time by scaling down or terminating the S4 pods or tasks; you are billed only for the pod-hours you actually run. A free trial is available so you can evaluate the product before incurring software charges.
+
+Because charges are metered hourly and usage is under your control, usage that has already been incurred is generally non-refundable. If you believe you were billed in error, or a product defect prevented normal use, contact us within 30 days of the charge and we will review your request. Where a refund is warranted, it is processed through AWS Marketplace.
+
+Contact: aws-support@abyo.net (abyo software LLC). Please include your AWS account ID, the product name (S4 - Squished S3), and the billing period in question.
