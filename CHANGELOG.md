@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-06-13
+
+**v1.2.1 - AWS Marketplace paid-container release.** Ships the
+`--marketplace-product-code` RegisterUsage metering integration (added
+after the v1.2.0 tag) so the AWS Marketplace container distribution can
+meter per-pod hourly billing, plus a security dependency bump. The
+v1.0 freeze contract holds: the Marketplace integration is additive and
+opt-in (flag absent = bit-for-bit identical to v1.2.0).
+
+### Security
+- **pyo3 0.24 -> 0.29** closing RUSTSEC-2026-0176 / RUSTSEC-2026-0177
+  (missing `Sync` bound on `PyCFunction::new_closure`; not used by the
+  s4-codec bindings, but the CI `cargo audit` gate flagged it). The
+  only API change is `Python::allow_threads` -> `Python::detach`.
+
 ### Added
 - **AWS Marketplace paid-container metering (`--marketplace-product-code
   <CODE>`, opt-in)** — when set, the gateway calls the AWS Marketplace
