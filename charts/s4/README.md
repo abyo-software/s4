@@ -177,8 +177,18 @@ Requirements (both routes):
      --set backend.endpointUrl=https://s3.us-east-1.amazonaws.com \
      --set backend.region=us-east-1 \
      --set marketplace.productCode=<YOUR_PRODUCT_CODE> \
-     --set marketplace.usageDimension=Hours \
+     --set marketplace.usageDimension=<DIMENSION_KEY> \
      --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::<ACCOUNT_ID>:role/s4-marketplace
+   ```
+
+   `<DIMENSION_KEY>` is the dimension's **API identifier** — the catalog
+   `Dimensions[].Key` (for the S4 listing this is `PID1`), **not** the
+   human-readable display name (passing the display name is rejected with
+   `InvalidUsageDimension`). Find it with:
+
+   ```bash
+   aws marketplace-catalog describe-entity --catalog AWSMarketplace \
+     --entity-id <PRODUCT_ENTITY_ID> --query 'DetailsDocument.Dimensions'
    ```
 
 With `marketplace.productCode` left at its default `""`, no metering flag is

@@ -21,7 +21,9 @@
 //!    `MeterUsage` record per pod per hour against that dimension for the
 //!    lifetime of the pod. Selected by setting BOTH
 //!    `--marketplace-product-code` and `--marketplace-usage-dimension <NAME>`
-//!    (the dimension's API name, e.g. `Hours`). See
+//!    (the dimension's API identifier — the catalog `Dimensions[].Key`, e.g.
+//!    `PID1`, NOT the display name; the display name is rejected with
+//!    `InvalidUsageDimension`). See
 //!    [`meter_usage_entitlement_check`] (boot, fail-closed) and
 //!    [`meter_one_hour`] (the hourly loop, fail-open).
 //!

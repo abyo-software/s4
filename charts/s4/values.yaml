@@ -94,13 +94,14 @@ marketplace:
   # (chart 0.3.4, s4 v1.2.2). Leave empty (default) for products that let
   # AWS meter per-pod hours automatically (the RegisterUsage route above).
   # Set it ONLY when your product's pricing defines a custom dimension
-  # (catalog Type `ExternallyMetered`, e.g. an `Hours` dimension you price
+  # (catalog Type `ExternallyMetered`, e.g. an hourly dimension you price
   # per unit): the gateway then uses the MeterUsage API instead — a DryRun
   # at boot confirms entitlement (fail-closed) and a background task sends
-  # one MeterUsage record per pod per hour against this dimension. The name
-  # must match the dimension's API name in the AWS Marketplace Management
-  # Portal. Requires `aws-marketplace:MeterUsage` (see IAM note above).
-  # Only honored when productCode is also set.
+  # one MeterUsage record per pod per hour against this dimension. The value
+  # is the dimension's API identifier — the catalog `Dimensions[].Key`
+  # (e.g. `PID1`), NOT the human-readable display name (the display name is
+  # rejected with InvalidUsageDimension). Requires `aws-marketplace:MeterUsage`
+  # (see IAM note above). Only honored when productCode is also set.
   usageDimension: ""
 
 # -- Default compression codec. One of: cpu-zstd, nvcomp-zstd, nvcomp-bitcomp,

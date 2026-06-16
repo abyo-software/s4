@@ -828,7 +828,7 @@ struct Opt {
     /// dimension API name. Set this TOGETHER WITH
     /// `--marketplace-product-code` when the Marketplace product is
     /// configured with a custom-metered dimension (its catalog `Type` is
-    /// `ExternallyMetered`, e.g. an hourly `Hours` dimension you price
+    /// `ExternallyMetered`, e.g. an hourly dimension you price
     /// per unit). When set, the gateway uses the `MeterUsage` API instead
     /// of `RegisterUsage`: a `DryRun` `MeterUsage` at boot confirms
     /// entitlement (fail-closed — a non-entitled pod refuses to start), and
@@ -841,8 +841,11 @@ struct Opt {
     /// (IRSA / task role) and running on Amazon ECS / EKS / Fargate. Leave
     /// UNSET for per-pod hourly products that let AWS meter automatically —
     /// that is the `RegisterUsage` route (see `--marketplace-product-code`).
-    /// The name must match the dimension's API name in the AWS Marketplace
-    /// Management Portal. See `s4_server::marketplace`.
+    /// The value is the dimension's API identifier — the catalog
+    /// `Dimensions[].Key` (e.g. `PID1`), NOT the human-readable display name
+    /// (passing the display name is rejected with `InvalidUsageDimension`).
+    /// Confirm it with `aws marketplace-catalog describe-entity ... --query
+    /// DetailsDocument.Dimensions`. See `s4_server::marketplace`.
     #[clap(long, value_name = "NAME", requires = "marketplace_product_code")]
     marketplace_usage_dimension: Option<String>,
 
