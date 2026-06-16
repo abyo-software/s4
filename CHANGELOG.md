@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-06-16
+
+**v1.2.2 - AWS Marketplace metering fix (MeterUsage custom-dimension
+route).** The v1.2.1 Marketplace container listing was rejected in review
+because its pricing dimension is custom ("externally metered") and AWS does
+not auto-meter those — yet the binary only called `RegisterUsage`. This
+release adds the `MeterUsage` route so the dimension actually receives
+metering records. Server-only change; the library crates and s4fs are
+functionally unchanged. The v1.0 freeze contract holds (both Marketplace
+flags absent = bit-for-bit identical behavior).
+
+### Added
+- **AWS Marketplace custom-metering route (`--marketplace-usage-dimension
+  <NAME>`, opt-in)** — for Marketplace container products whose pricing
+  defines a custom ("externally metered", catalog `Type:
+  ExternallyMetered`) dimension, which AWS does **not** meter
+  automatically. When set together with `--marketplace-product-code`, the
+  gateway uses the `MeterUsage` API instead of `RegisterUsage`: a `DryRun`
+  `MeterUsage` at boot confirms entitlement (fail-closed — a non-entitled or
+  unauthorized pod refuses to start; AWS signals a permitted DryRun with the
+  `DryRunOperation` error code, which the client translates to success), and
+  a background task then sends one `MeterUsage` record per pod per hour
+  against the dimension for the pod's lifetime (first record at startup,
+  then hourly). One unit means "pod active during that clock hour" — whole-
+  hour granularity, not prorated like `RegisterUsage`. The hourly loop is
+  **fail-open with backfill**: a failed hour is retained and retried on
+  later ticks (AWS accepts records up to 6 h in the past), so a transient
+  error neither under-bills the seller nor tears down the serving gateway
+  (entitlement is enforced once, at boot); hours that age past the 6 h
+  window are dropped with a loud WARN. Re-sending the same {dimension, hour}
+  with the same quantity is idempotent (AWS returns the original record id),
+  which makes backfill safe; note the once-per-hour rule is per ECS task /
+  EKS pod, so it does not dedup across pod restarts. New
+  `s4_marketplace_meter_usage_total{result}` counter
+  (`entitlement_ok|entitlement_err|ok|duplicate|err`); new mockable
+  `MeterUsageClient` trait + `meter_usage_entitlement_check` / `meter_one_hour`
+  / `drop_stale_pending` in `s4_server::marketplace`. Helm chart gains
+  `marketplace.usageDimension` (chart 0.3.4).
+- The `--marketplace-product-code`-only path (no dimension) is unchanged:
+  it remains the `RegisterUsage` per-pod hourly route where AWS meters
+  automatically. The v1.0 freeze contract holds — with neither flag set,
+  no metering code runs.
+
+### Fixed
+- **AWS Marketplace container listing review rejection** ("All metered
+  dimensions must be registered at the metering service"): the container
+  product's pricing dimension is `ExternallyMetered`, which requires
+  `MeterUsage` records, but the v1.2.1 binary only called `RegisterUsage`
+  (the auto-metered route), so the dimension never received a metering
+  record. The new `--marketplace-usage-dimension` route emits the required
+  `MeterUsage` records. See `crates/s4-server/src/marketplace.rs` module
+  docs for the two-route decision.
+
 ## [1.2.1] - 2026-06-13
 
 **v1.2.1 - AWS Marketplace paid-container release.** Ships the

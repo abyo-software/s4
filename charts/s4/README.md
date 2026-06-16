@@ -111,20 +111,36 @@ README's "HTTPS" section):
 
 Subscribers to the paid AWS Marketplace listing run the **same binary** as
 the free ghcr.io image — the only difference is that the Marketplace
-deployment sets `marketplace.productCode`, which makes each pod call the
-AWS Marketplace Metering Service `RegisterUsage` API once at boot. A
-successful call confirms your subscription and starts per-pod hourly
-metering (charges appear on your regular AWS invoice); a failed call
-(not subscribed, wrong code, unsupported platform) makes the pod exit
-non-zero before it ever serves a request.
+deployment sets `marketplace.productCode`, which makes each pod prove its
+entitlement and meter usage at boot (charges appear on your regular AWS
+invoice). A non-entitled pod (not subscribed, wrong code, unsupported
+platform) exits non-zero before it ever serves a request.
 
-Requirements:
+There are **two metering routes**, chosen by whether you also set
+`marketplace.usageDimension`. Pick the one that matches how your product's
+pricing dimension is configured (`describe-entity` →
+`Dimensions[].Types`):
 
-1. **EKS / ECS / Fargate only.** `RegisterUsage` is rejected with
-   `PlatformNotSupportedException` from plain `docker run` or a direct
-   EC2 launch — the pod logs a clear error and exits.
-2. **IRSA with `aws-marketplace:RegisterUsage`.** Create an IAM role for
-   the service account with this policy:
+| Product dimension type | Set | Metering API |
+|---|---|---|
+| none / `Metered` (per-pod hour, AWS auto-meters) | `productCode` only | `RegisterUsage` once at boot |
+| `ExternallyMetered` (custom dimension you price per unit) | `productCode` **and** `usageDimension` | `MeterUsage` DryRun at boot + one record per pod per hour |
+
+Using the wrong route is silently unbillable: `RegisterUsage` never emits a
+record against an `ExternallyMetered` dimension, and AWS will reject the
+listing with *"all metered dimensions must be registered at the metering
+service."*
+
+Requirements (both routes):
+
+1. **Run on Amazon EKS / ECS / Fargate.** This is a container listing, so
+   deploy the metered build there. The `RegisterUsage` hourly route in
+   particular refuses any other platform (plain `docker run`, bare EC2) with
+   `PlatformNotSupportedException`, and the pod logs a clear error and exits.
+2. **IRSA with the metering permission.** Create an IAM role for the
+   service account. Grant `aws-marketplace:RegisterUsage` for the hourly
+   route, `aws-marketplace:MeterUsage` for the custom-dimension route, or
+   both if unsure:
 
    ```json
    {
@@ -132,14 +148,19 @@ Requirements:
      "Statement": [
        {
          "Effect": "Allow",
-         "Action": ["aws-marketplace:RegisterUsage"],
+         "Action": [
+           "aws-marketplace:RegisterUsage",
+           "aws-marketplace:MeterUsage"
+         ],
          "Resource": "*"
        }
      ]
    }
    ```
 
-3. Install with the product code from your Marketplace fulfillment page:
+3. Install with the product code from your Marketplace fulfillment page.
+
+   Hourly (RegisterUsage) route:
 
    ```bash
    helm install s4 ./charts/s4 \
@@ -149,7 +170,18 @@ Requirements:
      --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::<ACCOUNT_ID>:role/s4-marketplace
    ```
 
-With `marketplace.productCode` left at its default `""`, the flag is not
+   Custom-dimension (MeterUsage) route — add the dimension API name:
+
+   ```bash
+   helm install s4 ./charts/s4 \
+     --set backend.endpointUrl=https://s3.us-east-1.amazonaws.com \
+     --set backend.region=us-east-1 \
+     --set marketplace.productCode=<YOUR_PRODUCT_CODE> \
+     --set marketplace.usageDimension=Hours \
+     --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::<ACCOUNT_ID>:role/s4-marketplace
+   ```
+
+With `marketplace.productCode` left at its default `""`, no metering flag is
 rendered at all and the deployment is the unmetered free OSS gateway.
 
 ## Bucket policy
@@ -175,6 +207,7 @@ checksum annotations roll the deployment when the policy text changes.
 | `backend.endpointUrl` | `""` (**REQUIRED**) | Real S3 endpoint the gateway forwards to. |
 | `backend.region` | `""` | AWS region (set as `AWS_REGION` env). |
 | `marketplace.productCode` | `""` | AWS Marketplace paid-container product code. Empty = free OSS deployment (no metering code runs). See [AWS Marketplace](#aws-marketplace-paid-container). |
+| `marketplace.usageDimension` | `""` | AWS Marketplace custom (`ExternallyMetered`) dimension API name. Empty = RegisterUsage hourly route. Set (with `productCode`) to use the MeterUsage route. See [AWS Marketplace](#aws-marketplace-paid-container). |
 | `codec` | `cpu-zstd` | Default codec: `cpu-zstd` / `nvcomp-zstd` / `nvcomp-bitcomp` / `nvcomp-gdeflate` / `identity`. |
 | `dispatcher` | `sampling` | `always` (pin to `codec`) or `sampling` (auto-select per object). |
 | `gpu.enabled` | `false` | Request `nvidia.com/gpu` and apply GPU node selector. Requires the GPU build of the image. |

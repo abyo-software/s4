@@ -824,6 +824,28 @@ struct Opt {
     #[clap(long, value_name = "CODE")]
     marketplace_product_code: Option<String>,
 
+    /// v1.2.2: AWS Marketplace custom ("externally metered") pricing
+    /// dimension API name. Set this TOGETHER WITH
+    /// `--marketplace-product-code` when the Marketplace product is
+    /// configured with a custom-metered dimension (its catalog `Type` is
+    /// `ExternallyMetered`, e.g. an hourly `Hours` dimension you price
+    /// per unit). When set, the gateway uses the `MeterUsage` API instead
+    /// of `RegisterUsage`: a `DryRun` `MeterUsage` at boot confirms
+    /// entitlement (fail-closed — a non-entitled pod refuses to start), and
+    /// a background task then sends one `MeterUsage` record per pod per hour
+    /// against this dimension for the pod's lifetime (AWS bills using the
+    /// per-unit price set on the dimension). The hourly loop is fail-open: a
+    /// transient metering error is logged + counted
+    /// (`s4_marketplace_meter_usage_total`) but never tears down the serving
+    /// gateway. Requires the `aws-marketplace:MeterUsage` IAM permission
+    /// (IRSA / task role) and running on Amazon ECS / EKS / Fargate. Leave
+    /// UNSET for per-pod hourly products that let AWS meter automatically —
+    /// that is the `RegisterUsage` route (see `--marketplace-product-code`).
+    /// The name must match the dimension's API name in the AWS Marketplace
+    /// Management Portal. See `s4_server::marketplace`.
+    #[clap(long, value_name = "NAME", requires = "marketplace_product_code")]
+    marketplace_usage_dimension: Option<String>,
+
     /// v0.5 #31: optional subcommand. When omitted, runs the gateway
     /// (existing v0.4 behaviour). Available subcommands:
     /// `verify-audit-log <FILE> --hmac-key <SPEC>` walks an audit-log
@@ -1666,22 +1688,62 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // the pod itself runs in (ECS / EKS inject AWS_REGION; the service
     // rejects cross-region calls with InvalidRegionException). See
     // `s4_server::marketplace` module docs.
+    // When the MeterUsage (custom-metering) route is taken, the boot DryRun
+    // entitlement check runs here (fail-closed) but the hourly metering loop
+    // can only be spawned later, once `shutdown_notify` + `background_handles`
+    // exist — so stash the client + code + dimension and spawn below.
+    let mut marketplace_metering: Option<(
+        s4_server::marketplace::SdkMeteringClient,
+        String,
+        String,
+    )> = None;
     if let Some(product_code) = opt.marketplace_product_code.as_deref() {
         let metering_conf = aws_config::from_env().load().await;
         let metering_client = s4_server::marketplace::SdkMeteringClient::new(&metering_conf);
-        let registered = s4_server::marketplace::register_usage(
-            &metering_client,
-            product_code,
-            s4_server::marketplace::RetryPolicy::default(),
-        )
-        .await?;
-        info!(
-            product_code,
-            attempts = registered.attempts,
-            "AWS Marketplace RegisterUsage succeeded — entitlement confirmed, \
-             per-pod hourly metering started (AWS measures runtime automatically \
-             from here; no further metering calls are made)"
-        );
+        match opt.marketplace_usage_dimension.as_deref() {
+            // MeterUsage route: the product defines a custom ("externally
+            // metered") dimension. AWS does NOT auto-meter — prove
+            // entitlement with a DryRun now (fail-closed) and start the
+            // hourly per-pod-hour metering loop below.
+            Some(dimension) => {
+                s4_server::marketplace::meter_usage_entitlement_check(
+                    &metering_client,
+                    product_code,
+                    dimension,
+                    s4_server::marketplace::RetryPolicy::default(),
+                )
+                .await?;
+                info!(
+                    product_code,
+                    dimension,
+                    "AWS Marketplace MeterUsage entitlement confirmed (DryRun) — \
+                     starting per-pod hourly metering loop for the custom dimension"
+                );
+                marketplace_metering = Some((
+                    metering_client,
+                    product_code.to_owned(),
+                    dimension.to_owned(),
+                ));
+            }
+            // RegisterUsage route: per-pod hourly, AWS auto-meters. One call
+            // verifies entitlement and starts AWS's metering clock; no
+            // further calls for the pod's lifetime.
+            None => {
+                let registered = s4_server::marketplace::register_usage(
+                    &metering_client,
+                    product_code,
+                    s4_server::marketplace::RetryPolicy::default(),
+                )
+                .await?;
+                info!(
+                    product_code,
+                    attempts = registered.attempts,
+                    "AWS Marketplace RegisterUsage succeeded — entitlement confirmed, \
+                     per-pod hourly metering started (AWS measures runtime automatically \
+                     from here; no further metering calls are made)"
+                );
+            }
+        }
     }
 
     // v0.8.5 #81 (audit C-1 + H-7): central shutdown signal, fanned out
@@ -1706,6 +1768,119 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // shutdown branch awaits each handle (with a short timeout) so a
     // wedged background task can't keep the process alive forever.
     let mut background_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // v1.2.2: AWS Marketplace custom-metering hourly loop (`MeterUsage`).
+    // Spawned only when `--marketplace-usage-dimension` was set and the boot
+    // DryRun entitlement check above passed. One unit per pod per hour
+    // against the custom dimension; the first tick fires immediately so the
+    // current pod-hour is metered at startup, then once per hour.
+    //
+    // Fail-OPEN with backfill: a failed hour is RETAINED (not dropped) and
+    // retried on later ticks, because AWS accepts records up to 6 h in the
+    // past — metering `now()` each tick would silently under-bill the seller
+    // for every transient failure. The backlog is bounded (≤ ~6 entries: one
+    // per hour within the window); hours that age past the window are dropped
+    // with a loud WARN (no silent revenue loss). A transient error never
+    // tears down the serving gateway (entitlement was enforced fail-closed at
+    // boot). Cancellation-aware via `shutdown_notify`, same shape as the
+    // lifecycle / inventory scanners below.
+    if let Some((metering_client, product_code, dimension)) = marketplace_metering {
+        let shutdown_cl = Arc::clone(&shutdown_notify);
+        let handle = tokio::spawn(async move {
+            use s4_server::marketplace::{MeterOutcome, drop_stale_pending, meter_one_hour};
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+            // Skip (don't burst) ticks missed while the host was suspended or
+            // the clock jumped — those hours weren't really served, and a
+            // burst would just re-enqueue the current hour (idempotent). The
+            // per-call timeout below keeps the loop body well under one tick
+            // in normal operation, so ticks are never missed for ordinary
+            // metering latency and we don't need per-hour-bucket catch-up.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Pod-hours awaiting a successful record, oldest-first.
+            let mut pending: std::collections::VecDeque<std::time::SystemTime> =
+                std::collections::VecDeque::new();
+            loop {
+                tokio::select! {
+                    () = shutdown_cl.notified() => {
+                        tracing::info!(
+                            pending = pending.len(),
+                            "AWS Marketplace metering loop shutting down (got cancel signal)"
+                        );
+                        return;
+                    }
+                    _ = ticker.tick() => {}
+                }
+                let now = std::time::SystemTime::now();
+                pending.push_back(now);
+                let dropped = drop_stale_pending(
+                    &mut pending,
+                    now,
+                    s4_server::marketplace::MAX_METER_BACKLOG,
+                );
+                if dropped > 0 {
+                    tracing::warn!(
+                        product_code,
+                        dimension,
+                        dropped,
+                        "AWS Marketplace MeterUsage: dropped pod-hour(s) older than the 6h \
+                         reporting window — these hours are now unbillable (sustained metering \
+                         outage)"
+                    );
+                }
+                // Drain oldest-first; stop at the first failure so ordering is
+                // preserved and the failed hour is backfilled next tick.
+                while let Some(&ts) = pending.front() {
+                    match meter_one_hour(
+                        &metering_client,
+                        &product_code,
+                        &dimension,
+                        1,
+                        ts,
+                        s4_server::marketplace::METER_USAGE_CALL_TIMEOUT,
+                    )
+                    .await
+                    {
+                        MeterOutcome::Metered { record_id } => {
+                            pending.pop_front();
+                            tracing::info!(
+                                product_code,
+                                dimension,
+                                record_id = record_id.as_deref().unwrap_or("(none)"),
+                                "AWS Marketplace MeterUsage recorded one pod-hour"
+                            );
+                        }
+                        MeterOutcome::AlreadyMetered => {
+                            pending.pop_front();
+                            tracing::debug!(
+                                product_code,
+                                dimension,
+                                "AWS Marketplace MeterUsage: this pod-hour was already metered"
+                            );
+                        }
+                        MeterOutcome::Failed(e) => {
+                            tracing::warn!(
+                                product_code,
+                                dimension,
+                                pending = pending.len(),
+                                error = %e,
+                                "AWS Marketplace MeterUsage failed — continuing to serve \
+                                 (entitlement was enforced at boot); will backfill this hour on a \
+                                 later tick"
+                            );
+                            break;
+                        }
+                        // MeterOutcome is #[non_exhaustive]; the per-call
+                        // metric is recorded inside meter_one_hour. Treat an
+                        // unknown future variant as handled so we don't spin.
+                        _ => {
+                            pending.pop_front();
+                        }
+                    }
+                }
+            }
+        });
+        background_handles.push(handle);
+    }
 
     let endpoint_url = opt.endpoint_url.as_deref().ok_or(
         "--endpoint-url is required when running as a server (omit only \
@@ -4868,5 +5043,43 @@ mod sigusr1_dump_tests {
             Some("1a2b3c4d5e6f7g8h9i0jEXAMPLE"),
             "product code must pass through verbatim"
         );
+    }
+
+    /// v1.2.2 `--marketplace-usage-dimension`: selects the MeterUsage
+    /// (custom metering) route. Default `None` → RegisterUsage route. The
+    /// flag `requires` `--marketplace-product-code`, so it cannot be used
+    /// alone (a dimension is meaningless without a product code).
+    #[test]
+    fn marketplace_usage_dimension_flag_parses_and_requires_product_code() {
+        use clap::Parser as _;
+        let default =
+            super::Opt::try_parse_from(["s4-server", "--endpoint-url", "http://127.0.0.1:9000"])
+                .expect("minimal Opt must parse");
+        assert!(
+            default.marketplace_usage_dimension.is_none(),
+            "default must be None (RegisterUsage route)"
+        );
+
+        let set = super::Opt::try_parse_from([
+            "s4-server",
+            "--endpoint-url",
+            "http://127.0.0.1:9000",
+            "--marketplace-product-code",
+            "1a2b3c4d5e6f7g8h9i0jEXAMPLE",
+            "--marketplace-usage-dimension",
+            "Hours",
+        ])
+        .expect("Opt with both marketplace flags must parse");
+        assert_eq!(set.marketplace_usage_dimension.as_deref(), Some("Hours"));
+
+        // The dimension alone (no product code) must be rejected.
+        super::Opt::try_parse_from([
+            "s4-server",
+            "--endpoint-url",
+            "http://127.0.0.1:9000",
+            "--marketplace-usage-dimension",
+            "Hours",
+        ])
+        .expect_err("--marketplace-usage-dimension requires --marketplace-product-code");
     }
 }

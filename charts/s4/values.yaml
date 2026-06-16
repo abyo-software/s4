@@ -61,15 +61,21 @@ marketplace:
   # Requirements (EKS):
   #   1. The pod must run on EKS / ECS / Fargate — RegisterUsage is rejected
   #      with PlatformNotSupported anywhere else (plain docker, bare EC2).
-  #   2. The pod's IAM identity needs `aws-marketplace:RegisterUsage`. On
-  #      EKS use IRSA — attach a policy like this to the pod role:
+  #   2. The pod's IAM identity needs the metering permission for the route
+  #      in use (see usageDimension below): `aws-marketplace:RegisterUsage`
+  #      for the default hourly route, or `aws-marketplace:MeterUsage` for
+  #      the custom-dimension route. On EKS use IRSA — attach a policy like
+  #      this to the pod role (grant both actions if unsure):
   #
   #        {
   #          "Version": "2012-10-17",
   #          "Statement": [
   #            {
   #              "Effect": "Allow",
-  #              "Action": ["aws-marketplace:RegisterUsage"],
+  #              "Action": [
+  #                "aws-marketplace:RegisterUsage",
+  #                "aws-marketplace:MeterUsage"
+  #              ],
   #              "Resource": "*"
   #            }
   #          ]
@@ -84,6 +90,18 @@ marketplace:
   # The product code itself is shown on the product's AWS Marketplace
   # listing page / in the fulfillment instructions after subscribing.
   productCode: ""
+  # -- AWS Marketplace custom ("externally metered") dimension API name
+  # (chart 0.3.4, s4 v1.2.2). Leave empty (default) for products that let
+  # AWS meter per-pod hours automatically (the RegisterUsage route above).
+  # Set it ONLY when your product's pricing defines a custom dimension
+  # (catalog Type `ExternallyMetered`, e.g. an `Hours` dimension you price
+  # per unit): the gateway then uses the MeterUsage API instead — a DryRun
+  # at boot confirms entitlement (fail-closed) and a background task sends
+  # one MeterUsage record per pod per hour against this dimension. The name
+  # must match the dimension's API name in the AWS Marketplace Management
+  # Portal. Requires `aws-marketplace:MeterUsage` (see IAM note above).
+  # Only honored when productCode is also set.
+  usageDimension: ""
 
 # -- Default compression codec. One of: cpu-zstd, nvcomp-zstd, nvcomp-bitcomp,
 # nvcomp-gdeflate, identity. nvcomp-* require gpu.enabled=true and a GPU build

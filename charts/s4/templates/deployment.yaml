@@ -61,6 +61,9 @@ spec:
             - --log-format={{ .Values.logFormat }}
             {{- if .Values.marketplace.productCode }}
             - --marketplace-product-code={{ .Values.marketplace.productCode }}
+            {{- if .Values.marketplace.usageDimension }}
+            - --marketplace-usage-dimension={{ .Values.marketplace.usageDimension }}
+            {{- end }}
             {{- end }}
             {{- if .Values.otlpEndpoint }}
             - --otlp-endpoint={{ .Values.otlpEndpoint }}

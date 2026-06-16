@@ -295,6 +295,20 @@ pub mod names {
     /// sample is mostly forensic: a failed registration aborts boot, so
     /// `/metrics` never comes up to be scraped in that process.
     pub const MARKETPLACE_REGISTER_USAGE_TOTAL: &str = "s4_marketplace_register_usage_total";
+    /// v1.2.2 `--marketplace-usage-dimension`: bumped per AWS Marketplace
+    /// `MeterUsage` call (the custom / "externally metered" route).
+    /// Labels: `result` —
+    /// * `"entitlement_ok"` / `"entitlement_err"` — the boot-time DryRun
+    ///   entitlement check (one per pod boot; `entitlement_err` aborts boot
+    ///   so it is mostly forensic, like the RegisterUsage `err` sample);
+    /// * `"ok"` — a real (DryRun=false) per-pod-hour record was accepted;
+    /// * `"duplicate"` — this pod-hour was already metered
+    ///   (`DuplicateRequestException`), which is benign;
+    /// * `"err"` — a real metering call failed (the loop is fail-open: the
+    ///   gateway keeps serving and retries next hour).
+    ///
+    /// Cardinality 5. Never recorded when the flag is off.
+    pub const MARKETPLACE_METER_USAGE_TOTAL: &str = "s4_marketplace_meter_usage_total";
 }
 
 /// v1.2 `--savings-ledger-state-file`: stamp the three per-bucket
@@ -327,6 +341,14 @@ pub fn record_gpu_batch(result: &'static str) {
 /// [`names::MARKETPLACE_REGISTER_USAGE_TOTAL`].
 pub fn record_marketplace_register_usage(result: &'static str) {
     metrics::counter!(names::MARKETPLACE_REGISTER_USAGE_TOTAL, "result" => result).increment(1);
+}
+
+/// v1.2.2 `--marketplace-usage-dimension`: bump the AWS Marketplace
+/// `MeterUsage` (custom metering) counter. `result` is one of
+/// `"entitlement_ok"`, `"entitlement_err"`, `"ok"`, `"duplicate"`, or
+/// `"err"` — see [`names::MARKETPLACE_METER_USAGE_TOTAL`].
+pub fn record_marketplace_meter_usage(result: &'static str) {
+    metrics::counter!(names::MARKETPLACE_METER_USAGE_TOTAL, "result" => result).increment(1);
 }
 
 /// v1.1 `--zstd-dict`: bump the lazy dictionary-fetch counter. `result`

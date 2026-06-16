@@ -26,9 +26,18 @@ type: application
 #        Minor bump because the values.yaml key set changed
 #        (chart-shape change); the default ("") rendering is
 #        byte-identical to 0.2.5.
-version: 0.3.1
+# 0.3.4: s4 v1.2.2 — additive `marketplace.usageDimension` key (default ""):
+#        wires --marketplace-usage-dimension for AWS Marketplace products
+#        with a custom ("externally metered") dimension. When set (with
+#        productCode), each pod uses the MeterUsage API (boot DryRun
+#        entitlement + per-pod hourly MeterUsage records) instead of
+#        RegisterUsage. Minor bump because the values.yaml key set changed;
+#        the default ("") rendering is byte-identical to 0.3.1 (RegisterUsage
+#        route preserved). Note: chart versions 0.3.2/0.3.3 were published to
+#        the Marketplace ECR as appVersion-only bumps (no chart-shape change).
+version: 0.3.4
 # appVersion tracks the s4-server release shipped on crates.io / ghcr.io.
-appVersion: "1.2.1"
+appVersion: "1.2.2"
 kubeVersion: ">=1.24.0-0"
 home: https://github.com/abyo-software/s4
 sources:

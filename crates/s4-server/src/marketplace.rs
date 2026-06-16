@@ -1,12 +1,45 @@
-//! v1.3: AWS Marketplace paid-container metering — `RegisterUsage` at boot.
+//! v1.3: AWS Marketplace paid-container metering.
 //!
-//! AWS Marketplace **container** products with hourly pricing must call the
-//! AWS Marketplace Metering Service `RegisterUsage` API once at container
-//! startup. The single successful call both (a) verifies the customer's
-//! entitlement to the product and (b) starts the per-pod / per-task hourly
-//! metering clock on the AWS side — no further calls are required for the
-//! lifetime of the pod (AWS measures runtime automatically after the
-//! one-shot registration).
+//! ## Two metering routes (they are mutually exclusive)
+//!
+//! AWS Marketplace **container** products meter usage one of two ways, and
+//! a product is configured for exactly one of them at listing time:
+//!
+//! 1. **`RegisterUsage` — per-pod/per-task hourly, AWS auto-meters.** Used
+//!    when the product has *no custom dimension* (the dimension would not
+//!    appear, or appears with catalog type `Metered`). One call at boot
+//!    both verifies entitlement and starts AWS's hourly metering clock; the
+//!    software makes no further metering calls. Selected by setting
+//!    `--marketplace-product-code` and leaving `--marketplace-usage-dimension`
+//!    unset. See [`register_usage`].
+//!
+//! 2. **`MeterUsage` — custom ("externally metered") dimension, the seller
+//!    meters hourly.** Used when the product's pricing defines a custom
+//!    dimension (catalog type `ExternallyMetered`). AWS does **not** meter
+//!    automatically: the software must (a) call `MeterUsage` with
+//!    `DryRun=true` at boot to confirm entitlement, and (b) send one
+//!    `MeterUsage` record per pod per hour against that dimension for the
+//!    lifetime of the pod. Selected by setting BOTH
+//!    `--marketplace-product-code` and `--marketplace-usage-dimension <NAME>`
+//!    (the dimension's API name, e.g. `Hours`). See
+//!    [`meter_usage_entitlement_check`] (boot, fail-closed) and
+//!    [`meter_one_hour`] (the hourly loop, fail-open).
+//!
+//! Picking the wrong route is silently broken: `RegisterUsage` never emits
+//! a record against an `ExternallyMetered` dimension, so AWS rejects the
+//! listing with "all metered dimensions must be registered at the metering
+//! service". Confirm the route with the dimension's `Types` in the product
+//! entity (`describe-entity` → `Dimensions[].Types`) before deploying.
+//!
+//! ## `RegisterUsage` route
+//!
+//! AWS Marketplace **container** products with per-pod hourly pricing call
+//! the AWS Marketplace Metering Service `RegisterUsage` API once at
+//! container startup. The single successful call both (a) verifies the
+//! customer's entitlement to the product and (b) starts the per-pod /
+//! per-task hourly metering clock on the AWS side — no further calls are
+//! required for the lifetime of the pod (AWS measures runtime automatically
+//! after the one-shot registration).
 //!
 //! S4 wires this behind `--marketplace-product-code <CODE>`:
 //!
@@ -74,7 +107,8 @@
 //! pre-listing baseline, not a substitute for verification.
 
 use async_trait::async_trait;
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::time::{Duration, SystemTime};
 
 /// `PublicKeyVersion` sent on every `RegisterUsage` call. AWS currently
 /// defines version 1; bump only when AWS rotates the Marketplace metering
@@ -185,6 +219,36 @@ pub enum MarketplaceError {
          the registration as valid"
     )]
     MissingSignature { product_code: String },
+    /// MeterUsage route: the boot-time DryRun entitlement check failed with
+    /// a non-retryable error (not entitled / invalid dimension / invalid
+    /// product code / region / …). Fail-closed: the gateway refuses to
+    /// start.
+    #[error(
+        "AWS Marketplace MeterUsage DryRun entitlement check failed for \
+         product code {product_code} dimension {dimension} (fatal, not \
+         retryable — refusing to start): {source}"
+    )]
+    MeterUsageFatal {
+        product_code: String,
+        dimension: String,
+        #[source]
+        source: MeterUsageCallError,
+    },
+    /// MeterUsage route: the boot-time DryRun entitlement check kept hitting
+    /// Throttling / InternalServiceError through the whole backoff budget.
+    #[error(
+        "AWS Marketplace MeterUsage DryRun entitlement check for product \
+         code {product_code} dimension {dimension} still failing after \
+         {attempts} attempts (exponential backoff exhausted — refusing to \
+         start): {source}"
+    )]
+    MeterUsageRetriesExhausted {
+        product_code: String,
+        dimension: String,
+        attempts: u32,
+        #[source]
+        source: MeterUsageCallError,
+    },
 }
 
 /// Subset of the `RegisterUsage` response the boot sequence cares about.
@@ -414,6 +478,435 @@ async fn register_usage_inner(
     }
 }
 
+// ============================================================================
+// MeterUsage route — custom ("externally metered") hourly metering
+// ============================================================================
+//
+// See the module-level "Two metering routes" section. This route is used
+// when the Marketplace product defines a custom dimension (catalog type
+// `ExternallyMetered`). Unlike RegisterUsage, AWS does not meter
+// automatically: the gateway proves entitlement once at boot (DryRun, fail-
+// closed) and then sends one record per pod per hour for the dimension.
+
+/// Classified outcome of one `MeterUsage` attempt, decoupled from the AWS
+/// SDK error types so the boot retry loop and the hourly loop (and their
+/// unit tests) can run against a mock [`MeterUsageClient`].
+///
+/// v1.3 stability: `#[non_exhaustive]` — new metering failure modes may be
+/// added in minor releases. Downstream callers must include a `_ =>` arm
+/// when matching on this enum.
+#[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
+pub enum MeterUsageCallError {
+    /// `CustomerNotEntitledException` — the AWS account running the pod has
+    /// no valid subscription. Fatal at boot, never retried. (Per AWS, this
+    /// is only thrown on the first call; a mid-run unsubscribe does not stop
+    /// an already-running pod from being metered.)
+    #[error(
+        "customer is not entitled to this AWS Marketplace product \
+         (no valid subscription for the product code): {0}"
+    )]
+    CustomerNotEntitled(String),
+    /// `DuplicateRequestException` — a record for this {dimension,
+    /// timestamp-hour} was already emitted by this resource. Benign for the
+    /// hourly loop (the hour is already metered); impossible on a DryRun.
+    #[error("AWS Marketplace MeterUsage: this pod-hour was already metered: {0}")]
+    DuplicateRequest(String),
+    /// `InvalidUsageDimensionException` — the dimension name passed does not
+    /// match any dimension defined on the product. Fatal: a wrong
+    /// `--marketplace-usage-dimension` cannot be retried away.
+    #[error(
+        "the dimension passed to --marketplace-usage-dimension does not \
+         match any UsageDimension defined on this AWS Marketplace product \
+         (check the dimension API name in the product's pricing): {0}"
+    )]
+    InvalidUsageDimension(String),
+    /// `InvalidProductCodeException` — the product code matches no published
+    /// product. Fatal.
+    #[error(
+        "the product code passed to --marketplace-product-code does not \
+         match the product code of any published AWS Marketplace product: {0}"
+    )]
+    InvalidProductCode(String),
+    /// `UnauthorizedException` — a DryRun call whose IAM identity lacks the
+    /// `aws-marketplace:MeterUsage` permission (this is the DryRun "not
+    /// permitted" signal; the permitted signal is the `DryRunOperation`
+    /// code, which the SDK client translates to `Ok`). Fatal: an unsigned /
+    /// under-privileged pod must not serve a paid product.
+    #[error(
+        "the pod's IAM identity is not authorized to call AWS Marketplace \
+         MeterUsage — grant aws-marketplace:MeterUsage via IRSA (EKS) or the \
+         task role (ECS): {0}"
+    )]
+    Unauthorized(String),
+    /// `TimestampOutOfBoundsException` — the record timestamp is outside the
+    /// accepted window (AWS accepts up to 6 h in the past). Fatal at boot; in
+    /// the hourly loop it surfaces as a failed hour (logged + retried, then
+    /// dropped once it ages past the window).
+    #[error("AWS Marketplace MeterUsage timestamp out of allowed range: {0}")]
+    TimestampOutOfBounds(String),
+    /// `ThrottlingException` — retried with exponential backoff.
+    #[error("AWS Marketplace metering throttled the MeterUsage call: {0}")]
+    Throttling(String),
+    /// `InternalServiceErrorException` — retried with exponential backoff
+    /// (the AWS docs explicitly say "Retry your request" for this one).
+    #[error("AWS Marketplace metering internal service error: {0}")]
+    InternalServiceError(String),
+    /// The call did not return within the per-call timeout (a hung
+    /// connection with no SDK-level deadline). Only produced by
+    /// [`meter_one_hour`]; the hourly loop retains the hour and backfills it
+    /// on a later tick, and the timeout keeps a stuck send from blocking the
+    /// loop past its tick interval (or delaying shutdown).
+    #[error("AWS Marketplace MeterUsage call timed out: {0}")]
+    Timeout(String),
+    /// Everything else: `InvalidEndpointRegionException`,
+    /// `InvalidTagException`, `InvalidUsageAllocationsException`,
+    /// `IdempotencyConflictException`, credential / connector / build
+    /// failures, unmodeled service errors. Fatal at boot.
+    #[error("AWS Marketplace MeterUsage failed: {0}")]
+    Other(String),
+}
+
+impl MeterUsageCallError {
+    /// `true` only for the two error classes AWS designates as retryable
+    /// (`ThrottlingException` / `InternalServiceErrorException`).
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Throttling(_) | Self::InternalServiceError(_))
+    }
+}
+
+/// `true` iff a failed `MeterUsage` call was actually a *permitted* DryRun.
+///
+/// AWS does not return a normal `Ok` for `DryRun=true`: a permitted DryRun
+/// comes back as the `DryRunOperation` error code, and an unpermitted one as
+/// `UnauthorizedException` (see the `MeterUsage` API reference, `DryRun`
+/// parameter). Neither is in the operation's modeled error set, so both
+/// arrive as the SDK `Unhandled` variant — we must inspect the error *code*
+/// to tell "DryRun succeeded" from a real failure.
+pub fn is_dry_run_success(dry_run: bool, error_code: Option<&str>) -> bool {
+    dry_run && error_code == Some("DryRunOperation")
+}
+
+/// Map an *unmodeled* `MeterUsage` error (a common error not in the
+/// operation's modeled set, surfaced by the SDK as `Unhandled`) onto our
+/// classification by its error code. `UnauthorizedException` (the DryRun
+/// "not permitted" signal) gets a clear IAM message; everything else is
+/// `Other` (fatal at boot). Pure + sync so it is directly unit-testable
+/// without constructing a sealed `Unhandled`.
+pub fn classify_meter_usage_unmodeled(code: Option<&str>, display: String) -> MeterUsageCallError {
+    match code {
+        Some("UnauthorizedException") => MeterUsageCallError::Unauthorized(display),
+        _ => MeterUsageCallError::Other(display),
+    }
+}
+
+/// Map the SDK's modeled `MeterUsageError` onto our retry-classified
+/// [`MeterUsageCallError`]. Pure + sync so the classification table is
+/// directly unit-testable with builder-constructed exception values.
+pub fn classify_meter_usage_sdk_error(
+    err: &aws_sdk_marketplacemetering::operation::meter_usage::MeterUsageError,
+) -> MeterUsageCallError {
+    use aws_sdk_marketplacemetering::error::ProvideErrorMetadata as _;
+    use aws_sdk_marketplacemetering::operation::meter_usage::MeterUsageError as E;
+    fn msg(m: Option<&str>) -> String {
+        m.unwrap_or("(no message from service)").to_owned()
+    }
+    match err {
+        E::CustomerNotEntitledException(e) => {
+            MeterUsageCallError::CustomerNotEntitled(msg(e.message()))
+        }
+        E::DuplicateRequestException(e) => MeterUsageCallError::DuplicateRequest(msg(e.message())),
+        E::InvalidUsageDimensionException(e) => {
+            MeterUsageCallError::InvalidUsageDimension(msg(e.message()))
+        }
+        E::InvalidProductCodeException(e) => {
+            MeterUsageCallError::InvalidProductCode(msg(e.message()))
+        }
+        E::TimestampOutOfBoundsException(e) => {
+            MeterUsageCallError::TimestampOutOfBounds(msg(e.message()))
+        }
+        E::ThrottlingException(e) => MeterUsageCallError::Throttling(msg(e.message())),
+        E::InternalServiceErrorException(e) => {
+            MeterUsageCallError::InternalServiceError(msg(e.message()))
+        }
+        // InvalidEndpointRegion / InvalidTag / InvalidUsageAllocations /
+        // IdempotencyConflict / Unhandled (+ any variant AWS adds —
+        // MeterUsageError is #[non_exhaustive]). The DryRun signals
+        // (UnauthorizedException, and DryRunOperation which the SDK client
+        // intercepts before classification) land here as `Unhandled`, so we
+        // dispatch on the error code.
+        other => classify_meter_usage_unmodeled(other.code(), other.to_string()),
+    }
+}
+
+/// Subset of the `MeterUsage` response the caller cares about.
+#[derive(Debug, Clone)]
+pub struct MeterUsageResponse {
+    /// The metering record id AWS assigns to an accepted (non-DryRun)
+    /// record. `None` for a DryRun (which records nothing).
+    pub metering_record_id: Option<String>,
+}
+
+/// One `MeterUsage` round-trip, abstracted so the boot fail-closed logic
+/// and the hourly fail-open loop are unit-testable with a mock (the real
+/// AWS API only works from inside an ECS task / EKS pod with
+/// `aws-marketplace:MeterUsage` IAM permission — there is no local
+/// emulator).
+#[async_trait]
+pub trait MeterUsageClient: Send + Sync {
+    async fn meter_usage(
+        &self,
+        product_code: &str,
+        dimension: &str,
+        quantity: i32,
+        timestamp: SystemTime,
+        dry_run: bool,
+    ) -> Result<MeterUsageResponse, MeterUsageCallError>;
+}
+
+#[async_trait]
+impl MeterUsageClient for SdkMeteringClient {
+    async fn meter_usage(
+        &self,
+        product_code: &str,
+        dimension: &str,
+        quantity: i32,
+        timestamp: SystemTime,
+        dry_run: bool,
+    ) -> Result<MeterUsageResponse, MeterUsageCallError> {
+        let ts = aws_sdk_marketplacemetering::primitives::DateTime::from(timestamp);
+        match self
+            .client
+            .meter_usage()
+            .product_code(product_code)
+            .timestamp(ts)
+            .usage_dimension(dimension)
+            .usage_quantity(quantity)
+            .dry_run(dry_run)
+            .send()
+            .await
+        {
+            Ok(out) => Ok(MeterUsageResponse {
+                metering_record_id: out.metering_record_id().map(str::to_owned),
+            }),
+            Err(sdk_err) => {
+                use aws_sdk_marketplacemetering::error::ProvideErrorMetadata as _;
+                let svc = sdk_err.into_service_error();
+                // A permitted DryRun is reported as the `DryRunOperation`
+                // error code, NOT a normal Ok — translate it to success so
+                // the boot entitlement check (and only it ever sets
+                // dry_run=true) sees a clean pass instead of aborting boot.
+                if is_dry_run_success(dry_run, svc.code()) {
+                    return Ok(MeterUsageResponse {
+                        metering_record_id: None,
+                    });
+                }
+                Err(classify_meter_usage_sdk_error(&svc))
+            }
+        }
+    }
+}
+
+/// Boot-time `MeterUsage` DryRun entitlement check for the custom-metering
+/// route. Mirrors [`register_usage`]'s fail-closed + retry semantics:
+/// `Err` aborts boot (a paid container that cannot prove entitlement must
+/// not serve). Bumps `s4_marketplace_meter_usage_total{result="entitlement_ok"
+/// |"entitlement_err"}` once per final outcome.
+///
+/// A permitted DryRun is signaled by AWS with the `DryRunOperation` error
+/// code, which [`SdkMeteringClient::meter_usage`] translates to `Ok` — so a
+/// clean entitlement check returns `Ok` here. `CustomerNotEntitled`,
+/// `Unauthorized` (missing `aws-marketplace:MeterUsage` IAM), invalid
+/// product code, and invalid dimension are all fatal. DryRun records
+/// nothing, so it never bills; if AWS reports a duplicate we treat it as
+/// proof of entitlement and continue.
+pub async fn meter_usage_entitlement_check(
+    client: &dyn MeterUsageClient,
+    product_code: &str,
+    dimension: &str,
+    policy: RetryPolicy,
+) -> Result<(), MarketplaceError> {
+    let outcome = meter_usage_entitlement_inner(client, product_code, dimension, policy).await;
+    let result = if outcome.is_ok() {
+        "entitlement_ok"
+    } else {
+        "entitlement_err"
+    };
+    crate::metrics::record_marketplace_meter_usage(result);
+    outcome
+}
+
+async fn meter_usage_entitlement_inner(
+    client: &dyn MeterUsageClient,
+    product_code: &str,
+    dimension: &str,
+    policy: RetryPolicy,
+) -> Result<(), MarketplaceError> {
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        // DryRun=true: validate entitlement + dimension only. Quantity 1 is
+        // a valid placeholder; nothing is billed.
+        match client
+            .meter_usage(product_code, dimension, 1, SystemTime::now(), true)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            // A duplicate on a DryRun is effectively impossible, but if it
+            // happens it still proves the customer is entitled — succeed.
+            Err(MeterUsageCallError::DuplicateRequest(_)) => return Ok(()),
+            Err(err) if err.is_retryable() => {
+                let retry_index = attempts - 1; // 0-based
+                if retry_index >= policy.max_retries {
+                    return Err(MarketplaceError::MeterUsageRetriesExhausted {
+                        product_code: product_code.to_owned(),
+                        dimension: dimension.to_owned(),
+                        attempts,
+                        source: err,
+                    });
+                }
+                let delay = policy.delay_for(retry_index);
+                tracing::warn!(
+                    product_code,
+                    dimension,
+                    attempt = attempts,
+                    max_attempts = policy.max_retries + 1,
+                    delay_ms = delay.as_millis() as u64,
+                    error = %err,
+                    "AWS Marketplace MeterUsage DryRun failed with a retryable error — backing off"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(err) => {
+                return Err(MarketplaceError::MeterUsageFatal {
+                    product_code: product_code.to_owned(),
+                    dimension: dimension.to_owned(),
+                    source: err,
+                });
+            }
+        }
+    }
+}
+
+/// Outcome of one hourly [`meter_one_hour`] send, for the caller to log.
+///
+/// v1.3 stability: `#[non_exhaustive]`.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum MeterOutcome {
+    /// A real per-pod-hour record was accepted.
+    Metered { record_id: Option<String> },
+    /// This pod-hour was already metered (`DuplicateRequestException`) —
+    /// benign, no action needed.
+    AlreadyMetered,
+    /// The call failed. The hourly loop is **fail-open**: it logs + counts
+    /// this and keeps serving (entitlement was enforced at boot), retrying
+    /// on the next hourly tick.
+    Failed(MeterUsageCallError),
+}
+
+/// Send one real (DryRun=false) `MeterUsage` record of `quantity` units for
+/// the clock hour containing `now`, against `dimension`. Records
+/// `s4_marketplace_meter_usage_total{result=...}` and returns the classified
+/// [`MeterOutcome`] for the caller to log. Never returns `Err` / never
+/// panics — a metering hiccup must never take down a paying customer's data
+/// plane.
+///
+/// The call is bounded by `timeout`: a hung connection (no SDK deadline)
+/// surfaces as [`MeterUsageCallError::Timeout`] / [`MeterOutcome::Failed`]
+/// instead of blocking the hourly loop past its tick interval (which would
+/// otherwise miss subsequent hour buckets) or stalling shutdown.
+///
+/// `now` is injected for testability (and for backfilling a past hour);
+/// production passes `SystemTime::now()` for the current hour or a retained
+/// past hour from the backlog.
+///
+/// **Billing unit:** one unit means "this pod was active during that clock
+/// hour" — whole-hour granularity, *not* prorated to the second the way
+/// `RegisterUsage` is. A pod that lives five minutes still meters one unit
+/// for that hour.
+///
+/// **Idempotency / duplicates (per the `MeterUsage` API reference):** AWS
+/// rounds the timestamp down to the hour and enforces once-per-hour metering
+/// *per ECS task / EKS pod*. Re-sending the same {dimension, hour} with the
+/// *same* quantity is idempotent — AWS returns the original `MeteringRecordId`
+/// and does not double-charge — which makes backfill retries safe. Only a
+/// *different* quantity for the same {dimension, hour} yields
+/// `DuplicateRequestException` ([`MeterOutcome::AlreadyMetered`]). Because the
+/// rule is per-pod, it does **not** dedup across pod restarts: a restarted
+/// pod is a new pod and can be metered again for the same hour (an inherent
+/// property of per-pod-hour custom metering, not something this code can
+/// prevent without external aggregation).
+pub async fn meter_one_hour(
+    client: &dyn MeterUsageClient,
+    product_code: &str,
+    dimension: &str,
+    quantity: i32,
+    now: SystemTime,
+    timeout: Duration,
+) -> MeterOutcome {
+    let call = client.meter_usage(product_code, dimension, quantity, now, false);
+    let outcome = match tokio::time::timeout(timeout, call).await {
+        Ok(Ok(resp)) => MeterOutcome::Metered {
+            record_id: resp.metering_record_id,
+        },
+        Ok(Err(MeterUsageCallError::DuplicateRequest(_))) => MeterOutcome::AlreadyMetered,
+        Ok(Err(err)) => MeterOutcome::Failed(err),
+        Err(_elapsed) => MeterOutcome::Failed(MeterUsageCallError::Timeout(format!(
+            "no response within {}s",
+            timeout.as_secs()
+        ))),
+    };
+    let result = match &outcome {
+        MeterOutcome::Metered { .. } => "ok",
+        MeterOutcome::AlreadyMetered => "duplicate",
+        MeterOutcome::Failed(_) => "err",
+    };
+    crate::metrics::record_marketplace_meter_usage(result);
+    outcome
+}
+
+/// Per-call timeout for an hourly [`meter_one_hour`] send. Far below the
+/// 1-hour tick interval so a hung connection can never delay the loop past
+/// its next tick (which would miss an hour bucket) or stall shutdown; far
+/// above any healthy round-trip so it never trips in normal operation.
+pub const METER_USAGE_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Maximum age of a pod-hour we will still try to meter. AWS rejects
+/// `MeterUsage` records "more than six hours after events occur"; we keep a
+/// 10-minute safety margin so a record never ages out between the staleness
+/// check and the `send()`.
+pub const MAX_METER_BACKLOG: Duration = Duration::from_secs(6 * 3600 - 600);
+
+/// Drop pod-hour timestamps from the front of `pending` that are older than
+/// `max_age` (AWS will reject them, so retrying is pointless). Returns how
+/// many were dropped — the caller MUST log a non-zero count: those are
+/// pod-hours that will never be billed (a sustained metering outage), and
+/// silently discarding billable usage would be a revenue bug hiding as a
+/// no-op.
+///
+/// `pending` is kept oldest-first (the hourly loop pushes `now` to the back),
+/// so this only ever pops from the front. A timestamp in the future relative
+/// to `now` (clock skew) is treated as "recent" and kept.
+pub fn drop_stale_pending(
+    pending: &mut VecDeque<SystemTime>,
+    now: SystemTime,
+    max_age: Duration,
+) -> usize {
+    let mut dropped = 0;
+    while let Some(&front) = pending.front() {
+        match now.duration_since(front) {
+            Ok(age) if age > max_age => {
+                pending.pop_front();
+                dropped += 1;
+            }
+            // Front is young enough, or is in the future (skew) — stop.
+            _ => break,
+        }
+    }
+    dropped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +961,12 @@ mod tests {
             max_retries: RetryPolicy::DEFAULT_MAX_RETRIES,
             base_delay: Duration::ZERO,
         }
+    }
+
+    /// A per-call timeout long enough that an immediately-resolving mock
+    /// never trips it (the timeout path is exercised separately).
+    fn far_timeout() -> Duration {
+        Duration::from_secs(30)
     }
 
     // ---- error classification: retryable vs fatal --------------------
@@ -670,5 +1169,423 @@ mod tests {
             .await
             .expect_err("signature presence is the minimum integrity bar");
         assert!(matches!(err, MarketplaceError::MissingSignature { .. }));
+    }
+
+    // ====================================================================
+    // MeterUsage route
+    // ====================================================================
+
+    /// Scripted MeterUsage mock: pops one result per call and records every
+    /// call's (quantity, dry_run) so tests can assert the boot DryRun vs the
+    /// hourly real-record distinction.
+    struct ScriptedMeterClient {
+        script: Mutex<Vec<Result<MeterUsageResponse, MeterUsageCallError>>>,
+        calls: Mutex<Vec<(i32, bool)>>,
+    }
+
+    impl ScriptedMeterClient {
+        fn new(script: Vec<Result<MeterUsageResponse, MeterUsageCallError>>) -> Self {
+            Self {
+                script: Mutex::new(script),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(i32, bool)> {
+            self.calls.lock().expect("calls lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl MeterUsageClient for ScriptedMeterClient {
+        async fn meter_usage(
+            &self,
+            product_code: &str,
+            dimension: &str,
+            quantity: i32,
+            _timestamp: SystemTime,
+            dry_run: bool,
+        ) -> Result<MeterUsageResponse, MeterUsageCallError> {
+            assert_eq!(product_code, "prod-test123", "product code passthrough");
+            assert_eq!(dimension, "Hours", "dimension passthrough");
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push((quantity, dry_run));
+            let mut script = self.script.lock().expect("script lock");
+            assert!(!script.is_empty(), "mock called more times than scripted");
+            script.remove(0)
+        }
+    }
+
+    fn ok_meter() -> Result<MeterUsageResponse, MeterUsageCallError> {
+        Ok(MeterUsageResponse {
+            metering_record_id: Some("rec-abc123".to_owned()),
+        })
+    }
+
+    #[test]
+    fn meter_usage_retryable_classification() {
+        assert!(MeterUsageCallError::Throttling("x".into()).is_retryable());
+        assert!(MeterUsageCallError::InternalServiceError("x".into()).is_retryable());
+        for e in [
+            MeterUsageCallError::CustomerNotEntitled("x".into()),
+            MeterUsageCallError::DuplicateRequest("x".into()),
+            MeterUsageCallError::InvalidUsageDimension("x".into()),
+            MeterUsageCallError::InvalidProductCode("x".into()),
+            MeterUsageCallError::TimestampOutOfBounds("x".into()),
+            MeterUsageCallError::Other("x".into()),
+        ] {
+            assert!(!e.is_retryable(), "{e:?} must be fatal");
+        }
+    }
+
+    /// One MeterUsage classification case (aliased to keep clippy's
+    /// `type_complexity` lint happy, mirroring `ClassifyCase` above).
+    type MeterClassifyCase = (
+        aws_sdk_marketplacemetering::operation::meter_usage::MeterUsageError,
+        fn(&MeterUsageCallError) -> bool,
+    );
+
+    #[test]
+    fn classify_meter_usage_sdk_error_maps_modeled_exceptions() {
+        use aws_sdk_marketplacemetering::operation::meter_usage::MeterUsageError as E;
+        use aws_sdk_marketplacemetering::types::error as sdk_err;
+
+        let cases: Vec<MeterClassifyCase> = vec![
+            (
+                E::CustomerNotEntitledException(
+                    sdk_err::CustomerNotEntitledException::builder()
+                        .message("no sub")
+                        .build(),
+                ),
+                |c| matches!(c, MeterUsageCallError::CustomerNotEntitled(m) if m == "no sub"),
+            ),
+            (
+                E::DuplicateRequestException(sdk_err::DuplicateRequestException::builder().build()),
+                |c| matches!(c, MeterUsageCallError::DuplicateRequest(_)),
+            ),
+            (
+                E::InvalidUsageDimensionException(
+                    sdk_err::InvalidUsageDimensionException::builder().build(),
+                ),
+                |c| matches!(c, MeterUsageCallError::InvalidUsageDimension(_)),
+            ),
+            (
+                E::InvalidProductCodeException(
+                    sdk_err::InvalidProductCodeException::builder().build(),
+                ),
+                |c| matches!(c, MeterUsageCallError::InvalidProductCode(_)),
+            ),
+            (
+                E::TimestampOutOfBoundsException(
+                    sdk_err::TimestampOutOfBoundsException::builder().build(),
+                ),
+                |c| matches!(c, MeterUsageCallError::TimestampOutOfBounds(_)),
+            ),
+            (
+                E::ThrottlingException(sdk_err::ThrottlingException::builder().build()),
+                |c| matches!(c, MeterUsageCallError::Throttling(_)),
+            ),
+            (
+                E::InternalServiceErrorException(
+                    sdk_err::InternalServiceErrorException::builder().build(),
+                ),
+                |c| matches!(c, MeterUsageCallError::InternalServiceError(_)),
+            ),
+            (
+                // Catch-all → Other (region mismatch is fatal at boot).
+                E::InvalidEndpointRegionException(
+                    sdk_err::InvalidEndpointRegionException::builder().build(),
+                ),
+                |c| matches!(c, MeterUsageCallError::Other(_)),
+            ),
+        ];
+        for (sdk, check) in cases {
+            let classified = classify_meter_usage_sdk_error(&sdk);
+            assert!(
+                check(&classified),
+                "misclassified: {sdk:?} -> {classified:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn meter_entitlement_dryrun_succeeds() {
+        let handle = crate::metrics::test_metrics_handle();
+        let client = ScriptedMeterClient::new(vec![ok_meter()]);
+        meter_usage_entitlement_check(&client, "prod-test123", "Hours", zero_delay())
+            .await
+            .expect("entitled customer must boot");
+        // Exactly one call, and it MUST be a DryRun (we never bill at boot).
+        assert_eq!(client.calls(), vec![(1, true)]);
+        assert!(
+            handle.render().contains("s4_marketplace_meter_usage_total"),
+            "meter_usage counter must be registered after the boot check"
+        );
+    }
+
+    #[tokio::test]
+    async fn meter_entitlement_dryrun_retries_then_succeeds() {
+        let client = ScriptedMeterClient::new(vec![
+            Err(MeterUsageCallError::Throttling("slow".into())),
+            Err(MeterUsageCallError::InternalServiceError("oops".into())),
+            ok_meter(),
+        ]);
+        meter_usage_entitlement_check(&client, "prod-test123", "Hours", zero_delay())
+            .await
+            .expect("recovers within the retry budget");
+        assert_eq!(client.calls().len(), 3);
+        assert!(client.calls().iter().all(|&(_, dry)| dry), "all DryRun");
+    }
+
+    #[tokio::test]
+    async fn meter_entitlement_not_entitled_refuses_boot() {
+        let client = ScriptedMeterClient::new(vec![Err(MeterUsageCallError::CustomerNotEntitled(
+            "no sub".into(),
+        ))]);
+        let err = meter_usage_entitlement_check(&client, "prod-test123", "Hours", zero_delay())
+            .await
+            .expect_err("non-entitled customer must not boot");
+        assert_eq!(client.calls().len(), 1, "fatal errors must not be retried");
+        assert!(matches!(err, MarketplaceError::MeterUsageFatal { .. }));
+        assert!(err.to_string().contains("refusing to start"));
+    }
+
+    #[tokio::test]
+    async fn meter_entitlement_invalid_dimension_refuses_boot() {
+        let client = ScriptedMeterClient::new(vec![Err(
+            MeterUsageCallError::InvalidUsageDimension("bad dim".into()),
+        )]);
+        let err = meter_usage_entitlement_check(&client, "prod-test123", "Hours", zero_delay())
+            .await
+            .expect_err("a wrong dimension name must abort boot");
+        assert!(matches!(err, MarketplaceError::MeterUsageFatal { .. }));
+        assert!(err.to_string().contains("--marketplace-usage-dimension"));
+    }
+
+    #[tokio::test]
+    async fn meter_entitlement_duplicate_is_treated_as_entitled() {
+        let client = ScriptedMeterClient::new(vec![Err(MeterUsageCallError::DuplicateRequest(
+            "already".into(),
+        ))]);
+        meter_usage_entitlement_check(&client, "prod-test123", "Hours", zero_delay())
+            .await
+            .expect("a duplicate still proves entitlement");
+    }
+
+    #[tokio::test]
+    async fn meter_entitlement_retry_budget_exhaustion_refuses_boot() {
+        let client = ScriptedMeterClient::new(vec![
+            Err(MeterUsageCallError::Throttling("1".into())),
+            Err(MeterUsageCallError::Throttling("2".into())),
+            Err(MeterUsageCallError::Throttling("3".into())),
+            Err(MeterUsageCallError::Throttling("4".into())),
+        ]);
+        let err = meter_usage_entitlement_check(&client, "prod-test123", "Hours", zero_delay())
+            .await
+            .expect_err("exhausted budget must refuse boot");
+        assert_eq!(client.calls().len(), 4);
+        match err {
+            MarketplaceError::MeterUsageRetriesExhausted {
+                dimension,
+                attempts,
+                ..
+            } => {
+                assert_eq!(dimension, "Hours");
+                assert_eq!(attempts, 4);
+            }
+            other => panic!("expected MeterUsageRetriesExhausted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn meter_one_hour_sends_one_real_record() {
+        let client = ScriptedMeterClient::new(vec![ok_meter()]);
+        let outcome = meter_one_hour(
+            &client,
+            "prod-test123",
+            "Hours",
+            1,
+            SystemTime::UNIX_EPOCH,
+            far_timeout(),
+        )
+        .await;
+        // The hourly loop sends a REAL (non-DryRun) record of quantity 1.
+        assert_eq!(client.calls(), vec![(1, false)]);
+        match outcome {
+            MeterOutcome::Metered { record_id } => {
+                assert_eq!(record_id.as_deref(), Some("rec-abc123"));
+            }
+            other => panic!("expected Metered, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn meter_one_hour_duplicate_is_already_metered() {
+        let client = ScriptedMeterClient::new(vec![Err(MeterUsageCallError::DuplicateRequest(
+            "this hour".into(),
+        ))]);
+        let outcome = meter_one_hour(
+            &client,
+            "prod-test123",
+            "Hours",
+            1,
+            SystemTime::UNIX_EPOCH,
+            far_timeout(),
+        )
+        .await;
+        assert!(matches!(outcome, MeterOutcome::AlreadyMetered));
+    }
+
+    #[tokio::test]
+    async fn meter_one_hour_failure_is_fail_open() {
+        // A transient failure must surface as Failed (the loop keeps serving)
+        // rather than panicking or returning an Err the caller must handle.
+        let client =
+            ScriptedMeterClient::new(vec![Err(MeterUsageCallError::Throttling("later".into()))]);
+        let outcome = meter_one_hour(
+            &client,
+            "prod-test123",
+            "Hours",
+            1,
+            SystemTime::UNIX_EPOCH,
+            far_timeout(),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            MeterOutcome::Failed(MeterUsageCallError::Throttling(_))
+        ));
+    }
+
+    /// A `meter_usage` that never returns must surface as `Failed(Timeout)`
+    /// (fail-open) rather than hang the hourly loop / block shutdown.
+    struct HangingMeterClient;
+
+    #[async_trait]
+    impl MeterUsageClient for HangingMeterClient {
+        async fn meter_usage(
+            &self,
+            _product_code: &str,
+            _dimension: &str,
+            _quantity: i32,
+            _timestamp: SystemTime,
+            _dry_run: bool,
+        ) -> Result<MeterUsageResponse, MeterUsageCallError> {
+            // Never readies within the test's (zero) timeout budget.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            ok_meter()
+        }
+    }
+
+    #[tokio::test]
+    async fn meter_one_hour_times_out_fail_open() {
+        // timeout = ZERO: the hung call is pending on first poll, so the
+        // timeout fires immediately (the test does not actually wait an hour).
+        let outcome = meter_one_hour(
+            &HangingMeterClient,
+            "prod-test123",
+            "Hours",
+            1,
+            SystemTime::UNIX_EPOCH,
+            Duration::ZERO,
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            MeterOutcome::Failed(MeterUsageCallError::Timeout(_))
+        ));
+    }
+
+    // ---- DryRun success sentinel + unmodeled-error classification --------
+
+    #[test]
+    fn dry_run_operation_code_is_success_only_for_dry_run() {
+        // Permitted DryRun comes back as the `DryRunOperation` error code,
+        // which must be read as success — but ONLY when we actually asked for
+        // a DryRun (a real call returning that code would be nonsense).
+        assert!(is_dry_run_success(true, Some("DryRunOperation")));
+        assert!(!is_dry_run_success(false, Some("DryRunOperation")));
+        assert!(!is_dry_run_success(true, Some("UnauthorizedException")));
+        assert!(!is_dry_run_success(
+            true,
+            Some("CustomerNotEntitledException")
+        ));
+        assert!(!is_dry_run_success(true, None));
+    }
+
+    #[test]
+    fn unmodeled_unauthorized_maps_to_fatal_iam_error() {
+        // UnauthorizedException is the DryRun "no IAM permission" signal and
+        // is NOT in the modeled MeterUsageError set — it must still classify
+        // as a clear, fatal (non-retryable) error, not a generic Other.
+        let unauthorized =
+            classify_meter_usage_unmodeled(Some("UnauthorizedException"), "denied".into());
+        assert!(matches!(unauthorized, MeterUsageCallError::Unauthorized(_)));
+        assert!(!unauthorized.is_retryable());
+        assert!(
+            unauthorized
+                .to_string()
+                .contains("aws-marketplace:MeterUsage")
+        );
+
+        // Anything else (incl. a stray DryRunOperation reaching classify on a
+        // non-DryRun path) is Other / fatal.
+        assert!(matches!(
+            classify_meter_usage_unmodeled(Some("DryRunOperation"), "x".into()),
+            MeterUsageCallError::Other(_)
+        ));
+        assert!(matches!(
+            classify_meter_usage_unmodeled(None, "x".into()),
+            MeterUsageCallError::Other(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn meter_entitlement_unauthorized_refuses_boot() {
+        let client = ScriptedMeterClient::new(vec![Err(MeterUsageCallError::Unauthorized(
+            "no perm".into(),
+        ))]);
+        let err = meter_usage_entitlement_check(&client, "prod-test123", "Hours", zero_delay())
+            .await
+            .expect_err("missing IAM permission must abort boot");
+        assert_eq!(client.calls().len(), 1, "Unauthorized is not retryable");
+        assert!(matches!(err, MarketplaceError::MeterUsageFatal { .. }));
+    }
+
+    // ---- backfill staleness window --------------------------------------
+
+    #[test]
+    fn drop_stale_pending_drops_only_too_old_front_entries() {
+        let base = SystemTime::UNIX_EPOCH;
+        let hour = Duration::from_secs(3600);
+        let mut pending: VecDeque<SystemTime> = VecDeque::new();
+        // Hours at t=0,1,2,3,4,5,6,7 relative to base.
+        for h in 0..8u32 {
+            pending.push_back(base + hour * h);
+        }
+        // "now" = t=7h. With MAX_METER_BACKLOG ~5h50m, entries at 0h and 1h
+        // (ages 7h, 6h) are stale; 2h (age 5h) is within the window.
+        let now = base + hour * 7;
+        let dropped = drop_stale_pending(&mut pending, now, MAX_METER_BACKLOG);
+        assert_eq!(dropped, 2, "the 7h-old and 6h-old hours must be dropped");
+        assert_eq!(
+            *pending.front().expect("queue not empty"),
+            base + hour * 2,
+            "oldest surviving entry is the 5h-old hour"
+        );
+        assert_eq!(pending.len(), 6);
+    }
+
+    #[test]
+    fn drop_stale_pending_keeps_future_and_recent_entries() {
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 3600);
+        let mut pending: VecDeque<SystemTime> = VecDeque::new();
+        pending.push_back(base); // exactly now
+        pending.push_back(base + Duration::from_secs(60)); // 1 min in the future (skew)
+        let dropped = drop_stale_pending(&mut pending, base, MAX_METER_BACKLOG);
+        assert_eq!(dropped, 0, "nothing recent/future may be dropped");
+        assert_eq!(pending.len(), 2);
     }
 }
