@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781374542907,
+  "lastUpdate": 1781591188266,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -14914,6 +14914,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "5131266b23e11a67dd259e0459017f3b3d918858",
+          "message": "feat(marketplace): MeterUsage custom-dimension route + cut v1.2.2\n\nThe AWS Marketplace container listing (prod-nimrbd77e4xfs) was rejected in\nreview (\"All metered dimensions must be registered at the metering\nservice\"): its pricing dimension is custom — catalog Type\n`ExternallyMetered` — which AWS does NOT auto-meter, yet the v1.2.1 binary\nonly called RegisterUsage (the auto-metered hourly route). RegisterUsage\nnever emits a record against an ExternallyMetered dimension, so the\ndimension received zero metering records.\n\nAdd the MeterUsage route behind `--marketplace-usage-dimension <NAME>`\n(used together with `--marketplace-product-code`):\n\n- boot: MeterUsage DryRun confirms entitlement, fail-closed (a non-entitled\n  pod refuses to start), with the same Throttling/InternalServiceError\n  retry/backoff as RegisterUsage;\n- runtime: a background task sends one MeterUsage record per pod per hour\n  against the dimension (first record at startup, then hourly), fail-open —\n  a transient metering error is logged + counted but never tears down the\n  serving gateway (entitlement is enforced once, at boot). AWS dedups a\n  second record for the same {dimension, hour} via DuplicateRequestException\n  (benign), guarding against double-billing on pod restarts within a clock\n  hour.\n\nThe dimension-less `--marketplace-product-code`-only path is unchanged: it\nremains the RegisterUsage per-pod hourly route where AWS meters\nautomatically. The v1.0 freeze contract holds — with neither flag set, no\nmetering code runs (bit-for-bit identical boot).\n\n- s4_server::marketplace: mockable MeterUsageClient trait,\n  classify_meter_usage_sdk_error, MeterUsageCallError (#[non_exhaustive]),\n  meter_usage_entitlement_check (boot), meter_one_hour + MeterOutcome\n  (hourly), MarketplaceError MeterUsage variants; +12 unit tests\n- metrics: s4_marketplace_meter_usage_total{result=\n  entitlement_ok|entitlement_err|ok|duplicate|err}\n- Helm chart 0.3.4: marketplace.usageDimension + MeterUsage IAM docs\n- cut v1.2.2 (workspace version); s4fs unchanged (its s4-codec floor\n  >=1.2.0 already permits 1.2.x)\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-16T15:18:24+09:00",
+          "tree_id": "d72c83f39d13cfa59215e6377f523bde0a627e2d",
+          "url": "https://github.com/abyo-software/s4/commit/5131266b23e11a67dd259e0459017f3b3d918858"
+        },
+        "date": 1781591187451,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 47370,
+            "range": "± 2999",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 56964,
+            "range": "± 2819",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 424,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2239986,
+            "range": "± 70916",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50621781,
+            "range": "± 106468",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201722,
+            "range": "± 460",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 50346977,
+            "range": "± 1455877",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 924184587,
+            "range": "± 4219561",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3224872,
+            "range": "± 62834",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 27286,
+            "range": "± 1891",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 32776,
+            "range": "± 1065",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 419,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 577640,
+            "range": "± 3425",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1645644,
+            "range": "± 23262",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201678,
+            "range": "± 1426",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12426848,
+            "range": "± 621106",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 28817776,
+            "range": "± 195806",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3222488,
+            "range": "± 61223",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1441676,
+            "range": "± 33981",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2093722,
+            "range": "± 78626",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 311652327,
+            "range": "± 6296581",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 136,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 8755,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 929,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 14445,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 3070,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 23882,
+            "range": "± 52",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 95350,
+            "range": "± 430",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 597,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4862,
+            "range": "± 66",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19261,
+            "range": "± 66",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
             "range": "± 0",
             "unit": "ns/iter"
           }
