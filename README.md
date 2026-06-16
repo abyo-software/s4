@@ -63,6 +63,11 @@ break-even maths.
 
 ---
 
+> ☁️ **Available on AWS Marketplace** — run S4 with AWS-billed hourly pricing, no app changes:
+> **[Container · EKS / ECS / Fargate](https://aws.amazon.com/marketplace/pp/prodview-kwpxxoeciis7e)** ·
+> **[GPU AMI · EC2 (g4dn / g5 / g6 / g6e)](https://aws.amazon.com/marketplace/pp/prodview-yvesl7lunql6i)**
+> &nbsp;—&nbsp; more tools from us → **[abyo software on AWS Marketplace](https://aws.amazon.com/marketplace/seller-profile?id=seller-65lhisp4ppavm)**
+
 ## What is S4?
 
 S4 (**Squished S3**) is an S3-compatible storage gateway written in Rust that
@@ -331,10 +336,23 @@ nvCOMP), inline or cert-manager TLS, and bucket-policy ConfigMap. See
 [.github/workflows/docker.yml](.github/workflows/docker.yml) for the image
 build / publish pipeline.
 
-### AWS Marketplace (paid container)
+### AWS Marketplace (paid, AWS-billed hourly)
 
-For teams that want to run S4 with AWS-billed hourly pricing, S4 can ship
-as a paid AWS Marketplace container product. **The Marketplace image and
+S4 is on AWS Marketplace as two listings, both billed hourly on your
+regular AWS invoice with no application code changes:
+
+- **[S4 — Transparent S3 Compression Gateway (Container)](https://aws.amazon.com/marketplace/pp/prodview-kwpxxoeciis7e)**
+  — runs on **EKS / ECS / Fargate** from the published image + Helm chart,
+  metered **per pod-hour**.
+- **[S4 — GPU S3 Compression Gateway (EC2 AMI)](https://aws.amazon.com/marketplace/pp/prodview-yvesl7lunql6i)**
+  — a self-contained Amazon Linux 2023 AMI (NVIDIA drivers + S4
+  pre-installed), metered **per instance-hour** on **g4dn / g5 / g6 / g6e**.
+  Launch it, point your S3 clients at the instance, done.
+
+For our other AWS-native cost / security tools, see
+**[More from abyo software](#more-from-abyo-software)** below.
+
+For teams running the **container** listing, **the Marketplace image and
 the free ghcr.io image are the same binary** — the only difference is that
 the Marketplace deployment passes `--marketplace-product-code <CODE>` (via
 the chart's `marketplace.productCode` value), which makes each pod
@@ -2127,6 +2145,25 @@ needed bytes from S3.
 - **Roadmap is driven by audit findings + continuous fuzz** rather than
   feature checklists; file issues at
   https://github.com/abyo-software/s4/issues to influence it.
+
+## More from abyo software
+
+S4 is one of a family of AWS-native cost-optimization and security tools we
+build in Rust, all on AWS Marketplace under one seller account. Browse the
+full catalog at
+**[abyo software on AWS Marketplace](https://aws.amazon.com/marketplace/seller-profile?id=seller-65lhisp4ppavm)**.
+
+| Product | What it does |
+|---|---|
+| **S4 — Squished S3** | This project: transparent GPU/CPU S3 compression gateway. → [Container](https://aws.amazon.com/marketplace/pp/prodview-kwpxxoeciis7e) · [GPU AMI](https://aws.amazon.com/marketplace/pp/prodview-yvesl7lunql6i) |
+| **S4 Logs** | CloudWatch Logs → S3 archiver that cuts log-storage cost. |
+| **S4 LogForge** | Realistic SIEM test-log generator — parser-verified output across 13 formats for PoCs, detection engineering, and load testing. |
+| **S4 Scan** | Amazon Athena scan-cost reducer. |
+| **S4 NAT** | Cost-optimized NAT for Amazon VPC. |
+| **S4 MockAPI** | Security API simulator for testing and demos. |
+
+Same engineering bar as S4: rigorous testing, continuous fuzzing, and a
+no-lock-in design.
 
 ## Contributing
 
