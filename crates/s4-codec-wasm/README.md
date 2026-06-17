@@ -9,7 +9,7 @@ This crate is the WASM-target sibling of `s4-codec` and shares the same
 
 ## Status
 
-- v1.0 — frozen public API (see [main README §Stability](../../README.md#stability--v10-guarantees)
+- v1.0 — frozen public API (see [the stability contract](../../docs/stability.md)
   for the cross-crate v1.0 contract).
 - API: `decompressFramed`, `decompressSingle`, `supportedCodecs`,
   `supportedFrameMagic`. These four names are the v1.0 contract for this

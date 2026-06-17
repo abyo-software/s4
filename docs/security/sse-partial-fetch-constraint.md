@@ -196,7 +196,7 @@ every Range GET reads the full object back. Same mitigation list.
   [`threat-model.md`](threat-model.md) §2 (compressed payload at
   rest).
 - Range GET fast-path entry:
-  [README §"Streaming I/O" → "Encryption-aware Range GET fast-path"](../../README.md#streaming-io).
+  [`features.md` §"Server-side encryption — Range GET fast-path matrix"](../features.md).
 - AES-GCM construction:
   [NIST SP 800-38D](https://csrc.nist.gov/publications/detail/sp/800-38d/final)
   (the AEAD contract — see §7.2 for the "any modification to the
