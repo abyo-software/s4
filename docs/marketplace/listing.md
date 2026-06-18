@@ -1,10 +1,23 @@
 # AWS Marketplace listing — source of truth
 
-Status: **container product draft blocked on seller public profile**
-(StartChangeSet/CreateProduct returns AccessDeniedException until
-Marketplace registration + public profile are completed in the
-Management Portal). Everything below is ready to submit via the
-Catalog API once that completes.
+Status (verified 2026-06-19 via Marketplace Catalog API, seller account
+393886308285) — the earlier "draft blocked on seller public profile /
+AccessDeniedException" state is **resolved**; both products now exist as
+catalog entities:
+
+- **GPU AMI** — `prod-l5my73chs43y6` ("S4 - Squished S3: GPU S3 Compression
+  Gateway (EC2 AMI)"): **Public / live** →
+  https://aws.amazon.com/marketplace/pp/prodview-yvesl7lunql6i
+- **Container** — `prod-nimrbd77e4xfs` ("S4 - Squished S3: Transparent S3
+  Compression Gateway"): **Limited visibility / live via direct URL**
+  (subscribable at
+  https://aws.amazon.com/marketplace/pp/prodview-kwpxxoeciis7e — not yet in
+  public catalog search). The change set to broaden it,
+  `fzadtfuuq65wav865rp2g9us`, has been in `PREPARING` since 2026-06-16; poll
+  with `aws --profile as marketplace-catalog describe-change-set --catalog
+  AWSMarketplace --change-set-id fzadtfuuq65wav865rp2g9us`.
+- **Cleanup**: a stale duplicate container draft `prod-xhip4gvojbuuy`
+  (Visibility: Draft) should be removed.
 
 All claims below are grep-verified against the README / code at the
 commit that last touched this file. Do not add numbers that are not
