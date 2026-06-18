@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781609415660,
+  "lastUpdate": 1781796857557,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -15575,6 +15575,232 @@ window.BENCHMARK_DATA = {
             "name": "decode_index/4096f",
             "value": 19236,
             "range": "± 140",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "6471b2f6254a237287808d9cf84b328ef285d50d",
+          "message": "docs(readme): restructure into Marketplace-funnel landing page + split detail into docs/\n\nSlim README.md 2,235 → 237 lines: hero → AWS Marketplace CTA (container/CPU\nthe default, GPU AMI for integer-columnar at high throughput) → CPU-first cost\ntable → honest proof → when-NOT-to-use → estimate/try → deploy → operate →\ndocs index. Move ~1,900 lines of reference detail into 18 docs/ files plus a\ndocs/README.md index.\n\n- Reframe copy to avoid replacement-positioning of named AWS services (S3 is\n  the backend S4 sits in front of), per Marketplace listing rules.\n- Add honesty caveats (155× is a single-pass codec ceiling, storage-bytes-only,\n  HEAD Content-Length, Marketplace fail-closed); correct bolero count 5 → 7.\n- Dedup the backend-compat matrix; fix two external links into moved anchors.\n- Re-translate README.ja.md (was frozen at v0.2.0) to the new structure.\n\nConverged over 4 Codex review rounds + link/anchor verification (0 broken\nacross 30 markdown files).\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-18T02:18:01+09:00",
+          "tree_id": "bcdd6a5c0742c5e68bc36c6c52f2d0fcd2399926",
+          "url": "https://github.com/abyo-software/s4/commit/6471b2f6254a237287808d9cf84b328ef285d50d"
+        },
+        "date": 1781796856456,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 49810,
+            "range": "± 1650",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 56954,
+            "range": "± 939",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 428,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2234012,
+            "range": "± 52309",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50580139,
+            "range": "± 176725",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201581,
+            "range": "± 322",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 49493837,
+            "range": "± 796063",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 922591208,
+            "range": "± 2513462",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3223960,
+            "range": "± 19575",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 27633,
+            "range": "± 1551",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 32891,
+            "range": "± 1338",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 420,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 597021,
+            "range": "± 2710",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1651384,
+            "range": "± 5435",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201428,
+            "range": "± 3540",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 13131619,
+            "range": "± 1222880",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 29244600,
+            "range": "± 156469",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3267979,
+            "range": "± 33266",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1465610,
+            "range": "± 31375",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2131515,
+            "range": "± 41175",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 331920330,
+            "range": "± 5982408",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 147,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 8743,
+            "range": "± 49",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 918,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 14222,
+            "range": "± 77",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 3070,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 23865,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 95286,
+            "range": "± 466",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 596,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4956,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19965,
+            "range": "± 273",
             "unit": "ns/iter"
           },
           {
