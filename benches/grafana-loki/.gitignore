@@ -1,0 +1,2 @@
+# runtime-generated Loki config (loki_bench.py writes this per run)
+loki-config/

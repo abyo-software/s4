@@ -1,0 +1,46 @@
+--logical-etag negative capture (2026-06-19, local MinIO)
+==========================================================
+
+Question: is S4's `--logical-etag` flag *required* for Grafana Loki, the way it
+is for OpenSearch's repository-s3 (which rejects every blob without it)?
+
+Setup
+-----
+- S4 gateway on :8013, NO --logical-etag:
+    s4 --endpoint-url=http://localhost:9000 --port=8013 \
+       --codec=cpu-zstd --dispatcher=always --zstd-level=3
+- Loki 3.3.2 chunk store pointed at this gateway (bucket loki-noetag).
+
+1. What ETag does S4 return WITHOUT the flag?
+---------------------------------------------
+PUT a known payload through the no-flag gateway, compare ETags:
+
+  MD5(original payload)               = c931dce475c85482fca3a7264342aff2
+  PUT-response ETag via no-flag S4    = "7894df867507da30a4020bd5e036cadd"
+  HEAD ETag on MinIO backend (stored) = "7894df867507da30a4020bd5e036cadd"
+  HEAD ETag via no-flag S4            = (none)
+
+=> Without the flag, S4's PUT returns the *compressed-object* ETag (= the
+   backend's ETag of the stored zstd bytes), which is NOT MD5 of the original
+   payload; HEAD returns no ETag. A client that validates the PUT-response ETag
+   against its own payload MD5 therefore sees a mismatch.
+
+2. Does Loki actually reject uploads without the flag?
+------------------------------------------------------
+Ingested 200,000 lines into Loki pointed at the no-flag gateway, flushed:
+
+  RESULT: objects-in-loki-noetag = 42   bytes = 18,630,261
+
+=> NO. Loki 3.3.2's default S3 client uploaded all chunks successfully through
+   the no-flag gateway — the ETag mismatch did NOT cause a rejection. (S4 also
+   decompresses on GET independent of the flag, so reads return the original
+   chunk bytes regardless.)
+
+Conclusion
+----------
+`--logical-etag` is NOT strictly required for Loki 3.3.2 — unlike OpenSearch's
+repository-s3, Loki's S3 client does not reject the ETag mismatch. It is still
+RECOMMENDED so S4 presents the correct logical ETag to any client or tool that
+DOES validate it (OpenSearch, integrity checkers, some SDK configurations). The
+documented Loki benchmark used the flag for that reason, but the storage and
+read-latency results do not depend on it.
