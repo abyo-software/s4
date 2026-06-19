@@ -1,0 +1,46 @@
+--logical-etag negative capture — Kafka tiered storage (2026-06-19, local MinIO)
+================================================================================
+
+Question: does S4's `--logical-etag` flag have to be set for Apache Kafka
+tiered storage (Aiven tiered-storage plugin, AWS SDK v2), the way it MUST be set
+for OpenSearch's repository-s3 (which rejects every blob without it)?
+
+Setup
+-----
+- S4 gateway on :8013, NO --logical-etag:
+    s4 --endpoint-url=http://localhost:9000 --port=8013 \
+       --codec=cpu-zstd --dispatcher=always --zstd-level=3
+- Kafka 3.9.1 broker, Aiven plugin RSM pointed at this gateway (bucket
+  kafka-noetag). Produced 200,000 records (compression.type=none) to a tiered
+  topic, waited for the rolled segments to tier.
+
+Test (a): plugin default — aws.checksum.check.enabled = false
+-------------------------------------------------------------
+  tiered to kafka-noetag: 12,663,081 bytes, 24 objects
+  Copied segments: 6   Copy errors: 0
+
+  => Tiering SUCCEEDS without --logical-etag.
+
+Test (b): aws.checksum.check.enabled = true (still no --logical-etag)
+--------------------------------------------------------------------
+  tiered to kafka-noetag: 12,656,083 bytes, 24 objects
+  Copied segments: 6   Copy errors: 0
+  (produce was slower — 99 MB/s vs 124 MB/s — confirming the SDK checksum path
+   was active, but it did not cause a rejection.)
+
+  => Tiering STILL SUCCEEDS without --logical-etag, even with the SDK checksum
+     check enabled.
+
+Conclusion
+----------
+`--logical-etag` is NOT required for Apache Kafka tiered storage with the Aiven
+plugin — in either checksum mode. Unlike OpenSearch's repository-s3, the Aiven
+plugin's S3 client does not validate the PUT-response ETag against the payload
+MD5, so S4's compressed-object ETag (returned without the flag) is not rejected.
+S4 also echoes the SDK's CRC32 checksums correctly, so aws.checksum.check.enabled
+passes too.
+
+The flag remains RECOMMENDED so S4 presents the correct logical ETag to any other
+client or tool that reads the same bucket and DOES validate it. The documented
+benchmark used --logical-etag on the S4 endpoint for that reason; the storage and
+read-latency results do not depend on it.

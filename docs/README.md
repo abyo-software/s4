@@ -7,6 +7,7 @@ Product overview, pitch, and quick start live in the top-level
 - [use-cases/elasticsearch-frozen-tier.md](use-cases/elasticsearch-frozen-tier.md) — S4 as an Elasticsearch frozen-tier backend: measured storage and snapshot throughput across standard / `best_compression` / LogsDB and zstd levels, plus cold frozen-search latency (at zstd-3)
 - [use-cases/opensearch-searchable-snapshots.md](use-cases/opensearch-searchable-snapshots.md) — S4 as an OpenSearch searchable-snapshot backend: −16–28% across `default` / `best_compression` / `zstd` / `zstd_no_dict` index codecs; requires `--logical-etag`
 - [use-cases/grafana-loki-chunks.md](use-cases/grafana-loki-chunks.md) — S4 in front of Grafana Loki chunk storage: −18.4% on the immutable snappy backlog, with an honest split vs Loki-native `zstd` (−38% for new chunks) and a measured ~1.7 ms read overhead per chunk fetch
+- [use-cases/kafka-tiered-storage.md](use-cases/kafka-tiered-storage.md) — S4 in front of Kafka tiered storage (KIP-405): −74.7% on uncompressed (`none`) tiered segments / ~20% over snappy/lz4 / ~0% over producer-`zstd`, with an honest split vs producer-side compression; no consistent cold-fetch penalty; works without `--logical-etag`
 
 ## Getting started
 - [install.md](install.md) — cargo / pip / WASM / build from source / supported targets

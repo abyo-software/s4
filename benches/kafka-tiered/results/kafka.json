@@ -1,0 +1,95 @@
+{
+  "meta": {
+    "date": "2026-06-19",
+    "host": "AMD Ryzen 9 9950X (16C/32T), Linux",
+    "kafka": "apache/kafka:3.9.1 (KRaft single-node, KIP-405 tiered storage)",
+    "plugin": "Aiven tiered-storage-for-apache-kafka v1.1.1 (S3 backend; plugin compression+encryption OFF)",
+    "object_store": "minio/minio:latest (local)",
+    "s4": "v1.2.2, --codec cpu-zstd --dispatcher always --zstd-level 3 --logical-etag",
+    "records_per_topic": 600000,
+    "segment_bytes": 8388608,
+    "stored_bytes": "tiered S3 bytes per topic prefix (rolled segments only; active local segment excluded \u2014 same for every config). Includes S4 sidecars for the s4 endpoint.",
+    "not_exercised": "multi-broker replication; plugin-level compression. The --logical-etag negative is captured in logical_etag_negative.txt (not required for Kafka, either checksum mode).",
+    "remote_fetch_ms": "single cold consume per config (broker restarted -> empty chunk cache; rolled segments local-deleted so served from S3). consumer-perf-test fetch.time.ms. Single-sample and noisy; the transferable signal is only that there is no consistent S4 penalty, not the exact ms."
+  },
+  "storage": [
+    {
+      "compression": "none",
+      "direct_bytes": 166194208,
+      "direct_objs": 60,
+      "s4_bytes": 42041198,
+      "s4_objs": 80,
+      "saving_pct": 74.7
+    },
+    {
+      "compression": "snappy",
+      "direct_bytes": 74177570,
+      "direct_objs": 27,
+      "s4_bytes": 57434929,
+      "s4_objs": 36,
+      "saving_pct": 22.57
+    },
+    {
+      "compression": "lz4",
+      "direct_bytes": 70505502,
+      "direct_objs": 27,
+      "s4_bytes": 55985625,
+      "s4_objs": 35,
+      "saving_pct": 20.59
+    },
+    {
+      "compression": "zstd",
+      "direct_bytes": 43946411,
+      "direct_objs": 18,
+      "s4_bytes": 43947294,
+      "s4_objs": 23,
+      "saving_pct": -0.0
+    }
+  ],
+  "latency": [
+    {
+      "compression": "none",
+      "direct_count": 600000,
+      "s4_count": 600000,
+      "direct_fetch_ms": 1233.0,
+      "s4_fetch_ms": 1350.0
+    },
+    {
+      "compression": "snappy",
+      "direct_count": 600000,
+      "s4_count": 600000,
+      "direct_fetch_ms": 961.0,
+      "s4_fetch_ms": 905.0
+    },
+    {
+      "compression": "lz4",
+      "direct_count": 600000,
+      "s4_count": 600000,
+      "direct_fetch_ms": 571.0,
+      "s4_fetch_ms": 628.0
+    },
+    {
+      "compression": "zstd",
+      "direct_count": 600000,
+      "s4_count": 600000,
+      "direct_fetch_ms": 538.0,
+      "s4_fetch_ms": 527.0
+    }
+  ],
+  "fairness_check": {
+    "note": "roll-point-independent check: one tiered `none` segment GET back through S4 (logical) vs its stored compressed size \u2014 confirms the none-row saving is the per-segment zstd ratio, not a counting artifact.",
+    "topic": "tnone",
+    "endpoint": "s4",
+    "key": "tnone-QpVRqfYeQwuCfJN4PibXyg/0/00000000000000000000-FjR6xDaHRGuwMxcpB9n9hQ.log",
+    "stored_compressed_bytes": 2123576,
+    "logical_bytes_via_s4": 8384517,
+    "per_segment_saving_pct": 74.67
+  },
+  "local_log_counts_after_tiering": {
+    "note": "local .log files per topic after tiering+local-retention (before the cold-fetch restart). 1 = only the active segment remains local, so consume-from-earliest reads rolled segments from S3.",
+    "tnone": 1,
+    "tsnappy": 1,
+    "tlz4": 1,
+    "tzstd": 1
+  }
+}
