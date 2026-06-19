@@ -43,7 +43,7 @@ aws-events = ["dep:aws-sdk-sns", "dep:aws-sdk-sqs"]
 # and re-encodes their column chunks to zstd, keeping the output natively
 # readable (pyarrow / Spark / Trino / DuckDB). Off by default — pulls the Arrow
 # tree, like aws-kms keeps the KMS tree out of the default build.
-parquet-recompact = ["dep:parquet", "dep:arrow"]
+parquet-recompact = ["dep:parquet", "dep:arrow", "dep:tempfile"]
 
 [[bin]]
 name = "s4"
@@ -122,9 +122,11 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 aws-sdk-sns = { version = "1", optional = true }
 aws-sdk-sqs = { version = "1", optional = true }
 # Parquet-aware recompaction (`parquet-recompact` feature). Optional so the
-# default build / WASM / GPU paths don't pull the Arrow tree.
+# default build / WASM / GPU paths don't pull the Arrow tree. `tempfile` spools
+# the rewritten Parquet to disk so the output never sits in RAM.
 parquet = { workspace = true, optional = true }
 arrow = { workspace = true, optional = true }
+tempfile = { version = "3", optional = true }
 # v1.3: AWS Marketplace paid-container metering (`RegisterUsage`). NOT
 # feature-gated, unlike aws-sdk-kms / sns / sqs: the Marketplace listing
 # and the free ghcr.io image must be the *same binary* (the only delta is

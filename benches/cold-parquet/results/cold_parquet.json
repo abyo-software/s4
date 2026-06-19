@@ -1,0 +1,61 @@
+{
+  "meta": {
+    "date": "2026-06-19",
+    "host": "AMD Ryzen 9 9950X (16C/32T), Linux",
+    "s4": "v1.2.2, parquet-recompact feature, --target-zstd-level 3",
+    "object_store": "minio/minio:latest (local)",
+    "dataset": "2000000-row ECS-style logs, 13 columns (seed 42)",
+    "tool": "s4 parquet-recompact (Arrow re-encode -> native zstd Parquet)",
+    "verification": "pyarrow: recompacted object read natively + table.equals(original) value-for-value; output codec asserted ZSTD"
+  },
+  "matrix": [
+    {
+      "input_codec": "none",
+      "input_bytes": 167411611,
+      "output_bytes": 80925279,
+      "saving_pct": 51.66,
+      "data_equal": true,
+      "output_codec": [
+        "ZSTD"
+      ],
+      "recompact_s": 2.86,
+      "cli_ok": true
+    },
+    {
+      "input_codec": "snappy",
+      "input_bytes": 127619286,
+      "output_bytes": 80925279,
+      "saving_pct": 36.59,
+      "data_equal": true,
+      "output_codec": [
+        "ZSTD"
+      ],
+      "recompact_s": 3.14,
+      "cli_ok": true
+    },
+    {
+      "input_codec": "gzip",
+      "input_bytes": 84082585,
+      "output_bytes": 80925279,
+      "saving_pct": 3.76,
+      "data_equal": true,
+      "output_codec": [
+        "ZSTD"
+      ],
+      "recompact_s": 2.76,
+      "cli_ok": true
+    },
+    {
+      "input_codec": "zstd",
+      "input_bytes": 79365462,
+      "output_bytes": 79365462,
+      "saving_pct": 0.0,
+      "data_equal": true,
+      "output_codec": [
+        "ZSTD"
+      ],
+      "recompact_s": 0.04,
+      "cli_ok": true
+    }
+  ]
+}

@@ -101,3 +101,26 @@ envelopes are v0.11+ roadmap candidates, not promised features.
 - v1.2: a `transition` rule in an `s4 maintain` policy automates the
   same change from the S4 side, with the sidecar guaranteed to
   accompany its main object — see [`s4 maintain`](ops/maintenance.md).
+
+### Parquet recompaction (offline, off-by-default feature)
+- `s4 parquet-recompact <bucket>/<prefix>` reads cold Parquet objects and
+  re-encodes their column chunks to **zstd**, writing back a **native** Parquet
+  (pyarrow / Spark / Trino / DuckDB read it directly — **no S4 in the read
+  path**). It is an offline rewrite (like `s4 recompact`), not the transparent
+  gateway.
+- **Build-time feature**, off by default (keeps the Arrow tree out of the default
+  build, the same shape as `--features aws-kms`): build with
+  `cargo install s4-server --features parquet-recompact`.
+- **Safety**: dry-run by default; `--execute` additionally requires
+  `--allow-lossy-physical-rewrite`. Each object is value-verified (per row group,
+  bounded memory, Parquet physical-schema-tree compared) **before** the in-place
+  overwrite — structural drift is a conservative skip, a decoded-value mismatch is
+  a hard failure (downgradable with `--tolerate-value-mismatch`), a corrupt footer
+  is a hard failure; it never overwrites with unverified data. Already-zstd
+  objects are detected from the footer and skipped (idempotent). Objects under
+  SSE / Object-Lock / `Expires` / archive tier / sort-order / bloom-filter
+  metadata are skipped, not silently rewritten. The PUT is conditional
+  (`If-Match` + pre-PUT re-HEAD of ETag / Last-Modified / version-id); run on
+  cold/quiescent prefixes (`--older-than`).
+- Measured −36.6% over snappy / −51.7% over uncompressed in a local benchmark —
+  see the [cold-Parquet use case](use-cases/cold-parquet.md).
