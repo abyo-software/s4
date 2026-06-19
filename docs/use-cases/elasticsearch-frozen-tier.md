@@ -37,7 +37,7 @@ repository:
 
 | Metric | Result |
 |---|---|
-| **Repository storage saved** (S4 zstd-3, the default PUT codec) | **−27%** on standard, **−15%** on `best_compression`, **−22%** on LogsDB |
+| **Repository storage saved** (S4 zstd-3, the default PUT codec) | **−15–27%**: −27% on the default codec (its max), −15% on `best_compression`, −22% on LogsDB (so −15–22% once you've already tuned the codec/mode) |
 | **Snapshot throughput** | S4 sustains 186–241 MB/s per shard stream at zstd-3 — **6× above** Elasticsearch's default 40 MB/s snapshot throttle, so **no added wall-clock** in normal operation |
 | **Restore throughput** | S4 decode sustains ~780–870 MB/s unthrottled; at ES's default 40 MB/s recovery throttle S4 is invisible (41.0 vs 41.8 MB/s direct) |
 | **Frozen search latency** (count / agg / full-text, cold cache) | **2–4 ms, S4 within ±1 ms of direct** (often equal or faster) |
@@ -46,9 +46,20 @@ repository:
 | **Compounding** | LogsDB **+** S4 zstd-9 = **510.6 MB** vs a plain standard-default repo at **1440.8 MB** → **2.82× smaller** total footprint |
 
 **Bottom line:** S4 at its default `zstd-3` cuts a frozen-tier repository by
-15–27% for free on the write path, with no measurable hit to the analytics
-queries that dominate frozen workloads. Push the cold repository to zstd-19
-with `s4 recompact` for the maximum ratio without ever slowing a snapshot.
+15–27% for free on the write path, with no measurable hit to the *analytics*
+queries that dominate frozen workloads. The **−27%** figure is the
+*zero-migration upside* for the (very common) clusters still on the default
+codec — you keep your existing index settings and just point the repository at
+S4. If you have already tuned to `best_compression` or LogsDB, S4 still adds
+−15–22% on top. Push the cold repository to zstd-19 with `s4 recompact` for the
+maximum ratio without ever slowing a snapshot.
+
+> **Scope.** This is **one** S4 use case. The general thread is broader — S4 is
+> a *range-GET-safe transparent compression gateway* for any S3 client (the
+> searchable-snapshot range-GET surface is just a demanding instance of it), and
+> [S4 Query](../benchmarks.md) pushes predicate/aggregation work down to the
+> gateway. The frozen tier is a clean, end-to-end-measurable proof point, not
+> the whole story.
 
 ---
 
@@ -182,14 +193,43 @@ If you are choosing between "switch to LogsDB" and "add S4," the honest answer
 is **do both**: LogsDB shrinks what Elasticsearch writes, S4 shrinks what S3
 stores, and the savings stack.
 
-> **Dollar intuition** — storage bytes only. S4 also writes one small
-> `.s4index` sidecar per blob (a few extra backend requests, negligible bytes);
-> client-visible egress is unchanged (GET returns the original bytes); and the
-> S4 host is a separate line item not modeled here. At S3 Standard
-> `$0.023/GB-month`, a **50 TB** frozen repository at −22%
-> (LogsDB + S4 zstd-3) saves ~**11 TB → ≈ $250/month ≈ $3,000/year**; the −27%
-> standard-default case saves ~**13.5 TB → ≈ $310/month**. Plug your real
-> footprint into [`s4 estimate`](../savings.md).
+### Break-even (does S4 pay for its own host?)
+
+S4 saves storage but runs as a separate host — a line item the byte counts
+above don't include. The break-even footprint, with the host cost made explicit
+and parameterised, is:
+
+```
+break_even_TB = (host_$/month × instances) / (saved_ratio × $23/TB-month)
+```
+
+where `saved_ratio` is the **measured** repository saving from Result 1 (not a
+codec micro-benchmark) and `$23/TB-month` is S3 Standard (`$0.023/GB-month`,
+us-east-1). At an illustrative **$70/month per S4 host** the break-even sizes
+are (model: [`benches/.../breakeven.py`](../../benches/elasticsearch-frozen/breakeven.py),
+raw: [`results/breakeven.json`](../../benches/elasticsearch-frozen/results/breakeven.json)):
+
+| Codec / mode | saved_ratio | break-even, 1 instance | break-even, **HA (2 instances)** |
+|---|---:|---:|---:|
+| standard-default (zstd-3) | 27.0% | ~11 TB | **~23 TB** |
+| LogsDB (zstd-3) | 22.2% | ~14 TB | ~27 TB |
+| `best_compression` (zstd-3) | 14.8% | ~21 TB | ~41 TB |
+| standard-default after `recompact` → zstd-19 | 33.2% | ~9 TB | ~18 TB |
+
+So: **for a standard-default frozen tier, any repository larger than ~23 TB is
+net-positive even with two HA gateway instances** (~11 TB with a single
+instance). Net savings at scale, HA (2 instances), $70/host:
+
+| Footprint | standard-default | LogsDB | `best_compression` |
+|---|---:|---:|---:|
+| 500 TB | ≈ **+$2,965/mo** (≈ $35.6k/yr) | ≈ +$2,413/mo | ≈ +$1,562/mo |
+| 1 PB | ≈ **+$6,070/mo** (≈ $72.8k/yr) | ≈ +$4,966/mo | ≈ +$3,264/mo |
+
+> Storage bytes only. S4 also writes one small `.s4index` sidecar per blob (no
+> *extra* backend round-trip per cold query — see Result 4 / B2 — and negligible
+> bytes); client-visible egress is unchanged (GET returns the original bytes).
+> Re-run `breakeven.py --s4-host-usd-month <your $> --instances <n>` with your
+> real host price, or plug your footprint into [`s4 estimate`](../savings.md).
 
 ---
 
@@ -258,6 +298,30 @@ by `recompact` before it writes).
 > but you will be trading snapshot wall-clock for a few percent of ratio that
 > `recompact` gets you for free off the critical path.
 
+### ⚠️ Run `recompact` in a quiet window — never concurrently with the repo
+
+`recompact` rewrites repository blobs **in place** (same key). It re-checks the
+source object's ETag with a HEAD immediately before each overwrite PUT, **but S3
+has no compare-and-swap**, so a writer that lands in the HEAD→PUT window is
+*silently overwritten*. Elasticsearch mutates the same repository objects during
+a snapshot finalize and during `POST _snapshot/<repo>/_cleanup`. Therefore:
+
+- **Do not run `s4 recompact` while an ES snapshot or `_cleanup` is in flight on
+  the same repository.** A collision can lose an ES write or have `recompact`
+  overwrite an object ES just changed — corrupting the repository.
+- **`--older-than` is a mitigation, not a guarantee.** It narrows which blobs
+  `recompact` touches by age, but it does *not* serialize against a concurrent
+  snapshot, and ES rewrites repository metadata (`index-N`) on every snapshot
+  regardless of blob age. The TOCTOU window is real and silent.
+- **Recommended:** schedule `recompact` inside an **exclusive quiet window** —
+  pause ILM rollovers into the repo, confirm no snapshot or `_cleanup` is
+  running, then recompact backend-direct. (S4 documents this hazard itself; see
+  [`results/recompact-concurrency.json`](../../benches/elasticsearch-frozen/results/recompact-concurrency.json),
+  which is `documented-not-tested` precisely because there is no safe way to make
+  a concurrent run safe on plain S3.) `recompact` also resets per-object ACLs and
+  Object Lock retention/legal-hold to bucket defaults on each rewrite, so don't
+  recompact a repository that relies on those.
+
 ---
 
 ## Result 3 — Throughput
@@ -296,6 +360,15 @@ Each query was run against the mounted frozen index with the shared cache
 **cleared first**, so every block is fetched cold from the repository through
 S4. Median of 6 cold runs (server-side `took`, ms); warm = cache populated:
 
+> **Read the absolute milliseconds with care.** These were measured against a
+> **co-located MinIO with effectively zero network RTT**, so the absolute values
+> (2–4 ms for analytics; 1.7–7.2 s for the cold top-N fetch) are a property of
+> *this host*, not of any real S3 deployment with tens of milliseconds of
+> round-trip. The **transferable** metric is S4's **relative** overhead — the
+> last column below — which is what a real deployment inherits. The
+> RTT-injection table further down shows how that relative overhead behaves as
+> the backend leg gets slower.
+
 | Query | Index | Direct cold | S4 zstd-3 cold | Direct warm | S4 warm |
 |---|---|---:|---:|---:|---:|
 | count, rare term (`status:500`) | standard | 3.0 | 2.0 | 1.5 | 1.0 |
@@ -325,6 +398,78 @@ The takeaway: S4's read-path overhead is small and lands precisely where the
 frozen tier is *already* slow and rarely-hit (cold raw-document fetches), not
 on the cheap analytics queries you actually run against frozen data.
 
+### How that overhead behaves under real backend RTT
+
+Because the numbers above are no-RTT, we re-ran the cold queries with a one-way
+delay injected on the S4↔backend path (toxiproxy, 0 / 5 / 20 / 50 ms one-way),
+direct and S4 zstd-3 both eating the same RTT, cache cleared each time. Relative
+overhead, standard-default index (raw:
+[`results/rtt-injection.json`](../../benches/elasticsearch-frozen/results/rtt-injection.json)):
+
+| Query | 0 ms | 5 ms | 20 ms | 50 ms |
+|---|---:|---:|---:|---:|
+| analytics (count / agg / full-text) | ±0–1 ms | ±0–1 ms | ±0–1 ms | ±0–1 ms |
+| **top-20 + sort** (relative S4 overhead) | +7.1% | +9.2% | +32.9% | +69.8% |
+
+Two honest, opposite results:
+
+- **The analytics queries stay flat** — they are answered without re-fetching
+  from the repository, so injected RTT barely touches them and S4 stays within
+  ±1 ms at *every* latency. This is the RTT-invariant, transferable win.
+- **The cold top-N+sort overhead *grows* with RTT** — and this is a real caveat,
+  not noise. That query issues several backend GETs, some of them
+  *sidecar-partial* (S4 consults the `.s4index` to fetch only the covering
+  compressed range), and each extra round-trip costs a full RTT. So on a real,
+  high-latency S3 the heavy raw-document fetch pays *more* than the local
+  +6.5–9.5% — budget for it if your frozen workload is dominated by cold
+  `sort + fetch top-N` rather than analytics.
+
+> **Does the sidecar add cold-path requests?** We counted backend GET ops per
+> cold query (S4 vs a no-sidecar passthrough baseline:
+> [`results/sidecar-overhead.json`](../../benches/elasticsearch-frozen/results/sidecar-overhead.json)).
+> On this workload S4 issues the **same** number of backend GETs as the baseline
+> and **no separate `.s4index`-keyed GET** per query — it folds the index into
+> each data GET to fetch a smaller covering range (`path="sidecar-partial"`),
+> rather than adding a round-trip. The analytics queries issue 0 backend GETs
+> (ES answers them without a repo fetch); warm queries issue 0 in either arm.
+> The RTT sensitivity above comes from the *number* of those GETs on the heavy
+> fetch, not from an extra sidecar request.
+
+---
+
+## Availability & HA
+
+S4 is a **read-path hard dependency** for cold frozen search: a query that
+misses the shared cache must range-GET its blocks *through* S4 to decompress
+them, so **a single S4 gateway is a single point of failure** for cold frozen
+queries (warm queries already in the shared cache are unaffected; so is anything
+not currently reading from the repository). Be honest about that and design for
+it — don't run one gateway in front of a frozen tier you care about.
+
+The fix is straightforward because **S4 instances are stateless**: the
+`.s4index` sidecars live in the object store next to the blobs, not on the
+gateway, so any instance can serve any request. Run **two or more S4 instances**
+behind **multi-value DNS or a load balancer** and ES will fail over to a
+survivor transparently.
+
+We smoke-tested exactly this (B4 below: 2 stateless S4 instances behind an nginx
+round-robin upstream; raw:
+[`results/ha-failover.json`](../../benches/elasticsearch-frozen/results/ha-failover.json)).
+Registering the repository through the LB and then **killing one instance**, all
+of the following still worked through the survivor:
+
+| Check after killing one of two instances | Result |
+|---|---|
+| Cold frozen query (must hit the survivor) | ✅ succeeded (79,925 hits) |
+| Warm frozen query (served from the shared cache) | ✅ unaffected (3 ms) |
+| Snapshot PUT issued while one instance is down | ✅ completed |
+
+One LB caveat worth stating: AWS SigV4 signs the `Host` header, so the load
+balancer must **preserve the client Host** (`proxy_set_header Host $http_host`
+in nginx) — rewriting it to the upstream name returns `403
+SignatureDoesNotMatch`. (S4 still re-signs to the backend with its own
+credentials.)
+
 ---
 
 ## Compatibility — what was exercised
@@ -341,6 +486,7 @@ interaction in Result 2):
 | Searchable-snapshot **frozen mount** (`storage: shared_cache`) | ✅ |
 | Cold frozen search (on-demand range-GET via `.s4index` sidecar) | ✅ |
 | Snapshot still valid **after `s4 recompact`** (in-place rewrite) | ✅ restored 4,000,000 docs |
+| **HA failover** — repo registered through an LB over 2 stateless instances, one killed | ✅ cold + warm query + snapshot PUT survive (see [Availability & HA](#availability--ha)) |
 
 This matches S4's [compatibility matrix](../compatibility.md): full-spec Range
 GET, multipart, HEAD and conditional requests are exactly the `repository-s3`
@@ -363,14 +509,32 @@ surface.
 - **`best_compression` indices** — S4 still saves ~15%, but you are partly
   double-compressing; measure with [`s4 estimate`](../savings.md) first.
 - **Cold workloads dominated by raw-document retrieval / sorting** — the frozen
-  tier is already slow there and S4 adds single-digit-percent on top.
+  tier is already slow there, S4 adds single-digit-percent locally, and that
+  relative overhead **grows with backend RTT** (see Result 4's RTT table). If
+  your frozen access pattern is mostly cold `sort + fetch top-N` rather than
+  analytics, weigh that.
 - **Glacier / Deep Archive snapshot repositories** — Glacier already prices low
   enough that compression rarely pays for the compute; see
   [storage-class transitions](../storage-class-transitions.md) and keep the
-  `.s4index` sidecar in the same class as its blob.
+  `.s4index` sidecar in the same class as its blob. This is also where **Elastic
+  Deepfreeze** (which rotates frozen snapshots down into Glacier-class storage)
+  is the better tool — for *truly* cold data you rarely search, Glacier-class
+  pricing beats keeping bytes in Standard and compressing them. The two are
+  **complementary layers, not alternatives**: Deepfreeze wins for archive-cold
+  data; **S4's sweet spot is the "warmish-frozen" data you keep in Standard
+  because it still gets search traffic**, where Glacier's retrieval latency/cost
+  would hurt but a 15–27% Standard saving is real money. Use Deepfreeze to push
+  the genuinely-cold tail to Glacier and S4 to shrink what stays in Standard.
 - **Hot/warm tiers** — those are latency-critical; S4's frozen sweet spot is
   the cold path. (S4 never makes hot reads *wrong*, just adds decode latency
   you don't want on a hot path.)
+
+> **LogsDB shelf-life.** The LogsDB column here reflects Elasticsearch as of
+> 9.4.2; LogsDB's density (synthetic `_source`, sorted columns) is still
+> evolving release to release, so re-measure with `s4 estimate` on your own ES
+> version rather than treating the −22% as a fixed constant — the *relative*
+> ordering (LogsDB already dense, S4 adds less than on default-codec) is the
+> durable takeaway, the exact percentage is not.
 
 ---
 
@@ -384,11 +548,16 @@ s4 --endpoint-url https://s3.<region>.amazonaws.com \
    --codec cpu-zstd --zstd-level 3 --dispatcher always
 ```
 
-**Elasticsearch** — point the `repository-s3` client at S4 instead of S3.
-Endpoints live in `elasticsearch.yml`; credentials in the keystore:
+For anything you care about, run **two or more of these** behind multi-value DNS
+or a load balancer — S4 is a read-path hard dependency for cold frozen search,
+and instances are stateless (sidecars live in S3), so this removes the SPOF with
+no extra coordination. See [Availability & HA](#availability--ha).
+
+**Elasticsearch** — point the `repository-s3` client at S4 (or its LB) instead
+of S3. Endpoints live in `elasticsearch.yml`; credentials in the keystore:
 
 ```yaml
-# elasticsearch.yml
+# elasticsearch.yml — point at one S4 instance, or the HA load balancer's address
 s3.client.frozen.endpoint: s4.internal:8014
 s3.client.frozen.protocol: http          # or https if S4 terminates TLS
 s3.client.frozen.path_style_access: true
@@ -436,11 +605,22 @@ exact steps used for the numbers on this page:
 7. **Phase D** — `s4 recompact` the zstd-3 repo to zstd-19 and re-verify the
    restore.
 
-All measurements: AMD Ryzen 9 9950X, ES 9.4.2, MinIO RELEASE.2025-09-07, S4
-v1.2.2, local (no network RTT), 2026-06-18. Storage figures are **bytes stored
-on the backend**; dollar figures are estimates at public S3 Standard pricing.
-S4 adds a small per-blob `.s4index` sidecar (minor extra request count,
-negligible bytes) and runs as a separate host — neither is modeled here.
+The 2026-06-19 revision adds four non-destructive phases (raw JSON + a one-page
+[`results/REVISION-NOTES.md`](../../benches/elasticsearch-frozen/results/REVISION-NOTES.md)):
+**B1** cold latency under injected backend RTT (`phase_b1_rtt.{py,sh}`), **B2**
+`.s4index` sidecar cold-path backend-op count (`phase_b2_sidecar.py`), **B3** the
+parameterised break-even model (`breakeven.py`), **B4** an HA failover smoke test
+with 2 stateless instances behind an LB (`phase_b4_ha.sh`), and **B5** the
+`documented-not-tested` recompact-concurrency note.
+
+Storage / snapshot / restore / latency numbers above are the **2026-06-18**
+baseline run: AMD Ryzen 9 9950X, ES 9.4.2, MinIO RELEASE.2025-09-07, S4 v1.2.2,
+local (no network RTT). Storage figures are **bytes stored on the backend**;
+dollar figures are estimates at public S3 Standard pricing — the break-even
+model's host price is an explicit `--s4-host-usd-month` parameter, not a billed
+measurement. S4 adds a small per-blob `.s4index` sidecar (negligible bytes, and
+*no* extra cold-path backend round-trip per query — B2) and runs as a separate
+host (modeled in the break-even section, not in the raw byte counts).
 
 ---
 
