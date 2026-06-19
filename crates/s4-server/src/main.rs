@@ -970,6 +970,13 @@ enum Cmd {
     /// recompacted or skipped; exit 1 when any object failed.
     Recompact(RecompactArgs),
 
+    /// Parquet-aware recompaction: re-encode cold Parquet objects' columns to
+    /// zstd in place, keeping the output a native Parquet readable by
+    /// pyarrow / Spark / Trino / DuckDB (no S4 in the read path). Dry-run
+    /// unless `--execute`. Requires the `parquet-recompact` build feature.
+    #[cfg(feature = "parquet-recompact")]
+    ParquetRecompact(ParquetRecompactArgs),
+
     /// v1.2: run a declarative maintenance policy — a TOML file of
     /// `[[rule]]` entries (`action = "migrate" | "recompact" |
     /// "transition"`, each with the matching CLI flags as keys plus a
@@ -1285,6 +1292,34 @@ struct RecompactArgs {
     /// Output format.
     #[clap(long, value_enum, default_value = "table")]
     format: RecompactFormat,
+}
+
+/// `s4 parquet-recompact` — re-encode cold Parquet objects' columns to zstd.
+#[cfg(feature = "parquet-recompact")]
+#[derive(Debug, Args)]
+struct ParquetRecompactArgs {
+    /// `<bucket>` or `<bucket>/<prefix>` to scan on the backend.
+    target: String,
+
+    /// Actually write the re-encoded Parquet back (default: dry-run / report only).
+    #[clap(long, default_value_t = false)]
+    execute: bool,
+
+    /// zstd level for the re-encoded column chunks (1–22).
+    #[clap(long, default_value_t = 3)]
+    target_zstd_level: i32,
+
+    /// Skip an object unless the re-encode shrinks it by at least this percent.
+    #[clap(long, default_value_t = 3.0)]
+    min_gain_percent: f64,
+
+    /// Only consider keys ending with this suffix.
+    #[clap(long, default_value = ".parquet")]
+    suffix: String,
+
+    /// Stop after re-encoding this many objects.
+    #[clap(long)]
+    max_objects: Option<usize>,
 }
 
 /// v1.2: `s4 maintain` output format.
@@ -3176,6 +3211,8 @@ async fn run_subcommand(
         Cmd::Savings(args) => run_savings_cmd(args),
         Cmd::Migrate(args) => run_migrate_cmd(opt, args).await,
         Cmd::Recompact(args) => run_recompact_cmd(opt, args).await,
+        #[cfg(feature = "parquet-recompact")]
+        Cmd::ParquetRecompact(args) => run_parquet_recompact_cmd(opt, args).await,
         Cmd::Maintain(args) => run_maintain_cmd(opt, args).await,
         Cmd::TrainDict(args) => run_train_dict_cmd(opt, args).await,
         Cmd::DictStatus(args) => run_dict_status_cmd(args).await,
@@ -3470,6 +3507,63 @@ async fn run_recompact_cmd(
     // Exit contract: all-recompacted / all-skipped = 0, any hard failure = 1.
     if report.failed > 0 {
         return Err(format!("{} object(s) failed to recompact", report.failed).into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "parquet-recompact")]
+async fn run_parquet_recompact_cmd(
+    opt: &Opt,
+    args: &ParquetRecompactArgs,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    if opt.sse_s4_key.is_some() || !opt.sse_s4_key_rotated.is_empty() || opt.kms_local_dir.is_some()
+    {
+        return Err("parquet-recompact does not support SSE-enabled deployments".into());
+    }
+    let (bucket, prefix) = s4_server::estimate::parse_bucket_prefix(&args.target)
+        .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.to_string().into() })?;
+    let client = build_sidecar_client(opt).await?;
+    let params = s4_server::parquet_recompact::ParquetRecompactParams {
+        execute: args.execute,
+        target_zstd_level: args.target_zstd_level,
+        min_gain_percent: args.min_gain_percent,
+        suffix: args.suffix.clone(),
+        max_objects: args.max_objects,
+    };
+    let r = s4_server::parquet_recompact::run_parquet_recompact(
+        &client,
+        &bucket,
+        prefix.as_deref(),
+        &params,
+    )
+    .await?;
+    let mode = if args.execute { "EXECUTE" } else { "DRY-RUN" };
+    let pct = if r.bytes_before > 0 {
+        (r.bytes_before as f64 - r.bytes_after as f64) / r.bytes_before as f64 * 100.0
+    } else {
+        0.0
+    };
+    println!(
+        "[{mode}] parquet-recompact s3://{bucket}{}\n  scanned={} recompacted={} \
+         (before={:.1}MB after={:.1}MB saved={:.1}%)\n  skipped: not-parquet={} low-gain={} \
+         already={} wrong-suffix={}  failed={}",
+        prefix
+            .as_deref()
+            .map(|p| format!("/{p}"))
+            .unwrap_or_default(),
+        r.scanned,
+        r.recompacted,
+        r.bytes_before as f64 / 1e6,
+        r.bytes_after as f64 / 1e6,
+        pct,
+        r.skipped_not_parquet,
+        r.skipped_low_gain,
+        r.skipped_already,
+        r.skipped_suffix,
+        r.failed,
+    );
+    if r.failed > 0 {
+        return Err(format!("{} object(s) failed to recompact", r.failed).into());
     }
     Ok(())
 }

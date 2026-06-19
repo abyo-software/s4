@@ -21,6 +21,8 @@ pub mod migrate;
 pub mod multipart_state;
 pub mod notifications;
 pub mod object_lock;
+#[cfg(feature = "parquet-recompact")]
+pub mod parquet_recompact;
 pub mod policy;
 pub mod rate_limit;
 pub mod recompact;
