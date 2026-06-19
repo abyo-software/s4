@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781854398678,
+  "lastUpdate": 1781854582574,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -16501,6 +16501,234 @@ window.BENCHMARK_DATA = {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 31,
             "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "masumi.ryugo@gmail.com",
+            "name": "masumi-ryugo",
+            "username": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "dd84888b5247bdc00a058677980eae23d803147d",
+          "message": "fix(server): --logical-etag + echo original-payload checksums (OpenSearch repo-s3 compat) (#132)\n\n* fix(server): --logical-etag + echo original-payload checksums (OpenSearch repo-s3 compat)\n\nOn a compressed PUT, S4 returned the backend's checksum/ETag of the\nCOMPRESSED bytes, so AWS SDK v2 clients that validate upload integrity\nagainst the ORIGINAL payload rejected every blob (\"Data read has a\ndifferent checksum than expected\"). This blocked OpenSearch's\n`repository-s3` snapshot repository entirely; Elasticsearch's older\npath was unaffected.\n\n- Always echo the client's verified original-payload checksum\n  (crc32 / crc32c / sha1 / sha256 / crc64nvme) on the compressed PUT\n  response instead of leaking the compressed object's checksum.\n  Passthrough objects are left untouched (their backend checksum is\n  already correct).\n- Add opt-in `--logical-etag`: compute MD5 of the original payload and\n  present it as the ETag on the PUT response + HEAD + GET, stamped as\n  `s4-logical-etag` metadata. Default-off keeps ETag behaviour\n  bit-for-bit unchanged. Captured on every compress branch (dict /\n  gpu-batch / streaming-framed / buffered); the ETag swap happens after\n  the sidecar binding + version entry record the backend ETag, so\n  GET-side staleness detection is unaffected.\n\nVerified end-to-end against OpenSearch 2.19: repo `_verify`, snapshot\n(SUCCESS, was PARTIAL), searchable-snapshot mount + cold search all\npass through S4. Tests: logical-etag on (PUT/HEAD/GET = MD5(original)),\ndefault-off contract (no stamp, no ETag), existing roundtrip. 623 lib\ntests + clippy -D warnings green.\n\nKnown limitation: ETag-based conditional requests (If-Match /\nIf-None-Match) are not yet translated under `--logical-etag` — they are\nevaluated by the backend against the compressed-object ETag. Documented\nin the flag help (conditional-on-compressed was unsupported pre-flag\ntoo, since HEAD returned no ETag).\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n* feat(server): evaluate ETag conditionals against the logical ETag (--logical-etag)\n\nAddresses the conditional-request gap in the previous commit. Under\n`--logical-etag`, S4 now owns `If-Match` / `If-None-Match` evaluation on\nGET and HEAD instead of forwarding them to the backend (which would\ncompare the client's logical ETag against the compressed-object ETag and\nfail incorrectly):\n\n- Strip the preconditions before forwarding; evaluate them locally\n  against the object's logical ETag (or the backend ETag for passthrough\n  / non-S4 objects, so those are unaffected). If-Match miss -> 412,\n  If-None-Match hit -> 304.\n- RFC 9110 §13.2.2 precedence: a present ETag condition supersedes the\n  paired date condition (If-Match > If-Unmodified-Since; If-None-Match >\n  If-Modified-Since), so the superseded date header is stripped too.\n- The sidecar partial-range fast path is bypassed when a precondition is\n  present, so range+conditional GETs fall through to the full path that\n  evaluates the precondition before slicing.\n\nRemaining limitation (documented in the flag help): write-path ETag\npreconditions (If-Match on PUT / CopyObject) still go to the backend.\n\nTests: `evaluate_etag_preconditions` unit test (If-Match/If-None-Match/`*`\nmatch + miss + precedence), `logical_etag_if_match_uses_logical_etag` e2e\n(correct logical ETag matches, wrong -> 412). 624 lib + e2e +\nclippy -D warnings green.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n* fix(server): emit 304 via NotModified error code (s3s ignores Response.status on GET/HEAD)\n\nCodex review caught that s3s' generated GET/HEAD serializer does not copy\n`S3Response.status` (it only infers 206 from Content-Range), so setting\n`status = 304` on an If-None-Match hit silently returned 200. Emit the 304\nthrough the `NotModified` error code instead (the error serializer maps it\nto HTTP 304, no body). e2e now asserts the If-None-Match hit returns HTTP\n304 (raw_response status), not a 200-with-body.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n* fix(server): only fall back to backend ETag for non-S4 objects in conditional eval\n\nCodex review: a framed/passthrough S4 object hides its compressed-bytes ETag\nfrom clients (GET/HEAD return the logical ETag or None), so evaluating an\nIf-Match/If-None-Match against the backend ETag for an unstamped framed object\nwould use a validator the client never saw. Restrict the backend-ETag fallback\nto non-S4 objects (no manifest); framed/passthrough objects without a logical\nstamp evaluate with no current ETag.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n* fix(server): preserve s4-logical-etag across REPLACE-directive CopyObject\n\nCodex review: a REPLACE CopyObject re-stamps client metadata while preserving\nthe S4 manifest fields, but did not carry over `s4-logical-etag`. Since a copy\nis byte-identical (MD5(original) unchanged), the stamp stays valid — add it to\nthe preserved-keys allowlist so the destination still reports the logical ETag\non HEAD/GET. New e2e `logical_etag_survives_copy_object_replace` locks it in.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: masumi-ryugo <abyo.software@gmail.com>\nCo-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-19T16:28:30+09:00",
+          "tree_id": "7ffa959d2ef672a0671c5686b8c5f40e7cbc40f7",
+          "url": "https://github.com/abyo-software/s4/commit/dd84888b5247bdc00a058677980eae23d803147d"
+        },
+        "date": 1781854582125,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 47941,
+            "range": "± 1572",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 55960,
+            "range": "± 5884",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 425,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2215584,
+            "range": "± 17787",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50552571,
+            "range": "± 290232",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201771,
+            "range": "± 3024",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 49199768,
+            "range": "± 1331663",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 921617026,
+            "range": "± 5456407",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3238919,
+            "range": "± 17366",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 27845,
+            "range": "± 1047",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 32595,
+            "range": "± 2187",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 418,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 580305,
+            "range": "± 13168",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1645803,
+            "range": "± 22056",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201660,
+            "range": "± 6723",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12546275,
+            "range": "± 103723",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 28844330,
+            "range": "± 173493",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3228068,
+            "range": "± 7493",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1434734,
+            "range": "± 27135",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2096711,
+            "range": "± 17543",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 324061331,
+            "range": "± 7919109",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 136,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 8285,
+            "range": "± 95",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 913,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 14051,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 3071,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 23874,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 95338,
+            "range": "± 1905",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 600,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4812,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19143,
+            "range": "± 50",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
+            "range": "± 1",
             "unit": "ns/iter"
           }
         ]
