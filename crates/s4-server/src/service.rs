@@ -5311,6 +5311,7 @@ impl<B: S3> S3 for S4Service<B> {
         if !needs_frame_parse && manifest_opt.is_none() {
             // S4 が書いていないオブジェクトは透過 (raw bucket pre-existing object 等)
             debug!("S4 get_object: object lacks s4-codec metadata, returning as-is");
+            strip_reserved_client_metadata(&mut resp.output.metadata);
             return Ok(resp);
         }
 
@@ -5410,6 +5411,7 @@ impl<B: S3> S3 for S4Service<B> {
                         elapsed.as_secs_f64(),
                         true,
                     );
+                    strip_reserved_client_metadata(&mut resp.output.metadata);
                     return Ok(resp);
                 }
                 let plain = match crate::sse::peek_magic(&body) {
@@ -5551,6 +5553,7 @@ impl<B: S3> S3 for S4Service<B> {
                     setup_latency_ms = elapsed.as_millis() as u64,
                     "S4 get started (streaming)"
                 );
+                strip_reserved_client_metadata(&mut resp.output.metadata);
                 return Ok(resp);
             }
             // Passthrough: そのまま流す (Range なしの場合のみ streaming)
@@ -5568,6 +5571,7 @@ impl<B: S3> S3 for S4Service<B> {
                 resp.output.e_tag = None;
                 resp.output.body = Some(blob);
                 debug!("S4 get_object: passthrough streaming");
+                strip_reserved_client_metadata(&mut resp.output.metadata);
                 return Ok(resp);
             }
 
@@ -5681,6 +5685,11 @@ impl<B: S3> S3 for S4Service<B> {
                 status.as_aws_str().to_owned(),
             ));
         }
+        // Client-transparency: strip S4's reserved `s4-*` control metadata (see
+        // head_object) — every internal key has been consumed by here; the body
+        // returned is the original/decrypted content, so the client must see only
+        // its own user metadata.
+        strip_reserved_client_metadata(&mut resp.output.metadata);
         Ok(resp)
     }
 
@@ -5852,6 +5861,14 @@ impl<B: S3> S3 for S4Service<B> {
                 }
             }
         }
+        // Client-transparency: strip S4's reserved `s4-*` control metadata from
+        // the response. By here every key S4 surfaces to the client has already
+        // been translated into a real response field (Content-Length from
+        // `s4-original-size`, the SSE indicators from `s4-sse-*`, the ETag from
+        // `s4-logical-etag`), so the client must not also see the raw `s4-*`
+        // user-metadata keys — they break metadata round-trip/copy and leak
+        // codec internals. Symmetric with the inbound `strip_reserved_client_metadata`.
+        strip_reserved_client_metadata(&mut resp.output.metadata);
         Ok(resp)
     }
     async fn delete_object(

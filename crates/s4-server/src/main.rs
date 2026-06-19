@@ -441,21 +441,23 @@ struct Opt {
     #[clap(long, value_name = "N", default_value_t = 1024)]
     max_concurrent_connections: usize,
 
-    /// Present the object's ETag (PUT response + HEAD + GET) as the MD5 of
-    /// the **original** payload instead of the backend's MD5 of the
-    /// compressed bytes. Off by default — **ETag behaviour is unchanged
-    /// when off** (a compressed object's HEAD already returns no ETag).
-    /// Enable it for AWS SDK v2 clients that validate upload integrity
-    /// against `MD5(body)` — notably OpenSearch's `repository-s3` snapshot
-    /// repository, which otherwise rejects every blob with `Data read has a
-    /// different checksum than expected`. Costs one MD5 pass over each PUT
-    /// body. GET/HEAD ETag conditionals (`If-Match` / `If-None-Match`,
-    /// incl. RFC 9110 §13.2.2 date-precedence) are evaluated by S4 against
-    /// the logical ETag. **Limitation:** write-path ETag preconditions
-    /// (an `If-Match` on PUT / CopyObject) are still evaluated by the
-    /// backend against the compressed-object ETag — avoid those under
-    /// `--logical-etag`.
-    #[clap(long)]
+    /// **Client-transparent ETag is now the DEFAULT.** S4 presents the object's
+    /// ETag (PUT response + HEAD + GET) as the MD5 of the **original** payload —
+    /// what an S3 client expects (`ETag == MD5(body)`), e.g. AWS SDK v2 upload
+    /// integrity and OpenSearch `repository-s3`. GET/HEAD ETag conditionals
+    /// (`If-Match` / `If-None-Match`, incl. RFC 9110 §13.2.2 date-precedence) are
+    /// evaluated by S4 against the logical ETag. Costs one MD5 pass per PUT.
+    /// Use `--physical-passthrough` to opt out (present the backend's
+    /// compressed-object ETag instead). NOTE write-path ETag preconditions
+    /// (`If-Match` on PUT / CopyObject) are tracked separately on the road to
+    /// full S3 compatibility.
+    #[clap(long = "physical-passthrough")]
+    physical_passthrough: bool,
+
+    /// Deprecated no-op: client-transparent ETag is now the default (see
+    /// `--physical-passthrough` to opt out). Kept so existing `--logical-etag`
+    /// invocations keep working.
+    #[clap(long, hide = true)]
     logical_etag: bool,
 
     /// v0.8.5 #84 (audit H-6): max HTTP/1 header buffer size in
@@ -2322,7 +2324,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // was the `with_max_body_bytes` library builder, which doesn't
     // help an operator running `s4-server` from the CLI.
     s4 = s4.with_max_body_bytes(opt.max_body_bytes);
-    s4 = s4.with_logical_etag(opt.logical_etag);
+    // Client-transparent ETag is the default; `--physical-passthrough` opts out.
+    // The deprecated `--logical-etag` flag is a no-op now (already the default).
+    let _ = opt.logical_etag;
+    s4 = s4.with_logical_etag(!opt.physical_passthrough);
     info!(
         max_body_bytes = opt.max_body_bytes,
         "S4 max-body-bytes cap (v0.8.19 D-1: now CLI-tunable; default 5 GiB = AWS S3 single-PUT max)"
