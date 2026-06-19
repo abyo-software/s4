@@ -189,7 +189,7 @@ rely on it not shifting under you. Full freeze contract: **[docs/stability.md](d
 | Area | Docs |
 |---|---|
 | Get started | [install](docs/install.md) · [GPU](docs/gpu.md) · [deploy (Helm)](docs/deployment.md) · [configuration](docs/configuration.md) |
-| Use cases | [Elasticsearch frozen tier](docs/use-cases/elasticsearch-frozen-tier.md) — measured storage & snapshot throughput across LogsDB + zstd levels; frozen-search latency at zstd-3 |
+| Use cases | [Elasticsearch frozen tier](docs/use-cases/elasticsearch-frozen-tier.md) — storage/throughput/frozen-search across LogsDB + zstd levels · [OpenSearch searchable snapshots](docs/use-cases/opensearch-searchable-snapshots.md) — −16–28% across index codecs (needs `--logical-etag`) |
 | Cost & operations | [savings & estimate](docs/savings.md) · [maintenance](docs/ops/maintenance.md) · [dictionaries](docs/ops/dictionaries.md) · [repair & durability](docs/ops/repair.md) · [runbook](docs/ops/runbook.md) · [observability](docs/observability.md) · [storage-class transitions](docs/storage-class-transitions.md) |
 | Reference | [compatibility matrices](docs/compatibility.md) · [architecture](docs/architecture.md) · [on-the-wire format](docs/wire-format.md) · [production features](docs/features.md) |
 | Proof & trust | [benchmarks](docs/benchmarks.md) · [testing & validation](docs/testing.md) · [stability contract](docs/stability.md) · [project status](docs/status.md) · [threat model](docs/security/threat-model.md) · [security overview](docs/security/overview.md) |
