@@ -436,6 +436,10 @@ pub struct S4Service<B: S3> {
     registry: Arc<CodecRegistry>,
     dispatcher: Arc<dyn CodecDispatcher>,
     max_body_bytes: usize,
+    /// When set, the object's ETag is presented as the MD5 of the
+    /// original payload rather than the backend's MD5 of the compressed
+    /// bytes (opt-in; see `--logical-etag`). Off by default.
+    logical_etag: bool,
     policy: Option<crate::policy::SharedPolicy>,
     /// v0.3 #13: surfaced as the `aws:SecureTransport` Condition key. Set
     /// to `true` when the listener is wrapped in TLS (or ACME), so policies
@@ -752,6 +756,7 @@ impl<B: S3> S4Service<B> {
             registry,
             dispatcher,
             max_body_bytes: Self::DEFAULT_MAX_BODY_BYTES,
+            logical_etag: false,
             policy: None,
             secure_transport: false,
             rate_limits: None,
@@ -1734,6 +1739,14 @@ impl<B: S3> S4Service<B> {
     #[must_use]
     pub fn with_max_body_bytes(mut self, n: usize) -> Self {
         self.max_body_bytes = n;
+        self
+    }
+
+    /// Opt in to presenting the original-payload MD5 as the object ETag
+    /// (`--logical-etag`). Off by default. See the field docs.
+    #[must_use]
+    pub fn with_logical_etag(mut self, on: bool) -> Self {
+        self.logical_etag = on;
         self
     }
 
@@ -3051,6 +3064,79 @@ const META_MULTIPART: &str = "s4-multipart";
 /// 旧 v0.1 single-PUT は raw 圧縮 bytes (この flag なし)。GET 時にこの flag を
 /// 見て framed 経路 (= multipart と同じ FrameIter parse) に流す。
 pub(crate) const META_FRAMED: &str = "s4-framed";
+/// `--logical-etag`: hex MD5 of the **original** (pre-compression) payload,
+/// stamped at PUT time so HEAD/GET can echo the logical ETag instead of the
+/// backend's MD5 of the compressed bytes. Only present when the gateway ran
+/// with `--logical-etag` for that PUT; absent objects fall back to the
+/// backend ETag (= pre-flag behaviour).
+pub(crate) const META_LOGICAL_ETAG: &str = "s4-logical-etag";
+
+/// Lowercase-hex of a 16-byte MD5 digest — the raw `ETag::Strong` value
+/// (s3s adds the surrounding quotes on the wire) and the
+/// `s4-logical-etag` metadata value.
+fn md5_hex(md5: &[u8; 16]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(32);
+    for b in md5 {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// MD5 of a buffered body — used on the buffered/dict/gpu PUT paths under
+/// `--logical-etag` (the streaming path reads it from the checksum tee).
+fn md5_of_bytes(bytes: &[u8]) -> [u8; 16] {
+    use md5::{Digest as _, Md5};
+    let mut h = Md5::new();
+    h.update(bytes);
+    h.finalize().into()
+}
+
+/// Outcome of evaluating ETag-based read preconditions (RFC 9110 §13).
+enum EtagPrecondition {
+    /// No precondition, or all satisfied — serve the request normally.
+    Proceed,
+    /// `If-Match` did not match — return `412 Precondition Failed`.
+    Failed,
+    /// `If-None-Match` matched on a GET/HEAD — return `304 Not Modified`.
+    NotModified,
+}
+
+/// Evaluate `If-Match` / `If-None-Match` for a GET/HEAD against the object's
+/// **logical** ETag. S4 must own this under `--logical-etag`: the gateway
+/// advertises `MD5(original)` as the ETag, but the backend object carries the
+/// compressed-bytes ETag, so forwarding the client's preconditions would make
+/// the backend compare against the wrong value. AWS S3 uses strong
+/// comparison; `current` is the object's logical ETag value (unquoted), or
+/// `None` if the object has no logical ETag. Per RFC 9110 §13.2.2, `If-Match`
+/// is evaluated before `If-None-Match`.
+fn evaluate_etag_preconditions(
+    if_match: Option<&s3s::dto::ETagCondition>,
+    if_none_match: Option<&s3s::dto::ETagCondition>,
+    current: Option<&str>,
+) -> EtagPrecondition {
+    use s3s::dto::ETagCondition;
+    let matches = |cond: &ETagCondition| -> bool {
+        match cond {
+            // `*` matches iff the entity exists.
+            ETagCondition::Any => current.is_some(),
+            // Strong comparison of the ETag value (weak validators never match).
+            ETagCondition::ETag(e) => current.is_some_and(|c| e.as_strong() == Some(c)),
+        }
+    };
+    if let Some(im) = if_match
+        && !matches(im)
+    {
+        return EtagPrecondition::Failed;
+    }
+    if let Some(inm) = if_none_match
+        && matches(inm)
+    {
+        return EtagPrecondition::NotModified;
+    }
+    EtagPrecondition::Proceed
+}
+
 /// v1.1 `--zstd-dict`: 16-hex dictionary id (`.s4dict/<id>` の `<id>`) を
 /// 指す。`cpu-zstd-dict` (codec id 8) で圧縮した single-PUT framed object に
 /// だけ stamp される。GET 側はこの id で辞書を解決する (preloaded →
@@ -3511,6 +3597,27 @@ impl<B: S3> S3 for S4Service<B> {
                 req.input.checksum_sha256.as_deref(),
                 req.input.checksum_crc64nvme.as_deref(),
             )?;
+            // A checksummed PUT (AWS SDK v2 flexible checksums, header form)
+            // validates the PutObject *response* checksum against the digest
+            // the client computed over its ORIGINAL payload. When S4
+            // compresses, the backend (and the backend SDK's own
+            // `when_supported` checksum) computes the digest over the STORED
+            // (compressed) bytes, which never matches — so an integrity-
+            // validating client like OpenSearch's `repository-s3` rejects the
+            // upload (`Data read has a different checksum than expected`).
+            // Capture the client's header-supplied checksum value(s) here, so
+            // the response path below can echo them verbatim (we already
+            // verify them in-stream) instead of leaking the compressed
+            // object's checksum. `None` for an algorithm the client didn't
+            // send (incl. the aws-chunked trailer form) → that field is
+            // nulled in the response rather than carrying a wrong value.
+            let echo_checksums = (
+                req.input.checksum_crc32.clone(),
+                req.input.checksum_crc32c.clone(),
+                req.input.checksum_sha1.clone(),
+                req.input.checksum_sha256.clone(),
+                req.input.checksum_crc64nvme.clone(),
+            );
             // Sample 4 KiB から codec を決定。streaming-aware codec なら streaming
             // compress fast path、そうでなければ従来の collect-then-compress。
             let (sample, rest_stream) = peek_sample(blob, SAMPLE_BYTES)
@@ -3584,7 +3691,16 @@ impl<B: S3> S3 for S4Service<B> {
                 .and_then(|v| v.to_str().ok())
                 .map(crate::streaming_checksum::WhichHashers::from_trailer_header)
                 .unwrap_or_default();
-            let which_hashers = client_checksums.which_hashers().or(trailer_hashers);
+            let mut which_hashers = client_checksums.which_hashers().or(trailer_hashers);
+            // `--logical-etag`: present the ETag as MD5(original payload). Force
+            // the MD5 hasher on so every PUT path computes it (the tee has no
+            // client `Content-MD5` claim to compare against, so this never
+            // raises a spurious BadDigest); `logical_etag_md5` is filled per
+            // compress branch below and consumed at the response/stamp sites.
+            if self.logical_etag {
+                which_hashers.content_md5 = true;
+            }
+            let mut logical_etag_md5: Option<[u8; 16]> = None;
             // v1.1 `--zstd-dict`: small-object shared-dictionary path.
             // Applies only when (a) a dict store is configured, (b) the
             // dispatcher picked cpu-zstd, (c) the key longest-prefix-
@@ -3643,6 +3759,9 @@ impl<B: S3> S3 for S4Service<B> {
                 let bytes = collect_with_sample(sample, rest_stream, self.max_body_bytes)
                     .await
                     .map_err(internal("collect put body (dict path)"))?;
+                if self.logical_etag {
+                    logical_etag_md5 = Some(md5_of_bytes(&bytes));
+                }
                 // Same buffered-path integrity checkpoint as the
                 // bytes-buffered branch below: all six header checksums
                 // plus the SigV4-streaming trailer comparison.
@@ -3725,6 +3844,9 @@ impl<B: S3> S3 for S4Service<B> {
                 let bytes = collect_with_sample(sample, rest_stream, self.max_body_bytes)
                     .await
                     .map_err(internal("collect put body (gpu-batch path)"))?;
+                if self.logical_etag {
+                    logical_etag_md5 = Some(md5_of_bytes(&bytes));
+                }
                 verify_client_body_checksums(
                     &bytes,
                     req.input.content_md5.as_deref(),
@@ -3969,6 +4091,9 @@ impl<B: S3> S3 for S4Service<B> {
                         .expect("digest handle lock poisoned")
                         .clone()
                         .unwrap_or_default();
+                    if self.logical_etag {
+                        logical_etag_md5 = computed.content_md5;
+                    }
                     verify_client_trailer_checksums(
                         announced,
                         req.trailing_headers.as_ref(),
@@ -3982,6 +4107,9 @@ impl<B: S3> S3 for S4Service<B> {
                 let bytes = collect_with_sample(sample, rest_stream, self.max_body_bytes)
                     .await
                     .map_err(internal("collect put body (buffered path)"))?;
+                if self.logical_etag {
+                    logical_etag_md5 = Some(md5_of_bytes(&bytes));
+                }
                 // v0.8.12 HIGH-12 / #128 MED-C: verify all six AWS
                 // checksum algorithms against the received body on
                 // the buffered path. The streaming-framed branch
@@ -4057,6 +4185,19 @@ impl<B: S3> S3 for S4Service<B> {
             };
 
             write_manifest(&mut req.input.metadata, &manifest);
+            // `--logical-etag`: persist the original-payload MD5 so HEAD/GET
+            // can echo the logical ETag. Only stamped when the flag is on and
+            // the body was actually compressed (passthrough keeps the backend
+            // bytes, so its backend ETag already equals MD5(original)).
+            if self.logical_etag
+                && kind != CodecKind::Passthrough
+                && let Some(md5) = logical_etag_md5
+            {
+                req.input
+                    .metadata
+                    .get_or_insert_with(Default::default)
+                    .insert(META_LOGICAL_ETAG.into(), md5_hex(&md5));
+            }
             // v1.2 audit R1 P2: this PUT is about to be added to the
             // savings ledger — stamp the accounting marker so a later
             // DELETE / overwrite probe knows the subtraction is
@@ -4425,6 +4566,25 @@ impl<B: S3> S3 for S4Service<B> {
                     None
                 };
             let mut backend_resp = self.backend.put_object(req).await;
+            // Echo the client's original-payload checksum(s) on the response
+            // and drop any checksum the backend computed over the compressed
+            // bytes. Only on a genuinely compressed object — a `passthrough`
+            // store keeps the backend bytes (and therefore its checksum is
+            // correct), so we leave its response untouched. See the
+            // `echo_checksums` capture above for the why; this is what
+            // unblocks AWS SDK v2 upload-integrity validation (OpenSearch
+            // `repository-s3`, and increasingly any SDK-v2 client as the
+            // checksum default moves to `when_supported`).
+            if kind != CodecKind::Passthrough
+                && let Ok(resp) = backend_resp.as_mut()
+            {
+                let (crc32, crc32c, sha1, sha256, crc64nvme) = echo_checksums;
+                resp.output.checksum_crc32 = crc32;
+                resp.output.checksum_crc32c = crc32c;
+                resp.output.checksum_sha1 = sha1;
+                resp.output.checksum_sha256 = sha256;
+                resp.output.checksum_crc64nvme = crc64nvme;
+            }
             // v0.9 #106 (Codex P2): on the SSE-S4 chunked PUT path,
             // if we *couldn't* recover the per-PUT salt / key_id /
             // chunk_count (= `sse_binding.is_none()`), we MUST NOT
@@ -4518,6 +4678,20 @@ impl<B: S3> S3 for S4Service<B> {
                 if pv.versioned_response {
                     resp.output.version_id = Some(pv.version_id.clone());
                 }
+            }
+            // `--logical-etag`: the sidecar binding + version entry above are
+            // now recorded against the backend's compressed-object ETag (so
+            // GET-side staleness checks still line up with the backend HEAD).
+            // Swap the *client-facing* response ETag to the original-payload
+            // MD5 — what an AWS SDK v2 upload-integrity check (OpenSearch
+            // `repository-s3`) validates against; HEAD/GET echo the same value
+            // from `s4-logical-etag` metadata.
+            if self.logical_etag
+                && kind != CodecKind::Passthrough
+                && let Some(md5) = logical_etag_md5
+                && let Ok(resp) = backend_resp.as_mut()
+            {
+                resp.output.e_tag = Some(ETag::Strong(md5_hex(&md5)));
             }
             // v0.5 #27: AWS S3 echoes the SSE-C headers back on success
             // so the client knows the server actually applied the
@@ -4877,6 +5051,30 @@ impl<B: S3> S3 for S4Service<B> {
         self.check_not_reserved_key(&get_key, ReservedKeyMode::Read)?;
         self.enforce_rate_limit(&req, &get_bucket)?;
         self.enforce_policy(&req, "s3:GetObject", &get_bucket, Some(&get_key))?;
+        // `--logical-etag`: S4 owns ETag preconditions (see `head_object` —
+        // the backend would compare the client's logical ETag against the
+        // compressed-object ETag). Strip `If-Match` / `If-None-Match` and
+        // capture them for local evaluation on the full path below. When a
+        // precondition is present the sidecar partial-range fast path is
+        // bypassed (gated below) so the full path can evaluate it first.
+        let (cond_if_match, cond_if_none_match) = if self.logical_etag {
+            (req.input.if_match.take(), req.input.if_none_match.take())
+        } else {
+            (None, None)
+        };
+        let has_etag_precondition = cond_if_match.is_some() || cond_if_none_match.is_some();
+        // RFC 9110 §13.2.2 precedence: an evaluated ETag condition supersedes
+        // the paired date condition — strip the superseded one so the backend
+        // doesn't re-evaluate it (If-Match > If-Unmodified-Since;
+        // If-None-Match > If-Modified-Since).
+        if self.logical_etag {
+            if cond_if_match.is_some() {
+                req.input.if_unmodified_since = None;
+            }
+            if cond_if_none_match.is_some() {
+                req.input.if_modified_since = None;
+            }
+        }
         // Range request の事前検出 (decompress 後 slice する path に使う)。
         let range_request = req.input.range.take();
         // v0.5 #27: pull SSE-C material from the input headers before
@@ -4963,6 +5161,7 @@ impl<B: S3> S3 for S4Service<B> {
         // best-effort behaviour so existing on-disk indexes don't suddenly
         // start missing the partial-fetch path.
         if let Some(ref r) = range_request
+            && !has_etag_precondition
             && let Some(index) = self.read_sidecar(&req.input.bucket, &req.input.key).await
             && self
                 .sidecar_version_binding_ok(&req.input.bucket, &req.input.key, &index)
@@ -5035,6 +5234,14 @@ impl<B: S3> S3 for S4Service<B> {
             }
         }
         let mut resp = self.backend.get_object(req).await?;
+        // Backend's own ETag (real for passthrough / non-S4 objects); captured
+        // before the decompress paths clear it, for `--logical-etag`
+        // precondition evaluation below.
+        let backend_etag = resp
+            .output
+            .e_tag
+            .as_ref()
+            .and_then(|e| e.as_strong().map(str::to_owned));
         // v0.5 #34: stamp the resolved version-id so the client sees a
         // coherent `x-amz-version-id` header (only for chains owned by
         // the manager — Unversioned buckets / no-manager paths never
@@ -5048,6 +5255,55 @@ impl<B: S3> S3 for S4Service<B> {
         // multipart と同じ path に流す。
         let needs_frame_parse = is_multipart || is_framed_v2;
         let manifest_opt = extract_manifest(&resp.output.metadata);
+        // `--logical-etag`: evaluate the stripped ETag preconditions against
+        // the object's logical ETag (or the backend ETag for passthrough /
+        // non-S4 objects) before any body shaping. Range+precondition requests
+        // were routed here (the fast path is gated off above), so the slice is
+        // applied afterwards only if the precondition holds.
+        if has_etag_precondition {
+            let logical = resp
+                .output
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get(META_LOGICAL_ETAG))
+                .cloned();
+            // The client-visible validator: the logical ETag when stamped;
+            // otherwise the backend ETag ONLY for non-S4 objects (no manifest →
+            // GET/HEAD expose the backend ETag). A framed / passthrough S4
+            // object hides its compressed-bytes ETag, so a missing stamp means
+            // "no validator", not the backend ETag.
+            let current = match logical {
+                Some(ref l) => Some(l.as_str()),
+                None if manifest_opt.is_some() => None,
+                None => backend_etag.as_deref(),
+            };
+            match evaluate_etag_preconditions(
+                cond_if_match.as_ref(),
+                cond_if_none_match.as_ref(),
+                current,
+            ) {
+                EtagPrecondition::Failed => {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::from_bytes(b"PreconditionFailed")
+                            .unwrap_or(S3ErrorCode::InvalidArgument),
+                        "At least one of the preconditions you specified did not hold",
+                    ));
+                }
+                EtagPrecondition::NotModified => {
+                    // 304 Not Modified. s3s ignores `S3Response.status` for the
+                    // GET/HEAD success path (it only infers 206 from
+                    // Content-Range), so emit 304 via the `NotModified` error
+                    // code, which the error serializer maps to HTTP 304 (no
+                    // body — correct for a conditional GET hit).
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::from_bytes(b"NotModified")
+                            .unwrap_or(S3ErrorCode::InvalidArgument),
+                        "Not Modified",
+                    ));
+                }
+                EtagPrecondition::Proceed => {}
+            }
+        }
         // v1.1 `--zstd-dict`: dict-compressed objects are framed single-
         // PUTs whose frames need the dictionary named by `s4-dict-id`.
         let dict_id_meta = extract_dict_id(&resp.output.metadata);
@@ -5264,7 +5520,17 @@ impl<B: S3> S3 for S4Service<B> {
                 resp.output.checksum_crc64nvme = None;
                 resp.output.checksum_sha1 = None;
                 resp.output.checksum_sha256 = None;
-                resp.output.e_tag = None;
+                // `--logical-etag`: echo the original-payload MD5 if the object
+                // was PUT with the flag (stamp present) — keeps GET consistent
+                // with PUT/HEAD. Falls back to None (pre-flag behaviour) when
+                // unstamped, regardless of this gateway's current flag state.
+                let logical_etag = resp
+                    .output
+                    .metadata
+                    .as_ref()
+                    .and_then(|mm| mm.get(META_LOGICAL_ETAG))
+                    .map(|hex| ETag::Strong(hex.clone()));
+                resp.output.e_tag = logical_etag;
                 resp.output.body = Some(verified_blob);
                 let elapsed = get_start.elapsed();
                 crate::metrics::record_get(
@@ -5373,7 +5639,15 @@ impl<B: S3> S3 for S4Service<B> {
             resp.output.checksum_crc64nvme = None;
             resp.output.checksum_sha1 = None;
             resp.output.checksum_sha256 = None;
-            resp.output.e_tag = None;
+            // `--logical-etag`: see the streaming path above — echo the
+            // original-payload MD5 stamp if present so GET matches PUT/HEAD.
+            let logical_etag = resp
+                .output
+                .metadata
+                .as_ref()
+                .and_then(|mm| mm.get(META_LOGICAL_ETAG))
+                .map(|hex| ETag::Strong(hex.clone()));
+            resp.output.e_tag = logical_etag;
             let returned_size = final_bytes.len() as u64;
             let codec_label = manifest_opt
                 .as_ref()
@@ -5437,7 +5711,7 @@ impl<B: S3> S3 for S4Service<B> {
     }
     async fn head_object(
         &self,
-        req: S3Request<HeadObjectInput>,
+        mut req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
         // v0.6 #40: capture bucket/key before req is consumed so the
         // replication-status echo can look the entry up.
@@ -5445,7 +5719,33 @@ impl<B: S3> S3 for S4Service<B> {
         let head_key = req.input.key.clone();
         // v0.8.16 F-13 / v0.8.17 G-2: shared reserved-name guard.
         self.check_not_reserved_key(&head_key, ReservedKeyMode::Read)?;
+        // `--logical-etag`: S4 owns ETag preconditions (the backend would
+        // compare the client's logical ETag against the compressed-object
+        // ETag). Strip If-Match / If-None-Match before forwarding and capture
+        // them for local evaluation below.
+        let (cond_if_match, cond_if_none_match) = if self.logical_etag {
+            (req.input.if_match.take(), req.input.if_none_match.take())
+        } else {
+            (None, None)
+        };
+        // RFC 9110 §13.2.2 precedence (see get_object): drop the date
+        // condition a present ETag condition supersedes.
+        if self.logical_etag {
+            if cond_if_match.is_some() {
+                req.input.if_unmodified_since = None;
+            }
+            if cond_if_none_match.is_some() {
+                req.input.if_modified_since = None;
+            }
+        }
         let mut resp = self.backend.head_object(req).await?;
+        // The backend's own ETag (real for passthrough / non-S4 objects);
+        // captured before the framed block clears it below.
+        let backend_etag = resp
+            .output
+            .e_tag
+            .as_ref()
+            .and_then(|e| e.as_strong().map(str::to_owned));
         if let Some(manifest) = extract_manifest(&resp.output.metadata) {
             // 客側には decompress 後の意味のある content_length / checksum を返す。
             // backend が返す圧縮済 bytes の checksum / e_tag は意味が違うため除去
@@ -5456,7 +5756,62 @@ impl<B: S3> S3 for S4Service<B> {
             resp.output.checksum_crc64nvme = None;
             resp.output.checksum_sha1 = None;
             resp.output.checksum_sha256 = None;
-            resp.output.e_tag = None;
+            // `--logical-etag`: echo the original-payload MD5 stamped at PUT
+            // time so HEAD reports the same ETag the client validated its
+            // upload against. Objects PUT without the flag carry no
+            // `s4-logical-etag` stamp → ETag stays `None` (pre-flag
+            // behaviour, since the backend's compressed-bytes ETag is
+            // meaningless for a framed object).
+            resp.output.e_tag = resp
+                .output
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get(META_LOGICAL_ETAG))
+                .map(|hex| ETag::Strong(hex.clone()));
+        }
+        // `--logical-etag`: evaluate the stripped ETag preconditions against
+        // the object's logical ETag (or the backend ETag for passthrough /
+        // non-S4 objects). Only runs when a precondition was present.
+        if cond_if_match.is_some() || cond_if_none_match.is_some() {
+            let logical = resp
+                .output
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get(META_LOGICAL_ETAG))
+                .cloned();
+            // See get_object: only a non-S4 object (no manifest) exposes the
+            // backend ETag; a framed / passthrough object without a logical
+            // stamp has no client-visible validator.
+            let is_s4_object = extract_manifest(&resp.output.metadata).is_some();
+            let current = match logical {
+                Some(ref l) => Some(l.as_str()),
+                None if is_s4_object => None,
+                None => backend_etag.as_deref(),
+            };
+            match evaluate_etag_preconditions(
+                cond_if_match.as_ref(),
+                cond_if_none_match.as_ref(),
+                current,
+            ) {
+                EtagPrecondition::Failed => {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::from_bytes(b"PreconditionFailed")
+                            .unwrap_or(S3ErrorCode::InvalidArgument),
+                        "At least one of the preconditions you specified did not hold",
+                    ));
+                }
+                EtagPrecondition::NotModified => {
+                    // 304 via the NotModified error code (s3s ignores
+                    // `S3Response.status` on the HEAD success path — see the
+                    // get_object NotModified arm).
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::from_bytes(b"NotModified")
+                            .unwrap_or(S3ErrorCode::InvalidArgument),
+                        "Not Modified",
+                    ));
+                }
+                EtagPrecondition::Proceed => {}
+            }
         }
         // v0.6 #40: echo `x-amz-replication-status` (PENDING / COMPLETED
         // / FAILED) so consumers can poll progress without a GET.
@@ -6073,6 +6428,10 @@ impl<B: S3> S3 for S4Service<B> {
                     // same source marker, so destination metadata and
                     // counters stay in lockstep.
                     META_LEDGER,
+                    // `--logical-etag`: a copy has byte-identical content, so
+                    // MD5(original) is unchanged — preserve the stamp or the
+                    // destination's HEAD/GET would report no logical ETag.
+                    META_LOGICAL_ETAG,
                 ] {
                     if let Some(v) = src_meta.get(key) {
                         dest_meta.insert(key.to_string(), v.clone());
@@ -9847,6 +10206,68 @@ impl SigV4aGateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn etag_preconditions_evaluate_against_logical_etag() {
+        use s3s::dto::ETagCondition;
+        let etag = |s: &str| ETagCondition::parse_http_header(s.as_bytes()).expect("parse etag");
+        let any = ETagCondition::Any;
+        let cur = Some("d41d8cd98f00b204e9800998ecf8427e");
+
+        // If-Match: exact -> proceed, mismatch -> 412, `*` -> proceed if exists.
+        assert!(matches!(
+            evaluate_etag_preconditions(
+                Some(&etag("\"d41d8cd98f00b204e9800998ecf8427e\"")),
+                None,
+                cur
+            ),
+            EtagPrecondition::Proceed
+        ));
+        assert!(matches!(
+            evaluate_etag_preconditions(
+                Some(&etag("\"deadbeefdeadbeefdeadbeefdeadbeef\"")),
+                None,
+                cur
+            ),
+            EtagPrecondition::Failed
+        ));
+        assert!(matches!(
+            evaluate_etag_preconditions(Some(&any), None, cur),
+            EtagPrecondition::Proceed
+        ));
+        // `If-Match: *` against a non-existent object fails.
+        assert!(matches!(
+            evaluate_etag_preconditions(Some(&any), None, None),
+            EtagPrecondition::Failed
+        ));
+
+        // If-None-Match: match -> 304, mismatch -> proceed, `*` -> 304 if exists.
+        assert!(matches!(
+            evaluate_etag_preconditions(
+                None,
+                Some(&etag("\"d41d8cd98f00b204e9800998ecf8427e\"")),
+                cur
+            ),
+            EtagPrecondition::NotModified
+        ));
+        assert!(matches!(
+            evaluate_etag_preconditions(
+                None,
+                Some(&etag("\"deadbeefdeadbeefdeadbeefdeadbeef\"")),
+                cur
+            ),
+            EtagPrecondition::Proceed
+        ));
+        assert!(matches!(
+            evaluate_etag_preconditions(None, Some(&any), cur),
+            EtagPrecondition::NotModified
+        ));
+        // No preconditions -> proceed.
+        assert!(matches!(
+            evaluate_etag_preconditions(None, None, cur),
+            EtagPrecondition::Proceed
+        ));
+    }
 
     #[test]
     fn manifest_roundtrip_via_metadata() {

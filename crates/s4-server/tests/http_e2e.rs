@@ -68,6 +68,14 @@ fn build_aws_client(endpoint_url: &str) -> aws_sdk_s3::Client {
 
 /// S4Service を hyper server として spawn し、(endpoint_url, shutdown_tx) を返す。
 async fn spawn_s4_server(backend_endpoint: &str) -> (String, oneshot::Sender<()>) {
+    spawn_s4_server_opts(backend_endpoint, false).await
+}
+
+/// `spawn_s4_server` with `--logical-etag` toggleable (default path passes `false`).
+async fn spawn_s4_server_opts(
+    backend_endpoint: &str,
+    logical_etag: bool,
+) -> (String, oneshot::Sender<()>) {
     let backend_client = build_aws_client(backend_endpoint);
     let proxy = s3s_aws::Proxy::from(backend_client);
     let registry = Arc::new(
@@ -76,7 +84,7 @@ async fn spawn_s4_server(backend_endpoint: &str) -> (String, oneshot::Sender<()>
             .with(Arc::new(CpuZstd::default())),
     );
     let dispatcher = Arc::new(AlwaysDispatcher(CodecKind::CpuZstd));
-    let s4 = S4Service::new(proxy, registry, dispatcher);
+    let s4 = S4Service::new(proxy, registry, dispatcher).with_logical_etag(logical_etag);
 
     let mut svc = S3ServiceBuilder::new(s4);
     svc.set_auth(SimpleAuth::from_single(MINIO_USER, MINIO_PASS));
@@ -204,6 +212,321 @@ async fn http_roundtrip_through_full_s4_stack() {
         "MinIO 上の object は圧縮されているべき: {} -> {} bytes",
         payload.len(),
         raw_bytes.len()
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// `--logical-etag`: a compressed PUT must report the ETag of the ORIGINAL
+/// payload (MD5), not the backend's MD5 of the compressed bytes — otherwise
+/// AWS SDK v2 clients that validate upload integrity (e.g. OpenSearch's
+/// `repository-s3`) reject every blob. We avoid pulling an `md5` dev-dep by
+/// using the fact that a direct (uncompressed) PUT to MinIO returns
+/// `ETag == MD5(payload)`.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn logical_etag_reports_original_payload_md5() {
+    let minio = start_minio().await;
+    let (s4_endpoint, shutdown) = spawn_s4_server_opts(&minio.endpoint_url, true).await;
+
+    let backend_client = build_aws_client(&minio.endpoint_url);
+    let _ = backend_client.create_bucket().bucket("le-e2e").send().await;
+
+    // Highly compressible so the object genuinely takes the compress path.
+    let payload = Bytes::from("logical-etag payload row; ".repeat(4000));
+
+    // Ground truth: MD5(payload) == the ETag MinIO returns for the raw bytes.
+    let raw_etag = backend_client
+        .put_object()
+        .bucket("le-e2e")
+        .key("raw")
+        .body(payload.clone().into())
+        .send()
+        .await
+        .expect("direct PUT to MinIO")
+        .e_tag()
+        .map(str::to_owned);
+    assert!(
+        raw_etag.is_some(),
+        "MinIO must return an ETag for the raw PUT"
+    );
+
+    // PUT through S4 (compresses). With --logical-etag the response ETag must
+    // equal MD5(original), i.e. the raw ETag above.
+    let s4_client = build_aws_client(&s4_endpoint);
+    let put = s4_client
+        .put_object()
+        .bucket("le-e2e")
+        .key("compressed")
+        .body(payload.clone().into())
+        .send()
+        .await
+        .expect("PUT through S4");
+    assert_eq!(
+        put.e_tag().map(str::to_owned),
+        raw_etag,
+        "PUT response ETag must be MD5(original payload), not the compressed object's MD5"
+    );
+
+    // HEAD through S4 must echo the same logical ETag.
+    let head = s4_client
+        .head_object()
+        .bucket("le-e2e")
+        .key("compressed")
+        .send()
+        .await
+        .expect("HEAD through S4");
+    assert_eq!(
+        head.e_tag().map(str::to_owned),
+        raw_etag,
+        "HEAD ETag must echo the original-payload MD5"
+    );
+
+    // GET through S4 must echo the same logical ETag (consistent w/ PUT+HEAD)
+    // and roundtrip losslessly.
+    let get = s4_client
+        .get_object()
+        .bucket("le-e2e")
+        .key("compressed")
+        .send()
+        .await
+        .expect("GET through S4");
+    assert_eq!(
+        get.e_tag().map(str::to_owned),
+        raw_etag,
+        "GET ETag must echo the original-payload MD5"
+    );
+    let got = get.body.collect().await.expect("body").into_bytes();
+    assert_eq!(got, payload, "GET roundtrip must be lossless");
+
+    // And the object on the backend is genuinely compressed (the whole point).
+    let raw = backend_client
+        .get_object()
+        .bucket("le-e2e")
+        .key("compressed")
+        .send()
+        .await
+        .expect("raw GET against MinIO");
+    let stored = raw.body.collect().await.expect("body").into_bytes();
+    assert!(
+        stored.len() < payload.len() / 5,
+        "stored object must be compressed: {} -> {} bytes",
+        payload.len(),
+        stored.len()
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// `--logical-etag`: `If-Match` / `If-None-Match` must be evaluated against the
+/// LOGICAL ETag (MD5 of original), not the backend's compressed-object ETag.
+/// A correct logical ETag matching proves S4 owns the precondition (it would
+/// 412 if the backend compared against the compressed bytes).
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn logical_etag_if_match_uses_logical_etag() {
+    let minio = start_minio().await;
+    let (s4_endpoint, shutdown) = spawn_s4_server_opts(&minio.endpoint_url, true).await;
+    let backend_client = build_aws_client(&minio.endpoint_url);
+    let _ = backend_client
+        .create_bucket()
+        .bucket("le-cond")
+        .send()
+        .await;
+
+    let payload = Bytes::from("conditional payload row; ".repeat(4000));
+    // MD5(payload) == the ETag MinIO returns for a direct (raw) PUT.
+    let raw_etag = backend_client
+        .put_object()
+        .bucket("le-cond")
+        .key("raw")
+        .body(payload.clone().into())
+        .send()
+        .await
+        .expect("raw PUT to MinIO")
+        .e_tag()
+        .map(str::to_owned)
+        .expect("MinIO ETag");
+
+    let s4 = build_aws_client(&s4_endpoint);
+    s4.put_object()
+        .bucket("le-cond")
+        .key("k")
+        .body(payload.clone().into())
+        .send()
+        .await
+        .expect("PUT through S4");
+
+    // If-Match with the logical ETag -> succeeds (would 412 if compared to the
+    // backend's compressed-object ETag).
+    let ok = s4
+        .get_object()
+        .bucket("le-cond")
+        .key("k")
+        .if_match(raw_etag.clone())
+        .send()
+        .await;
+    assert!(
+        ok.is_ok(),
+        "If-Match with the logical ETag must succeed: {:?}",
+        ok.err()
+    );
+    let body = ok.unwrap().body.collect().await.expect("body").into_bytes();
+    assert_eq!(body, payload, "conditional GET roundtrip must be lossless");
+
+    // A wrong If-Match -> 412 (Err).
+    let bad = s4
+        .get_object()
+        .bucket("le-cond")
+        .key("k")
+        .if_match("\"00000000000000000000000000000000\"")
+        .send()
+        .await;
+    assert!(bad.is_err(), "wrong If-Match must fail the precondition");
+
+    // If-None-Match with the logical ETag -> 304 Not Modified (surfaces as an
+    // SDK error with HTTP 304, NOT a 200-with-body).
+    let nm = s4
+        .get_object()
+        .bucket("le-cond")
+        .key("k")
+        .if_none_match(raw_etag.clone())
+        .send()
+        .await;
+    let status = nm
+        .as_ref()
+        .err()
+        .and_then(|e| e.raw_response())
+        .map(|r| r.status().as_u16());
+    assert_eq!(
+        status,
+        Some(304),
+        "If-None-Match on a matching ETag must return 304, got {:?}",
+        nm.map(|_| "200 OK with body")
+            .map_err(|e| e.raw_response().map(|r| r.status().as_u16()))
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// Default-off contract: with `--logical-etag` NOT set, a compressed PUT must
+/// behave exactly as before — no `s4-logical-etag` metadata stamped, and HEAD
+/// returns no ETag for the framed object (the pre-flag behaviour).
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn logical_etag_off_leaves_etag_and_metadata_unchanged() {
+    let minio = start_minio().await;
+    // spawn_s4_server passes logical_etag = false.
+    let (s4_endpoint, shutdown) = spawn_s4_server(&minio.endpoint_url).await;
+    let backend_client = build_aws_client(&minio.endpoint_url);
+    let _ = backend_client.create_bucket().bucket("le-off").send().await;
+
+    let payload = Bytes::from("logical-etag OFF payload; ".repeat(4000));
+    let s4_client = build_aws_client(&s4_endpoint);
+    s4_client
+        .put_object()
+        .bucket("le-off")
+        .key("k")
+        .body(payload.clone().into())
+        .send()
+        .await
+        .expect("PUT through S4 (flag off)");
+
+    // HEAD via S4: a framed object reports no ETag (pre-flag behaviour).
+    let head = s4_client
+        .head_object()
+        .bucket("le-off")
+        .key("k")
+        .send()
+        .await
+        .expect("HEAD through S4");
+    assert!(
+        head.e_tag().is_none(),
+        "flag-off compressed object must report no ETag, got {:?}",
+        head.e_tag()
+    );
+
+    // The backend object must NOT carry the logical-etag stamp.
+    let raw = backend_client
+        .get_object()
+        .bucket("le-off")
+        .key("k")
+        .send()
+        .await
+        .expect("raw GET against MinIO");
+    let meta = raw.metadata().cloned().unwrap_or_default();
+    assert!(
+        !meta.contains_key("s4-logical-etag"),
+        "flag-off PUT must not stamp s4-logical-etag, metadata = {meta:?}"
+    );
+    // Roundtrip still lossless.
+    let body = raw.body.collect().await.expect("body");
+    assert!(
+        body.into_bytes().len() < payload.len() / 5,
+        "still compressed"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// `--logical-etag`: a REPLACE-directive CopyObject of a compressed object is
+/// byte-identical, so MD5(original) is unchanged — the destination must keep
+/// its logical-ETag stamp and still report it on HEAD.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn logical_etag_survives_copy_object_replace() {
+    let minio = start_minio().await;
+    let (s4_endpoint, shutdown) = spawn_s4_server_opts(&minio.endpoint_url, true).await;
+    let backend_client = build_aws_client(&minio.endpoint_url);
+    let _ = backend_client
+        .create_bucket()
+        .bucket("le-copy")
+        .send()
+        .await;
+
+    let payload = Bytes::from("copy-object payload row; ".repeat(4000));
+    let raw_etag = backend_client
+        .put_object()
+        .bucket("le-copy")
+        .key("raw")
+        .body(payload.clone().into())
+        .send()
+        .await
+        .expect("raw PUT")
+        .e_tag()
+        .map(str::to_owned)
+        .expect("MinIO ETag");
+
+    let s4 = build_aws_client(&s4_endpoint);
+    s4.put_object()
+        .bucket("le-copy")
+        .key("src")
+        .body(payload.clone().into())
+        .send()
+        .await
+        .expect("PUT src");
+    // REPLACE-directive copy through S4 (re-stamps client metadata).
+    s4.copy_object()
+        .bucket("le-copy")
+        .key("dst")
+        .copy_source("le-copy/src")
+        .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+        .metadata("user-meta", "v")
+        .send()
+        .await
+        .expect("copy through S4");
+
+    let head = s4
+        .head_object()
+        .bucket("le-copy")
+        .key("dst")
+        .send()
+        .await
+        .expect("HEAD dst");
+    assert_eq!(
+        head.e_tag().map(str::to_owned),
+        Some(raw_etag),
+        "REPLACE-copied compressed object must keep its logical ETag"
     );
 
     let _ = shutdown.send(());
