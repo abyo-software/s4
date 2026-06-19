@@ -223,7 +223,7 @@ instance). Net savings at scale, HA (2 instances), $70/host:
 | Footprint | standard-default | LogsDB | `best_compression` |
 |---|---:|---:|---:|
 | 500 TB | ≈ **+$2,965/mo** (≈ $35.6k/yr) | ≈ +$2,413/mo | ≈ +$1,562/mo |
-| 1 PB | ≈ **+$6,070/mo** (≈ $72.8k/yr) | ≈ +$4,966/mo | ≈ +$3,264/mo |
+| 1 PB (1000 TB) | ≈ **+$6,070/mo** (≈ $72.8k/yr) | ≈ +$4,966/mo | ≈ +$3,264/mo |
 
 > Storage bytes only. S4 also writes one small `.s4index` sidecar per blob (no
 > *extra* backend round-trip per cold query — see Result 4 / B2 — and negligible
@@ -357,8 +357,11 @@ Either way, S4 decode never becomes the restore bottleneck.
 ## Result 4 — Frozen search performance (cold cache)
 
 Each query was run against the mounted frozen index with the shared cache
-**cleared first**, so every block is fetched cold from the repository through
-S4. Median of 6 cold runs (server-side `took`, ms); warm = cache populated:
+**cleared before each run**, so any repository blocks a query needs are
+fetched cold through S4. (The B2 op-count below shows the lightweight
+analytics queries here were answered *without* a backend GET in this run —
+only the heavy top-N fetch actually pulls blocks cold.) Median of 6 cold runs
+(server-side `took`, ms); warm = cache populated:
 
 > **Read the absolute milliseconds with care.** These were measured against a
 > **co-located MinIO with effectively zero network RTT**, so the absolute values
@@ -402,8 +405,11 @@ on the cheap analytics queries you actually run against frozen data.
 
 Because the numbers above are no-RTT, we re-ran the cold queries with a one-way
 delay injected on the S4↔backend path (toxiproxy, 0 / 5 / 20 / 50 ms one-way),
-direct and S4 zstd-3 both eating the same RTT, cache cleared each time. Relative
-overhead, standard-default index (raw:
+direct and S4 zstd-3 both eating the same RTT, cache cleared each time. This is a
+**separate run** (toxiproxy in-path), so its own `0 ms` baseline (+7.1% top-N
+overhead) differs slightly from the headline 2026-06-18 table's +9.5% — read the
+columns as *the same run's* overhead growing with RTT, not against the headline
+number. Relative overhead, standard-default index (raw:
 [`results/rtt-injection.json`](../../benches/elasticsearch-frozen/results/rtt-injection.json)):
 
 | Query | 0 ms | 5 ms | 20 ms | 50 ms |
@@ -448,15 +454,19 @@ it — don't run one gateway in front of a frozen tier you care about.
 
 The fix is straightforward because **S4 instances are stateless**: the
 `.s4index` sidecars live in the object store next to the blobs, not on the
-gateway, so any instance can serve any request. Run **two or more S4 instances**
-behind **multi-value DNS or a load balancer** and ES will fail over to a
-survivor transparently.
+gateway, so any instance can serve any request. Run **two or more S4 instances
+behind a load balancer that health-checks and routes to healthy upstreams**, and
+a dead instance is routed around. (Multi-value DNS can also work, but DNS
+caching / stale pooled connections / per-IP retry behaviour in the ES JVM S3
+client are environment-specific — validate that path in your own setup; what we
+measured below is the load-balancer case.)
 
-We smoke-tested exactly this (B4 below: 2 stateless S4 instances behind an nginx
+We smoke-tested exactly that (B4 below: 2 stateless S4 instances behind an nginx
 round-robin upstream; raw:
 [`results/ha-failover.json`](../../benches/elasticsearch-frozen/results/ha-failover.json)).
-Registering the repository through the LB and then **killing one instance**, all
-of the following still worked through the survivor:
+Registering the repository through the LB and then **killing one instance**, the
+cold query and snapshot PUT were served through the survivor, and the warm query
+stayed unaffected (it did not need the repository at all):
 
 | Check after killing one of two instances | Result |
 |---|---|
@@ -548,10 +558,10 @@ s4 --endpoint-url https://s3.<region>.amazonaws.com \
    --codec cpu-zstd --zstd-level 3 --dispatcher always
 ```
 
-For anything you care about, run **two or more of these** behind multi-value DNS
-or a load balancer — S4 is a read-path hard dependency for cold frozen search,
-and instances are stateless (sidecars live in S3), so this removes the SPOF with
-no extra coordination. See [Availability & HA](#availability--ha).
+For anything you care about, run **two or more of these** behind a health-
+checking load balancer — S4 is a read-path hard dependency for cold frozen
+search, and instances are stateless (sidecars live in S3), so this removes the
+SPOF with no extra coordination. See [Availability & HA](#availability--ha).
 
 **Elasticsearch** — point the `repository-s3` client at S4 (or its LB) instead
 of S3. Endpoints live in `elasticsearch.yml`; credentials in the keystore:
