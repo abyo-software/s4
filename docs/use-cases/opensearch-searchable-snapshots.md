@@ -35,7 +35,7 @@ segment), snapshotted to a real S3 repository through S4:
 | Metric | Result |
 |---|---|
 | **Repository storage saved** (S4 zstd-3) | **−16.5% to −28.1%** — biggest on the `default` (LZ4) codec; **~17%** even on OpenSearch's **native `zstd` codec** |
-| **The catch** | requires S4's **`--logical-etag`** flag — without it, OpenSearch's `repository-s3` rejects every blob (`Data read has a different checksum than expected`). See [Compatibility](#compatibility-logical-etag-is-required). |
+| **The catch** | requires S4's **`--logical-etag`** flag — without it, OpenSearch's `repository-s3` rejects every blob (`Data read has a different checksum than expected`). See [Compatibility](#compatibility---logical-etag-is-required). |
 | **Searchable-snapshot search** (count / agg / full-text) | **S4 within ~1.5 ms of direct** in this local run (equal or faster on every query) |
 | **End-to-end** | repo `_verify`, snapshot (SUCCESS), `remote_snapshot` mount + cold search all work through S4 |
 | **Compounding** | native `zstd` codec **+** S4 zstd-3 = **909.9 MB** vs `default`-codec direct **1484.7 MB** → **1.63× smaller** |
