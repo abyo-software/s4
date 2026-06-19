@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781855523346,
+  "lastUpdate": 1781863899375,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -16939,6 +16939,234 @@ window.BENCHMARK_DATA = {
             "name": "decode_index/4096f",
             "value": 18045,
             "range": "± 84",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "masumi.ryugo@gmail.com",
+            "name": "masumi-ryugo",
+            "username": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a3c846bcefb38b45e62ad00d9f4673981fd2ea7f",
+          "message": "docs(use-cases): add Grafana Loki chunk-compression use case (#3) + real benchmark (#135)\n\nThird use-case doc in the S4 series: S4 in front of Grafana Loki's S3 chunk\nstore. End-to-end measured locally (Loki 3.3.2 + S4 v1.2.2 + MinIO, 4M lines).\n\nHeadline results (all trace to benches/grafana-loki/results/loki.json):\n- Storage: S4 zstd-3 -18.4% over snappy chunks (zstd-9 -19.3%); Loki-native\n  zstd -38.0%. Honest split: native zstd wins for NEW chunks; S4's wedge is the\n  immutable snappy backlog (chunk_encoding is forward-only).\n- Read overhead (measured the honest way): a whole-chunk GET through S4 costs\n  ~1.7 ms more than raw snappy (3.8 vs 2.1 ms median, ~1.8x), bytes byte-identical.\n- Ingest+flush: S4 zstd-3 ~= direct; Loki-native zstd slowest.\n- Break-even ~16.5 TB of snappy backlog at a 1-host S4 (illustrative pricing).\n\nCompatibility finding: --logical-etag is NOT required for Loki (unlike\nOpenSearch's repository-s3) — Loki 3.3.2 uploads chunks fine without it; the\nflag is still recommended for correct ETags. Captured in\nresults/logical_etag_negative.txt.\n\nHarness (benches/grafana-loki/): loki_ingest.py + loki_bench.py (storage,\ningest+flush with flush-settle in the timed region, and an index-independent\nwhole-chunk GET latency probe), README, raw results. Guards against silent\npartial ingest. Also fixes a pre-existing broken anchor in the OpenSearch doc\nand adds the Loki link to README.md + docs/README.md.\n\nReviewed with CodexCLI to convergence (no blocking findings; every figure\nverified against the raw JSON).\n\nCo-authored-by: masumi-ryugo <abyo.software@gmail.com>\nCo-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-19T19:03:55+09:00",
+          "tree_id": "6e588a1315874ab14441845395d695cf38f49cc5",
+          "url": "https://github.com/abyo-software/s4/commit/a3c846bcefb38b45e62ad00d9f4673981fd2ea7f"
+        },
+        "date": 1781863898480,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 56853,
+            "range": "± 4152",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 55491,
+            "range": "± 2806",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 365,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2656153,
+            "range": "± 41002",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 42420264,
+            "range": "± 98352",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192169,
+            "range": "± 833",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 52160056,
+            "range": "± 999139",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 767732358,
+            "range": "± 1015218",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3136522,
+            "range": "± 48506",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 35893,
+            "range": "± 2865",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 41118,
+            "range": "± 2689",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 376,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 579047,
+            "range": "± 8695",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1625746,
+            "range": "± 34619",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192625,
+            "range": "± 558",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12727637,
+            "range": "± 99352",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 28943410,
+            "range": "± 655259",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3187419,
+            "range": "± 20274",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1540615,
+            "range": "± 13579",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2591469,
+            "range": "± 22798",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 353714725,
+            "range": "± 7466291",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 138,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 7531,
+            "range": "± 65",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 799,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 12751,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 3085,
+            "range": "± 46",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 23998,
+            "range": "± 220",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 96011,
+            "range": "± 794",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 639,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4492,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 17653,
+            "range": "± 38",
             "unit": "ns/iter"
           },
           {
