@@ -436,6 +436,10 @@ pub struct S4Service<B: S3> {
     registry: Arc<CodecRegistry>,
     dispatcher: Arc<dyn CodecDispatcher>,
     max_body_bytes: usize,
+    /// When set, the object's ETag is presented as the MD5 of the
+    /// original payload rather than the backend's MD5 of the compressed
+    /// bytes (opt-in; see `--logical-etag`). Off by default.
+    logical_etag: bool,
     policy: Option<crate::policy::SharedPolicy>,
     /// v0.3 #13: surfaced as the `aws:SecureTransport` Condition key. Set
     /// to `true` when the listener is wrapped in TLS (or ACME), so policies
@@ -752,6 +756,7 @@ impl<B: S3> S4Service<B> {
             registry,
             dispatcher,
             max_body_bytes: Self::DEFAULT_MAX_BODY_BYTES,
+            logical_etag: false,
             policy: None,
             secure_transport: false,
             rate_limits: None,
@@ -1734,6 +1739,14 @@ impl<B: S3> S4Service<B> {
     #[must_use]
     pub fn with_max_body_bytes(mut self, n: usize) -> Self {
         self.max_body_bytes = n;
+        self
+    }
+
+    /// Opt in to presenting the original-payload MD5 as the object ETag
+    /// (`--logical-etag`). Off by default. See the field docs.
+    #[must_use]
+    pub fn with_logical_etag(mut self, on: bool) -> Self {
+        self.logical_etag = on;
         self
     }
 
@@ -3051,6 +3064,34 @@ const META_MULTIPART: &str = "s4-multipart";
 /// 旧 v0.1 single-PUT は raw 圧縮 bytes (この flag なし)。GET 時にこの flag を
 /// 見て framed 経路 (= multipart と同じ FrameIter parse) に流す。
 pub(crate) const META_FRAMED: &str = "s4-framed";
+/// `--logical-etag`: hex MD5 of the **original** (pre-compression) payload,
+/// stamped at PUT time so HEAD/GET can echo the logical ETag instead of the
+/// backend's MD5 of the compressed bytes. Only present when the gateway ran
+/// with `--logical-etag` for that PUT; absent objects fall back to the
+/// backend ETag (= pre-flag behaviour).
+pub(crate) const META_LOGICAL_ETAG: &str = "s4-logical-etag";
+
+/// Lowercase-hex of a 16-byte MD5 digest — the raw `ETag::Strong` value
+/// (s3s adds the surrounding quotes on the wire) and the
+/// `s4-logical-etag` metadata value.
+fn md5_hex(md5: &[u8; 16]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(32);
+    for b in md5 {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// MD5 of a buffered body — used on the buffered/dict/gpu PUT paths under
+/// `--logical-etag` (the streaming path reads it from the checksum tee).
+fn md5_of_bytes(bytes: &[u8]) -> [u8; 16] {
+    use md5::{Digest as _, Md5};
+    let mut h = Md5::new();
+    h.update(bytes);
+    h.finalize().into()
+}
+
 /// v1.1 `--zstd-dict`: 16-hex dictionary id (`.s4dict/<id>` の `<id>`) を
 /// 指す。`cpu-zstd-dict` (codec id 8) で圧縮した single-PUT framed object に
 /// だけ stamp される。GET 側はこの id で辞書を解決する (preloaded →
@@ -3511,6 +3552,27 @@ impl<B: S3> S3 for S4Service<B> {
                 req.input.checksum_sha256.as_deref(),
                 req.input.checksum_crc64nvme.as_deref(),
             )?;
+            // A checksummed PUT (AWS SDK v2 flexible checksums, header form)
+            // validates the PutObject *response* checksum against the digest
+            // the client computed over its ORIGINAL payload. When S4
+            // compresses, the backend (and the backend SDK's own
+            // `when_supported` checksum) computes the digest over the STORED
+            // (compressed) bytes, which never matches — so an integrity-
+            // validating client like OpenSearch's `repository-s3` rejects the
+            // upload (`Data read has a different checksum than expected`).
+            // Capture the client's header-supplied checksum value(s) here, so
+            // the response path below can echo them verbatim (we already
+            // verify them in-stream) instead of leaking the compressed
+            // object's checksum. `None` for an algorithm the client didn't
+            // send (incl. the aws-chunked trailer form) → that field is
+            // nulled in the response rather than carrying a wrong value.
+            let echo_checksums = (
+                req.input.checksum_crc32.clone(),
+                req.input.checksum_crc32c.clone(),
+                req.input.checksum_sha1.clone(),
+                req.input.checksum_sha256.clone(),
+                req.input.checksum_crc64nvme.clone(),
+            );
             // Sample 4 KiB から codec を決定。streaming-aware codec なら streaming
             // compress fast path、そうでなければ従来の collect-then-compress。
             let (sample, rest_stream) = peek_sample(blob, SAMPLE_BYTES)
@@ -3584,7 +3646,16 @@ impl<B: S3> S3 for S4Service<B> {
                 .and_then(|v| v.to_str().ok())
                 .map(crate::streaming_checksum::WhichHashers::from_trailer_header)
                 .unwrap_or_default();
-            let which_hashers = client_checksums.which_hashers().or(trailer_hashers);
+            let mut which_hashers = client_checksums.which_hashers().or(trailer_hashers);
+            // `--logical-etag`: present the ETag as MD5(original payload). Force
+            // the MD5 hasher on so every PUT path computes it (the tee has no
+            // client `Content-MD5` claim to compare against, so this never
+            // raises a spurious BadDigest); `logical_etag_md5` is filled per
+            // compress branch below and consumed at the response/stamp sites.
+            if self.logical_etag {
+                which_hashers.content_md5 = true;
+            }
+            let mut logical_etag_md5: Option<[u8; 16]> = None;
             // v1.1 `--zstd-dict`: small-object shared-dictionary path.
             // Applies only when (a) a dict store is configured, (b) the
             // dispatcher picked cpu-zstd, (c) the key longest-prefix-
@@ -3643,6 +3714,9 @@ impl<B: S3> S3 for S4Service<B> {
                 let bytes = collect_with_sample(sample, rest_stream, self.max_body_bytes)
                     .await
                     .map_err(internal("collect put body (dict path)"))?;
+                if self.logical_etag {
+                    logical_etag_md5 = Some(md5_of_bytes(&bytes));
+                }
                 // Same buffered-path integrity checkpoint as the
                 // bytes-buffered branch below: all six header checksums
                 // plus the SigV4-streaming trailer comparison.
@@ -3725,6 +3799,9 @@ impl<B: S3> S3 for S4Service<B> {
                 let bytes = collect_with_sample(sample, rest_stream, self.max_body_bytes)
                     .await
                     .map_err(internal("collect put body (gpu-batch path)"))?;
+                if self.logical_etag {
+                    logical_etag_md5 = Some(md5_of_bytes(&bytes));
+                }
                 verify_client_body_checksums(
                     &bytes,
                     req.input.content_md5.as_deref(),
@@ -3969,6 +4046,9 @@ impl<B: S3> S3 for S4Service<B> {
                         .expect("digest handle lock poisoned")
                         .clone()
                         .unwrap_or_default();
+                    if self.logical_etag {
+                        logical_etag_md5 = computed.content_md5;
+                    }
                     verify_client_trailer_checksums(
                         announced,
                         req.trailing_headers.as_ref(),
@@ -3982,6 +4062,9 @@ impl<B: S3> S3 for S4Service<B> {
                 let bytes = collect_with_sample(sample, rest_stream, self.max_body_bytes)
                     .await
                     .map_err(internal("collect put body (buffered path)"))?;
+                if self.logical_etag {
+                    logical_etag_md5 = Some(md5_of_bytes(&bytes));
+                }
                 // v0.8.12 HIGH-12 / #128 MED-C: verify all six AWS
                 // checksum algorithms against the received body on
                 // the buffered path. The streaming-framed branch
@@ -4057,6 +4140,19 @@ impl<B: S3> S3 for S4Service<B> {
             };
 
             write_manifest(&mut req.input.metadata, &manifest);
+            // `--logical-etag`: persist the original-payload MD5 so HEAD/GET
+            // can echo the logical ETag. Only stamped when the flag is on and
+            // the body was actually compressed (passthrough keeps the backend
+            // bytes, so its backend ETag already equals MD5(original)).
+            if self.logical_etag
+                && kind != CodecKind::Passthrough
+                && let Some(md5) = logical_etag_md5
+            {
+                req.input
+                    .metadata
+                    .get_or_insert_with(Default::default)
+                    .insert(META_LOGICAL_ETAG.into(), md5_hex(&md5));
+            }
             // v1.2 audit R1 P2: this PUT is about to be added to the
             // savings ledger — stamp the accounting marker so a later
             // DELETE / overwrite probe knows the subtraction is
@@ -4425,6 +4521,25 @@ impl<B: S3> S3 for S4Service<B> {
                     None
                 };
             let mut backend_resp = self.backend.put_object(req).await;
+            // Echo the client's original-payload checksum(s) on the response
+            // and drop any checksum the backend computed over the compressed
+            // bytes. Only on a genuinely compressed object — a `passthrough`
+            // store keeps the backend bytes (and therefore its checksum is
+            // correct), so we leave its response untouched. See the
+            // `echo_checksums` capture above for the why; this is what
+            // unblocks AWS SDK v2 upload-integrity validation (OpenSearch
+            // `repository-s3`, and increasingly any SDK-v2 client as the
+            // checksum default moves to `when_supported`).
+            if kind != CodecKind::Passthrough
+                && let Ok(resp) = backend_resp.as_mut()
+            {
+                let (crc32, crc32c, sha1, sha256, crc64nvme) = echo_checksums;
+                resp.output.checksum_crc32 = crc32;
+                resp.output.checksum_crc32c = crc32c;
+                resp.output.checksum_sha1 = sha1;
+                resp.output.checksum_sha256 = sha256;
+                resp.output.checksum_crc64nvme = crc64nvme;
+            }
             // v0.9 #106 (Codex P2): on the SSE-S4 chunked PUT path,
             // if we *couldn't* recover the per-PUT salt / key_id /
             // chunk_count (= `sse_binding.is_none()`), we MUST NOT
@@ -4518,6 +4633,20 @@ impl<B: S3> S3 for S4Service<B> {
                 if pv.versioned_response {
                     resp.output.version_id = Some(pv.version_id.clone());
                 }
+            }
+            // `--logical-etag`: the sidecar binding + version entry above are
+            // now recorded against the backend's compressed-object ETag (so
+            // GET-side staleness checks still line up with the backend HEAD).
+            // Swap the *client-facing* response ETag to the original-payload
+            // MD5 — what an AWS SDK v2 upload-integrity check (OpenSearch
+            // `repository-s3`) validates against; HEAD/GET echo the same value
+            // from `s4-logical-etag` metadata.
+            if self.logical_etag
+                && kind != CodecKind::Passthrough
+                && let Some(md5) = logical_etag_md5
+                && let Ok(resp) = backend_resp.as_mut()
+            {
+                resp.output.e_tag = Some(ETag::Strong(md5_hex(&md5)));
             }
             // v0.5 #27: AWS S3 echoes the SSE-C headers back on success
             // so the client knows the server actually applied the
@@ -5264,7 +5393,17 @@ impl<B: S3> S3 for S4Service<B> {
                 resp.output.checksum_crc64nvme = None;
                 resp.output.checksum_sha1 = None;
                 resp.output.checksum_sha256 = None;
-                resp.output.e_tag = None;
+                // `--logical-etag`: echo the original-payload MD5 if the object
+                // was PUT with the flag (stamp present) — keeps GET consistent
+                // with PUT/HEAD. Falls back to None (pre-flag behaviour) when
+                // unstamped, regardless of this gateway's current flag state.
+                let logical_etag = resp
+                    .output
+                    .metadata
+                    .as_ref()
+                    .and_then(|mm| mm.get(META_LOGICAL_ETAG))
+                    .map(|hex| ETag::Strong(hex.clone()));
+                resp.output.e_tag = logical_etag;
                 resp.output.body = Some(verified_blob);
                 let elapsed = get_start.elapsed();
                 crate::metrics::record_get(
@@ -5373,7 +5512,15 @@ impl<B: S3> S3 for S4Service<B> {
             resp.output.checksum_crc64nvme = None;
             resp.output.checksum_sha1 = None;
             resp.output.checksum_sha256 = None;
-            resp.output.e_tag = None;
+            // `--logical-etag`: see the streaming path above — echo the
+            // original-payload MD5 stamp if present so GET matches PUT/HEAD.
+            let logical_etag = resp
+                .output
+                .metadata
+                .as_ref()
+                .and_then(|mm| mm.get(META_LOGICAL_ETAG))
+                .map(|hex| ETag::Strong(hex.clone()));
+            resp.output.e_tag = logical_etag;
             let returned_size = final_bytes.len() as u64;
             let codec_label = manifest_opt
                 .as_ref()
@@ -5456,7 +5603,18 @@ impl<B: S3> S3 for S4Service<B> {
             resp.output.checksum_crc64nvme = None;
             resp.output.checksum_sha1 = None;
             resp.output.checksum_sha256 = None;
-            resp.output.e_tag = None;
+            // `--logical-etag`: echo the original-payload MD5 stamped at PUT
+            // time so HEAD reports the same ETag the client validated its
+            // upload against. Objects PUT without the flag carry no
+            // `s4-logical-etag` stamp → ETag stays `None` (pre-flag
+            // behaviour, since the backend's compressed-bytes ETag is
+            // meaningless for a framed object).
+            resp.output.e_tag = resp
+                .output
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get(META_LOGICAL_ETAG))
+                .map(|hex| ETag::Strong(hex.clone()));
         }
         // v0.6 #40: echo `x-amz-replication-status` (PENDING / COMPLETED
         // / FAILED) so consumers can poll progress without a GET.
