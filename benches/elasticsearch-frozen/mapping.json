@@ -1,0 +1,20 @@
+{
+  "properties": {
+    "@timestamp": {"type": "date"},
+    "host":    {"properties": {"name": {"type": "keyword"}}},
+    "service": {"properties": {"name": {"type": "keyword"}}},
+    "log":     {"properties": {"level": {"type": "keyword"}}},
+    "http":    {"properties": {
+        "request":  {"properties": {"method": {"type": "keyword"}}},
+        "response": {"properties": {"status_code": {"type": "integer"},
+                                     "body": {"properties": {"bytes": {"type": "long"}}}}}}},
+    "url":     {"properties": {"path": {"type": "keyword"}}},
+    "event":   {"properties": {"duration": {"type": "long"}}},
+    "source":  {"properties": {"ip": {"type": "ip"}}},
+    "user":    {"properties": {"name": {"type": "keyword"}}},
+    "user_agent": {"properties": {"original": {"type": "keyword"}}},
+    "trace":   {"properties": {"id": {"type": "keyword"}}},
+    "span":    {"properties": {"id": {"type": "keyword"}}},
+    "message": {"type": "match_only_text"}
+  }
+}

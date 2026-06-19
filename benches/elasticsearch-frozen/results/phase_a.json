@@ -1,0 +1,134 @@
+[
+  {
+    "index": "bench-standard-default",
+    "repo": "repo_direct",
+    "label": "direct (no S4)",
+    "es_snapshot_bytes": 1440807399,
+    "es_files": 22,
+    "stored_bytes": 1440811727,
+    "stored_objects": 27,
+    "snapshot_wall_s": 1.6,
+    "es_dur_ms": 1597
+  },
+  {
+    "index": "bench-standard-default",
+    "repo": "repo_s4z3",
+    "label": "S4 zstd-3",
+    "es_snapshot_bytes": 1440807399,
+    "es_files": 22,
+    "stored_bytes": 1051216060,
+    "stored_objects": 34,
+    "snapshot_wall_s": 5.98,
+    "es_dur_ms": 5979
+  },
+  {
+    "index": "bench-standard-default",
+    "repo": "repo_s4z9",
+    "label": "S4 zstd-9",
+    "es_snapshot_bytes": 1440807399,
+    "es_files": 22,
+    "stored_bytes": 995746513,
+    "stored_objects": 34,
+    "snapshot_wall_s": 19.99,
+    "es_dur_ms": 19988
+  },
+  {
+    "index": "bench-standard-default",
+    "repo": "repo_s4z19",
+    "label": "S4 zstd-19",
+    "es_snapshot_bytes": 0,
+    "es_files": 0,
+    "stored_bytes": 3860,
+    "stored_objects": 6,
+    "snapshot_wall_s": 120.78,
+    "es_dur_ms": 120784
+  },
+  {
+    "index": "bench-standard-bestcomp",
+    "repo": "repo_direct",
+    "label": "direct (no S4)",
+    "es_snapshot_bytes": 1057610816,
+    "es_files": 4,
+    "stored_bytes": 1057613850,
+    "stored_objects": 9,
+    "snapshot_wall_s": 1.95,
+    "es_dur_ms": 1949
+  },
+  {
+    "index": "bench-standard-bestcomp",
+    "repo": "repo_s4z3",
+    "label": "S4 zstd-3",
+    "es_snapshot_bytes": 1057610816,
+    "es_files": 4,
+    "stored_bytes": 901265200,
+    "stored_objects": 10,
+    "snapshot_wall_s": 5.27,
+    "es_dur_ms": 5268
+  },
+  {
+    "index": "bench-standard-bestcomp",
+    "repo": "repo_s4z9",
+    "label": "S4 zstd-9",
+    "es_snapshot_bytes": 1057610816,
+    "es_files": 4,
+    "stored_bytes": 895182489,
+    "stored_objects": 10,
+    "snapshot_wall_s": 8.83,
+    "es_dur_ms": 8830
+  },
+  {
+    "index": "bench-standard-bestcomp",
+    "repo": "repo_s4z19",
+    "label": "S4 zstd-19",
+    "es_snapshot_bytes": 0,
+    "es_files": 0,
+    "stored_bytes": 3061,
+    "stored_objects": 6,
+    "snapshot_wall_s": 180.69,
+    "es_dur_ms": 180693
+  },
+  {
+    "index": "bench-logsdb",
+    "repo": "repo_direct",
+    "label": "direct (no S4)",
+    "es_snapshot_bytes": 660873049,
+    "es_files": 4,
+    "stored_bytes": 660876050,
+    "stored_objects": 9,
+    "snapshot_wall_s": 1.11,
+    "es_dur_ms": 1114
+  },
+  {
+    "index": "bench-logsdb",
+    "repo": "repo_s4z3",
+    "label": "S4 zstd-3",
+    "es_snapshot_bytes": 660873049,
+    "es_files": 4,
+    "stored_bytes": 514266441,
+    "stored_objects": 10,
+    "snapshot_wall_s": 3.55,
+    "es_dur_ms": 3553
+  },
+  {
+    "index": "bench-logsdb",
+    "repo": "repo_s4z9",
+    "label": "S4 zstd-9",
+    "es_snapshot_bytes": 660873049,
+    "es_files": 4,
+    "stored_bytes": 510603847,
+    "stored_objects": 10,
+    "snapshot_wall_s": 7.16,
+    "es_dur_ms": 7156
+  },
+  {
+    "index": "bench-logsdb",
+    "repo": "repo_s4z19",
+    "label": "S4 zstd-19",
+    "es_snapshot_bytes": 0,
+    "es_files": 0,
+    "stored_bytes": 3088,
+    "stored_objects": 6,
+    "snapshot_wall_s": 90.4,
+    "es_dur_ms": 90398
+  }
+]

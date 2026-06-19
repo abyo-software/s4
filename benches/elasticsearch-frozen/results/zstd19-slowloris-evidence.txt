@@ -1,0 +1,27 @@
+# Evidence: driving a snapshot through an S4 gateway pinned to zstd-19 trips
+# S4's 30s per-connection read timeout (--read-timeout-seconds, "slowloris
+# guard") while compressing a large multipart part, so repository-s3 sees a
+# dropped upload and the snapshot completes PARTIAL. This is why high zstd
+# levels belong to `s4 recompact` (backend-direct, no client connection), not
+# the live snapshot path. Captured 2026-06-18, S4 v1.2.2.
+
+## S4 zstd-19 gateway log (port 8013) during the snapshot:
+2026-06-18T19:09:44.763Z  WARN s4: connection timeout (slowloris guard) timeout_secs=30
+2026-06-18T19:10:14.824Z  WARN s4: connection timeout (slowloris guard) timeout_secs=30
+2026-06-18T19:10:45.080Z  WARN s4: connection timeout (slowloris guard) timeout_secs=30
+... (repeats for the duration of the attempted snapshot)
+
+## Elasticsearch snapshot result (_status / _snapshot get):
+state: PARTIAL
+shards: {'total': 1, 'failed': 1, 'successful': 0}
+FAILURE: IOException[Unable to upload or copy object
+  [indices/<uuid>/0/__<blob>] using multipart upload];
+  nested: SdkClientException[Unable to execute HTTP request:
+  The target server failed to respond (SDK Attempt Count: 4)];
+  nested: NoHttpResponseException[The target server failed to respond]
+
+## zstd-3 and zstd-9 on the same path: SUCCESS (see phase_a.json).
+## Workaround A (recommended): snapshot at zstd-3, then `s4 recompact
+##   --target-zstd-level 19` backend-direct (see phase_d_recompact.sh).
+## Workaround B: raise the gateway's --read-timeout-seconds above the
+##   per-part compress time (trades snapshot wall-clock for ratio).

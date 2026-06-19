@@ -3,6 +3,9 @@
 Product overview, pitch, and quick start live in the top-level
 [README.md](../README.md). This folder holds the detailed reference.
 
+## Use cases
+- [use-cases/elasticsearch-frozen-tier.md](use-cases/elasticsearch-frozen-tier.md) — S4 as an Elasticsearch frozen-tier backend: measured storage and snapshot throughput across standard / `best_compression` / LogsDB and zstd levels, plus cold frozen-search latency (at zstd-3)
+
 ## Getting started
 - [install.md](install.md) — cargo / pip / WASM / build from source / supported targets
 - [gpu.md](gpu.md) — GPU trial + `--gpu-batch-small-puts` tuning

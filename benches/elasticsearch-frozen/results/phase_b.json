@@ -1,0 +1,194 @@
+[
+  {
+    "index": "bench-standard-default",
+    "repo": "direct",
+    "query": "term_rare(status:500)",
+    "cold_ms_median": 3.0,
+    "cold_ms_min": 3,
+    "warm_ms_median": 1.5
+  },
+  {
+    "index": "bench-standard-default",
+    "repo": "direct",
+    "query": "agg(date_hist+terms)",
+    "cold_ms_median": 4.0,
+    "cold_ms_min": 3,
+    "warm_ms_median": 2.0
+  },
+  {
+    "index": "bench-standard-default",
+    "repo": "direct",
+    "query": "fulltext(message:items)",
+    "cold_ms_median": 3.0,
+    "cold_ms_min": 2,
+    "warm_ms_median": 1.5
+  },
+  {
+    "index": "bench-standard-default",
+    "repo": "direct",
+    "query": "topN(level:ERROR sort ts)",
+    "cold_ms_median": 1714.0,
+    "cold_ms_min": 1640,
+    "warm_ms_median": 8.5
+  },
+  {
+    "index": "bench-standard-default",
+    "repo": "S4 zstd-3",
+    "query": "term_rare(status:500)",
+    "cold_ms_median": 2.0,
+    "cold_ms_min": 2,
+    "warm_ms_median": 1.0
+  },
+  {
+    "index": "bench-standard-default",
+    "repo": "S4 zstd-3",
+    "query": "agg(date_hist+terms)",
+    "cold_ms_median": 3.0,
+    "cold_ms_min": 2,
+    "warm_ms_median": 1.0
+  },
+  {
+    "index": "bench-standard-default",
+    "repo": "S4 zstd-3",
+    "query": "fulltext(message:items)",
+    "cold_ms_median": 2.0,
+    "cold_ms_min": 2,
+    "warm_ms_median": 1.0
+  },
+  {
+    "index": "bench-standard-default",
+    "repo": "S4 zstd-3",
+    "query": "topN(level:ERROR sort ts)",
+    "cold_ms_median": 1877.5,
+    "cold_ms_min": 1871,
+    "warm_ms_median": 7.0
+  },
+  {
+    "index": "bench-standard-bestcomp",
+    "repo": "direct",
+    "query": "term_rare(status:500)",
+    "cold_ms_median": 2.0,
+    "cold_ms_min": 1,
+    "warm_ms_median": 1.0
+  },
+  {
+    "index": "bench-standard-bestcomp",
+    "repo": "direct",
+    "query": "agg(date_hist+terms)",
+    "cold_ms_median": 3.5,
+    "cold_ms_min": 2,
+    "warm_ms_median": 2.0
+  },
+  {
+    "index": "bench-standard-bestcomp",
+    "repo": "direct",
+    "query": "fulltext(message:items)",
+    "cold_ms_median": 3.0,
+    "cold_ms_min": 2,
+    "warm_ms_median": 2.0
+  },
+  {
+    "index": "bench-standard-bestcomp",
+    "repo": "direct",
+    "query": "topN(level:ERROR sort ts)",
+    "cold_ms_median": 2328.0,
+    "cold_ms_min": 2328,
+    "warm_ms_median": 9.5
+  },
+  {
+    "index": "bench-standard-bestcomp",
+    "repo": "S4 zstd-3",
+    "query": "term_rare(status:500)",
+    "cold_ms_median": 2.0,
+    "cold_ms_min": 1,
+    "warm_ms_median": 0.0
+  },
+  {
+    "index": "bench-standard-bestcomp",
+    "repo": "S4 zstd-3",
+    "query": "agg(date_hist+terms)",
+    "cold_ms_median": 2.0,
+    "cold_ms_min": 2,
+    "warm_ms_median": 2.5
+  },
+  {
+    "index": "bench-standard-bestcomp",
+    "repo": "S4 zstd-3",
+    "query": "fulltext(message:items)",
+    "cold_ms_median": 1.0,
+    "cold_ms_min": 1,
+    "warm_ms_median": 0.5
+  },
+  {
+    "index": "bench-standard-bestcomp",
+    "repo": "S4 zstd-3",
+    "query": "topN(level:ERROR sort ts)",
+    "cold_ms_median": 2516.5,
+    "cold_ms_min": 2512,
+    "warm_ms_median": 9.0
+  },
+  {
+    "index": "bench-logsdb",
+    "repo": "direct",
+    "query": "term_rare(status:500)",
+    "cold_ms_median": 2.0,
+    "cold_ms_min": 2,
+    "warm_ms_median": 2.0
+  },
+  {
+    "index": "bench-logsdb",
+    "repo": "direct",
+    "query": "agg(date_hist+terms)",
+    "cold_ms_median": 2.0,
+    "cold_ms_min": 2,
+    "warm_ms_median": 1.0
+  },
+  {
+    "index": "bench-logsdb",
+    "repo": "direct",
+    "query": "fulltext(message:items)",
+    "cold_ms_median": 2.0,
+    "cold_ms_min": 2,
+    "warm_ms_median": 1.0
+  },
+  {
+    "index": "bench-logsdb",
+    "repo": "direct",
+    "query": "topN(level:ERROR sort ts)",
+    "cold_ms_median": 7188.0,
+    "cold_ms_min": 7187,
+    "warm_ms_median": 5.0
+  },
+  {
+    "index": "bench-logsdb",
+    "repo": "S4 zstd-3",
+    "query": "term_rare(status:500)",
+    "cold_ms_median": 2.0,
+    "cold_ms_min": 2,
+    "warm_ms_median": 1.0
+  },
+  {
+    "index": "bench-logsdb",
+    "repo": "S4 zstd-3",
+    "query": "agg(date_hist+terms)",
+    "cold_ms_median": 2.5,
+    "cold_ms_min": 2,
+    "warm_ms_median": 1.0
+  },
+  {
+    "index": "bench-logsdb",
+    "repo": "S4 zstd-3",
+    "query": "fulltext(message:items)",
+    "cold_ms_median": 1.5,
+    "cold_ms_min": 1,
+    "warm_ms_median": 0.0
+  },
+  {
+    "index": "bench-logsdb",
+    "repo": "S4 zstd-3",
+    "query": "topN(level:ERROR sort ts)",
+    "cold_ms_median": 7657.5,
+    "cold_ms_min": 7626,
+    "warm_ms_median": 4.5
+  }
+]

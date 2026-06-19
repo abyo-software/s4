@@ -19,6 +19,8 @@
 | `--acme-cache-dir` | `~/.s4/acme/` | Cert + account cache directory (so restarts don't trigger fresh enrollments and exhaust LE rate limits) |
 | `--acme-staging` | (off) | Use the LE staging directory (no rate limits; cert is not browser-trusted). Recommended for first-run |
 | `--policy` | (none) | AWS-style bucket policy JSON. When set, every PUT/GET/DELETE/List request is evaluated before backend dispatch |
+| `--read-timeout-seconds` | `30` | Per-connection wall-clock cap covering header reads, body reads, **and request handling/compression** (slowloris guard). `0` disables it (not recommended). Because compression time counts toward the cap, a single PUT that needs longer than 30s — e.g. compressing a large body at a **high `--zstd-level` (19–22) on the PUT path** — will trip it; for that case prefer the latency-friendly default level and `s4 recompact` cold data instead (see the [Elasticsearch frozen-tier use case](use-cases/elasticsearch-frozen-tier.md)) |
+| `--max-concurrent-connections` | `1024` | Hard cap on in-flight HTTP connections; when the cap is reached the listener waits before accepting another connection until one drains |
 
 AWS credentials are read from the standard AWS chain (`AWS_ACCESS_KEY_ID` /
 `AWS_SECRET_ACCESS_KEY` / `AWS_PROFILE` / IAM role on EC2).
