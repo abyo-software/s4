@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781867670441,
+  "lastUpdate": 1781884204254,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -17412,6 +17412,234 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 24,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "masumi.ryugo@gmail.com",
+            "name": "masumi-ryugo",
+            "username": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e6b591e2ec2f83c9af42d73a51746119719a36ec",
+          "message": "feat(parquet-recompact): productionize + cold-Parquet use case (#5) (#137)\n\n* feat(parquet-recompact): spike — re-encode cold Parquet columns to zstd in place\n\nNew optional `parquet-recompact` feature on s4-server adding an\n`s4 parquet-recompact <bucket>[/prefix]` subcommand: lists a backend\nbucket/prefix, reads each Parquet object, re-encodes its column chunks to zstd\nvia Arrow (decode → ArrowWriter with Compression::ZSTD), and (with --execute)\nwrites a *native* Parquet back in place — still readable by\npyarrow/Spark/Trino/DuckDB with no S4 in the read path. Dry-run by default;\ngain-gate + idempotency stamp (s4-parquet-zstd-level).\n\nOff by default (pulls the Arrow tree, like aws-kms keeps the KMS tree out);\ndefault build verified unaffected.\n\nVerified end-to-end against MinIO: a 2M-row snappy log Parquet (127.6 MB)\nrecompacts to 73.6 MB (-42.3%); pyarrow reads the result natively and confirms\n`data equal: True` (value-for-value identical, all columns ZSTD). In-crate the\nre-encode self-verifies column-data equality (ArrayData) before writing.\n\nSpike checkpoint — not yet productized (Codex gate / docs / versioning pending).\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n* feat(parquet-recompact): productionize + cold-Parquet use case (#5)\n\nHarden the off-by-default `s4 parquet-recompact` subcommand to a GA bar and\npublish the #5 use-case doc in the series.\n\nFeature (off-by-default `parquet-recompact` cargo feature; default build / ghcr\nimage / Marketplace AMI unchanged):\n- Offline, in-place re-encode of cold Parquet column chunks snappy/none/gzip ->\n  zstd, producing NATIVE Parquet (pyarrow/Spark/Trino/DuckDB read it with no S4\n  in the read path). Preserves input row-group boundaries + non-ARROW KV file\n  metadata.\n- Value-verified before overwrite: per-row-group, batch-streamed (bounded\n  memory), full Arrow schema + Parquet physical-schema-tree (catches INT96 /\n  decimal / field-id / nested LIST-MAP drift the Arrow round-trip would hide) +\n  row/row-group counts + carried KV. Structural drift => conservative skip;\n  decoded-value mismatch => hard failure (--tolerate-value-mismatch downgrades);\n  corrupt footer => hard failure. Never overwrites unverified data.\n- Bounded resources: input+output spooled to temp files (peak RAM independent of\n  object size), byte-budgeted decode batches, decoded-batch + live-writer memory\n  guards, footer-size guard, output-size cap, --max-body-bytes / --max-objects.\n- Safe in-place overwrite: dry-run default (+ honest preflight: reports\n  etag-unavailable / tags-unreadable like execute), --execute requires\n  --allow-lossy-physical-rewrite, conditional If-Match + pre-PUT re-HEAD of\n  ETag/Last-Modified/version-id, ambiguous-PUT nonce recovery. Skips (never\n  silently rewrites) SSE / Object-Lock / Expires / archive-tier / sort-order /\n  bloom-filter objects; idempotent already-zstd footer skip; --older-than cold\n  gate. Page-indexes + checksums regenerated; ACLs not carried (acknowledged).\n- 6 unit tests incl. INT96 physical-drift positive case.\n\nBenchmark (benches/cold-parquet/, local MinIO, 2M-row ECS table): -36.6% over\nsnappy / -51.7% over uncompressed / -3.8% gzip / -0.0% already-zstd, all\npyarrow table.equals(original) == True, output codec ZSTD.\n\nDocs: docs/use-cases/cold-parquet.md (#5), docs/features.md section, README\nuse-cases link. Code + article each Codex-gated to convergence.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: masumi-ryugo <abyo.software@gmail.com>\nCo-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-20T00:42:25+09:00",
+          "tree_id": "67a8fca96d3be60d65231bdcaafd96ccc3ea1049",
+          "url": "https://github.com/abyo-software/s4/commit/e6b591e2ec2f83c9af42d73a51746119719a36ec"
+        },
+        "date": 1781884203161,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 55602,
+            "range": "± 3627",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 44366,
+            "range": "± 1846",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 391,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2230666,
+            "range": "± 89142",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 28577667,
+            "range": "± 39145",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 152196,
+            "range": "± 1139",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 51436621,
+            "range": "± 719753",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 504960057,
+            "range": "± 2563823",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 2459096,
+            "range": "± 24941",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 25163,
+            "range": "± 2105",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 29177,
+            "range": "± 2119",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 395,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 527708,
+            "range": "± 12342",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1396955,
+            "range": "± 40189",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 152308,
+            "range": "± 491",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12940663,
+            "range": "± 684410",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27084444,
+            "range": "± 197388",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 2454784,
+            "range": "± 23896",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1337507,
+            "range": "± 35180",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2159740,
+            "range": "± 57059",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 394195196,
+            "range": "± 4710462",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 118,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 5856,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 843,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13189,
+            "range": "± 46",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2457,
+            "range": "± 65",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 18976,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 75613,
+            "range": "± 166",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 556,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4569,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19673,
+            "range": "± 46",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 30,
             "range": "± 0",
             "unit": "ns/iter"
           }
