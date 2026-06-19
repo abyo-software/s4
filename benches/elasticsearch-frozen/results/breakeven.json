@@ -1,0 +1,301 @@
+{
+  "model": "break_even_TB = host_usd_month * instances / (saved_ratio * price_per_TB_month)",
+  "params": {
+    "s4_host_usd_month": 70.0,
+    "instances": 2,
+    "price_per_tb_month": 23.0,
+    "scales_tb": [
+      50,
+      100,
+      500,
+      1000
+    ]
+  },
+  "source": "saved_ratio from benches/elasticsearch-frozen/results/phase_a.json (2026-06-18); host price is the parameterised --s4-host-usd-month",
+  "scenarios": {
+    "standard-default": {
+      "saved_ratio": 0.27,
+      "break_even_TB_non_ha_1_instance": 11.27,
+      "break_even_TB_ha_2_instances": 22.54,
+      "scales": {
+        "50TB": {
+          "non_ha_1_instance": {
+            "storage_saved_usd_mo": 310.5,
+            "host_cost_usd_mo": 70.0,
+            "net_usd_mo": 240.5,
+            "net_usd_yr": 2886.0,
+            "net_positive": true
+          },
+          "ha_2_instances": {
+            "storage_saved_usd_mo": 310.5,
+            "host_cost_usd_mo": 140.0,
+            "net_usd_mo": 170.5,
+            "net_usd_yr": 2046.0,
+            "net_positive": true
+          }
+        },
+        "100TB": {
+          "non_ha_1_instance": {
+            "storage_saved_usd_mo": 621.0,
+            "host_cost_usd_mo": 70.0,
+            "net_usd_mo": 551.0,
+            "net_usd_yr": 6612.0,
+            "net_positive": true
+          },
+          "ha_2_instances": {
+            "storage_saved_usd_mo": 621.0,
+            "host_cost_usd_mo": 140.0,
+            "net_usd_mo": 481.0,
+            "net_usd_yr": 5772.0,
+            "net_positive": true
+          }
+        },
+        "500TB": {
+          "non_ha_1_instance": {
+            "storage_saved_usd_mo": 3105.0,
+            "host_cost_usd_mo": 70.0,
+            "net_usd_mo": 3035.0,
+            "net_usd_yr": 36420.0,
+            "net_positive": true
+          },
+          "ha_2_instances": {
+            "storage_saved_usd_mo": 3105.0,
+            "host_cost_usd_mo": 140.0,
+            "net_usd_mo": 2965.0,
+            "net_usd_yr": 35580.0,
+            "net_positive": true
+          }
+        },
+        "1000TB": {
+          "non_ha_1_instance": {
+            "storage_saved_usd_mo": 6210.0,
+            "host_cost_usd_mo": 70.0,
+            "net_usd_mo": 6140.0,
+            "net_usd_yr": 73680.0,
+            "net_positive": true
+          },
+          "ha_2_instances": {
+            "storage_saved_usd_mo": 6210.0,
+            "host_cost_usd_mo": 140.0,
+            "net_usd_mo": 6070.0,
+            "net_usd_yr": 72840.0,
+            "net_positive": true
+          }
+        }
+      }
+    },
+    "best_compression": {
+      "saved_ratio": 0.148,
+      "break_even_TB_non_ha_1_instance": 20.56,
+      "break_even_TB_ha_2_instances": 41.13,
+      "scales": {
+        "50TB": {
+          "non_ha_1_instance": {
+            "storage_saved_usd_mo": 170.2,
+            "host_cost_usd_mo": 70.0,
+            "net_usd_mo": 100.2,
+            "net_usd_yr": 1202.4,
+            "net_positive": true
+          },
+          "ha_2_instances": {
+            "storage_saved_usd_mo": 170.2,
+            "host_cost_usd_mo": 140.0,
+            "net_usd_mo": 30.2,
+            "net_usd_yr": 362.4,
+            "net_positive": true
+          }
+        },
+        "100TB": {
+          "non_ha_1_instance": {
+            "storage_saved_usd_mo": 340.4,
+            "host_cost_usd_mo": 70.0,
+            "net_usd_mo": 270.4,
+            "net_usd_yr": 3244.8,
+            "net_positive": true
+          },
+          "ha_2_instances": {
+            "storage_saved_usd_mo": 340.4,
+            "host_cost_usd_mo": 140.0,
+            "net_usd_mo": 200.4,
+            "net_usd_yr": 2404.8,
+            "net_positive": true
+          }
+        },
+        "500TB": {
+          "non_ha_1_instance": {
+            "storage_saved_usd_mo": 1702.0,
+            "host_cost_usd_mo": 70.0,
+            "net_usd_mo": 1632.0,
+            "net_usd_yr": 19584.0,
+            "net_positive": true
+          },
+          "ha_2_instances": {
+            "storage_saved_usd_mo": 1702.0,
+            "host_cost_usd_mo": 140.0,
+            "net_usd_mo": 1562.0,
+            "net_usd_yr": 18744.0,
+            "net_positive": true
+          }
+        },
+        "1000TB": {
+          "non_ha_1_instance": {
+            "storage_saved_usd_mo": 3404.0,
+            "host_cost_usd_mo": 70.0,
+            "net_usd_mo": 3334.0,
+            "net_usd_yr": 40008.0,
+            "net_positive": true
+          },
+          "ha_2_instances": {
+            "storage_saved_usd_mo": 3404.0,
+            "host_cost_usd_mo": 140.0,
+            "net_usd_mo": 3264.0,
+            "net_usd_yr": 39168.0,
+            "net_positive": true
+          }
+        }
+      }
+    },
+    "logsdb": {
+      "saved_ratio": 0.222,
+      "break_even_TB_non_ha_1_instance": 13.71,
+      "break_even_TB_ha_2_instances": 27.42,
+      "scales": {
+        "50TB": {
+          "non_ha_1_instance": {
+            "storage_saved_usd_mo": 255.3,
+            "host_cost_usd_mo": 70.0,
+            "net_usd_mo": 185.3,
+            "net_usd_yr": 2223.6,
+            "net_positive": true
+          },
+          "ha_2_instances": {
+            "storage_saved_usd_mo": 255.3,
+            "host_cost_usd_mo": 140.0,
+            "net_usd_mo": 115.3,
+            "net_usd_yr": 1383.6,
+            "net_positive": true
+          }
+        },
+        "100TB": {
+          "non_ha_1_instance": {
+            "storage_saved_usd_mo": 510.6,
+            "host_cost_usd_mo": 70.0,
+            "net_usd_mo": 440.6,
+            "net_usd_yr": 5287.2,
+            "net_positive": true
+          },
+          "ha_2_instances": {
+            "storage_saved_usd_mo": 510.6,
+            "host_cost_usd_mo": 140.0,
+            "net_usd_mo": 370.6,
+            "net_usd_yr": 4447.2,
+            "net_positive": true
+          }
+        },
+        "500TB": {
+          "non_ha_1_instance": {
+            "storage_saved_usd_mo": 2553.0,
+            "host_cost_usd_mo": 70.0,
+            "net_usd_mo": 2483.0,
+            "net_usd_yr": 29796.0,
+            "net_positive": true
+          },
+          "ha_2_instances": {
+            "storage_saved_usd_mo": 2553.0,
+            "host_cost_usd_mo": 140.0,
+            "net_usd_mo": 2413.0,
+            "net_usd_yr": 28956.0,
+            "net_positive": true
+          }
+        },
+        "1000TB": {
+          "non_ha_1_instance": {
+            "storage_saved_usd_mo": 5106.0,
+            "host_cost_usd_mo": 70.0,
+            "net_usd_mo": 5036.0,
+            "net_usd_yr": 60432.0,
+            "net_positive": true
+          },
+          "ha_2_instances": {
+            "storage_saved_usd_mo": 5106.0,
+            "host_cost_usd_mo": 140.0,
+            "net_usd_mo": 4966.0,
+            "net_usd_yr": 59592.0,
+            "net_positive": true
+          }
+        }
+      }
+    },
+    "standard-default-zstd19": {
+      "saved_ratio": 0.332,
+      "break_even_TB_non_ha_1_instance": 9.17,
+      "break_even_TB_ha_2_instances": 18.33,
+      "scales": {
+        "50TB": {
+          "non_ha_1_instance": {
+            "storage_saved_usd_mo": 381.8,
+            "host_cost_usd_mo": 70.0,
+            "net_usd_mo": 311.8,
+            "net_usd_yr": 3741.6,
+            "net_positive": true
+          },
+          "ha_2_instances": {
+            "storage_saved_usd_mo": 381.8,
+            "host_cost_usd_mo": 140.0,
+            "net_usd_mo": 241.8,
+            "net_usd_yr": 2901.6,
+            "net_positive": true
+          }
+        },
+        "100TB": {
+          "non_ha_1_instance": {
+            "storage_saved_usd_mo": 763.6,
+            "host_cost_usd_mo": 70.0,
+            "net_usd_mo": 693.6,
+            "net_usd_yr": 8323.2,
+            "net_positive": true
+          },
+          "ha_2_instances": {
+            "storage_saved_usd_mo": 763.6,
+            "host_cost_usd_mo": 140.0,
+            "net_usd_mo": 623.6,
+            "net_usd_yr": 7483.2,
+            "net_positive": true
+          }
+        },
+        "500TB": {
+          "non_ha_1_instance": {
+            "storage_saved_usd_mo": 3818.0,
+            "host_cost_usd_mo": 70.0,
+            "net_usd_mo": 3748.0,
+            "net_usd_yr": 44976.0,
+            "net_positive": true
+          },
+          "ha_2_instances": {
+            "storage_saved_usd_mo": 3818.0,
+            "host_cost_usd_mo": 140.0,
+            "net_usd_mo": 3678.0,
+            "net_usd_yr": 44136.0,
+            "net_positive": true
+          }
+        },
+        "1000TB": {
+          "non_ha_1_instance": {
+            "storage_saved_usd_mo": 7636.0,
+            "host_cost_usd_mo": 70.0,
+            "net_usd_mo": 7566.0,
+            "net_usd_yr": 90792.0,
+            "net_positive": true
+          },
+          "ha_2_instances": {
+            "storage_saved_usd_mo": 7636.0,
+            "host_cost_usd_mo": 140.0,
+            "net_usd_mo": 7496.0,
+            "net_usd_yr": 89952.0,
+            "net_positive": true
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "measurement": "B4 - HA failover smoke (2 stateless S4 instances behind nginx LB)",
+  "topology": "ES -> nginx:8030 (round-robin upstream) -> S4 :8027 + :8028 -> MinIO. Both S4 instances stateless (sidecars in S3).",
+  "host": "AMD Ryzen 9 9950X, ES 9.4.2, MinIO RELEASE.2025-09-07, S4 v1.2.2",
+  "overall_pass": true,
+  "steps": [
+    {
+      "step": "register_repo_via_LB+verify",
+      "ok": true,
+      "detail": "verify returned nodes"
+    },
+    {
+      "step": "snapshot_both_up",
+      "ok": true,
+      "detail": "snapshot state=SUCCESS"
+    },
+    {
+      "step": "frozen_mount+warm",
+      "ok": true,
+      "detail": "warm took=3ms"
+    },
+    {
+      "step": "kill_one_s4_instance",
+      "ok": true,
+      "detail": "killed pid=2405982 on :8027; survivor :8028"
+    },
+    {
+      "step": "warm_query_after_kill",
+      "ok": true,
+      "detail": "warm took=3ms (served from shared cache)"
+    },
+    {
+      "step": "cold_query_after_kill",
+      "ok": true,
+      "detail": "cold took=232ms hits={'value': 79925, 'relation': 'eq'}"
+    },
+    {
+      "step": "snapshot_PUT_during_kill",
+      "ok": true,
+      "detail": "snapshot state=SUCCESS"
+    }
+  ],
+  "interpretation": "S4 is a read-path hard dependency for cold frozen search; a single gateway is a SPOF. With >=2 stateless instances behind a load balancer (or multi-value DNS), losing one instance leaves cold search, warm search and snapshot PUT all working through the survivor."
+}
