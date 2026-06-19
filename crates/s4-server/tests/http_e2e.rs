@@ -384,6 +384,28 @@ async fn logical_etag_if_match_uses_logical_etag() {
         .await;
     assert!(bad.is_err(), "wrong If-Match must fail the precondition");
 
+    // If-None-Match with the logical ETag -> 304 Not Modified (surfaces as an
+    // SDK error with HTTP 304, NOT a 200-with-body).
+    let nm = s4
+        .get_object()
+        .bucket("le-cond")
+        .key("k")
+        .if_none_match(raw_etag.clone())
+        .send()
+        .await;
+    let status = nm
+        .as_ref()
+        .err()
+        .and_then(|e| e.raw_response())
+        .map(|r| r.status().as_u16());
+    assert_eq!(
+        status,
+        Some(304),
+        "If-None-Match on a matching ETag must return 304, got {:?}",
+        nm.map(|_| "200 OK with body")
+            .map_err(|e| e.raw_response().map(|r| r.status().as_u16()))
+    );
+
     let _ = shutdown.send(());
 }
 

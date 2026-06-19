@@ -5281,14 +5281,16 @@ impl<B: S3> S3 for S4Service<B> {
                     ));
                 }
                 EtagPrecondition::NotModified => {
-                    // 304: drop the body, echo the (logical) ETag validator.
-                    resp.output.body = None;
-                    resp.output.content_length = None;
-                    resp.output.e_tag = logical
-                        .map(ETag::Strong)
-                        .or_else(|| resp.output.e_tag.take());
-                    resp.status = Some(http::StatusCode::NOT_MODIFIED);
-                    return Ok(resp);
+                    // 304 Not Modified. s3s ignores `S3Response.status` for the
+                    // GET/HEAD success path (it only infers 206 from
+                    // Content-Range), so emit 304 via the `NotModified` error
+                    // code, which the error serializer maps to HTTP 304 (no
+                    // body — correct for a conditional GET hit).
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::from_bytes(b"NotModified")
+                            .unwrap_or(S3ErrorCode::InvalidArgument),
+                        "Not Modified",
+                    ));
                 }
                 EtagPrecondition::Proceed => {}
             }
@@ -5782,8 +5784,14 @@ impl<B: S3> S3 for S4Service<B> {
                     ));
                 }
                 EtagPrecondition::NotModified => {
-                    resp.status = Some(http::StatusCode::NOT_MODIFIED);
-                    return Ok(resp);
+                    // 304 via the NotModified error code (s3s ignores
+                    // `S3Response.status` on the HEAD success path — see the
+                    // get_object NotModified arm).
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::from_bytes(b"NotModified")
+                            .unwrap_or(S3ErrorCode::InvalidArgument),
+                        "Not Modified",
+                    ));
                 }
                 EtagPrecondition::Proceed => {}
             }
