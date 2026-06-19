@@ -6428,6 +6428,10 @@ impl<B: S3> S3 for S4Service<B> {
                     // same source marker, so destination metadata and
                     // counters stay in lockstep.
                     META_LEDGER,
+                    // `--logical-etag`: a copy has byte-identical content, so
+                    // MD5(original) is unchanged — preserve the stamp or the
+                    // destination's HEAD/GET would report no logical ETag.
+                    META_LOGICAL_ETAG,
                 ] {
                     if let Some(v) = src_meta.get(key) {
                         dest_meta.insert(key.to_string(), v.clone());

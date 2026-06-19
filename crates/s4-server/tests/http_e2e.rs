@@ -469,6 +469,69 @@ async fn logical_etag_off_leaves_etag_and_metadata_unchanged() {
     let _ = shutdown.send(());
 }
 
+/// `--logical-etag`: a REPLACE-directive CopyObject of a compressed object is
+/// byte-identical, so MD5(original) is unchanged — the destination must keep
+/// its logical-ETag stamp and still report it on HEAD.
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn logical_etag_survives_copy_object_replace() {
+    let minio = start_minio().await;
+    let (s4_endpoint, shutdown) = spawn_s4_server_opts(&minio.endpoint_url, true).await;
+    let backend_client = build_aws_client(&minio.endpoint_url);
+    let _ = backend_client
+        .create_bucket()
+        .bucket("le-copy")
+        .send()
+        .await;
+
+    let payload = Bytes::from("copy-object payload row; ".repeat(4000));
+    let raw_etag = backend_client
+        .put_object()
+        .bucket("le-copy")
+        .key("raw")
+        .body(payload.clone().into())
+        .send()
+        .await
+        .expect("raw PUT")
+        .e_tag()
+        .map(str::to_owned)
+        .expect("MinIO ETag");
+
+    let s4 = build_aws_client(&s4_endpoint);
+    s4.put_object()
+        .bucket("le-copy")
+        .key("src")
+        .body(payload.clone().into())
+        .send()
+        .await
+        .expect("PUT src");
+    // REPLACE-directive copy through S4 (re-stamps client metadata).
+    s4.copy_object()
+        .bucket("le-copy")
+        .key("dst")
+        .copy_source("le-copy/src")
+        .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+        .metadata("user-meta", "v")
+        .send()
+        .await
+        .expect("copy through S4");
+
+    let head = s4
+        .head_object()
+        .bucket("le-copy")
+        .key("dst")
+        .send()
+        .await
+        .expect("HEAD dst");
+    assert_eq!(
+        head.e_tag().map(str::to_owned),
+        Some(raw_etag),
+        "REPLACE-copied compressed object must keep its logical ETag"
+    );
+
+    let _ = shutdown.send(());
+}
+
 #[tokio::test]
 #[ignore = "requires Docker for MinIO container"]
 async fn http_range_get_on_s4_compressed_object_returns_partial_bytes() {
