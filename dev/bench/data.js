@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781854582574,
+  "lastUpdate": 1781855523346,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -16729,6 +16729,234 @@ window.BENCHMARK_DATA = {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 31,
             "range": "± 1",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "masumi.ryugo@gmail.com",
+            "name": "masumi-ryugo",
+            "username": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bd5987d7d518a19bb1c9d4c28076a6ffd605a38b",
+          "message": "docs(use-cases): OpenSearch searchable-snapshot use case + harness (#134)\n\n* docs(use-cases): add OpenSearch searchable-snapshot use case + harness\n\nSeries #2: using S4 as an OpenSearch searchable-snapshot backend. Measured\nend-to-end (OpenSearch 2.19 -> S4 v1.2.2 --logical-etag -> MinIO, 4M-doc log\nindex) across the four index.codec variants:\n\n- storage saved (S4 zstd-3): default -28.1% / best_compression -17.2% /\n  zstd -16.8% / zstd_no_dict -16.5%. index.codec only compresses stored fields,\n  so S4 still finds ~17% on a native-zstd index (doc-values/postings/term dicts);\n  native zstd + S4 = 1.63x smaller than default-codec direct.\n- requires S4's --logical-etag (OpenSearch repository-s3 validates uploads\n  against MD5(original); this use case is what surfaced + drove that fix).\n- searchable-snapshot (remote_snapshot) search: S4 within +/-1 ms of direct in\n  this local run (cold-ish; honest caveats in the doc).\n\nIncludes a reproducible local harness (benches/opensearch-searchable/) with raw\nresults JSON + a runbook (security off, repository-s3 plugin install, region,\n--logical-etag). Reviewed with Codex.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n* docs(use-cases): correct OpenSearch search-latency claim to ~1.5 ms\n\nCodex: the headline '±1 ms' was inconsistent with the table (default\ndate-histogram agg 27.5 ms via S4 vs 29.0 direct = 1.5 ms, S4 faster). State\n'within ~1.5 ms, equal or faster' with the datapoint.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: masumi-ryugo <abyo.software@gmail.com>\nCo-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-19T16:44:08+09:00",
+          "tree_id": "e845eac056699350367f6028701389085429a479",
+          "url": "https://github.com/abyo-software/s4/commit/bd5987d7d518a19bb1c9d4c28076a6ffd605a38b"
+        },
+        "date": 1781855522267,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 55697,
+            "range": "± 3734",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 54692,
+            "range": "± 4048",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 364,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2632457,
+            "range": "± 40013",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 42698017,
+            "range": "± 185659",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192400,
+            "range": "± 1116",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 52130759,
+            "range": "± 1503932",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 768906171,
+            "range": "± 1477967",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3085151,
+            "range": "± 11694",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 31774,
+            "range": "± 3031",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 38316,
+            "range": "± 2469",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 376,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 583005,
+            "range": "± 20958",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1586153,
+            "range": "± 19313",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192028,
+            "range": "± 518",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12379551,
+            "range": "± 103279",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27441210,
+            "range": "± 120786",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3087852,
+            "range": "± 26141",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1505547,
+            "range": "± 17162",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2393308,
+            "range": "± 23516",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 351688368,
+            "range": "± 8935811",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 139,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 8780,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 819,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13044,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2971,
+            "range": "± 63",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 24064,
+            "range": "± 438",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 92101,
+            "range": "± 2338",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 590,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4522,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 18045,
+            "range": "± 84",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
+            "range": "± 0",
             "unit": "ns/iter"
           }
         ]
