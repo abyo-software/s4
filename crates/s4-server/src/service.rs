@@ -5267,7 +5267,16 @@ impl<B: S3> S3 for S4Service<B> {
                 .as_ref()
                 .and_then(|m| m.get(META_LOGICAL_ETAG))
                 .cloned();
-            let current = logical.as_deref().or(backend_etag.as_deref());
+            // The client-visible validator: the logical ETag when stamped;
+            // otherwise the backend ETag ONLY for non-S4 objects (no manifest →
+            // GET/HEAD expose the backend ETag). A framed / passthrough S4
+            // object hides its compressed-bytes ETag, so a missing stamp means
+            // "no validator", not the backend ETag.
+            let current = match logical {
+                Some(ref l) => Some(l.as_str()),
+                None if manifest_opt.is_some() => None,
+                None => backend_etag.as_deref(),
+            };
             match evaluate_etag_preconditions(
                 cond_if_match.as_ref(),
                 cond_if_none_match.as_ref(),
@@ -5770,7 +5779,15 @@ impl<B: S3> S3 for S4Service<B> {
                 .as_ref()
                 .and_then(|m| m.get(META_LOGICAL_ETAG))
                 .cloned();
-            let current = logical.as_deref().or(backend_etag.as_deref());
+            // See get_object: only a non-S4 object (no manifest) exposes the
+            // backend ETag; a framed / passthrough object without a logical
+            // stamp has no client-visible validator.
+            let is_s4_object = extract_manifest(&resp.output.metadata).is_some();
+            let current = match logical {
+                Some(ref l) => Some(l.as_str()),
+                None if is_s4_object => None,
+                None => backend_etag.as_deref(),
+            };
             match evaluate_etag_preconditions(
                 cond_if_match.as_ref(),
                 cond_if_none_match.as_ref(),
