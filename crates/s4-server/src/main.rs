@@ -970,6 +970,13 @@ enum Cmd {
     /// recompacted or skipped; exit 1 when any object failed.
     Recompact(RecompactArgs),
 
+    /// Parquet-aware recompaction: re-encode cold Parquet objects' columns to
+    /// zstd in place, keeping the output a native Parquet readable by
+    /// pyarrow / Spark / Trino / DuckDB (no S4 in the read path). Dry-run
+    /// unless `--execute`. Requires the `parquet-recompact` build feature.
+    #[cfg(feature = "parquet-recompact")]
+    ParquetRecompact(ParquetRecompactArgs),
+
     /// v1.2: run a declarative maintenance policy — a TOML file of
     /// `[[rule]]` entries (`action = "migrate" | "recompact" |
     /// "transition"`, each with the matching CLI flags as keys plus a
@@ -1285,6 +1292,104 @@ struct RecompactArgs {
     /// Output format.
     #[clap(long, value_enum, default_value = "table")]
     format: RecompactFormat,
+}
+
+/// Reject NaN / negative `--min-gain-percent` up front (a NaN would make the
+/// gain comparison vacuously pass and write every object).
+#[cfg(feature = "parquet-recompact")]
+fn parse_min_gain_percent(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("invalid number: {s}"))?;
+    if !v.is_finite() || v < 0.0 {
+        return Err("must be a finite percentage >= 0".to_string());
+    }
+    Ok(v)
+}
+
+/// `s4 parquet-recompact` — re-encode cold Parquet objects' columns to zstd in
+/// place, keeping the output a native Parquet (pyarrow / Spark / Trino /
+/// DuckDB readable, no S4 in the read path). Dry-run unless `--execute`.
+#[cfg(feature = "parquet-recompact")]
+#[derive(Debug, Args)]
+struct ParquetRecompactArgs {
+    /// `<bucket>` or `<bucket>/<prefix>` to scan on the backend.
+    target: String,
+
+    /// Actually write the re-encoded Parquet back (default: dry-run / report only).
+    #[clap(long, default_value_t = false)]
+    execute: bool,
+
+    /// zstd level for the re-encoded column chunks (1–22).
+    #[clap(long, value_name = "LEVEL", default_value_t = 3,
+           value_parser = clap::value_parser!(i32).range(1..=22))]
+    target_zstd_level: i32,
+
+    /// Skip an object unless the re-encode shrinks it by at least this percent.
+    #[clap(long, value_name = "PERCENT", default_value_t = 3.0,
+           value_parser = parse_min_gain_percent)]
+    min_gain_percent: f64,
+
+    /// Only consider keys ending with this suffix.
+    #[clap(long, default_value = ".parquet")]
+    suffix: String,
+
+    /// Stop after scanning this many matching (suffix) objects, including skips.
+    #[clap(long, value_name = "N")]
+    max_objects: Option<usize>,
+
+    /// Per-object body cap — larger objects are skipped (`too-large`). Input and
+    /// output are both spooled to temp files (see `--tmp-dir`), so this is mainly
+    /// a disk cap; peak RAM ≈ one decoded row group (bounded by
+    /// `--max-row-group-bytes`), independent of object size. Raise with headroom.
+    #[clap(long, value_name = "BYTES",
+           default_value_t = s4_server::parquet_recompact::DEFAULT_MAX_BODY_BYTES)]
+    max_body_bytes: u64,
+
+    /// Live-memory bound for the re-encode. Used as a footer preflight (skip an
+    /// object whose row-group `total_byte_size` exceeds it) AND as the cap on
+    /// in-flight Arrow heap (decoded-batch + writer guards abort above it). The
+    /// re-encode and verify stream batch-by-batch, so neither holds a whole row
+    /// group; this bounds peak RAM independently of the body cap.
+    #[clap(long, value_name = "BYTES",
+           default_value_t = s4_server::parquet_recompact::DEFAULT_MAX_ROW_GROUP_BYTES)]
+    max_row_group_bytes: u64,
+
+    /// Only recompact objects older than this (e.g. `30d`, `12h`) — a cold-data
+    /// guard so `--execute` doesn't rewrite hot partitions. Objects newer than
+    /// the cutoff are skipped (`too-new`).
+    #[clap(long, value_name = "DUR", value_parser = s4_server::recompact::parse_duration_suffix)]
+    older_than: Option<std::time::Duration>,
+
+    /// Skip the GetObjectTagging read and rewrite WITHOUT carrying object tags
+    /// over. Explicit opt-out for credentials lacking `s3:GetObjectTagging`,
+    /// where objects otherwise skip as `tags-unreadable`.
+    #[clap(long, default_value_t = false)]
+    no_tags: bool,
+
+    /// Directory to spool the rewritten Parquet into before the PUT. Defaults to
+    /// the OS temp dir; point it at a volume with headroom when raising
+    /// `--max-body-bytes` so a large rewrite can't fill `/tmp`.
+    #[clap(long, value_name = "DIR")]
+    tmp_dir: Option<std::path::PathBuf>,
+
+    /// Downgrade a decoded-VALUE verify mismatch from a hard failure (default,
+    /// nonzero exit) to a counted `value-mismatch` skip. Opt-in for the rare
+    /// benign representation-drift case on exotic (explicit-dictionary) schemas;
+    /// the object is never overwritten either way.
+    #[clap(long, default_value_t = false)]
+    tolerate_value_mismatch: bool,
+
+    /// Emit the report as JSON (for automation) instead of the human summary.
+    #[clap(long, default_value_t = false)]
+    json: bool,
+
+    /// Required with `--execute`: acknowledge that this is a LOSSY-PHYSICAL
+    /// rewrite — column values + file key-value metadata are preserved, but
+    /// encodings, statistics shape, `created_by`, page/column indexes are
+    /// regenerated, and object ACLs are not carried over. (Objects under SSE /
+    /// Object-Lock or carrying an `Expires` header are skipped, not rewritten.)
+    /// Dry-run does not need it.
+    #[clap(long, default_value_t = false)]
+    allow_lossy_physical_rewrite: bool,
 }
 
 /// v1.2: `s4 maintain` output format.
@@ -3176,6 +3281,8 @@ async fn run_subcommand(
         Cmd::Savings(args) => run_savings_cmd(args),
         Cmd::Migrate(args) => run_migrate_cmd(opt, args).await,
         Cmd::Recompact(args) => run_recompact_cmd(opt, args).await,
+        #[cfg(feature = "parquet-recompact")]
+        Cmd::ParquetRecompact(args) => run_parquet_recompact_cmd(opt, args).await,
         Cmd::Maintain(args) => run_maintain_cmd(opt, args).await,
         Cmd::TrainDict(args) => run_train_dict_cmd(opt, args).await,
         Cmd::DictStatus(args) => run_dict_status_cmd(args).await,
@@ -3470,6 +3577,140 @@ async fn run_recompact_cmd(
     // Exit contract: all-recompacted / all-skipped = 0, any hard failure = 1.
     if report.failed > 0 {
         return Err(format!("{} object(s) failed to recompact", report.failed).into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "parquet-recompact")]
+async fn run_parquet_recompact_cmd(
+    opt: &Opt,
+    args: &ParquetRecompactArgs,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    if opt.sse_s4_key.is_some() || !opt.sse_s4_key_rotated.is_empty() || opt.kms_local_dir.is_some()
+    {
+        return Err("parquet-recompact does not support SSE-enabled deployments".into());
+    }
+    if args.execute && !args.allow_lossy_physical_rewrite {
+        return Err(
+            "--execute requires --allow-lossy-physical-rewrite: this is a \
+                    lossy-physical Parquet rewrite (regenerates encodings / statistics / \
+                    created_by / page indexes; does not carry object ACLs). Re-run with \
+                    both flags to confirm."
+                .into(),
+        );
+    }
+    let (bucket, prefix) = s4_server::estimate::parse_bucket_prefix(&args.target)
+        .map_err(|e| -> Box<dyn Error + Send + Sync + 'static> { e.to_string().into() })?;
+    let client = build_sidecar_client(opt).await?;
+    // Versioned buckets retain the pre-rewrite Parquet as an old version, so the
+    // in-place rewrite double-bills until those versions expire — warn loudly.
+    if args.execute
+        && let Ok(v) = client.get_bucket_versioning().bucket(&bucket).send().await
+        && v.status().map(|s| s.as_str()) == Some("Enabled")
+    {
+        eprintln!(
+            "WARNING: bucket {bucket} has versioning ENABLED — each in-place \
+             rewrite keeps the old Parquet version and double-bills storage until \
+             those versions expire (configure a noncurrent-version lifecycle rule)."
+        );
+    }
+    if args.execute && args.no_tags {
+        eprintln!(
+            "WARNING: --no-tags — rewritten objects will NOT carry their existing \
+             object tags over (the tagging read is skipped)."
+        );
+    }
+    let params = s4_server::parquet_recompact::ParquetRecompactParams {
+        execute: args.execute,
+        target_zstd_level: args.target_zstd_level,
+        min_gain_percent: args.min_gain_percent,
+        suffix: args.suffix.clone(),
+        max_objects: args.max_objects,
+        max_body_bytes: args.max_body_bytes,
+        max_uncompressed_row_group_bytes: args.max_row_group_bytes,
+        older_than: args.older_than,
+        no_tags: args.no_tags,
+        tmp_dir: args.tmp_dir.clone(),
+        tolerate_value_mismatch: args.tolerate_value_mismatch,
+    };
+    let r = s4_server::parquet_recompact::run_parquet_recompact(
+        &client,
+        &bucket,
+        prefix.as_deref(),
+        &params,
+    )
+    .await?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&r)?);
+        if r.failed > 0 {
+            return Err(format!("{} object(s) failed to recompact", r.failed).into());
+        }
+        return Ok(());
+    }
+    let mode = if args.execute { "EXECUTE" } else { "DRY-RUN" };
+    let pct = if r.bytes_before > 0 {
+        (r.bytes_before as f64 - r.bytes_after as f64) / r.bytes_before as f64 * 100.0
+    } else {
+        0.0
+    };
+    println!(
+        "[{mode}] parquet-recompact s3://{bucket}{}\n  scanned={} recompacted={} \
+         (before={:.1}MB after={:.1}MB saved={:.1}%)\n  skipped: not-parquet={} low-gain={} \
+         already-zstd={} too-large={} too-new={} unknown-age={} unsupported-footer={} \
+         verify-failed={} value-mismatch={} encrypted={} locked={} has-expires={} \
+         archived={} etag-unavailable={} etag-raced={} tags-unreadable={} wrong-suffix={}  \
+         failed={}",
+        prefix
+            .as_deref()
+            .map(|p| format!("/{p}"))
+            .unwrap_or_default(),
+        r.scanned,
+        r.recompacted,
+        r.bytes_before as f64 / 1e6,
+        r.bytes_after as f64 / 1e6,
+        pct,
+        r.skipped_not_parquet,
+        r.skipped_low_gain,
+        r.skipped_already_zstd,
+        r.skipped_too_large,
+        r.skipped_too_new,
+        r.skipped_unknown_age,
+        r.skipped_unsupported_footer,
+        r.skipped_verify_failed,
+        r.skipped_value_mismatch,
+        r.skipped_encrypted,
+        r.skipped_locked,
+        r.skipped_has_expires,
+        r.skipped_archived,
+        r.skipped_etag_unavailable,
+        r.skipped_etag_raced,
+        r.skipped_tags_unreadable,
+        r.skipped_suffix,
+        r.failed,
+    );
+    // Output is native Parquet (decoded-value + KV-metadata compatible, not
+    // byte/footer identical) and in-place: S3 has no compare-and-swap, so the
+    // ETag re-check before PUT narrows but does not eliminate a concurrent-writer
+    // race. Run against cold/quiescent prefixes.
+    if args.execute {
+        println!(
+            "  note: in-place LOSSY-PHYSICAL rewrite to native zstd Parquet — \
+             column values + file key-value metadata are preserved, but encodings, \
+             statistics shape, created_by, and page/column indexes are regenerated. \
+             Object ACLs are NOT carried over (objects under SSE / Object-Lock or \
+             carrying an Expires header are skipped, not rewritten). The PUT is \
+             conditional on the source ETag (If-Match) plus a re-HEAD of ETag + \
+             Last-Modified, so a concurrent CONTENT rewrite is detected; but \
+             tag-only / same-second metadata-only changes on an unversioned bucket \
+             can't be CAS-protected — run on cold/quiescent prefixes (a versioned \
+             bucket keeps the prior version regardless)."
+        );
+    }
+    for (key, cause) in r.failures.iter().take(10) {
+        eprintln!("  FAILED {key}: {cause}");
+    }
+    if r.failed > 0 {
+        return Err(format!("{} object(s) failed to recompact", r.failed).into());
     }
     Ok(())
 }
