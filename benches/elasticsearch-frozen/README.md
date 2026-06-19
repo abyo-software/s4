@@ -88,11 +88,48 @@ python3 phase_b_frozen.py       # cold frozen-search latency          -> results
 bash phase_d_recompact.sh bench-standard-default   # snapshot zstd-3 -> s4 recompact zstd-19 -> verify restore
 ```
 
+## 5. Revision phases (2026-06-19) — RTT / sidecar / HA / break-even
+
+These are **non-destructive additions** layered on top of A–D; they don't change
+the A–D outputs. All are env-parameterised (defaults reproduce the canonical
+`localhost:9200`/`:9000` stack; override `ES_URL` / `MINIO_URL` etc. for an
+isolated stack). Raw outputs + a one-page summary land in `results/`.
+
+```bash
+# B3 break-even model (pure arithmetic on the measured saved_ratio; no infra)
+python3 breakeven.py --s4-host-usd-month 70 --instances 2 --out results/breakeven.json
+
+# B1 cold latency under injected backend RTT (needs a toxiproxy in front of the
+# object store + a dedicated S4 instance upstream of it + ES clients tdirect/ts4z3;
+# the .sh prints the exact prereqs). Per-connection latency proxy is used on
+# purpose — NOT a global `tc netem` (that would perturb co-tenant processes).
+bash phase_b1_rtt.sh                         # -> results/rtt-injection.json
+
+# B2 .s4index sidecar cold-path overhead (backend GETs per cold query, S4 vs a
+# passthrough-codec baseline; counts ops from S4's structured op log — run the
+# S4 instances with structured logging on stdout).
+python3 phase_b2_sidecar.py                  # -> results/sidecar-overhead.json
+
+# B4 HA failover smoke (starts 2 stateless S4 instances + an nginx round-robin
+# upstream, registers a repo through the LB, kills one instance).
+bash phase_b4_ha.sh                          # -> results/ha-failover.json
+
+# B5 recompact concurrency: documented-not-tested (running recompact concurrently
+# with ES snapshot/_cleanup on the same repo is unsafe by the tool's own TOCTOU
+# admission — see results/recompact-concurrency.json; no script, by design).
+```
+
+> **nginx + SigV4:** the B4 LB must preserve the client Host header
+> (`proxy_set_header Host $http_host`) — AWS SigV4 signs Host, so rewriting it to
+> the upstream name returns 403 SignatureDoesNotMatch. `phase_b4_ha.sh` does this.
+
+See `results/REVISION-NOTES.md` for what each phase found and what's still TODO.
+
 ## Cleanup
 
 ```bash
-docker rm -f esfrozen-es esfrozen-minio
-pkill -f 'target/release/s4 .*--port=801'
+docker rm -f esfrozen-es esfrozen-minio esfrozen-toxiproxy esfrozen-nginx
+pkill -f 'target/release/s4 .*--port=80'
 ```
 
 ## Notes / gotchas (encountered building this)

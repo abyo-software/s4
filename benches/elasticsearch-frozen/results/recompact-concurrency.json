@@ -1,0 +1,18 @@
+{
+  "measurement": "B5 — s4 recompact concurrency safety vs ES snapshot/_cleanup on the same repo",
+  "status": "documented-not-tested",
+  "reason": "Deliberately NOT executed. Running `s4 recompact` concurrently with a live ES snapshot or `POST _snapshot/<repo>/_cleanup` on the SAME repository is unsafe by the tool's own admission and there is no way to make it safe on plain S3 — so a 'test' here would either (a) be a coin-flip that proves nothing about safety, or (b) risk corrupting a repository. We document the hazard from first principles + the tool's own evidence instead of fabricating a pass.",
+  "hazard": {
+    "mechanism": "recompact rewrites each blob in place (same key) after re-reading its source ETag via HEAD immediately before the overwrite PUT. S3 (and MinIO) provide no compare-and-swap on PUT, so any writer that lands between recompact's HEAD and its PUT is silently overwritten. ES snapshot finalize and `_cleanup` both mutate repository objects (index-N, snap-*, segment blobs), so an overlapping window can lose an ES write or have recompact overwrite an object ES just changed.",
+    "toctou_window": "HEAD -> (compress) -> PUT. The compress step is the whole point of recompact and at zstd-19 on a multi-MB blob is hundreds of ms to seconds, so the window is NOT negligible.",
+    "older_than_is_mitigation_not_guarantee": "`--older-than 7d` only skips objects whose mtime is recent; it narrows the set of blobs recompact will touch but does NOT serialize against a concurrent snapshot/_cleanup, and repository metadata objects (index-N) are rewritten by ES on every snapshot regardless of age."
+  },
+  "evidence": {
+    "source": "benches/elasticsearch-frozen/results/phase_d_recompact-evidence.txt (this harness, 2026-06-18 run)",
+    "quoted_admission": "conflict safety: the source ETag is re-checked via HEAD immediately before each overwrite, but S3 has no compare-and-swap - a writer landing between the HEAD and the PUT is silently overwritten",
+    "also": "storage class and object tags are carried over on each rewrite; ACLs and Object Lock retention/legal-hold are NOT - the overwrite PUT resets them to bucket defaults"
+  },
+  "recommendation": "Run `s4 recompact` only inside an exclusive quiet window for the repository: pause ILM rollovers into the repo, ensure no snapshot or `_cleanup` is in flight, then recompact backend-direct. Do not rely on `--older-than` as a concurrency guard. This matches the doc's A3 caveat.",
+  "what_would_be_needed_to_test_safely": "A backend with conditional PUT / If-Match (S3 added If-None-Match in 2024 for create-only; If-Match overwrite is not generally available on MinIO) OR an external repository lock. Neither is exercised here; the safe operational answer is the quiet window above.",
+  "host": "AMD Ryzen 9 9950X, ES 9.4.2, MinIO RELEASE.2025-09-07, S4 v1.2.2 (concurrency NOT executed by design)"
+}

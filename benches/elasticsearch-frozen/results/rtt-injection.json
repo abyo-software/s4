@@ -1,0 +1,141 @@
+{
+  "measurement": "B1 - cold frozen-search latency under injected backend RTT",
+  "method": "toxiproxy injects symmetric one-way delay on the object-store leg; both arms (direct, S4 zstd-3) traverse it so they eat the same RTT. Shared cache cleared before every query (cold). Relative overhead = (s4 - direct)/direct. Local MinIO base, no AWS billing.",
+  "host": "AMD Ryzen 9 9950X, ES 9.4.2, MinIO RELEASE.2025-09-07, S4 v1.2.2",
+  "rtt_levels_one_way_ms": [
+    0,
+    5,
+    20,
+    50
+  ],
+  "rows": [
+    {
+      "rtt_one_way_ms": 0,
+      "index": "bench-standard-default",
+      "query": "term_rare(status:500)",
+      "direct_cold_ms_median": 3,
+      "s4_cold_ms_median": 2,
+      "rel_overhead_pct": -33.3
+    },
+    {
+      "rtt_one_way_ms": 0,
+      "index": "bench-standard-default",
+      "query": "agg(date_hist+terms)",
+      "direct_cold_ms_median": 4,
+      "s4_cold_ms_median": 3,
+      "rel_overhead_pct": -25.0
+    },
+    {
+      "rtt_one_way_ms": 0,
+      "index": "bench-standard-default",
+      "query": "fulltext(message:items)",
+      "direct_cold_ms_median": 4,
+      "s4_cold_ms_median": 3,
+      "rel_overhead_pct": -25.0
+    },
+    {
+      "rtt_one_way_ms": 0,
+      "index": "bench-standard-default",
+      "query": "topN(level:ERROR sort ts)",
+      "direct_cold_ms_median": 2035,
+      "s4_cold_ms_median": 2180,
+      "rel_overhead_pct": 7.1
+    },
+    {
+      "rtt_one_way_ms": 5,
+      "index": "bench-standard-default",
+      "query": "term_rare(status:500)",
+      "direct_cold_ms_median": 2,
+      "s4_cold_ms_median": 2,
+      "rel_overhead_pct": 0.0
+    },
+    {
+      "rtt_one_way_ms": 5,
+      "index": "bench-standard-default",
+      "query": "agg(date_hist+terms)",
+      "direct_cold_ms_median": 4,
+      "s4_cold_ms_median": 3,
+      "rel_overhead_pct": -25.0
+    },
+    {
+      "rtt_one_way_ms": 5,
+      "index": "bench-standard-default",
+      "query": "fulltext(message:items)",
+      "direct_cold_ms_median": 2,
+      "s4_cold_ms_median": 2,
+      "rel_overhead_pct": 0.0
+    },
+    {
+      "rtt_one_way_ms": 5,
+      "index": "bench-standard-default",
+      "query": "topN(level:ERROR sort ts)",
+      "direct_cold_ms_median": 2040,
+      "s4_cold_ms_median": 2228,
+      "rel_overhead_pct": 9.2
+    },
+    {
+      "rtt_one_way_ms": 20,
+      "index": "bench-standard-default",
+      "query": "term_rare(status:500)",
+      "direct_cold_ms_median": 2,
+      "s4_cold_ms_median": 2,
+      "rel_overhead_pct": 0.0
+    },
+    {
+      "rtt_one_way_ms": 20,
+      "index": "bench-standard-default",
+      "query": "agg(date_hist+terms)",
+      "direct_cold_ms_median": 3,
+      "s4_cold_ms_median": 2,
+      "rel_overhead_pct": -33.3
+    },
+    {
+      "rtt_one_way_ms": 20,
+      "index": "bench-standard-default",
+      "query": "fulltext(message:items)",
+      "direct_cold_ms_median": 2,
+      "s4_cold_ms_median": 2,
+      "rel_overhead_pct": 0.0
+    },
+    {
+      "rtt_one_way_ms": 20,
+      "index": "bench-standard-default",
+      "query": "topN(level:ERROR sort ts)",
+      "direct_cold_ms_median": 2102,
+      "s4_cold_ms_median": 2793,
+      "rel_overhead_pct": 32.9
+    },
+    {
+      "rtt_one_way_ms": 50,
+      "index": "bench-standard-default",
+      "query": "term_rare(status:500)",
+      "direct_cold_ms_median": 2,
+      "s4_cold_ms_median": 2,
+      "rel_overhead_pct": 0.0
+    },
+    {
+      "rtt_one_way_ms": 50,
+      "index": "bench-standard-default",
+      "query": "agg(date_hist+terms)",
+      "direct_cold_ms_median": 3,
+      "s4_cold_ms_median": 3,
+      "rel_overhead_pct": 0.0
+    },
+    {
+      "rtt_one_way_ms": 50,
+      "index": "bench-standard-default",
+      "query": "fulltext(message:items)",
+      "direct_cold_ms_median": 2,
+      "s4_cold_ms_median": 2,
+      "rel_overhead_pct": 0.0
+    },
+    {
+      "rtt_one_way_ms": 50,
+      "index": "bench-standard-default",
+      "query": "topN(level:ERROR sort ts)",
+      "direct_cold_ms_median": 2224,
+      "s4_cold_ms_median": 3776,
+      "rel_overhead_pct": 69.8
+    }
+  ]
+}

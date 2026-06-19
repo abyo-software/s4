@@ -1,0 +1,76 @@
+{
+  "measurement": "B2 - .s4index sidecar cold-path overhead (backend ops per cold query)",
+  "method": "backend object ops counted from each S4 instance's structured INFO log (one line per backend op). 'S4 zstd-3' carries the .s4index sidecar; 'passthrough' is the same proxy hop with no compression/sidecar = the direct-equivalent op count. Shared cache cleared before each cold query; warm = cache populated. Local MinIO, no AWS billing.",
+  "host": "AMD Ryzen 9 9950X, ES 9.4.2, MinIO RELEASE.2025-09-07, S4 v1.2.2",
+  "note": "Backend GETs on the cold path appear only for the heavy top-N+sort fetch; the cheap analytics queries (count/agg/full-text) are answered by ES without re-fetching from the repository, so both arms issue ~0 backend GETs. For the top-N fetch the S4 arm issues the SAME number of backend GETs as the passthrough (no-sidecar) arm \u2014 S4 does NOT add a separate .s4index-keyed backend round-trip per cold query in this configuration (cold_separate_s4index_gets_median = 0). Instead the .s4index lets each data GET fetch only a partial covering compressed range (path=\"sidecar-partial\"), which is what makes range-GET-backed searchable snapshots safe. Once the shared cache is warm, both arms issue 0 backend GETs.",
+  "arms": {
+    "S4 zstd-3 (sidecar)": {
+      "term_rare(status:500)": {
+        "cold_backend_gets_median": 0,
+        "cold_sidecar_partial_gets_median": 0,
+        "cold_range_gets_median": 0,
+        "cold_separate_s4index_gets_median": 0,
+        "warm_backend_gets": 0,
+        "warm_sidecar_partial_gets": 0
+      },
+      "agg(date_hist+terms)": {
+        "cold_backend_gets_median": 0,
+        "cold_sidecar_partial_gets_median": 0,
+        "cold_range_gets_median": 0,
+        "cold_separate_s4index_gets_median": 0,
+        "warm_backend_gets": 0,
+        "warm_sidecar_partial_gets": 0
+      },
+      "fulltext(message:items)": {
+        "cold_backend_gets_median": 0,
+        "cold_sidecar_partial_gets_median": 0,
+        "cold_range_gets_median": 0,
+        "cold_separate_s4index_gets_median": 0,
+        "warm_backend_gets": 0,
+        "warm_sidecar_partial_gets": 0
+      },
+      "topN(level:ERROR sort ts)": {
+        "cold_backend_gets_median": 8,
+        "cold_sidecar_partial_gets_median": 5,
+        "cold_range_gets_median": 8,
+        "cold_separate_s4index_gets_median": 0,
+        "warm_backend_gets": 0,
+        "warm_sidecar_partial_gets": 0
+      }
+    },
+    "passthrough (no sidecar)": {
+      "term_rare(status:500)": {
+        "cold_backend_gets_median": 0,
+        "cold_sidecar_partial_gets_median": 0,
+        "cold_range_gets_median": 0,
+        "cold_separate_s4index_gets_median": 0,
+        "warm_backend_gets": 0,
+        "warm_sidecar_partial_gets": 0
+      },
+      "agg(date_hist+terms)": {
+        "cold_backend_gets_median": 0,
+        "cold_sidecar_partial_gets_median": 0,
+        "cold_range_gets_median": 0,
+        "cold_separate_s4index_gets_median": 0,
+        "warm_backend_gets": 0,
+        "warm_sidecar_partial_gets": 0
+      },
+      "fulltext(message:items)": {
+        "cold_backend_gets_median": 0,
+        "cold_sidecar_partial_gets_median": 0,
+        "cold_range_gets_median": 0,
+        "cold_separate_s4index_gets_median": 0,
+        "warm_backend_gets": 0,
+        "warm_sidecar_partial_gets": 0
+      },
+      "topN(level:ERROR sort ts)": {
+        "cold_backend_gets_median": 8,
+        "cold_sidecar_partial_gets_median": 3,
+        "cold_range_gets_median": 8,
+        "cold_separate_s4index_gets_median": 0,
+        "warm_backend_gets": 0,
+        "warm_sidecar_partial_gets": 0
+      }
+    }
+  }
+}
