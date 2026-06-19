@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781863899375,
+  "lastUpdate": 1781867670441,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -17184,6 +17184,234 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "masumi.ryugo@gmail.com",
+            "name": "masumi-ryugo",
+            "username": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a10ec791316c4b40256b927f208e7d21dc0a34d6",
+          "message": "docs(use-cases): add Kafka tiered-storage (KIP-405) use case (#4) + real benchmark (#136)\n\nFourth use-case doc in the S4 series: S4 in front of Apache Kafka's tiered\nstorage. Measured end-to-end locally — KRaft Kafka 3.9.1 + Aiven tiered-storage\nplugin (S3 backend) + S4 v1.2.2 + MinIO, 600k records/topic across the producer\ncompression.type matrix.\n\nHeadline (all trace to benches/kafka-tiered/results/kafka.json):\n- Tiered storage: S4 zstd-3 over the tiered segments saves -74.7% on `none`\n  (uncompressed), -22.6% snappy, -20.6% lz4, -0.0% zstd. Honest split: the\n  producer's own compression.type is the source lever; producer-zstd tiers at\n  43.9 MB (the same floor S4 reaches over `none`, 42.0 MB) and S4 adds ~nothing\n  over already-zstd segments. S4's wedge is none/snappy/lz4 + can't-change-producer.\n- Fairness-verified: one tiered `none` segment GET-back through S4 is 2,123,576\n  stored vs 8,384,517 logical = -74.67% per segment (not a roll-point artifact).\n- Cold remote-fetch: no consistent S4 penalty (single noisy samples within ~10%).\n\nCompatibility finding: --logical-etag is NOT required for Kafka tiered storage\n(Aiven plugin, AWS SDK v2) in either checksum mode — captured in\nresults/logical_etag_negative.txt. Required only for OpenSearch's repository-s3.\n\nHarness (benches/kafka-tiered/): gen_payloads.py + kafka_bench.py (storage matrix,\ncold remote-fetch via consumer-perf-test, per-segment fairness check, ingest +\nlocal-deletion guards), README with plugin-download steps, raw results. Plugin\njars / runtime data are gitignored. Also adds the Kafka link to README.md +\ndocs/README.md.\n\nReviewed with CodexCLI to convergence (no blocking findings; every figure\nverified against the raw JSON).\n\nCo-authored-by: masumi-ryugo <abyo.software@gmail.com>\nCo-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-19T20:06:37+09:00",
+          "tree_id": "8770b28370b7f3947a25d5d98727780d7fdb3323",
+          "url": "https://github.com/abyo-software/s4/commit/a10ec791316c4b40256b927f208e7d21dc0a34d6"
+        },
+        "date": 1781867669560,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 38880,
+            "range": "± 1361",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 44728,
+            "range": "± 1006",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 330,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 1749543,
+            "range": "± 16915",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 39165884,
+            "range": "± 29116",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 155915,
+            "range": "± 1913",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 38831856,
+            "range": "± 383050",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 714718933,
+            "range": "± 306009",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 2494906,
+            "range": "± 1985",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 22411,
+            "range": "± 960",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 25761,
+            "range": "± 826",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 329,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 506460,
+            "range": "± 35184",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1342197,
+            "range": "± 37590",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 156294,
+            "range": "± 136",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 9317369,
+            "range": "± 465866",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 22112248,
+            "range": "± 78508",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 2497571,
+            "range": "± 2077",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1146081,
+            "range": "± 19859",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 1749423,
+            "range": "± 11213",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 249808108,
+            "range": "± 645117",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 104,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 6788,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 701,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 10867,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2379,
+            "range": "± 126",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 20739,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 82800,
+            "range": "± 281",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 491,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4068,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 16276,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 24,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 24,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 24,
             "range": "± 0",
             "unit": "ns/iter"
           }
