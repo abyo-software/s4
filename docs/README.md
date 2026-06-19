@@ -5,6 +5,7 @@ Product overview, pitch, and quick start live in the top-level
 
 ## Use cases
 - [use-cases/elasticsearch-frozen-tier.md](use-cases/elasticsearch-frozen-tier.md) — S4 as an Elasticsearch frozen-tier backend: measured storage and snapshot throughput across standard / `best_compression` / LogsDB and zstd levels, plus cold frozen-search latency (at zstd-3)
+- [use-cases/opensearch-searchable-snapshots.md](use-cases/opensearch-searchable-snapshots.md) — S4 as an OpenSearch searchable-snapshot backend: −16–28% across `default` / `best_compression` / `zstd` / `zstd_no_dict` index codecs; requires `--logical-etag`
 
 ## Getting started
 - [install.md](install.md) — cargo / pip / WASM / build from source / supported targets

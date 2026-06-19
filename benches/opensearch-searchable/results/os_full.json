@@ -1,0 +1,246 @@
+{
+  "cost": [
+    {
+      "codec": "os-default",
+      "repo": "direct",
+      "state": "SUCCESS",
+      "es_bytes": 1484691917,
+      "stored_bytes": 1484698317,
+      "wall_s": 1.95
+    },
+    {
+      "codec": "os-default",
+      "repo": "S4 zstd-3",
+      "state": "SUCCESS",
+      "es_bytes": 1484691917,
+      "stored_bytes": 1067278597,
+      "wall_s": 6.13
+    },
+    {
+      "codec": "os-default",
+      "repo": "S4 zstd-9",
+      "state": "SUCCESS",
+      "es_bytes": 1484691917,
+      "stored_bytes": 1010936607,
+      "wall_s": 19.84
+    },
+    {
+      "codec": "os-bestcomp",
+      "repo": "direct",
+      "state": "SUCCESS",
+      "es_bytes": 1068736509,
+      "stored_bytes": 1068742962,
+      "wall_s": 0.95
+    },
+    {
+      "codec": "os-bestcomp",
+      "repo": "S4 zstd-3",
+      "state": "SUCCESS",
+      "es_bytes": 1068736509,
+      "stored_bytes": 884598127,
+      "wall_s": 2.02
+    },
+    {
+      "codec": "os-bestcomp",
+      "repo": "S4 zstd-9",
+      "state": "SUCCESS",
+      "es_bytes": 1068736509,
+      "stored_bytes": 877748680,
+      "wall_s": 6.94
+    },
+    {
+      "codec": "os-zstd",
+      "repo": "direct",
+      "state": "SUCCESS",
+      "es_bytes": 1094107615,
+      "stored_bytes": 1094114063,
+      "wall_s": 1.37
+    },
+    {
+      "codec": "os-zstd",
+      "repo": "S4 zstd-3",
+      "state": "SUCCESS",
+      "es_bytes": 1094107615,
+      "stored_bytes": 909858552,
+      "wall_s": 2.32
+    },
+    {
+      "codec": "os-zstd",
+      "repo": "S4 zstd-9",
+      "state": "SUCCESS",
+      "es_bytes": 1094107615,
+      "stored_bytes": 903054468,
+      "wall_s": 6.15
+    },
+    {
+      "codec": "os-zstdnodict",
+      "repo": "direct",
+      "state": "SUCCESS",
+      "es_bytes": 1116539790,
+      "stored_bytes": 1116546272,
+      "wall_s": 1.06
+    },
+    {
+      "codec": "os-zstdnodict",
+      "repo": "S4 zstd-3",
+      "state": "SUCCESS",
+      "es_bytes": 1116539790,
+      "stored_bytes": 932384040,
+      "wall_s": 2.67
+    },
+    {
+      "codec": "os-zstdnodict",
+      "repo": "S4 zstd-9",
+      "state": "SUCCESS",
+      "es_bytes": 1116539790,
+      "stored_bytes": 913927249,
+      "wall_s": 6.92
+    }
+  ],
+  "search": [
+    {
+      "codec": "os-default",
+      "repo": "direct",
+      "query": "term(status:500)",
+      "med_ms": 1.0
+    },
+    {
+      "codec": "os-default",
+      "repo": "direct",
+      "query": "agg(date_hist+terms)",
+      "med_ms": 29.0
+    },
+    {
+      "codec": "os-default",
+      "repo": "direct",
+      "query": "fulltext(message:items)",
+      "med_ms": 1.0
+    },
+    {
+      "codec": "os-default",
+      "repo": "S4 zstd-3",
+      "query": "term(status:500)",
+      "med_ms": 1.0
+    },
+    {
+      "codec": "os-default",
+      "repo": "S4 zstd-3",
+      "query": "agg(date_hist+terms)",
+      "med_ms": 27.5
+    },
+    {
+      "codec": "os-default",
+      "repo": "S4 zstd-3",
+      "query": "fulltext(message:items)",
+      "med_ms": 1.0
+    },
+    {
+      "codec": "os-bestcomp",
+      "repo": "direct",
+      "query": "term(status:500)",
+      "med_ms": 1.0
+    },
+    {
+      "codec": "os-bestcomp",
+      "repo": "direct",
+      "query": "agg(date_hist+terms)",
+      "med_ms": 26.0
+    },
+    {
+      "codec": "os-bestcomp",
+      "repo": "direct",
+      "query": "fulltext(message:items)",
+      "med_ms": 1.0
+    },
+    {
+      "codec": "os-bestcomp",
+      "repo": "S4 zstd-3",
+      "query": "term(status:500)",
+      "med_ms": 0.5
+    },
+    {
+      "codec": "os-bestcomp",
+      "repo": "S4 zstd-3",
+      "query": "agg(date_hist+terms)",
+      "med_ms": 26.5
+    },
+    {
+      "codec": "os-bestcomp",
+      "repo": "S4 zstd-3",
+      "query": "fulltext(message:items)",
+      "med_ms": 1.0
+    },
+    {
+      "codec": "os-zstd",
+      "repo": "direct",
+      "query": "term(status:500)",
+      "med_ms": 0.5
+    },
+    {
+      "codec": "os-zstd",
+      "repo": "direct",
+      "query": "agg(date_hist+terms)",
+      "med_ms": 26.0
+    },
+    {
+      "codec": "os-zstd",
+      "repo": "direct",
+      "query": "fulltext(message:items)",
+      "med_ms": 0.5
+    },
+    {
+      "codec": "os-zstd",
+      "repo": "S4 zstd-3",
+      "query": "term(status:500)",
+      "med_ms": 0.5
+    },
+    {
+      "codec": "os-zstd",
+      "repo": "S4 zstd-3",
+      "query": "agg(date_hist+terms)",
+      "med_ms": 25.0
+    },
+    {
+      "codec": "os-zstd",
+      "repo": "S4 zstd-3",
+      "query": "fulltext(message:items)",
+      "med_ms": 0.5
+    },
+    {
+      "codec": "os-zstdnodict",
+      "repo": "direct",
+      "query": "term(status:500)",
+      "med_ms": 0.0
+    },
+    {
+      "codec": "os-zstdnodict",
+      "repo": "direct",
+      "query": "agg(date_hist+terms)",
+      "med_ms": 25.5
+    },
+    {
+      "codec": "os-zstdnodict",
+      "repo": "direct",
+      "query": "fulltext(message:items)",
+      "med_ms": 0.5
+    },
+    {
+      "codec": "os-zstdnodict",
+      "repo": "S4 zstd-3",
+      "query": "term(status:500)",
+      "med_ms": 1.0
+    },
+    {
+      "codec": "os-zstdnodict",
+      "repo": "S4 zstd-3",
+      "query": "agg(date_hist+terms)",
+      "med_ms": 25.0
+    },
+    {
+      "codec": "os-zstdnodict",
+      "repo": "S4 zstd-3",
+      "query": "fulltext(message:items)",
+      "med_ms": 0.5
+    }
+  ]
+}
