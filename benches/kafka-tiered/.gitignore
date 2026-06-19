@@ -1,0 +1,7 @@
+# Aiven tiered-storage plugin jars (~100 MB) — downloaded by the harness, not committed.
+# See README.md for the download/extract steps.
+plugins/
+# runtime broker data / generated configs
+data/
+kafka-config/
+results/raw-*/
