@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781846752520,
+  "lastUpdate": 1781854398678,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -16272,6 +16272,234 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "masumi.ryugo@gmail.com",
+            "name": "masumi-ryugo",
+            "username": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "785103fdff6168a59010f6ffb6acdb4757116b43",
+          "message": "docs(es-frozen): break-even, HA, RTT context + B-phase measurements (#133)\n\n* bench(es-frozen): add RTT / sidecar / HA / break-even measurements (Part B)\n\nFollow-up measurements layered non-destructively on top of the existing A-D\nphases. All measured locally against MinIO (no AWS billing), 4M docs, S4 v1.2.2.\n\n- B1 phase_b1_rtt.{py,sh}: cold frozen-search latency under injected backend RTT\n  (toxiproxy, 0/5/20/50ms one-way, direct vs S4 zstd-3). Finding: analytics\n  queries are RTT-invariant (S4 +/-1ms at every RTT); the heavy cold top-N+sort\n  is NOT invariant -- S4 overhead grows +7.1% -> +69.8% from 0 -> 50ms because\n  its sidecar-partial GETs each cost a backend round-trip. -> results/rtt-injection.json\n- B2 phase_b2_sidecar.py: .s4index sidecar cold-path overhead. S4 issues the SAME\n  backend GET count as a passthrough baseline (8 vs 8) and ZERO separate\n  .s4index-keyed GETs; the sidecar is folded into each data GET as a\n  path=\"sidecar-partial\" covering range. -> results/sidecar-overhead.json\n- B3 breakeven.py: parameterised break-even model on the measured saved_ratio,\n  HA(2) & non-HA(1), 500TB & 1PB net savings (all net-positive). -> results/breakeven.json\n- B4 phase_b4_ha.{sh}/phase_b4_ha_failover.py: 2 stateless S4 instances behind an\n  nginx LB; kill one -> cold/warm query + snapshot PUT all survive (7/7 PASS).\n  -> results/ha-failover.json\n- B5 results/recompact-concurrency.json: documented-not-tested (recompact vs ES\n  snapshot/_cleanup is unsafe by the tool's own HEAD->PUT TOCTOU admission).\n- results/REVISION-NOTES.md: one-page summary of what measured / what's TODO.\n- README: section 5 documents the new phases + the nginx-SigV4-Host gotcha.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n* docs(es-frozen): break-even, HA, recompact-consistency, RTT context (Part A)\n\nReflects the Part B measurements into the use-case doc; preserves all existing\nhonesty (the +6.5-9.5% cold-sort overhead, best_compression double-compression\ncaveat, zstd-19 slowloris PARTIAL failure, 4,000,000-doc round-trip).\n\n- A1 Break-even: real saved_ratio + explicit parameterised $/host model, scaled\n  to 500TB-1PB; asserts standard-default is net-positive above ~23 TB (HA 2x).\n- A2 New \"Availability & HA\" section: S4 is a read-path hard dependency / SPOF\n  for cold frozen search; mitigate with >=2 stateless instances behind an LB or\n  multi-value DNS (sidecars in S3 -> stateless). Cites the B4 failover smoke +\n  the nginx SigV4 Host-header gotcha. Recommended-config now points at the LB.\n- A3 recompact<->snapshot consistency caveat: must NOT run concurrently with ES\n  snapshot/_cleanup; HEAD->PUT TOCTOU silently overwrites; --older-than is a\n  mitigation not a guarantee; recommend an exclusive quiet window.\n- A4 Cold-latency context: absolute 2-4ms are no-RTT local-MinIO; the\n  transferable metric is S4's RELATIVE overhead. Adds the B1 RTT table (analytics\n  RTT-invariant; top-N+sort overhead GROWS +7.1% -> +69.8% from 0 -> 50ms) and a\n  B2 note that the sidecar adds no extra cold-path backend round-trip.\n- A5 TL;DR storage reworded to \"-15-27% (default max; best_comp/LogsDB -15-22%)\";\n  -27% framed as zero-migration upside for default-codec clusters.\n- A6 Honest Elastic Deepfreeze note (Glacier rotation = cheaper for truly-cold;\n  S4 sweet spot = warmish-frozen kept in Standard; complementary not exclusive),\n  LogsDB shelf-life caveat, and a restrained \"this is ONE use case\" scope note.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n* docs(es-frozen): tighten honesty/precision per review (Codex)\n\n- Reconcile Result 4 \"every block cold\" setup with the B2 op-count (analytics\n  queries answered without a backend GET in that run).\n- Label the RTT-injection table as a separate toxiproxy rerun whose 0ms\n  baseline (+7.1%) differs from the headline +9.5% — read columns as the same\n  run's overhead growing with RTT, not against the headline.\n- Narrow the HA claim to \"behind a health-checking load balancer that routes to\n  healthy upstreams\" (what B4 measured); move multi-value DNS to\n  \"validate in your environment\" (DNS caching / pooled connections / JVM retry\n  are environment-specific).\n- Clarify the warm-query HA row stayed unaffected because it did not need the\n  repository (not a survivor-backed read).\n- Label the break-even \"1 PB\" row as \"1 PB (1000 TB)\" to disambiguate.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: masumi-ryugo <abyo.software@gmail.com>\nCo-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-19T16:24:58+09:00",
+          "tree_id": "ec5502a6ea45ef1eebd4b8752027e22e70bbc0b5",
+          "url": "https://github.com/abyo-software/s4/commit/785103fdff6168a59010f6ffb6acdb4757116b43"
+        },
+        "date": 1781854398225,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 49018,
+            "range": "± 1703",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 56609,
+            "range": "± 2202",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 428,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2221725,
+            "range": "± 34953",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50517973,
+            "range": "± 66670",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201590,
+            "range": "± 1035",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 49389497,
+            "range": "± 924825",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 921419667,
+            "range": "± 4869657",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3218066,
+            "range": "± 5410",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 28237,
+            "range": "± 1156",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 33112,
+            "range": "± 977",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 419,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 581352,
+            "range": "± 2494",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1640245,
+            "range": "± 5799",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201657,
+            "range": "± 263",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12188280,
+            "range": "± 58869",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 28677447,
+            "range": "± 104802",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3221888,
+            "range": "± 26621",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1451355,
+            "range": "± 17702",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2110728,
+            "range": "± 76564",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 312532592,
+            "range": "± 4262945",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 136,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 8375,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 904,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13971,
+            "range": "± 43",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 3067,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 23862,
+            "range": "± 42",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 95163,
+            "range": "± 401",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 632,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 5212,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 20858,
+            "range": "± 67",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
             "range": "± 0",
             "unit": "ns/iter"
           }
