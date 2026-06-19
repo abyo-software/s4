@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781797138544,
+  "lastUpdate": 1781846752520,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -16027,6 +16027,234 @@ window.BENCHMARK_DATA = {
             "name": "decode_index/4096f",
             "value": 17926,
             "range": "± 82",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "masumi.ryugo@gmail.com",
+            "name": "masumi-ryugo",
+            "username": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "fb34c0820ade3fea91767e743d2cbefa9da539fd",
+          "message": "docs(use-cases): add Elasticsearch frozen-tier use case + benchmark harness (#131)\n\nFirst entry in the S4 use-case series: using S4 as an Elasticsearch\nfrozen-tier backend. Measured end-to-end (ES 9.4.2 -> S4 v1.2.2 -> MinIO,\n4M-doc structured-log index) across standard / best_compression / LogsDB\nindex modes and zstd levels:\n\n- storage: -27% / -15% / -22% at the default zstd-3; -33% after\n  `s4 recompact` to zstd-19; LogsDB + S4 zstd-9 = 2.82x smaller repo\n- snapshot throughput 186-241 MB/s at zstd-3 (>> ES's 40 MB/s default\n  snapshot throttle); restore decode ~780-870 MB/s unthrottled\n- frozen cold analytics queries: 2-4 ms, S4 within +/-1 ms of direct\n- finding: zstd-19 on the live snapshot path trips S4's 30s read timeout\n  (slowloris guard); use `s4 recompact` for high levels (verified\n  transparent: restored all 4,000,000 docs post-recompaction)\n\nIncludes a reproducible local harness (benches/elasticsearch-frozen/) with\nraw result JSONs + failure evidence, \"Use cases\" links from README/docs,\nand documents --read-timeout-seconds / --max-concurrent-connections in\ndocs/configuration.md.\n\nReviewed with Codex to convergence; all reported numbers verified against\nthe committed raw JSON + recompact log.\n\nCo-authored-by: masumi-ryugo <abyo.software@gmail.com>\nCo-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-19T14:18:03+09:00",
+          "tree_id": "d09a2f7e053db191eb17e05f33cbccdad4b689f5",
+          "url": "https://github.com/abyo-software/s4/commit/fb34c0820ade3fea91767e743d2cbefa9da539fd"
+        },
+        "date": 1781846751947,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 56617,
+            "range": "± 3803",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 56890,
+            "range": "± 3513",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 366,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2559307,
+            "range": "± 23346",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 42481883,
+            "range": "± 184965",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 191986,
+            "range": "± 516",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 50978012,
+            "range": "± 914411",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 767818652,
+            "range": "± 986751",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3063183,
+            "range": "± 5582",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 32223,
+            "range": "± 4262",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 39136,
+            "range": "± 2477",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 378,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 574625,
+            "range": "± 6258",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1571176,
+            "range": "± 37681",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 191986,
+            "range": "± 567",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 11339233,
+            "range": "± 70152",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 26488351,
+            "range": "± 567443",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3065383,
+            "range": "± 2923",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1590881,
+            "range": "± 18898",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2638734,
+            "range": "± 30956",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 342699433,
+            "range": "± 3745056",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 139,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 9567,
+            "range": "± 75",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 803,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 12693,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 3076,
+            "range": "± 120",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 24930,
+            "range": "± 1113",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 95955,
+            "range": "± 2825",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 591,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 5063,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19680,
+            "range": "± 66",
             "unit": "ns/iter"
           },
           {
