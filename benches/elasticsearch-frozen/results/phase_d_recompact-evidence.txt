@@ -1,0 +1,20 @@
+### recompact path for index: bench-standard-default
+1) snapshot bench-standard-default through S4 zstd-3 ...
+   state: SUCCESS
+   stored @ zstd-3 : 1051.2 MB
+2) s4 recompact -> zstd-19 (dry-run projection) ...
+  objects: 27   total: 1002.5 MiB (1051213711 bytes)
+  would recompact: 14 object(s), 759.7 MiB -> 674.6 MiB (saves 85.1 MiB)
+  skipped: 0 not-s4, 0 already-compacted, 0 unsupported-codec, 0 unstamped-framed, 13 insufficient-gain, 0 too-large, 0 etag-raced, 0 too-recent, 0 tags-unreadable
+3) s4 recompact -> zstd-19 (execute) ...
+  skipped: 0 not-s4, 0 already-compacted, 0 unsupported-codec, 0 unstamped-framed, 13 insufficient-gain, 0 too-large, 0 etag-raced, 0 too-recent, 0 tags-unreadable
+  failed: 0
+
+Notes:
+  - conflict safety: the source ETag is re-checked via HEAD immediately before each overwrite, but S3 has no compare-and-swap — a writer landing between the HEAD and the PUT is silently overwritten
+  - storage class and object tags are carried over on each rewrite; ACLs and Object Lock retention/legal-hold are NOT — the overwrite PUT resets them to bucket defaults, so do not recompact buckets relying on per-object ACLs or Object Lock
+   stored @ zstd-19: 962.0 MB
+4) verify snapshot still restores after recompaction ...
+   restore shards: {'total': 1, 'failed': 0, 'successful': 1}
+   restored doc count: 4000000 (post-zstd-19-recompact, read back through S4)
+SUMMARY bench-standard-default: zstd-3=1051.2MB  zstd-19=962.0MB  extra_saved=8.5% vs zstd-3

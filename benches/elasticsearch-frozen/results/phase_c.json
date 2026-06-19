@@ -1,0 +1,20 @@
+[
+  {
+    "repo": "direct",
+    "logical_mb": 1440.8,
+    "restore_s": 0.5,
+    "mb_per_s": 2899.0
+  },
+  {
+    "repo": "S4 zstd-3",
+    "logical_mb": 1440.8,
+    "restore_s": 1.66,
+    "mb_per_s": 869.4
+  },
+  {
+    "repo": "S4 zstd-9",
+    "logical_mb": 1440.8,
+    "restore_s": 1.85,
+    "mb_per_s": 777.8
+  }
+]
