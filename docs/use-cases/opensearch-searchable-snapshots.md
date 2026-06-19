@@ -36,7 +36,7 @@ segment), snapshotted to a real S3 repository through S4:
 |---|---|
 | **Repository storage saved** (S4 zstd-3) | **−16.5% to −28.1%** — biggest on the `default` (LZ4) codec; **~17%** even on OpenSearch's **native `zstd` codec** |
 | **The catch** | requires S4's **`--logical-etag`** flag — without it, OpenSearch's `repository-s3` rejects every blob (`Data read has a different checksum than expected`). See [Compatibility](#compatibility-logical-etag-is-required). |
-| **Searchable-snapshot cold search** (count / agg / full-text) | **S4 within ±1 ms of direct** (often equal or faster) |
+| **Searchable-snapshot search** (count / agg / full-text) | **S4 within ~1.5 ms of direct** in this local run (equal or faster on every query) |
 | **End-to-end** | repo `_verify`, snapshot (SUCCESS), `remote_snapshot` mount + cold search all work through S4 |
 | **Compounding** | native `zstd` codec **+** S4 zstd-3 = **909.9 MB** vs `default`-codec direct **1484.7 MB** → **1.63× smaller** |
 
@@ -168,9 +168,10 @@ server-side `took` (ms) of 4 runs, direct vs S4 zstd-3:
 | date-histogram + terms agg | `zstd` | 26.0 | 25.0 |
 | count / full-text | `zstd` | 0.5 | 0.5 |
 
-**In this local run, S4's server-side `took` stayed within ±1 ms of direct on
-every query** — frequently equal or a hair faster (fewer compressed bytes to
-pull before the decode). The decompression cost lands on the cold, rarely-hit
+**In this local run, S4's server-side `took` stayed within ~1.5 ms of direct on
+every query — equal or a hair faster** (the largest gap, the `default`
+date-histogram agg, was 27.5 ms through S4 vs 29.0 direct; fewer compressed
+bytes to pull before the decode). The decompression cost lands on the cold, rarely-hit
 read path, where the searchable-snapshot tier already expects latency. Validate
 against your own object-store RTT and cache behaviour — the absolute
 milliseconds here are no-RTT local-MinIO values.
