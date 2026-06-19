@@ -3092,6 +3092,51 @@ fn md5_of_bytes(bytes: &[u8]) -> [u8; 16] {
     h.finalize().into()
 }
 
+/// Outcome of evaluating ETag-based read preconditions (RFC 9110 §13).
+enum EtagPrecondition {
+    /// No precondition, or all satisfied — serve the request normally.
+    Proceed,
+    /// `If-Match` did not match — return `412 Precondition Failed`.
+    Failed,
+    /// `If-None-Match` matched on a GET/HEAD — return `304 Not Modified`.
+    NotModified,
+}
+
+/// Evaluate `If-Match` / `If-None-Match` for a GET/HEAD against the object's
+/// **logical** ETag. S4 must own this under `--logical-etag`: the gateway
+/// advertises `MD5(original)` as the ETag, but the backend object carries the
+/// compressed-bytes ETag, so forwarding the client's preconditions would make
+/// the backend compare against the wrong value. AWS S3 uses strong
+/// comparison; `current` is the object's logical ETag value (unquoted), or
+/// `None` if the object has no logical ETag. Per RFC 9110 §13.2.2, `If-Match`
+/// is evaluated before `If-None-Match`.
+fn evaluate_etag_preconditions(
+    if_match: Option<&s3s::dto::ETagCondition>,
+    if_none_match: Option<&s3s::dto::ETagCondition>,
+    current: Option<&str>,
+) -> EtagPrecondition {
+    use s3s::dto::ETagCondition;
+    let matches = |cond: &ETagCondition| -> bool {
+        match cond {
+            // `*` matches iff the entity exists.
+            ETagCondition::Any => current.is_some(),
+            // Strong comparison of the ETag value (weak validators never match).
+            ETagCondition::ETag(e) => current.is_some_and(|c| e.as_strong() == Some(c)),
+        }
+    };
+    if let Some(im) = if_match
+        && !matches(im)
+    {
+        return EtagPrecondition::Failed;
+    }
+    if let Some(inm) = if_none_match
+        && matches(inm)
+    {
+        return EtagPrecondition::NotModified;
+    }
+    EtagPrecondition::Proceed
+}
+
 /// v1.1 `--zstd-dict`: 16-hex dictionary id (`.s4dict/<id>` の `<id>`) を
 /// 指す。`cpu-zstd-dict` (codec id 8) で圧縮した single-PUT framed object に
 /// だけ stamp される。GET 側はこの id で辞書を解決する (preloaded →
@@ -5006,6 +5051,30 @@ impl<B: S3> S3 for S4Service<B> {
         self.check_not_reserved_key(&get_key, ReservedKeyMode::Read)?;
         self.enforce_rate_limit(&req, &get_bucket)?;
         self.enforce_policy(&req, "s3:GetObject", &get_bucket, Some(&get_key))?;
+        // `--logical-etag`: S4 owns ETag preconditions (see `head_object` —
+        // the backend would compare the client's logical ETag against the
+        // compressed-object ETag). Strip `If-Match` / `If-None-Match` and
+        // capture them for local evaluation on the full path below. When a
+        // precondition is present the sidecar partial-range fast path is
+        // bypassed (gated below) so the full path can evaluate it first.
+        let (cond_if_match, cond_if_none_match) = if self.logical_etag {
+            (req.input.if_match.take(), req.input.if_none_match.take())
+        } else {
+            (None, None)
+        };
+        let has_etag_precondition = cond_if_match.is_some() || cond_if_none_match.is_some();
+        // RFC 9110 §13.2.2 precedence: an evaluated ETag condition supersedes
+        // the paired date condition — strip the superseded one so the backend
+        // doesn't re-evaluate it (If-Match > If-Unmodified-Since;
+        // If-None-Match > If-Modified-Since).
+        if self.logical_etag {
+            if cond_if_match.is_some() {
+                req.input.if_unmodified_since = None;
+            }
+            if cond_if_none_match.is_some() {
+                req.input.if_modified_since = None;
+            }
+        }
         // Range request の事前検出 (decompress 後 slice する path に使う)。
         let range_request = req.input.range.take();
         // v0.5 #27: pull SSE-C material from the input headers before
@@ -5092,6 +5161,7 @@ impl<B: S3> S3 for S4Service<B> {
         // best-effort behaviour so existing on-disk indexes don't suddenly
         // start missing the partial-fetch path.
         if let Some(ref r) = range_request
+            && !has_etag_precondition
             && let Some(index) = self.read_sidecar(&req.input.bucket, &req.input.key).await
             && self
                 .sidecar_version_binding_ok(&req.input.bucket, &req.input.key, &index)
@@ -5164,6 +5234,14 @@ impl<B: S3> S3 for S4Service<B> {
             }
         }
         let mut resp = self.backend.get_object(req).await?;
+        // Backend's own ETag (real for passthrough / non-S4 objects); captured
+        // before the decompress paths clear it, for `--logical-etag`
+        // precondition evaluation below.
+        let backend_etag = resp
+            .output
+            .e_tag
+            .as_ref()
+            .and_then(|e| e.as_strong().map(str::to_owned));
         // v0.5 #34: stamp the resolved version-id so the client sees a
         // coherent `x-amz-version-id` header (only for chains owned by
         // the manager — Unversioned buckets / no-manager paths never
@@ -5177,6 +5255,44 @@ impl<B: S3> S3 for S4Service<B> {
         // multipart と同じ path に流す。
         let needs_frame_parse = is_multipart || is_framed_v2;
         let manifest_opt = extract_manifest(&resp.output.metadata);
+        // `--logical-etag`: evaluate the stripped ETag preconditions against
+        // the object's logical ETag (or the backend ETag for passthrough /
+        // non-S4 objects) before any body shaping. Range+precondition requests
+        // were routed here (the fast path is gated off above), so the slice is
+        // applied afterwards only if the precondition holds.
+        if has_etag_precondition {
+            let logical = resp
+                .output
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get(META_LOGICAL_ETAG))
+                .cloned();
+            let current = logical.as_deref().or(backend_etag.as_deref());
+            match evaluate_etag_preconditions(
+                cond_if_match.as_ref(),
+                cond_if_none_match.as_ref(),
+                current,
+            ) {
+                EtagPrecondition::Failed => {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::from_bytes(b"PreconditionFailed")
+                            .unwrap_or(S3ErrorCode::InvalidArgument),
+                        "At least one of the preconditions you specified did not hold",
+                    ));
+                }
+                EtagPrecondition::NotModified => {
+                    // 304: drop the body, echo the (logical) ETag validator.
+                    resp.output.body = None;
+                    resp.output.content_length = None;
+                    resp.output.e_tag = logical
+                        .map(ETag::Strong)
+                        .or_else(|| resp.output.e_tag.take());
+                    resp.status = Some(http::StatusCode::NOT_MODIFIED);
+                    return Ok(resp);
+                }
+                EtagPrecondition::Proceed => {}
+            }
+        }
         // v1.1 `--zstd-dict`: dict-compressed objects are framed single-
         // PUTs whose frames need the dictionary named by `s4-dict-id`.
         let dict_id_meta = extract_dict_id(&resp.output.metadata);
@@ -5584,7 +5700,7 @@ impl<B: S3> S3 for S4Service<B> {
     }
     async fn head_object(
         &self,
-        req: S3Request<HeadObjectInput>,
+        mut req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
         // v0.6 #40: capture bucket/key before req is consumed so the
         // replication-status echo can look the entry up.
@@ -5592,7 +5708,33 @@ impl<B: S3> S3 for S4Service<B> {
         let head_key = req.input.key.clone();
         // v0.8.16 F-13 / v0.8.17 G-2: shared reserved-name guard.
         self.check_not_reserved_key(&head_key, ReservedKeyMode::Read)?;
+        // `--logical-etag`: S4 owns ETag preconditions (the backend would
+        // compare the client's logical ETag against the compressed-object
+        // ETag). Strip If-Match / If-None-Match before forwarding and capture
+        // them for local evaluation below.
+        let (cond_if_match, cond_if_none_match) = if self.logical_etag {
+            (req.input.if_match.take(), req.input.if_none_match.take())
+        } else {
+            (None, None)
+        };
+        // RFC 9110 §13.2.2 precedence (see get_object): drop the date
+        // condition a present ETag condition supersedes.
+        if self.logical_etag {
+            if cond_if_match.is_some() {
+                req.input.if_unmodified_since = None;
+            }
+            if cond_if_none_match.is_some() {
+                req.input.if_modified_since = None;
+            }
+        }
         let mut resp = self.backend.head_object(req).await?;
+        // The backend's own ETag (real for passthrough / non-S4 objects);
+        // captured before the framed block clears it below.
+        let backend_etag = resp
+            .output
+            .e_tag
+            .as_ref()
+            .and_then(|e| e.as_strong().map(str::to_owned));
         if let Some(manifest) = extract_manifest(&resp.output.metadata) {
             // 客側には decompress 後の意味のある content_length / checksum を返す。
             // backend が返す圧縮済 bytes の checksum / e_tag は意味が違うため除去
@@ -5615,6 +5757,36 @@ impl<B: S3> S3 for S4Service<B> {
                 .as_ref()
                 .and_then(|m| m.get(META_LOGICAL_ETAG))
                 .map(|hex| ETag::Strong(hex.clone()));
+        }
+        // `--logical-etag`: evaluate the stripped ETag preconditions against
+        // the object's logical ETag (or the backend ETag for passthrough /
+        // non-S4 objects). Only runs when a precondition was present.
+        if cond_if_match.is_some() || cond_if_none_match.is_some() {
+            let logical = resp
+                .output
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get(META_LOGICAL_ETAG))
+                .cloned();
+            let current = logical.as_deref().or(backend_etag.as_deref());
+            match evaluate_etag_preconditions(
+                cond_if_match.as_ref(),
+                cond_if_none_match.as_ref(),
+                current,
+            ) {
+                EtagPrecondition::Failed => {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::from_bytes(b"PreconditionFailed")
+                            .unwrap_or(S3ErrorCode::InvalidArgument),
+                        "At least one of the preconditions you specified did not hold",
+                    ));
+                }
+                EtagPrecondition::NotModified => {
+                    resp.status = Some(http::StatusCode::NOT_MODIFIED);
+                    return Ok(resp);
+                }
+                EtagPrecondition::Proceed => {}
+            }
         }
         // v0.6 #40: echo `x-amz-replication-status` (PENDING / COMPLETED
         // / FAILED) so consumers can poll progress without a GET.
@@ -10005,6 +10177,68 @@ impl SigV4aGateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn etag_preconditions_evaluate_against_logical_etag() {
+        use s3s::dto::ETagCondition;
+        let etag = |s: &str| ETagCondition::parse_http_header(s.as_bytes()).expect("parse etag");
+        let any = ETagCondition::Any;
+        let cur = Some("d41d8cd98f00b204e9800998ecf8427e");
+
+        // If-Match: exact -> proceed, mismatch -> 412, `*` -> proceed if exists.
+        assert!(matches!(
+            evaluate_etag_preconditions(
+                Some(&etag("\"d41d8cd98f00b204e9800998ecf8427e\"")),
+                None,
+                cur
+            ),
+            EtagPrecondition::Proceed
+        ));
+        assert!(matches!(
+            evaluate_etag_preconditions(
+                Some(&etag("\"deadbeefdeadbeefdeadbeefdeadbeef\"")),
+                None,
+                cur
+            ),
+            EtagPrecondition::Failed
+        ));
+        assert!(matches!(
+            evaluate_etag_preconditions(Some(&any), None, cur),
+            EtagPrecondition::Proceed
+        ));
+        // `If-Match: *` against a non-existent object fails.
+        assert!(matches!(
+            evaluate_etag_preconditions(Some(&any), None, None),
+            EtagPrecondition::Failed
+        ));
+
+        // If-None-Match: match -> 304, mismatch -> proceed, `*` -> 304 if exists.
+        assert!(matches!(
+            evaluate_etag_preconditions(
+                None,
+                Some(&etag("\"d41d8cd98f00b204e9800998ecf8427e\"")),
+                cur
+            ),
+            EtagPrecondition::NotModified
+        ));
+        assert!(matches!(
+            evaluate_etag_preconditions(
+                None,
+                Some(&etag("\"deadbeefdeadbeefdeadbeefdeadbeef\"")),
+                cur
+            ),
+            EtagPrecondition::Proceed
+        ));
+        assert!(matches!(
+            evaluate_etag_preconditions(None, Some(&any), cur),
+            EtagPrecondition::NotModified
+        ));
+        // No preconditions -> proceed.
+        assert!(matches!(
+            evaluate_etag_preconditions(None, None, cur),
+            EtagPrecondition::Proceed
+        ));
+    }
 
     #[test]
     fn manifest_roundtrip_via_metadata() {

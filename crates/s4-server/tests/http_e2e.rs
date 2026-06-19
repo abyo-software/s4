@@ -318,6 +318,75 @@ async fn logical_etag_reports_original_payload_md5() {
     let _ = shutdown.send(());
 }
 
+/// `--logical-etag`: `If-Match` / `If-None-Match` must be evaluated against the
+/// LOGICAL ETag (MD5 of original), not the backend's compressed-object ETag.
+/// A correct logical ETag matching proves S4 owns the precondition (it would
+/// 412 if the backend compared against the compressed bytes).
+#[tokio::test]
+#[ignore = "requires Docker for MinIO container"]
+async fn logical_etag_if_match_uses_logical_etag() {
+    let minio = start_minio().await;
+    let (s4_endpoint, shutdown) = spawn_s4_server_opts(&minio.endpoint_url, true).await;
+    let backend_client = build_aws_client(&minio.endpoint_url);
+    let _ = backend_client
+        .create_bucket()
+        .bucket("le-cond")
+        .send()
+        .await;
+
+    let payload = Bytes::from("conditional payload row; ".repeat(4000));
+    // MD5(payload) == the ETag MinIO returns for a direct (raw) PUT.
+    let raw_etag = backend_client
+        .put_object()
+        .bucket("le-cond")
+        .key("raw")
+        .body(payload.clone().into())
+        .send()
+        .await
+        .expect("raw PUT to MinIO")
+        .e_tag()
+        .map(str::to_owned)
+        .expect("MinIO ETag");
+
+    let s4 = build_aws_client(&s4_endpoint);
+    s4.put_object()
+        .bucket("le-cond")
+        .key("k")
+        .body(payload.clone().into())
+        .send()
+        .await
+        .expect("PUT through S4");
+
+    // If-Match with the logical ETag -> succeeds (would 412 if compared to the
+    // backend's compressed-object ETag).
+    let ok = s4
+        .get_object()
+        .bucket("le-cond")
+        .key("k")
+        .if_match(raw_etag.clone())
+        .send()
+        .await;
+    assert!(
+        ok.is_ok(),
+        "If-Match with the logical ETag must succeed: {:?}",
+        ok.err()
+    );
+    let body = ok.unwrap().body.collect().await.expect("body").into_bytes();
+    assert_eq!(body, payload, "conditional GET roundtrip must be lossless");
+
+    // A wrong If-Match -> 412 (Err).
+    let bad = s4
+        .get_object()
+        .bucket("le-cond")
+        .key("k")
+        .if_match("\"00000000000000000000000000000000\"")
+        .send()
+        .await;
+    assert!(bad.is_err(), "wrong If-Match must fail the precondition");
+
+    let _ = shutdown.send(());
+}
+
 /// Default-off contract: with `--logical-etag` NOT set, a compressed PUT must
 /// behave exactly as before — no `s4-logical-etag` metadata stamped, and HEAD
 /// returns no ETag for the framed object (the pre-flag behaviour).

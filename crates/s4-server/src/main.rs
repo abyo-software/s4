@@ -449,12 +449,12 @@ struct Opt {
     /// against `MD5(body)` — notably OpenSearch's `repository-s3` snapshot
     /// repository, which otherwise rejects every blob with `Data read has a
     /// different checksum than expected`. Costs one MD5 pass over each PUT
-    /// body. **Limitation:** ETag-based conditional requests
-    /// (`If-Match` / `If-None-Match`) are NOT yet translated — they are
-    /// still evaluated by the backend against the compressed-object ETag,
-    /// so do not combine `--logical-etag` with conditional GET/HEAD keyed
-    /// on the logical ETag. (Conditional requests on compressed objects
-    /// were unsupported before this flag too, since HEAD returned no ETag.)
+    /// body. GET/HEAD ETag conditionals (`If-Match` / `If-None-Match`,
+    /// incl. RFC 9110 §13.2.2 date-precedence) are evaluated by S4 against
+    /// the logical ETag. **Limitation:** write-path ETag preconditions
+    /// (an `If-Match` on PUT / CopyObject) are still evaluated by the
+    /// backend against the compressed-object ETag — avoid those under
+    /// `--logical-etag`.
     #[clap(long)]
     logical_etag: bool,
 
