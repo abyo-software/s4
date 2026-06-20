@@ -10,11 +10,11 @@ rows you need.
 
 | Surface | Status | Notes |
 |---|---|---|
-| PUT / GET object | ✅ Full | single-PUT + range-GET (see below) |
-| Multipart upload (create / part / complete / abort) | ✅ Full | with per-part framing + final-part padding trim |
-| HEAD object | ✅ Full | returns post-compression `Content-Length` (matches what S3 returns; original size in `x-amz-meta-s4-original-size`) |
-| Range GET | ✅ S3 spec | `bytes=N-M`, `bytes=-N` (suffix), `bytes=N-` (open-ended); range maps through S4IX sidecar to compressed byte offsets |
-| Conditional GET / PUT (`If-Match` / `If-None-Match` / `If-Modified-Since`) | ✅ Full | |
+| PUT / GET object | ✅ Full | single-PUT + range-GET (see below). **Client-transparent ETag** = `MD5(original)` by default (see [§ Client transparency](#client-transparency-compression-is-invisible-to-the-client)) |
+| Multipart upload (create / part / complete / abort) | ✅ Full | per-part framing + final-part padding trim. Composite object ETag is the AWS `MD5(concat(original-part-MD5s))-N` form — **best-effort** (see § Client transparency) |
+| HEAD object | ✅ Full | returns the **original** `Content-Length` and the client-transparent ETag; S4's `s4-*` control metadata is not exposed |
+| Range GET | ✅ S3 spec | `bytes=N-M`, `bytes=-N` (suffix), `bytes=N-` (open-ended); range maps through the S4IX sidecar; `s4-*` stripped + logical ETag echoed on the partial response |
+| Conditional GET / PUT / Copy (`If-Match` / `If-None-Match` / `If-Modified-Since`) | ✅ read-path full; write-path best-effort | read-path is fully evaluated against the logical ETag. Write-path (`If-Match` on PUT, `x-amz-copy-source-if-*` on Copy) is evaluated against the logical ETag too, but **non-atomically** (HEAD-then-write) — see § Client transparency |
 | PutObjectAcl / GetObjectAcl | ✅ canned ACLs only | `private` / `public-read` / `public-read-write` / `authenticated-read` / `aws-exec-read` / `bucket-owner-read` / `bucket-owner-full-control` |
 | Bucket versioning | ✅ Full | per-version UUIDv4 ID, delete-marker semantics |
 | Object lock (Governance / Compliance) | ✅ Full | per-object retention + legal-hold |
@@ -35,6 +35,51 @@ rows you need.
 | Storage class transitions (Standard ↔ IA ↔ Glacier) | ✅ tagging-driven | see [docs/storage-class-transitions.md](storage-class-transitions.md) |
 | Cross-region replication via S4 chain | — | use AWS S3 native CRR on the backend |
 | RequestPayment / Accelerate / Logging configuration | — | not implemented; report a 501 |
+
+### Client transparency (compression is invisible to the client)
+
+By default S4 presents every object as if it were stored uncompressed — the
+compression is invisible to the S3 client. This is what lets SDKs that validate
+upload integrity (AWS SDK v2, OpenSearch `repository-s3`, …) work unchanged.
+
+| Surface | Default (client-transparent) | Opt-out / notes |
+|---|---|---|
+| **Single-object ETag** (PUT / HEAD / GET) | `MD5(original payload)` — what a client computes from the bytes it uploaded/downloaded | `--physical-passthrough` presents the backend's compressed-object ETag instead |
+| **Content-Length & GET body** | the original (decompressed) size / bytes | — |
+| **`s4-*` control metadata** | stripped from GET / HEAD (incl. Range GET) responses | use a direct backend read to inspect S4's internal markers |
+| **Multipart composite ETag** | AWS `MD5(concat(original-part-MD5s))-N` — **best-effort** (see below) | `--physical-passthrough` keeps the backend composite |
+| **`ListObjects(V2)` Size & ETag** | the backend **compressed** size + ETag (so they disagree with HEAD/GET) | **`--accurate-list-size`** rewrites both to the original values via one bounded-concurrency backend HEAD per key (N+1) |
+| **Write-path `If-Match` / `If-None-Match`** (PUT) and **`x-amz-copy-source-if-*`** (Copy) | evaluated by S4 against the logical ETag | **non-atomic** (HEAD-then-write); a concurrent writer between the check and the write is not serialised — run conditional writes on cold / quiescent keys. A non-404 backend HEAD error fails the write (never silently proceeds) |
+
+**Multipart composite ETag is best-effort.** Computing the AWS composite needs
+every part's original-payload MD5, which S4 records in **in-memory** per-upload
+state. When the full set is present (single gateway, state survived) the object
+gets the client-transparent composite, stamped so HEAD/GET return it. When it is
+not — a **gateway restart mid-upload** or a **multi-gateway deployment** where
+parts landed on different instances — `CompleteMultipartUpload` still **succeeds**
+(parts are reverse-mapped authoritatively via the backend's `ListParts` by part
+number), but the object keeps the **backend** composite ETag with no logical
+stamp, and HEAD / GET / List return that same value consistently. In that
+recovery path S4 does not strictly re-validate the client's submitted part ETags
+(it assembles by part number); durable per-part state (which would restore both
+the composite and strict validation everywhere) is a roadmap item. Use
+`--physical-passthrough` if you require uniform backend-ETag behavior.
+
+**Known minor gaps** (low-impact; mostly upstream of S4):
+- Whitespace-only object keys (`" "` / `"\t"` / `"\n"`) return `500` — emitted by
+  the underlying `s3s` framework before S4's handler runs.
+- Error responses carry no `x-amz-request-id`, and `304 Not Modified` omits the
+  `ETag` header — both are `s3s` response-shape limitations.
+- `GetObjectAttributes(ObjectSize)` returns the backend `400` and is not
+  client-transparent — use `HeadObject` (which is) instead.
+- `CopyObject` of a **URL-encoded key on a specific source `versionId`** can
+  return `NoSuchKey`; copy by the unencoded key / latest version works.
+- Browser-based `POST` object-upload **policy** violations return `400` where AWS
+  returns `403`/`204` in a few cases (the happy path works).
+
+> Measured against the Ceph `s3-tests` conformance suite, the campaign cut
+> S4-introduced regressions from **21 → 11** (vs MinIO-direct, N=784); the
+> remaining 11 are the gaps listed above.
 
 **Range GET caveat** (#99): the S4IX sidecar gives a per-frame index, so
 range maps to a contiguous read of the covering frames and a decode that's
