@@ -737,6 +737,21 @@ struct LedgerFootprint {
 }
 
 impl<B: S3> S4Service<B> {
+    /// `head_object` variant that preserves S4's reserved `s4-*` control
+    /// metadata for S4-internal callers (e.g. the inventory scanner's SSE
+    /// classifier, which detects gateway-default SSE-S4 via the
+    /// `s4-encrypted` marker). The client-facing `head_object` strips those
+    /// keys for transparency; this opt-out sets [`InternalUnstrippedHead`] in
+    /// the request extensions so the strip is skipped. Every other behaviour
+    /// (logical size / ETag / SSE-indicator translation) is identical.
+    pub(crate) async fn head_object_unstripped(
+        &self,
+        mut req: S3Request<HeadObjectInput>,
+    ) -> S3Result<S3Response<HeadObjectOutput>> {
+        req.extensions.insert(InternalUnstrippedHead);
+        self.head_object(req).await
+    }
+
     /// AWS S3 単発 PUT の API 上限 (5 GiB)。
     ///
     /// v0.9 #106 (32-bit target support): `target_pointer_width` で gating して
@@ -3635,6 +3650,16 @@ fn strip_reserved_client_metadata(metadata: &mut Option<Metadata>) {
     }
 }
 
+/// Request-extension marker: an S4-internal caller needs the raw `s4-*`
+/// control metadata that `head_object` normally strips for client
+/// transparency. The inventory scanner's SSE classifier is the canonical
+/// consumer — gateway-default SSE-S4 is detected via the `s4-encrypted`
+/// marker, which the client must never see but the audit report must.
+/// Set via [`S4Service::head_object_unstripped`]; honored at the
+/// `head_object` exit so the client-facing path is unaffected.
+#[derive(Clone, Copy)]
+pub(crate) struct InternalUnstrippedHead;
+
 /// v1.2 audit R2 P2: snapshot of the metadata handed to the cross-bucket
 /// replication dispatcher. The dispatcher PUTs the replica directly
 /// against the backend (it never re-enters `put_object`), so replicas
@@ -6278,6 +6303,10 @@ impl<B: S3> S3 for S4Service<B> {
                 req.input.if_modified_since = None;
             }
         }
+        // S4-internal callers (the inventory SSE classifier) opt out of the
+        // client-facing `s4-*` strip via this request-extension marker, so the
+        // raw `s4-encrypted` / `s4-sse-*` markers survive for classification.
+        let keep_reserved_metadata = req.extensions.get::<InternalUnstrippedHead>().is_some();
         let mut resp = self.backend.head_object(req).await?;
         // The backend's own ETag (real for passthrough / non-S4 objects);
         // captured before the framed block clears it below.
@@ -6433,7 +6462,10 @@ impl<B: S3> S3 for S4Service<B> {
         // `s4-logical-etag`), so the client must not also see the raw `s4-*`
         // user-metadata keys — they break metadata round-trip/copy and leak
         // codec internals. Symmetric with the inbound `strip_reserved_client_metadata`.
-        strip_reserved_client_metadata(&mut resp.output.metadata);
+        // Skipped only for S4-internal callers that set `InternalUnstrippedHead`.
+        if !keep_reserved_metadata {
+            strip_reserved_client_metadata(&mut resp.output.metadata);
+        }
         Ok(resp)
     }
     async fn delete_object(

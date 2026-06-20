@@ -824,7 +824,12 @@ async fn scan_one_config<B: S3 + Send + Sync + 'static>(
                 http::Method::HEAD,
                 &format!("/{src}/{key}", src = cfg.bucket),
             );
-            let head = match s4.as_ref().head_object(head_req).await {
+            // Use the unstripped HEAD: the SSE classifier below
+            // (`encryption_status_from_head`) detects gateway-default SSE-S4
+            // via the raw `s4-encrypted` marker, which the client-facing
+            // `head_object` strips for transparency. The logical size / ETag /
+            // SSE-indicator fields are identical to the client view.
+            let head = match s4.as_ref().head_object_unstripped(head_req).await {
                 Ok(r) => r.output,
                 Err(e) => {
                     warn!(
