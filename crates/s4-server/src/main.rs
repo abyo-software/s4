@@ -449,8 +449,10 @@ struct Opt {
     /// evaluated by S4 against the logical ETag. Costs one MD5 pass per PUT.
     /// Use `--physical-passthrough` to opt out (present the backend's
     /// compressed-object ETag instead). NOTE write-path ETag preconditions
-    /// (`If-Match` on PUT / CopyObject) are tracked separately on the road to
-    /// full S3 compatibility.
+    /// (`If-Match` / `If-None-Match` on PUT, `x-amz-copy-source-if-*` on
+    /// CopyObject) are evaluated by S4 itself against the logical ETag via a
+    /// HEAD-then-write; this is best-effort / non-atomic (TOCTOU) on concurrent
+    /// writers — run conditional writes on quiescent keys.
     #[clap(long = "physical-passthrough")]
     physical_passthrough: bool,
 
