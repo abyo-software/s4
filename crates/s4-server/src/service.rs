@@ -1843,6 +1843,45 @@ impl<B: S3> S4Service<B> {
         }
     }
 
+    /// The CURRENT object's client-facing (logical) ETag for a write-path
+    /// precondition: the `s4-logical-etag` stamp if present, else the backend's
+    /// own strong ETag (a non-S4 object), else `None` if the object doesn't
+    /// exist. Used to evaluate `If-Match`/`If-None-Match` on PUT and
+    /// `copy_source_if_*` on Copy against the value the client actually saw,
+    /// since the backend would otherwise compare against the compressed-object
+    /// ETag and reject every conditional write.
+    async fn current_logical_etag(&self, bucket: &str, key: &str) -> Option<String> {
+        let uri = safe_object_uri(bucket, key).ok()?;
+        let head_req = S3Request {
+            input: HeadObjectInput {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                ..Default::default()
+            },
+            method: http::Method::HEAD,
+            uri,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        // `Err` (incl. 404) → object absent → `None`.
+        let head = self.backend.head_object(head_req).await.ok()?;
+        head.output
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get(META_LOGICAL_ETAG))
+            .cloned()
+            .or_else(|| {
+                head.output
+                    .e_tag
+                    .as_ref()
+                    .and_then(|e| e.as_strong().map(str::to_owned))
+            })
+    }
+
     /// Attach an optional bucket policy (v0.2 #7). When `Some(...)`, every
     /// PUT / GET / DELETE / List handler runs `policy.evaluate(...)` before
     /// delegating to the backend; failures return `S3ErrorCode::AccessDenied`.
@@ -3648,6 +3687,31 @@ impl<B: S3> S3 for S4Service<B> {
                         "Access Denied because object protected by object lock",
                     ));
                 }
+            }
+        }
+        // Write-path ETag preconditions (conditional PUT). S4 owns these: the
+        // backend would compare the client's *logical* `If-Match` against the
+        // compressed-object ETag and reject every conditional write. Evaluate
+        // against the CURRENT object's logical ETag and strip them before
+        // forwarding. NOTE best-effort — this HEAD-then-PUT is not atomic
+        // (a concurrent writer between the check and the PUT is not serialised);
+        // run conditional writes on cold / quiescent keys.
+        if self.logical_etag && (req.input.if_match.is_some() || req.input.if_none_match.is_some())
+        {
+            let im = req.input.if_match.take();
+            let inm = req.input.if_none_match.take();
+            let current = self.current_logical_etag(&put_bucket, &put_key).await;
+            // On the WRITE path both a failed `If-Match` and a matched
+            // `If-None-Match` mean 412 (a write is never "304 Not Modified").
+            if !matches!(
+                evaluate_etag_preconditions(im.as_ref(), inm.as_ref(), current.as_deref()),
+                EtagPrecondition::Proceed
+            ) {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::from_bytes(b"PreconditionFailed")
+                        .unwrap_or(S3ErrorCode::InvalidArgument),
+                    "At least one of the preconditions you specified did not hold",
+                ));
             }
         }
         // v0.5 #30: per-PUT explicit retention / legal hold (S3
@@ -6444,6 +6508,37 @@ impl<B: S3> S3 for S4Service<B> {
                 // the destination-side `s3:PutObject` gate above still
                 // applies).
                 self.check_not_reserved_key(key, ReservedKeyMode::Read)?;
+            }
+        }
+        // Copy-source ETag preconditions (`x-amz-copy-source-if-[none-]match`).
+        // Like the write-path If-Match, the backend would compare the client's
+        // logical condition against the SOURCE's compressed-object ETag, so S4
+        // evaluates it against the source's logical ETag and strips it before
+        // forwarding. Date conditions are left for the backend. AccessPoint
+        // sources fall through (bucket resolution is backend-specific).
+        if self.logical_etag
+            && (req.input.copy_source_if_match.is_some()
+                || req.input.copy_source_if_none_match.is_some())
+        {
+            let src = if let CopySource::Bucket { bucket, key, .. } = &req.input.copy_source {
+                Some((bucket.to_string(), key.to_string()))
+            } else {
+                None
+            };
+            if let Some((sb, sk)) = src {
+                let im = req.input.copy_source_if_match.take();
+                let inm = req.input.copy_source_if_none_match.take();
+                let current = self.current_logical_etag(&sb, &sk).await;
+                if !matches!(
+                    evaluate_etag_preconditions(im.as_ref(), inm.as_ref(), current.as_deref()),
+                    EtagPrecondition::Proceed
+                ) {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::from_bytes(b"PreconditionFailed")
+                            .unwrap_or(S3ErrorCode::InvalidArgument),
+                        "At least one of the preconditions you specified did not hold",
+                    ));
+                }
             }
         }
         // S4-aware copy: source object に s4-* metadata がある場合、それを
