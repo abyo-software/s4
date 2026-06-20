@@ -3275,6 +3275,88 @@ impl<B: S3> S4Service<B> {
         };
         Ok((framed, manifest, used_dict))
     }
+
+    /// s3-compat fix #4 P1 (multi-gateway / restart regression fix): page
+    /// through the BACKEND's own `ListParts` for `(bucket, key, upload_id)`
+    /// and build the authoritative `part_number -> backend_etag` map (each
+    /// part's ETag in the strong/unquoted `ETag::value()` form the backend's
+    /// Complete part-validation expects).
+    ///
+    /// This is the durable, gateway-independent source of truth: it reflects
+    /// every part the backend actually stored, regardless of which S4 instance
+    /// handled `UploadPart` (multi-gateway HA) or whether this process restarted
+    /// mid-upload. The in-memory `part_etags` side-table only ever holds the
+    /// parts THIS instance saw and survives only as long as the process does,
+    /// so before this fix a Complete arriving on a fresh / different gateway
+    /// reverse-mapped against an incomplete (or empty) map → `InvalidPart`.
+    ///
+    /// S3 multipart allows up to 10000 parts and `ListParts` returns at most
+    /// 1000 per page, so we loop on `is_truncated` + `next_part_number_marker`
+    /// (defensively stopping if the marker fails to advance). Returns `None`
+    /// only when `ListParts` itself fails (e.g. a backend that doesn't
+    /// implement it, or a transient error) — callers then fall back to the
+    /// in-memory `backend_etag` recorded by `UploadPart`.
+    async fn list_parts_backend_etags(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Option<std::collections::HashMap<i32, String>> {
+        let mut map: std::collections::HashMap<i32, String> = std::collections::HashMap::new();
+        let mut marker: Option<i32> = None;
+        loop {
+            let uri = safe_object_uri(bucket, key).ok()?;
+            let req = S3Request {
+                input: ListPartsInput {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    upload_id: upload_id.to_owned(),
+                    part_number_marker: marker,
+                    max_parts: Some(1000),
+                    ..Default::default()
+                },
+                method: http::Method::GET,
+                uri,
+                headers: http::HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            let out = match self.backend.list_parts(req).await {
+                Ok(resp) => resp.output,
+                Err(e) => {
+                    debug!(
+                        bucket = %bucket,
+                        key = %key,
+                        upload_id = %upload_id,
+                        error = %e,
+                        "fix #4 P1: ListParts failed; falling back to in-memory backend ETags \
+                         for the multipart reverse-map"
+                    );
+                    return None;
+                }
+            };
+            if let Some(parts) = out.parts {
+                for part in parts {
+                    if let (Some(pn), Some(etag)) = (part.part_number, part.e_tag.as_ref()) {
+                        map.insert(pn, etag.value().to_string());
+                    }
+                }
+            }
+            if !out.is_truncated.unwrap_or(false) {
+                break;
+            }
+            // Advance to the next page; stop defensively if the backend
+            // claims truncation but doesn't (or fails to) advance the marker.
+            match out.next_part_number_marker {
+                Some(m) if Some(m) != marker => marker = Some(m),
+                _ => break,
+            }
+        }
+        Some(map)
+    }
 }
 
 /// Parse a CopySourceRange header value (`bytes=N-M`, `bytes=N-`, `bytes=-N`)
@@ -7803,28 +7885,59 @@ impl<B: S3> S3 for S4Service<B> {
         let _ = req.input.sse_customer_algorithm.take();
         let _ = req.input.sse_customer_key.take();
         let _ = req.input.sse_customer_key_md5.take();
-        // s3-compat fix #4: client-transparent multipart composite ETag.
-        // Snapshot the per-part `(original_md5, backend_etag)` side-table
-        // recorded by `upload_part`, then BEFORE the backend Complete (a)
-        // reverse-map each client-sent logical part ETag in the manifest
+        // s3-compat fix #4 (+ P1 multi-gateway / restart regression fix):
+        // client-transparent multipart composite ETag.
+        //
+        // BEFORE the backend Complete (when `--logical-etag` is on) we must
+        // (a) reverse-map each client-sent logical part ETag in the manifest
         // back to the backend's compressed-part ETag so the backend's part
-        // validation passes, and (b) compute the AWS composite ETag
-        // `MD5(concat(ORIGINAL-part-MD5s))-N` over the completed parts in
-        // ascending part-number order. Gated on `--logical-etag`; with it
-        // off `get_parts` is never called and the manifest / composite are
-        // untouched (bit-for-bit unchanged Complete).
+        // validation passes, and (b) best-effort compute the AWS composite
+        // ETag `MD5(concat(ORIGINAL-part-MD5s))-N`.
+        //
+        // fix #4 P1: the reverse-map's source of truth is the BACKEND's own
+        // `ListParts` (paginated, authoritative), NOT the in-memory side-table.
+        // The earlier campaign made Complete depend on the per-`upload_id`
+        // in-memory `part_etags` map populated by `upload_part`; that map only
+        // holds the parts THIS instance saw and only survives while the process
+        // does, so it broke two cases that worked pre-campaign: (1) a gateway
+        // restart mid-upload (map gone), and (2) multi-gateway HA — the
+        // RECOMMENDED ">=2 stateless S4 behind a health-checking LB" deployment
+        // — where parts land on different instances and the gateway handling
+        // Complete only has ITS parts. `ListParts` reflects every part the
+        // backend stored, so reverse-mapping by part number works regardless of
+        // gateway state; pre-campaign behaviour (Complete succeeds) is restored.
+        //
+        // The in-memory side-table is still consulted for TWO things:
+        //   * VALIDATION — when we recorded a part we require the client's
+        //     submitted ETag to equal the original-bytes MD5 we advertised
+        //     from UploadPart (Fix-1 behaviour preserved where possible).
+        //   * the backend-ETag FALLBACK when `ListParts` itself is unavailable
+        //     (the `backend_etag` field; see `multipart_state::PartEtags`).
         //
         // fix #4 P1 (retry-safety): use the NON-draining `get_parts` (clone)
         // here, not `take_parts`. The side-table is dropped only AFTER the
         // backend Complete returns `Ok` (below); if Complete fails
         // (transient 5xx / `EntityTooSmall`) the map survives so the
         // client's retry can still reverse-map its valid parts.
+        //
+        // Gated on `--logical-etag`; with it off neither `ListParts` nor
+        // `get_parts` is called and the manifest / composite are untouched
+        // (bit-for-bit unchanged Complete).
         let logical_parts = if self.logical_etag {
             self.multipart_state.get_parts(upload_id.as_str())
         } else {
             None
         };
-        let logical_composite: Option<String> = if let Some(ref parts_map) = logical_parts {
+        // Authoritative `part_number -> backend_etag` from the backend's
+        // ListParts (paged). `None` = ListParts unavailable ⇒ fall back to the
+        // in-memory `backend_etag`.
+        let listparts_etags: Option<std::collections::HashMap<i32, String>> = if self.logical_etag {
+            self.list_parts_backend_etags(&bucket, &key, upload_id.as_str())
+                .await
+        } else {
+            None
+        };
+        let logical_composite: Option<String> = if self.logical_etag {
             // Reverse-map the manifest in place + collect completed part
             // numbers for the composite.
             let mut completed: Vec<i32> = Vec::new();
@@ -7832,48 +7945,70 @@ impl<B: S3> S3 for S4Service<B> {
                 && let Some(parts) = mp.parts.as_mut()
             {
                 for part in parts.iter_mut() {
-                    if let Some(pn) = part.part_number {
-                        completed.push(pn);
-                        if let Some(pe) = parts_map.get(&pn) {
-                            // fix #4 P1: only reverse-map when the client
-                            // actually submitted the logical part ETag we
-                            // advertised from `UploadPart` (= the recorded
-                            // ORIGINAL-bytes MD5). Normalise the client's
-                            // value to its strong, unquoted form
+                    let Some(pn) = part.part_number else {
+                        continue;
+                    };
+                    completed.push(pn);
+                    let in_mem = logical_parts.as_ref().and_then(|m| m.get(&pn));
+                    // Authoritative backend ETag for this part, in the strong/
+                    // unquoted `value()` form the backend Complete validates
+                    // against. ListParts wins; the in-memory `backend_etag` is
+                    // the fallback when ListParts couldn't supply it.
+                    let backend_etag = listparts_etags
+                        .as_ref()
+                        .and_then(|m| m.get(&pn).cloned())
+                        .or_else(|| in_mem.map(|pe| pe.backend_etag.clone()));
+                    match in_mem {
+                        Some(pe) => {
+                            // Fix-1 validation preserved: only reverse-map when
+                            // the client actually submitted the logical part
+                            // ETag we advertised from `UploadPart` (= the
+                            // recorded ORIGINAL-bytes MD5). Normalise the
+                            // client's value to its strong, unquoted form
                             // (`as_strong()` returns `None` for a weak
-                            // validator, surrounding quotes already stripped
-                            // by the s3s parser) and require an exact match.
-                            // ONLY on a match do we rewrite to the backend's
-                            // compressed-part ETag so the backend Complete
-                            // validates; on a mismatch we leave the client's
-                            // value UNCHANGED so the backend rejects it as
-                            // `InvalidPart` (AWS semantics) — an invalid
-                            // Complete must NOT become a 200 OK.
+                            // validator; surrounding quotes already stripped by
+                            // the s3s parser) and require an exact match. On a
+                            // mismatch we leave the client's value UNCHANGED so
+                            // the backend rejects it as `InvalidPart` (AWS
+                            // semantics) — an invalid Complete must NOT become a
+                            // 200 OK.
                             let client_logical = part.e_tag.as_ref().and_then(|e| e.as_strong());
-                            if client_logical == Some(pe.original_md5.as_str()) {
-                                // Backend part ETags are strong MD5 hex;
-                                // rebuild in the same strong form the backend
-                                // issued so the wire value is identical to
-                                // passthrough.
-                                part.e_tag = Some(ETag::Strong(pe.backend_etag.clone()));
+                            if client_logical == Some(pe.original_md5.as_str())
+                                && let Some(be) = backend_etag
+                            {
+                                part.e_tag = Some(ETag::Strong(be));
                             }
                             // Mismatch ⇒ left unchanged ⇒ backend InvalidPart.
                         }
-                        // A part missing from the map (abandoned / unknown),
-                        // or one the client omitted an ETag for, is left as
-                        // the client sent it — the backend rejects it as
-                        // InvalidPart, which is correct. We never synthesize
-                        // an ETag for a part the client didn't validate.
+                        None => {
+                            // Restart / other-gateway: we never recorded this
+                            // part, so we can't validate it — reverse-map to the
+                            // authoritative ListParts backend ETag so Complete
+                            // still succeeds (pre-campaign behaviour). A part
+                            // absent from BOTH the in-memory map AND ListParts
+                            // has `backend_etag == None` and is left unchanged so
+                            // the backend rejects it as `InvalidPart` (correct).
+                            if let Some(be) = backend_etag {
+                                part.e_tag = Some(ETag::Strong(be));
+                            }
+                        }
                     }
                 }
             }
-            // Composite over the completed parts, ascending part number.
+            // Composite (best-effort): ONLY when the in-memory side-table holds
+            // the ORIGINAL-bytes MD5 for EVERY completed part — i.e. all parts
+            // went through THIS gateway and the state survived. If ANY part is
+            // missing its in-memory `original_md5` (restart / other gateway),
+            // we do NOT compute or stamp the composite: the object keeps the
+            // backend's ETag and HEAD/GET return no logical ETag for it,
+            // consistent with the existing >5 GiB unstamped multipart path.
             completed.sort_unstable();
             let mut concat: Vec<u8> = Vec::with_capacity(completed.len() * 16);
             let mut all_known = !completed.is_empty();
             for pn in &completed {
-                match parts_map
-                    .get(pn)
+                match logical_parts
+                    .as_ref()
+                    .and_then(|m| m.get(pn))
                     .and_then(|pe| decode_md5_hex(&pe.original_md5))
                 {
                     Some(raw) => concat.extend_from_slice(&raw),

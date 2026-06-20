@@ -163,9 +163,14 @@ pub struct PartEtags {
     /// and the input to the AWS composite-ETag concatenation.
     pub original_md5: String,
     /// The backend-issued part ETag (`MD5(compressed/framed part)`),
-    /// stored in the same unquoted form `ETag::value()` returns. Used to
-    /// rewrite the `CompletedPart` manifest so the backend's Complete
-    /// part-validation passes.
+    /// stored in the same unquoted form `ETag::value()` returns.
+    ///
+    /// s3-compat fix #4 P1: Complete now reverse-maps the `CompletedPart`
+    /// manifest against the backend's authoritative `ListParts` (which works
+    /// across restart / multi-gateway). This field is retained as the FALLBACK
+    /// used only when that `ListParts` call is unavailable (a backend that
+    /// doesn't implement it, or a transient error) — it lets a single-gateway
+    /// Complete still reverse-map from local state.
     pub backend_etag: String,
 }
 
@@ -317,16 +322,29 @@ impl MultipartStateStore {
     /// `None` when no parts were recorded (upload tracked no parts, or
     /// `--logical-etag` was off).
     ///
-    /// RESTART LIMITATION (honest note): this map — like
-    /// [`MultipartUploadContext`] / the `by_upload_id` side-table — lives
-    /// only in process memory. A gateway restart mid-upload loses it, so a
-    /// `CompleteMultipartUpload` arriving after a restart cannot reverse-map
-    /// the logical part ETags the gateway previously handed out from
-    /// `UploadPart`; the rewritten manifest is gone, so the backend's part
-    /// validation rejects the Complete (`InvalidPart`). This is the same
-    /// lifecycle/durability limitation the existing in-memory multipart
-    /// context already carries (SSE recipe, tags, object-lock) — multipart
-    /// uploads are not durable across a gateway restart by design.
+    /// RESTART / MULTI-GATEWAY NOTE (s3-compat fix #4 P1): this map lives only
+    /// in process memory and only holds the parts THIS instance saw. A gateway
+    /// restart loses it, and in a multi-gateway HA deployment (`>=2` stateless
+    /// S4 behind an LB — the recommended topology) the instance handling
+    /// `CompleteMultipartUpload` may hold only a subset of the parts.
+    ///
+    /// Complete therefore NO LONGER depends on this map to reverse-map the
+    /// logical part ETags back to the backend ETags: it reverse-maps against
+    /// the BACKEND's own `ListParts` (authoritative, paginated — see
+    /// `service::list_parts_backend_etags`), which reflects every stored part
+    /// regardless of which gateway uploaded it or whether this process
+    /// restarted. So `CompleteMultipartUpload` now SUCCEEDS across restart /
+    /// multi-gateway, matching pre-campaign behaviour.
+    ///
+    /// This in-memory map is still consulted for (1) the Fix-1 VALIDATION (the
+    /// client must submit the original-bytes MD5 we advertised for any part we
+    /// recorded) and (2) the [`PartEtags::backend_etag`] FALLBACK when
+    /// `ListParts` is unavailable. The only thing that degrades when the map is
+    /// incomplete is the client-transparent composite ETag: it is best-effort
+    /// and only stamped when EVERY completed part's `original_md5` survives in
+    /// this map (single gateway with surviving state). Otherwise the object
+    /// keeps the backend's ETag and carries no `s4-logical-etag` stamp — a
+    /// best-effort degradation, no longer a hard `InvalidPart` failure.
     #[must_use]
     pub fn get_parts(&self, upload_id: &str) -> Option<HashMap<i32, PartEtags>> {
         self.part_etags.get(upload_id).map(|entry| {
