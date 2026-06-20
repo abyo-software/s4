@@ -462,13 +462,14 @@ struct Opt {
     #[clap(long, hide = true)]
     logical_etag: bool,
 
-    /// Report the **original** (pre-compression) object size in `ListObjects(V2)`
-    /// instead of the stored compressed size. Off by default: the listing then
-    /// reports the compressed size, which makes `aws s3 sync` / `rclone`
-    /// over-transfer (data is still correct on GET). Enabling this makes listings
-    /// match the size a client downloads, at the cost of one bounded-concurrency
-    /// backend HEAD per listed key (N+1) — use it where listing-size accuracy
-    /// matters more than listing latency.
+    /// Make `ListObjects(V2)` report the client-transparent **original size AND
+    /// ETag** (MD5 of the original payload) per object, instead of the stored
+    /// compressed size + backend ETag. Off by default: listings then report the
+    /// compressed size + backend ETag, which disagree with HEAD/GET (so
+    /// `aws s3 sync` / `rclone` over-transfer; data is still correct on GET).
+    /// Enabling this makes listings consistent with HEAD/GET, at the cost of one
+    /// bounded-concurrency backend HEAD per listed key (N+1) — use it where
+    /// listing accuracy matters more than listing latency.
     #[clap(long)]
     accurate_list_size: bool,
 

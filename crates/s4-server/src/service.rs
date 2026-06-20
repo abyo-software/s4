@@ -1780,7 +1780,18 @@ impl<B: S3> S4Service<B> {
     /// object's original (pre-compression) size. `None` if the HEAD fails or the
     /// object carries no stamp (a non-S4 / passthrough object, whose backend
     /// size already IS the original).
-    async fn backend_original_size(&self, bucket: &str, key: &str) -> Option<i64> {
+    /// HEAD the backend object once and derive its client-transparent listing
+    /// attributes — `(original size, client-facing ETag)`. The ETag is the
+    /// `s4-logical-etag` stamp if present, else `None` for an S4 object that
+    /// carries no stamp (the backend's compressed-bytes ETag is meaningless and
+    /// would disagree with HEAD/GET), else the backend's own ETag for a non-S4
+    /// (raw) object. Returns `None` only when the HEAD itself fails (caller then
+    /// leaves both the listed size and ETag untouched).
+    async fn backend_list_attrs(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Option<(Option<i64>, Option<String>)> {
         let uri = safe_object_uri(bucket, key).ok()?;
         let head_req = S3Request {
             input: HeadObjectInput {
@@ -1798,39 +1809,54 @@ impl<B: S3> S4Service<B> {
             trailing_headers: None,
         };
         let head = self.backend.head_object(head_req).await.ok()?;
-        head.output
-            .metadata
-            .as_ref()
+        let meta = head.output.metadata.as_ref();
+        let size = meta
             .and_then(|m| m.get(META_ORIGINAL_SIZE))
-            .and_then(|s| s.parse::<i64>().ok())
+            .and_then(|s| s.parse::<i64>().ok());
+        let is_s4 =
+            meta.is_some_and(|m| m.keys().any(|k| k.to_ascii_lowercase().starts_with("s4-")));
+        let etag = match meta.and_then(|m| m.get(META_LOGICAL_ETAG)).cloned() {
+            Some(logical) => Some(logical),
+            // S4 object with no logical stamp → no client-visible ETag (matches
+            // HEAD/GET, which clear it). Raw (non-S4) object → its real ETag.
+            None if is_s4 => None,
+            None => head
+                .output
+                .e_tag
+                .as_ref()
+                .and_then(|e| e.as_strong().map(str::to_owned)),
+        };
+        Some((size, etag))
     }
 
-    /// `--accurate-list-size`: map each key to its original (pre-compression)
-    /// size via a bounded-concurrency backend HEAD. Keys whose HEAD fails or
-    /// carry no `s4-original-size` stamp are absent from the map (the caller
-    /// keeps the listed size, which for a non-S4 object already IS the original).
-    async fn original_sizes(
+    /// `--accurate-list-size`: map each key to its client-transparent listing
+    /// attributes (original size + ETag) via a bounded-concurrency backend HEAD.
+    /// Keys whose HEAD fails are absent from the map (the caller keeps the listed
+    /// size + ETag); a present key may still carry `None` size / `None` ETag,
+    /// which the caller applies (clearing the ETag for an unstamped S4 object).
+    async fn original_attrs(
         &self,
         bucket: &str,
         keys: Vec<String>,
-    ) -> std::collections::HashMap<String, i64> {
+    ) -> std::collections::HashMap<String, (Option<i64>, Option<String>)> {
         use futures::StreamExt as _;
-        const LIST_SIZE_HEAD_CONCURRENCY: usize = 32;
+        const LIST_HEAD_CONCURRENCY: usize = 32;
         futures::stream::iter(keys)
             .map(|key| async move {
-                let sz = self.backend_original_size(bucket, &key).await;
-                (key, sz)
+                let attrs = self.backend_list_attrs(bucket, &key).await;
+                (key, attrs)
             })
-            .buffer_unordered(LIST_SIZE_HEAD_CONCURRENCY)
-            .filter_map(|(k, sz)| async move { sz.map(|s| (k, s)) })
+            .buffer_unordered(LIST_HEAD_CONCURRENCY)
+            .filter_map(|(k, attrs)| async move { attrs.map(|a| (k, a)) })
             .collect()
             .await
     }
 
-    /// Rewrite a listing page's entry sizes to original (no-op unless
-    /// `--accurate-list-size`). Shared by `list_objects` / `list_objects_v2`
-    /// (both page over `Object`). Runs AFTER the internal-key filter so it only
-    /// HEADs the keys the client will actually see.
+    /// Rewrite a listing page's entry Size AND ETag to the client-transparent
+    /// values (no-op unless `--accurate-list-size`). Shared by `list_objects` /
+    /// `list_objects_v2` (both page over `Object`). Runs AFTER the internal-key
+    /// filter so it only HEADs the keys the client will actually see. Under the
+    /// default (off), listings report the backend's compressed size + ETag.
     async fn apply_accurate_list_size(&self, bucket: &str, contents: Option<&mut Vec<Object>>) {
         if !self.accurate_list_size {
             return;
@@ -1842,12 +1868,17 @@ impl<B: S3> S4Service<B> {
         if keys.is_empty() {
             return;
         }
-        let sizes = self.original_sizes(bucket, keys).await;
+        let attrs = self.original_attrs(bucket, keys).await;
         for o in contents.iter_mut() {
             if let Some(k) = o.key.as_deref()
-                && let Some(&s) = sizes.get(k)
+                && let Some((size, etag)) = attrs.get(k)
             {
-                o.size = Some(s);
+                if let Some(s) = size {
+                    o.size = Some(*s);
+                }
+                // logical stamp / cleared for unstamped S4 objects / backend ETag
+                // for raw objects — consistent with HEAD/GET.
+                o.e_tag = etag.clone().map(ETag::Strong);
             }
         }
     }
