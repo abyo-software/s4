@@ -144,6 +144,31 @@ pub struct MultipartUploadContext {
     pub object_lock_legal_hold: bool,
 }
 
+/// Per-part ETag pair recorded by `UploadPart` and consumed by
+/// `CompleteMultipartUpload` for the client-transparent multipart
+/// composite ETag (s3-compat fix #4, `--logical-etag`).
+///
+/// S4 compresses each part before storing it, so the backend's per-part
+/// ETag is `MD5(compressed part)` and the backend's composite object
+/// ETag is `MD5(concat(compressed-part-MD5s))-N` — neither matches what
+/// a client that validates against the *original* bytes expects. We
+/// stash both halves per part so Complete can (a) reverse-map the
+/// client-sent logical part ETag back to the backend ETag (so the
+/// backend's part validation passes) and (b) recompute the AWS composite
+/// ETag `MD5(concat(ORIGINAL-part-MD5s))-N`.
+#[derive(Clone, Debug)]
+pub struct PartEtags {
+    /// `MD5(original part bytes)` as lowercase hex (32 chars) — the
+    /// value the gateway advertised to the client from `UploadPart`,
+    /// and the input to the AWS composite-ETag concatenation.
+    pub original_md5: String,
+    /// The backend-issued part ETag (`MD5(compressed/framed part)`),
+    /// stored in the same unquoted form `ETag::value()` returns. Used to
+    /// rewrite the `CompletedPart` manifest so the backend's Complete
+    /// part-validation passes.
+    pub backend_etag: String,
+}
+
 /// In-memory side-table mapping `upload_id` → context. One of these
 /// hangs off `S4Service` (always-on, no flag — the per-upload state is
 /// gateway-internal).
@@ -181,6 +206,16 @@ pub struct MultipartStateStore {
     /// returns and the prune sweep observes only the `DashMap`'s own
     /// `Arc` reference.
     completion_locks: DashMap<(String, String), Arc<Mutex<()>>>,
+    /// s3-compat fix #4: per-`upload_id` map of `part_number` →
+    /// [`PartEtags`], populated by `UploadPart` and drained by
+    /// `CompleteMultipartUpload` to build the client-transparent
+    /// composite ETag. Parts upload concurrently, so the inner
+    /// `HashMap` is guarded by a `std::sync::Mutex`; the outer
+    /// `DashMap` keeps the per-upload entries independently lockable.
+    /// Entries are removed on `take_parts` (Complete), `drop_parts`
+    /// (Abort), and alongside `remove` / `sweep_stale` so an abandoned
+    /// upload never leaks its part state.
+    part_etags: DashMap<String, std::sync::Mutex<HashMap<i32, PartEtags>>>,
 }
 
 impl MultipartStateStore {
@@ -192,6 +227,7 @@ impl MultipartStateStore {
         Self {
             by_upload_id: RwLock::new(HashMap::new()),
             completion_locks: DashMap::new(),
+            part_etags: DashMap::new(),
         }
     }
 
@@ -229,6 +265,52 @@ impl MultipartStateStore {
     pub fn remove(&self, upload_id: &str) {
         crate::lock_recovery::recover_write(&self.by_upload_id, "multipart_state.by_upload_id")
             .remove(upload_id);
+        // s3-compat fix #4: drop any per-part ETag state too so a
+        // Complete/Abort (or any other `remove` caller) doesn't leak
+        // the side-table entry.
+        self.part_etags.remove(upload_id);
+    }
+
+    /// s3-compat fix #4: record the `(original_md5, backend_etag)` pair
+    /// for one part of `upload_id`. Called from `UploadPart` under
+    /// `--logical-etag` after the backend returns the compressed-part
+    /// ETag. Concurrent parts of the same upload contend only on this
+    /// upload's inner `Mutex`. A re-PUT of the same `part_number`
+    /// overwrites (mirrors S3's last-writer-wins part semantics).
+    pub fn record_part(
+        &self,
+        upload_id: &str,
+        part_number: i32,
+        original_md5: String,
+        backend_etag: String,
+    ) {
+        let entry = self.part_etags.entry(upload_id.to_owned()).or_default();
+        let mut guard = entry.value().lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(
+            part_number,
+            PartEtags {
+                original_md5,
+                backend_etag,
+            },
+        );
+    }
+
+    /// s3-compat fix #4: remove and return the full `part_number →
+    /// [`PartEtags`]` map for `upload_id`. Called once at
+    /// `CompleteMultipartUpload` to drive both the reverse-map and the
+    /// composite-ETag computation. `None` when no parts were recorded
+    /// (upload tracked no parts, or `--logical-etag` was off).
+    #[must_use]
+    pub fn take_parts(&self, upload_id: &str) -> Option<HashMap<i32, PartEtags>> {
+        self.part_etags
+            .remove(upload_id)
+            .map(|(_, mutex)| mutex.into_inner().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// s3-compat fix #4: drop the per-part ETag state for `upload_id`
+    /// without returning it. Called from `AbortMultipartUpload`.
+    pub fn drop_parts(&self, upload_id: &str) {
+        self.part_etags.remove(upload_id);
     }
 
     /// v0.8.2 #62 (H-6 audit fix): drop every entry whose insertion
@@ -259,6 +341,9 @@ impl MultipartStateStore {
         let count = stale.len();
         for k in stale {
             map.remove(&k);
+            // s3-compat fix #4: an abandoned upload's per-part ETag
+            // state is dropped alongside its context so it can't leak.
+            self.part_etags.remove(&k);
         }
         count
     }
@@ -510,6 +595,82 @@ mod tests {
         assert!(store.get("old-1").is_none(), "old-1 must be gone");
         assert!(store.get("old-2").is_none(), "old-2 must be gone");
         let _ = sweep_now; // silence dead-code (kept to document the simpler-but-discarded plan)
+    }
+
+    /// s3-compat fix #4: `record_part` then `take_parts` round-trips
+    /// every recorded part, and `take_parts` removes the entry (a second
+    /// `take_parts` returns `None`).
+    #[test]
+    fn record_take_parts_round_trip() {
+        let store = MultipartStateStore::new();
+        store.record_part("u-mp", 1, "a".repeat(32), "be-1".to_owned());
+        store.record_part("u-mp", 2, "b".repeat(32), "be-2".to_owned());
+        let parts = store.take_parts("u-mp").expect("parts must be present");
+        assert_eq!(parts.len(), 2, "both recorded parts must round-trip");
+        let p1 = parts.get(&1).expect("part 1 present");
+        assert_eq!(p1.original_md5, "a".repeat(32));
+        assert_eq!(p1.backend_etag, "be-1");
+        let p2 = parts.get(&2).expect("part 2 present");
+        assert_eq!(p2.original_md5, "b".repeat(32));
+        assert_eq!(p2.backend_etag, "be-2");
+        assert!(
+            store.take_parts("u-mp").is_none(),
+            "take_parts must remove the entry"
+        );
+    }
+
+    /// s3-compat fix #4: a second `record_part` for the same
+    /// `part_number` overwrites (S3 last-writer-wins part semantics).
+    #[test]
+    fn record_part_overwrites_same_part_number() {
+        let store = MultipartStateStore::new();
+        store.record_part("u-ow", 1, "1".repeat(32), "be-old".to_owned());
+        store.record_part("u-ow", 1, "2".repeat(32), "be-new".to_owned());
+        let parts = store.take_parts("u-ow").expect("present");
+        assert_eq!(parts.len(), 1, "same part_number must not duplicate");
+        let p = parts.get(&1).expect("part 1");
+        assert_eq!(p.original_md5, "2".repeat(32));
+        assert_eq!(p.backend_etag, "be-new");
+    }
+
+    /// s3-compat fix #4: `drop_parts` removes the entry without
+    /// returning it; a later `take_parts` sees nothing.
+    #[test]
+    fn drop_parts_removes_entry() {
+        let store = MultipartStateStore::new();
+        store.record_part("u-drop", 1, "c".repeat(32), "be".to_owned());
+        store.drop_parts("u-drop");
+        assert!(
+            store.take_parts("u-drop").is_none(),
+            "drop_parts must clear the per-part state"
+        );
+    }
+
+    /// s3-compat fix #4: `remove` (Complete/Abort common path) and
+    /// `sweep_stale` (abandoned-upload janitor) must also drop the
+    /// per-part ETag state so it can't leak.
+    #[test]
+    fn remove_and_sweep_drop_part_state() {
+        let store = MultipartStateStore::new();
+        store.put("u-rm", sample_ctx("b", "k"));
+        store.record_part("u-rm", 1, "d".repeat(32), "be".to_owned());
+        store.remove("u-rm");
+        assert!(
+            store.take_parts("u-rm").is_none(),
+            "remove must drop per-part state alongside the context"
+        );
+
+        store.put("u-sw", sample_ctx("b", "k2"));
+        store.record_part("u-sw", 1, "e".repeat(32), "be".to_owned());
+        let swept = store.sweep_stale(
+            Utc::now() + chrono::Duration::hours(25),
+            chrono::Duration::hours(24),
+        );
+        assert_eq!(swept, 1, "the stale context must be swept");
+        assert!(
+            store.take_parts("u-sw").is_none(),
+            "sweep_stale must drop per-part state for swept uploads"
+        );
     }
 
     /// v0.8.1 #59: `completion_lock(bucket, key)` must return the
