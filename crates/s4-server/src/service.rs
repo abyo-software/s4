@@ -1854,17 +1854,34 @@ impl<B: S3> S4Service<B> {
 
     /// The CURRENT object's client-facing (logical) ETag for a write-path
     /// precondition: the `s4-logical-etag` stamp if present, else the backend's
-    /// own strong ETag (a non-S4 object), else `None` if the object doesn't
+    /// own strong ETag (a non-S4 object), else `Ok(None)` if the object doesn't
     /// exist. Used to evaluate `If-Match`/`If-None-Match` on PUT and
     /// `copy_source_if_*` on Copy against the value the client actually saw,
     /// since the backend would otherwise compare against the compressed-object
-    /// ETag and reject every conditional write.
-    async fn current_logical_etag(&self, bucket: &str, key: &str) -> Option<String> {
-        let uri = safe_object_uri(bucket, key).ok()?;
+    /// ETag and reject every conditional write. `version_id` pins the probe to
+    /// a specific version (a `copy_source` with `?versionId=` must be evaluated
+    /// against THAT version, not the latest); pass `None` for the latest.
+    ///
+    /// s3-compat Fix A (DATA SAFETY): returns `S3Result` so a backend HEAD
+    /// failure is NOT silently collapsed to "object absent". Only a genuine
+    /// 404 / `NoSuchKey` maps to `Ok(None)`; every other error (transient 5xx,
+    /// network, auth, throttling) propagates as `Err`, so the caller FAILS the
+    /// conditional write instead of proceeding — a `PUT If-None-Match: *`
+    /// during a transient HEAD error must not overwrite an existing object
+    /// (lost update), and an `If-Match` must not turn a backend fault into a
+    /// misleading 412.
+    async fn current_logical_etag(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> S3Result<Option<String>> {
+        let uri = safe_object_uri(bucket, key)?;
         let head_req = S3Request {
             input: HeadObjectInput {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
+                version_id: version_id.map(str::to_owned),
                 ..Default::default()
             },
             method: http::Method::HEAD,
@@ -1876,15 +1893,21 @@ impl<B: S3> S4Service<B> {
             service: None,
             trailing_headers: None,
         };
-        // `Err` (incl. 404) → object absent → `None`.
-        let head = self.backend.head_object(head_req).await.ok()?;
+        // Fix A: only a genuine not-found → absent (`Ok(None)`); propagate
+        // everything else so the conditional write fails rather than silently
+        // proceeding on a transient backend error.
+        let head = match self.backend.head_object(head_req).await {
+            Ok(h) => h,
+            Err(e) if is_not_found_error(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
         if let Some(stamp) = head
             .output
             .metadata
             .as_ref()
             .and_then(|m| m.get(META_LOGICAL_ETAG))
         {
-            return Some(stamp.clone());
+            return Ok(Some(stamp.clone()));
         }
         // s3-compat Fix C: a framed / multipart S4 object without a logical
         // stamp has NO client-visible validator (HEAD/GET present no ETag), so
@@ -1892,12 +1915,13 @@ impl<B: S3> S4Service<B> {
         // compressed-bytes ETag — the client never saw it. Only a genuinely
         // non-S4 (passthrough-to-backend) object exposes the backend ETag.
         if is_s4_logical_object(&head.output.metadata) {
-            return None;
+            return Ok(None);
         }
-        head.output
+        Ok(head
+            .output
             .e_tag
             .as_ref()
-            .and_then(|e| e.as_strong().map(str::to_owned))
+            .and_then(|e| e.as_strong().map(str::to_owned)))
     }
 
     /// Attach an optional bucket policy (v0.2 #7). When `Some(...)`, every
@@ -3538,6 +3562,22 @@ fn is_framed_v2_object(metadata: &Option<Metadata>) -> bool {
         .unwrap_or(false)
 }
 
+/// s3-compat Fix A (DATA SAFETY): classify a backend `S3Error` as
+/// "object genuinely not found" (404 / `NoSuchKey` / `NoSuchVersion`) vs a
+/// real failure (5xx, network, auth, throttling, …). A conditional write
+/// (`If-Match` / `If-None-Match`) MUST distinguish the two: mapping every
+/// HEAD error to "absent" let a `PUT If-None-Match: *` overwrite an existing
+/// object during a transient fault — a lost update. HEAD responses carry no
+/// body, so a missing object frequently surfaces as a bare 404 status with
+/// no modeled `NoSuchKey` code; match both the modeled code and the raw 404
+/// status so only a genuine absence is treated as `Ok(None)`.
+fn is_not_found_error(e: &S3Error) -> bool {
+    matches!(
+        e.code(),
+        &S3ErrorCode::NoSuchKey | &S3ErrorCode::NoSuchVersion
+    ) || e.status_code().map(|s| s.as_u16()) == Some(404)
+}
+
 /// s3-compat Fix C: an object whose client-visible ETag S4 owns — a
 /// single-object framed object (`extract_manifest`, incl. passthrough-codec),
 /// a framed-v2 single-PUT, or a multipart object. For all three the backend's
@@ -3899,7 +3939,13 @@ impl<B: S3> S3 for S4Service<B> {
         {
             let im = req.input.if_match.take();
             let inm = req.input.if_none_match.take();
-            let current = self.current_logical_etag(&put_bucket, &put_key).await;
+            // Fix A: `?` — a non-404 HEAD error FAILS the conditional PUT
+            // (the precondition must not silently proceed and overwrite on a
+            // transient backend fault). The dest precondition is on the
+            // latest version, so probe with `None`.
+            let current = self
+                .current_logical_etag(&put_bucket, &put_key, None)
+                .await?;
             // On the WRITE path both a failed `If-Match` and a matched
             // `If-None-Match` mean 412 (a write is never "304 Not Modified").
             if !matches!(
@@ -5884,13 +5930,20 @@ impl<B: S3> S3 for S4Service<B> {
                 // `--logical-etag`: echo the original-payload MD5 if the object
                 // was PUT with the flag (stamp present) — keeps GET consistent
                 // with PUT/HEAD. Falls back to None (pre-flag behaviour) when
-                // unstamped, regardless of this gateway's current flag state.
-                let logical_etag = resp
-                    .output
-                    .metadata
-                    .as_ref()
-                    .and_then(|mm| mm.get(META_LOGICAL_ETAG))
-                    .map(|hex| ETag::Strong(hex.clone()));
+                // unstamped. Fix C: gate on `self.logical_etag` so a
+                // `--physical-passthrough` gateway never echoes a previously
+                // stamped logical ETag — it clears the ETag for this framed
+                // object (the backend's compressed-bytes ETag is meaningless),
+                // matching the pre-logical behaviour bit-for-bit.
+                let logical_etag = if self.logical_etag {
+                    resp.output
+                        .metadata
+                        .as_ref()
+                        .and_then(|mm| mm.get(META_LOGICAL_ETAG))
+                        .map(|hex| ETag::Strong(hex.clone()))
+                } else {
+                    None
+                };
                 resp.output.e_tag = logical_etag;
                 resp.output.body = Some(verified_blob);
                 let elapsed = get_start.elapsed();
@@ -6004,12 +6057,18 @@ impl<B: S3> S3 for S4Service<B> {
             resp.output.checksum_sha256 = None;
             // `--logical-etag`: see the streaming path above — echo the
             // original-payload MD5 stamp if present so GET matches PUT/HEAD.
-            let logical_etag = resp
-                .output
-                .metadata
-                .as_ref()
-                .and_then(|mm| mm.get(META_LOGICAL_ETAG))
-                .map(|hex| ETag::Strong(hex.clone()));
+            // Fix C: gate on `self.logical_etag` so `--physical-passthrough`
+            // clears the ETag (no logical echo) for this framed / multipart
+            // object instead of returning a previously stamped logical value.
+            let logical_etag = if self.logical_etag {
+                resp.output
+                    .metadata
+                    .as_ref()
+                    .and_then(|mm| mm.get(META_LOGICAL_ETAG))
+                    .map(|hex| ETag::Strong(hex.clone()))
+            } else {
+                None
+            };
             resp.output.e_tag = logical_etag;
             let returned_size = final_bytes.len() as u64;
             let codec_label = manifest_opt
@@ -6129,13 +6188,20 @@ impl<B: S3> S3 for S4Service<B> {
             // upload against. Objects PUT without the flag carry no
             // `s4-logical-etag` stamp → ETag stays `None` (pre-flag
             // behaviour, since the backend's compressed-bytes ETag is
-            // meaningless for a framed object).
-            resp.output.e_tag = resp
-                .output
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get(META_LOGICAL_ETAG))
-                .map(|hex| ETag::Strong(hex.clone()));
+            // meaningless for a framed object). Fix C: gate on
+            // `self.logical_etag` so `--physical-passthrough` never echoes a
+            // previously stamped logical ETag — it clears it (pre-logical
+            // behaviour), consistent with the GET paths and the multipart
+            // block below.
+            resp.output.e_tag = if self.logical_etag {
+                resp.output
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get(META_LOGICAL_ETAG))
+                    .map(|hex| ETag::Strong(hex.clone()))
+            } else {
+                None
+            };
         }
         // s3-compat fix #4 / Fix C: multipart objects carry no single-object
         // manifest, so the `extract_manifest`-gated block above never echoes
@@ -6758,15 +6824,28 @@ impl<B: S3> S3 for S4Service<B> {
             && (req.input.copy_source_if_match.is_some()
                 || req.input.copy_source_if_none_match.is_some())
         {
-            let src = if let CopySource::Bucket { bucket, key, .. } = &req.input.copy_source {
-                Some((bucket.to_string(), key.to_string()))
+            // Fix B: capture the source `versionId` too — a copy of
+            // `src?versionId=<old>` must evaluate `copy_source_if_*` against
+            // THAT version's logical ETag, not the latest (pre-fix the probe
+            // hit the latest version → wrong-but-200). Cloned into the tuple
+            // so the immutable `copy_source` borrow ends before the `.take()`s.
+            let src = if let CopySource::Bucket {
+                bucket,
+                key,
+                version_id,
+            } = &req.input.copy_source
+            {
+                Some((bucket.to_string(), key.to_string(), version_id.clone()))
             } else {
                 None
             };
-            if let Some((sb, sk)) = src {
+            if let Some((sb, sk, svid)) = src {
                 let im = req.input.copy_source_if_match.take();
                 let inm = req.input.copy_source_if_none_match.take();
-                let current = self.current_logical_etag(&sb, &sk).await;
+                // Fix A: `?` — a non-404 source HEAD error FAILS the copy
+                // (don't turn a transient backend fault into a wrong-200 or a
+                // misleading 412).
+                let current = self.current_logical_etag(&sb, &sk, svid.as_deref()).await?;
                 if !matches!(
                     evaluate_etag_preconditions(im.as_ref(), inm.as_ref(), current.as_deref()),
                     EtagPrecondition::Proceed
@@ -11192,6 +11271,38 @@ mod tests {
     fn safe_object_uri_basic_ascii() {
         let uri = safe_object_uri("bucket", "key").expect("ascii must be safe");
         assert_eq!(uri.path(), "/bucket/key");
+    }
+
+    #[test]
+    fn is_not_found_error_classification() {
+        // s3-compat Fix A (DATA SAFETY): the conditional-write probe must
+        // treat ONLY a genuine absence as "object not found". A modeled
+        // `NoSuchKey` / `NoSuchVersion` and a bare 404 status (HEAD carries
+        // no body, so a missing object often surfaces code-less) are absent;
+        // everything else (5xx, throttling, auth, …) is a real failure that
+        // MUST propagate so the write does not silently overwrite.
+        assert!(is_not_found_error(&S3Error::new(S3ErrorCode::NoSuchKey)));
+        assert!(is_not_found_error(&S3Error::new(
+            S3ErrorCode::NoSuchVersion
+        )));
+
+        // Bare 404 with no modeled code (typical of a HEAD against a missing
+        // object) → still classified absent via the status code.
+        let mut bare_404 = S3Error::new(S3ErrorCode::InternalError);
+        bare_404.set_status_code(http::StatusCode::NOT_FOUND);
+        assert!(is_not_found_error(&bare_404));
+
+        // Transient / real failures MUST NOT be mistaken for absence.
+        assert!(!is_not_found_error(&S3Error::new(
+            S3ErrorCode::InternalError
+        )));
+        assert!(!is_not_found_error(&S3Error::new(S3ErrorCode::SlowDown)));
+        assert!(!is_not_found_error(&S3Error::new(
+            S3ErrorCode::AccessDenied
+        )));
+        let mut server_err = S3Error::new(S3ErrorCode::InternalError);
+        server_err.set_status_code(http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!is_not_found_error(&server_err));
     }
 
     #[test]
