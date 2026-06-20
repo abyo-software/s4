@@ -6366,6 +6366,15 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        // S3 caps DeleteObjects at 1000 keys per request — reject an oversized
+        // batch up front with 400 (AWS returns MalformedXML) rather than
+        // processing it.
+        if req.input.delete.objects.len() > 1000 {
+            return Err(S3Error::with_message(
+                S3ErrorCode::from_bytes(b"MalformedXML").unwrap_or(S3ErrorCode::InvalidArgument),
+                "The number of keys in a DeleteObjects request exceeds the maximum of 1000",
+            ));
+        }
         // v0.6 #42: MFA Delete applies once to the whole batch (S3 spec:
         // when MFA-Delete is on the bucket, a missing / invalid token
         // fails the entire DeleteObjects request, not per-object).
