@@ -277,6 +277,13 @@ async fn cpu_zstd_actually_compresses_in_backend_storage() {
     // 検証は S4Service の HEAD で `s4-compressed-size` metadata を読み、
     // 圧縮率が想定通り出ていることを確認する。
     let backend = MemoryBackend::new();
+    // s3-compat #3: client-transparency strips `s4-*` from S4's HEAD response, so
+    // the compression markers are no longer client-visible. Verify the ratio by
+    // reading the BACKEND's stored object metadata directly (the strip is
+    // response-only; the backend object still carries `s4-original-size` /
+    // `s4-compressed-size`). Keep a handle to the shared store before `backend`
+    // moves into the gateway.
+    let backend_view = Arc::clone(&backend.inner);
     let s4 = S4Service::new(
         backend,
         make_registry(CodecKind::CpuZstd),
@@ -288,32 +295,24 @@ async fn cpu_zstd_actually_compresses_in_backend_storage() {
         .await
         .expect("put");
 
-    // HEAD で metadata を取り出し、compressed_size が小さくなっていることを確認
-    let head = s4
-        .head_object(S3Request {
-            input: HeadObjectInput {
-                bucket: "bucket".into(),
-                key: "compressible".into(),
-                ..Default::default()
-            },
-            method: http::Method::HEAD,
-            uri: "/bucket/compressible".parse().unwrap(),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        })
-        .await
-        .expect("head");
-    let meta = head.output.metadata.expect("metadata must be set by S4");
-    let original = meta.get("s4-original-size").expect("original-size meta");
-    let compressed = meta
+    let store = backend_view.lock().unwrap();
+    let obj = store
+        .get(&("bucket".to_string(), "compressible".to_string()))
+        .expect("S4 stored the object on the backend");
+    let meta = obj
+        .metadata
+        .as_ref()
+        .expect("S4 stamps s4-* markers on the backend object");
+    let original_n: u64 = meta
+        .get("s4-original-size")
+        .expect("original-size meta")
+        .parse()
+        .unwrap();
+    let compressed_n: u64 = meta
         .get("s4-compressed-size")
-        .expect("compressed-size meta");
-    let original_n: u64 = original.parse().unwrap();
-    let compressed_n: u64 = compressed.parse().unwrap();
+        .expect("compressed-size meta")
+        .parse()
+        .unwrap();
     assert_eq!(original_n, payload.len() as u64);
     assert!(
         compressed_n < original_n / 100,

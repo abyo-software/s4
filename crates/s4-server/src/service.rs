@@ -438,8 +438,20 @@ pub struct S4Service<B: S3> {
     max_body_bytes: usize,
     /// When set, the object's ETag is presented as the MD5 of the
     /// original payload rather than the backend's MD5 of the compressed
-    /// bytes (opt-in; see `--logical-etag`). Off by default.
+    /// bytes (client-transparent ETag). **On by default** (`new()` sets it
+    /// `true`) so a library embedding S4Service gets the same client-transparent
+    /// behaviour the shipped `s4` binary does; the CLI keeps it on unless
+    /// `--physical-passthrough` is passed. Set `false` via
+    /// [`S4Service::with_logical_etag`] to restore the backend's
+    /// compressed-object ETag (physical passthrough).
     logical_etag: bool,
+    /// When set, `ListObjects(V2)` rewrites each entry's `Size` to the
+    /// **original** (pre-compression) size via a bounded-concurrency backend
+    /// HEAD per key (opt-in; see `--accurate-list-size`). Off by default — the
+    /// listing then reports the stored compressed size, which makes
+    /// `aws s3 sync`/`rclone` over-transfer (data is still correct). The N+1
+    /// HEAD cost is why it is opt-in.
+    accurate_list_size: bool,
     policy: Option<crate::policy::SharedPolicy>,
     /// v0.3 #13: surfaced as the `aws:SecureTransport` Condition key. Set
     /// to `true` when the listener is wrapped in TLS (or ACME), so policies
@@ -725,6 +737,21 @@ struct LedgerFootprint {
 }
 
 impl<B: S3> S4Service<B> {
+    /// `head_object` variant that preserves S4's reserved `s4-*` control
+    /// metadata for S4-internal callers (e.g. the inventory scanner's SSE
+    /// classifier, which detects gateway-default SSE-S4 via the
+    /// `s4-encrypted` marker). The client-facing `head_object` strips those
+    /// keys for transparency; this opt-out sets [`InternalUnstrippedHead`] in
+    /// the request extensions so the strip is skipped. Every other behaviour
+    /// (logical size / ETag / SSE-indicator translation) is identical.
+    pub(crate) async fn head_object_unstripped(
+        &self,
+        mut req: S3Request<HeadObjectInput>,
+    ) -> S3Result<S3Response<HeadObjectOutput>> {
+        req.extensions.insert(InternalUnstrippedHead);
+        self.head_object(req).await
+    }
+
     /// AWS S3 単発 PUT の API 上限 (5 GiB)。
     ///
     /// v0.9 #106 (32-bit target support): `target_pointer_width` で gating して
@@ -756,7 +783,12 @@ impl<B: S3> S4Service<B> {
             registry,
             dispatcher,
             max_body_bytes: Self::DEFAULT_MAX_BODY_BYTES,
-            logical_etag: false,
+            // s3-compat Fix B: client-transparent ETag is the default
+            // EVERYWHERE — the shipped binary wires it on (unless
+            // `--physical-passthrough`) and a library embedding now gets the
+            // same default instead of the old physical-passthrough behaviour.
+            logical_etag: true,
+            accurate_list_size: false,
             policy: None,
             secure_transport: false,
             rate_limits: None,
@@ -1750,6 +1782,194 @@ impl<B: S3> S4Service<B> {
         self
     }
 
+    /// Opt in to rewriting `ListObjects(V2)` entry `Size` to the original
+    /// (pre-compression) size via a bounded-concurrency backend HEAD per key
+    /// (`--accurate-list-size`). Off by default. See the field docs.
+    #[must_use]
+    pub fn with_accurate_list_size(mut self, on: bool) -> Self {
+        self.accurate_list_size = on;
+        self
+    }
+
+    /// HEAD the backend object and read the `s4-original-size` stamp = the
+    /// object's original (pre-compression) size. `None` if the HEAD fails or the
+    /// object carries no stamp (a non-S4 / passthrough object, whose backend
+    /// size already IS the original).
+    /// HEAD the backend object once and derive its client-transparent listing
+    /// attributes — `(original size, client-facing ETag)`. The ETag is the
+    /// `s4-logical-etag` stamp if present, else `None` for an S4 object that
+    /// carries no stamp (the backend's compressed-bytes ETag is meaningless and
+    /// would disagree with HEAD/GET), else the backend's own ETag for a non-S4
+    /// (raw) object. Returns `None` only when the HEAD itself fails (caller then
+    /// leaves both the listed size and ETag untouched).
+    async fn backend_list_attrs(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Option<(Option<i64>, Option<String>)> {
+        let uri = safe_object_uri(bucket, key).ok()?;
+        let head_req = S3Request {
+            input: HeadObjectInput {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                ..Default::default()
+            },
+            method: http::Method::HEAD,
+            uri,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let head = self.backend.head_object(head_req).await.ok()?;
+        let meta = head.output.metadata.as_ref();
+        let size = meta
+            .and_then(|m| m.get(META_ORIGINAL_SIZE))
+            .and_then(|s| s.parse::<i64>().ok());
+        let is_s4 =
+            meta.is_some_and(|m| m.keys().any(|k| k.to_ascii_lowercase().starts_with("s4-")));
+        let etag = match meta.and_then(|m| m.get(META_LOGICAL_ETAG)).cloned() {
+            Some(logical) => Some(logical),
+            // S4 object with no logical stamp → no client-visible ETag (matches
+            // HEAD/GET, which clear it). Raw (non-S4) object → its real ETag.
+            None if is_s4 => None,
+            None => head
+                .output
+                .e_tag
+                .as_ref()
+                .and_then(|e| e.as_strong().map(str::to_owned)),
+        };
+        Some((size, etag))
+    }
+
+    /// `--accurate-list-size`: map each key to its client-transparent listing
+    /// attributes (original size + ETag) via a bounded-concurrency backend HEAD.
+    /// Keys whose HEAD fails are absent from the map (the caller keeps the listed
+    /// size + ETag); a present key may still carry `None` size / `None` ETag,
+    /// which the caller applies (clearing the ETag for an unstamped S4 object).
+    async fn original_attrs(
+        &self,
+        bucket: &str,
+        keys: Vec<String>,
+    ) -> std::collections::HashMap<String, (Option<i64>, Option<String>)> {
+        use futures::StreamExt as _;
+        const LIST_HEAD_CONCURRENCY: usize = 32;
+        futures::stream::iter(keys)
+            .map(|key| async move {
+                let attrs = self.backend_list_attrs(bucket, &key).await;
+                (key, attrs)
+            })
+            .buffer_unordered(LIST_HEAD_CONCURRENCY)
+            .filter_map(|(k, attrs)| async move { attrs.map(|a| (k, a)) })
+            .collect()
+            .await
+    }
+
+    /// Rewrite a listing page's entry Size AND ETag to the client-transparent
+    /// values (no-op unless `--accurate-list-size`). Shared by `list_objects` /
+    /// `list_objects_v2` (both page over `Object`). Runs AFTER the internal-key
+    /// filter so it only HEADs the keys the client will actually see. Under the
+    /// default (off), listings report the backend's compressed size + ETag.
+    async fn apply_accurate_list_size(&self, bucket: &str, contents: Option<&mut Vec<Object>>) {
+        if !self.accurate_list_size {
+            return;
+        }
+        let Some(contents) = contents else {
+            return;
+        };
+        let keys: Vec<String> = contents.iter().filter_map(|o| o.key.clone()).collect();
+        if keys.is_empty() {
+            return;
+        }
+        let attrs = self.original_attrs(bucket, keys).await;
+        for o in contents.iter_mut() {
+            if let Some(k) = o.key.as_deref()
+                && let Some((size, etag)) = attrs.get(k)
+            {
+                if let Some(s) = size {
+                    o.size = Some(*s);
+                }
+                // logical stamp / cleared for unstamped S4 objects / backend ETag
+                // for raw objects — consistent with HEAD/GET.
+                o.e_tag = etag.clone().map(ETag::Strong);
+            }
+        }
+    }
+
+    /// The CURRENT object's client-facing (logical) ETag for a write-path
+    /// precondition: the `s4-logical-etag` stamp if present, else the backend's
+    /// own strong ETag (a non-S4 object), else `Ok(None)` if the object doesn't
+    /// exist. Used to evaluate `If-Match`/`If-None-Match` on PUT and
+    /// `copy_source_if_*` on Copy against the value the client actually saw,
+    /// since the backend would otherwise compare against the compressed-object
+    /// ETag and reject every conditional write. `version_id` pins the probe to
+    /// a specific version (a `copy_source` with `?versionId=` must be evaluated
+    /// against THAT version, not the latest); pass `None` for the latest.
+    ///
+    /// s3-compat Fix A (DATA SAFETY): returns `S3Result` so a backend HEAD
+    /// failure is NOT silently collapsed to "object absent". Only a genuine
+    /// 404 / `NoSuchKey` maps to `Ok(None)`; every other error (transient 5xx,
+    /// network, auth, throttling) propagates as `Err`, so the caller FAILS the
+    /// conditional write instead of proceeding — a `PUT If-None-Match: *`
+    /// during a transient HEAD error must not overwrite an existing object
+    /// (lost update), and an `If-Match` must not turn a backend fault into a
+    /// misleading 412.
+    async fn current_logical_etag(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> S3Result<Option<String>> {
+        let uri = safe_object_uri(bucket, key)?;
+        let head_req = S3Request {
+            input: HeadObjectInput {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                version_id: version_id.map(str::to_owned),
+                ..Default::default()
+            },
+            method: http::Method::HEAD,
+            uri,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        // Fix A: only a genuine not-found → absent (`Ok(None)`); propagate
+        // everything else so the conditional write fails rather than silently
+        // proceeding on a transient backend error.
+        let head = match self.backend.head_object(head_req).await {
+            Ok(h) => h,
+            Err(e) if is_not_found_error(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if let Some(stamp) = head
+            .output
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get(META_LOGICAL_ETAG))
+        {
+            return Ok(Some(stamp.clone()));
+        }
+        // s3-compat Fix C: a framed / multipart S4 object without a logical
+        // stamp has NO client-visible validator (HEAD/GET present no ETag), so
+        // the write-path precondition must NOT fall back to the backend's
+        // compressed-bytes ETag — the client never saw it. Only a genuinely
+        // non-S4 (passthrough-to-backend) object exposes the backend ETag.
+        if is_s4_logical_object(&head.output.metadata) {
+            return Ok(None);
+        }
+        Ok(head
+            .output
+            .e_tag
+            .as_ref()
+            .and_then(|e| e.as_strong().map(str::to_owned)))
+    }
+
     /// Attach an optional bucket policy (v0.2 #7). When `Some(...)`, every
     /// PUT / GET / DELETE / List handler runs `policy.evaluate(...)` before
     /// delegating to the backend; failures return `S3ErrorCode::AccessDenied`.
@@ -2038,6 +2258,23 @@ impl<B: S3> S4Service<B> {
         backend_resp.output.e_tag = None;
         backend_resp.output.body = Some(bytes_to_blob(sliced));
         backend_resp.status = Some(http::StatusCode::PARTIAL_CONTENT);
+        // s3-compat fix #4 (fix #5): this Range fast-path `return`s before
+        // the shared GET metadata strip, so it must (a) echo the object's
+        // logical (composite) ETag under `--logical-etag` instead of leaving
+        // it `None` — mirroring the buffered GET path (L~5891) — and (b)
+        // hide S4's internal `s4-*` control metadata. Without `--logical-etag`
+        // no stamp exists, so the ETag stays `None` (pre-flag behaviour) and
+        // the strip removes only gateway-internal keys.
+        if self.logical_etag
+            && let Some(stamp) = backend_resp
+                .output
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get(META_LOGICAL_ETAG))
+        {
+            backend_resp.output.e_tag = Some(ETag::Strong(stamp.clone()));
+        }
+        strip_reserved_client_metadata(&mut backend_resp.output.metadata);
 
         let elapsed = get_start.elapsed();
         crate::metrics::record_get(
@@ -2219,6 +2456,20 @@ impl<B: S3> S4Service<B> {
         backend_resp.output.e_tag = None;
         backend_resp.output.body = Some(bytes_to_blob(sliced));
         backend_resp.status = Some(http::StatusCode::PARTIAL_CONTENT);
+        // s3-compat fix #4 (fix #5): same as the unencrypted partial path —
+        // this fast-path `return`s before the shared GET metadata strip, so
+        // echo the object's logical (composite) ETag under `--logical-etag`
+        // and hide the internal `s4-*` control metadata.
+        if self.logical_etag
+            && let Some(stamp) = backend_resp
+                .output
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get(META_LOGICAL_ETAG))
+        {
+            backend_resp.output.e_tag = Some(ETag::Strong(stamp.clone()));
+        }
+        strip_reserved_client_metadata(&mut backend_resp.output.metadata);
 
         let elapsed = get_start.elapsed();
         // Use the encrypted bytes_in for the bandwidth-saved metric —
@@ -2393,6 +2644,124 @@ impl<B: S3> S4Service<B> {
             return false;
         }
         true
+    }
+
+    /// s3-compat fix #4 helper: stamp `s4-logical-etag = composite` onto a
+    /// just-completed multipart object via a **backend-level** self-copy
+    /// (`<bucket>/<key>` → itself, `MetadataDirective=REPLACE`) so a
+    /// subsequent HEAD/GET echoes the client-transparent composite ETag.
+    ///
+    /// CRITICAL: this calls `self.backend.copy_object` (the raw backend),
+    /// NOT `self.copy_object` (S4's handler, which re-frames framed
+    /// sources and would corrupt the stored bytes). The backend copy
+    /// preserves the stored framed bytes verbatim and only rewrites
+    /// metadata; the existing user metadata (every `s4-*` codec marker,
+    /// plus the object's content-type) is carried over from a backend
+    /// HEAD and the logical-ETag marker is layered on top. The
+    /// `<key>.s4index` sidecar is keyed on the same `<key>` and the bytes
+    /// are unchanged, so it continues to apply.
+    ///
+    /// Returns `Ok(true)` only when the self-copy actually persisted the
+    /// stamp. Returns `Ok(false)` when the stored object exceeds the
+    /// CopyObject 5 GiB limit (fix #4 P1 (a) — can't be self-copied; the
+    /// caller keeps the backend's composite ETag so HEAD/GET stay
+    /// consistent). A HEAD failure (length unknown) or a CopyObject error
+    /// surfaces as `Err`, which the caller treats the same way: leave the
+    /// object un-stamped and keep the backend composite ETag.
+    async fn stamp_logical_etag_via_self_copy(
+        &self,
+        bucket: &str,
+        key: &str,
+        composite: &str,
+    ) -> S3Result<bool> {
+        let head_req = S3Request {
+            input: HeadObjectInput {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                ..Default::default()
+            },
+            method: http::Method::HEAD,
+            uri: safe_object_uri(bucket, key)?,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        // fix #4 P1 (a): a simple CopyObject can't rewrite an object larger
+        // than 5 GiB. Source the guard from the backend HEAD's
+        // `content_length` — the STORED (framed/compressed) size that
+        // CopyObject would actually copy — NOT the assembled plaintext
+        // length (which is `None` when the post-Complete GET couldn't be
+        // collected). HEAD failure ⇒ `?` ⇒ caller skips the stamp.
+        let head = self.backend.head_object(head_req).await?;
+        const COPY_OBJECT_MAX_BYTES: i64 = 5 * 1024 * 1024 * 1024;
+        if let Some(stored_len) = head.output.content_length
+            && stored_len > COPY_OBJECT_MAX_BYTES
+        {
+            debug!(
+                bucket = %bucket,
+                key = %key,
+                stored_len,
+                "fix #4: multipart object exceeds 5 GiB CopyObject limit; \
+                 skipping logical-ETag stamp (HEAD/GET keep the backend composite ETag)"
+            );
+            return Ok(false);
+        }
+        let mut metadata = head.output.metadata.clone().unwrap_or_default();
+        metadata.insert(META_LOGICAL_ETAG.into(), composite.to_owned());
+        let mut builder = CopyObjectInput::builder();
+        builder.set_bucket(bucket.to_owned());
+        builder.set_key(key.to_owned());
+        builder.set_copy_source(CopySource::Bucket {
+            bucket: bucket.to_owned().into_boxed_str(),
+            key: key.to_owned().into_boxed_str(),
+            version_id: None,
+        });
+        builder.set_metadata_directive(Some(MetadataDirective::from_static(
+            MetadataDirective::REPLACE,
+        )));
+        builder.set_metadata(Some(metadata));
+        // fix #4 P1: `MetadataDirective=REPLACE` drops EVERY system header
+        // the copy request doesn't re-supply. Carry over the full set of
+        // headers Create/Complete may have set, read off the same HEAD,
+        // so a multipart object's Cache-Control / Content-Disposition /
+        // Content-Encoding / Content-Language / Content-Type / Expires /
+        // website-redirect survive the stamp instead of silently
+        // regressing to unset.
+        builder.set_content_type(head.output.content_type.clone());
+        builder.set_cache_control(head.output.cache_control.clone());
+        builder.set_content_disposition(head.output.content_disposition.clone());
+        builder.set_content_encoding(head.output.content_encoding.clone());
+        builder.set_content_language(head.output.content_language.clone());
+        builder.set_expires(head.output.expires);
+        builder.set_website_redirect_location(head.output.website_redirect_location.clone());
+        // Storage class: only carry a non-STANDARD class over (None /
+        // STANDARD are left unset so the copy takes the bucket default,
+        // mirroring the recompact PUT pattern).
+        builder.set_storage_class(
+            head.output
+                .storage_class
+                .clone()
+                .filter(|sc| sc.as_str() != StorageClass::STANDARD),
+        );
+        let copy_input = builder
+            .build()
+            .map_err(internal("fix #4 logical-etag CopyObject build"))?;
+        let copy_req = S3Request {
+            input: copy_input,
+            method: http::Method::PUT,
+            uri: safe_object_uri(bucket, key)?,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        self.backend.copy_object(copy_req).await?;
+        Ok(true)
     }
 
     /// `<key>.s4index` sidecar を backend から読み出す。なければ None。
@@ -2952,6 +3321,88 @@ impl<B: S3> S4Service<B> {
         };
         Ok((framed, manifest, used_dict))
     }
+
+    /// s3-compat fix #4 P1 (multi-gateway / restart regression fix): page
+    /// through the BACKEND's own `ListParts` for `(bucket, key, upload_id)`
+    /// and build the authoritative `part_number -> backend_etag` map (each
+    /// part's ETag in the strong/unquoted `ETag::value()` form the backend's
+    /// Complete part-validation expects).
+    ///
+    /// This is the durable, gateway-independent source of truth: it reflects
+    /// every part the backend actually stored, regardless of which S4 instance
+    /// handled `UploadPart` (multi-gateway HA) or whether this process restarted
+    /// mid-upload. The in-memory `part_etags` side-table only ever holds the
+    /// parts THIS instance saw and survives only as long as the process does,
+    /// so before this fix a Complete arriving on a fresh / different gateway
+    /// reverse-mapped against an incomplete (or empty) map → `InvalidPart`.
+    ///
+    /// S3 multipart allows up to 10000 parts and `ListParts` returns at most
+    /// 1000 per page, so we loop on `is_truncated` + `next_part_number_marker`
+    /// (defensively stopping if the marker fails to advance). Returns `None`
+    /// only when `ListParts` itself fails (e.g. a backend that doesn't
+    /// implement it, or a transient error) — callers then fall back to the
+    /// in-memory `backend_etag` recorded by `UploadPart`.
+    async fn list_parts_backend_etags(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Option<std::collections::HashMap<i32, String>> {
+        let mut map: std::collections::HashMap<i32, String> = std::collections::HashMap::new();
+        let mut marker: Option<i32> = None;
+        loop {
+            let uri = safe_object_uri(bucket, key).ok()?;
+            let req = S3Request {
+                input: ListPartsInput {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    upload_id: upload_id.to_owned(),
+                    part_number_marker: marker,
+                    max_parts: Some(1000),
+                    ..Default::default()
+                },
+                method: http::Method::GET,
+                uri,
+                headers: http::HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            let out = match self.backend.list_parts(req).await {
+                Ok(resp) => resp.output,
+                Err(e) => {
+                    debug!(
+                        bucket = %bucket,
+                        key = %key,
+                        upload_id = %upload_id,
+                        error = %e,
+                        "fix #4 P1: ListParts failed; falling back to in-memory backend ETags \
+                         for the multipart reverse-map"
+                    );
+                    return None;
+                }
+            };
+            if let Some(parts) = out.parts {
+                for part in parts {
+                    if let (Some(pn), Some(etag)) = (part.part_number, part.e_tag.as_ref()) {
+                        map.insert(pn, etag.value().to_string());
+                    }
+                }
+            }
+            if !out.is_truncated.unwrap_or(false) {
+                break;
+            }
+            // Advance to the next page; stop defensively if the backend
+            // claims truncation but doesn't (or fails to) advance the marker.
+            match out.next_part_number_marker {
+                Some(m) if Some(m) != marker => marker = Some(m),
+                _ => break,
+            }
+        }
+        Some(map)
+    }
 }
 
 /// Parse a CopySourceRange header value (`bytes=N-M`, `bytes=N-`, `bytes=-N`)
@@ -3092,6 +3543,23 @@ fn md5_of_bytes(bytes: &[u8]) -> [u8; 16] {
     h.finalize().into()
 }
 
+/// Decode 32 hex characters into a 16-byte MD5 digest — the inverse of
+/// [`md5_hex`]. Returns `None` unless the input is exactly 32 valid hex
+/// digits (used by the multipart composite-ETag builder to rebuild each
+/// part's raw MD5 from its stored hex form). s3-compat fix #4.
+fn decode_md5_hex(s: &str) -> Option<[u8; 16]> {
+    if s.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (slot, pair) in out.iter_mut().zip(s.as_bytes().chunks_exact(2)) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        *slot = ((hi << 4) | lo) as u8;
+    }
+    Some(out)
+}
+
 /// Outcome of evaluating ETag-based read preconditions (RFC 9110 §13).
 enum EtagPrecondition {
     /// No precondition, or all satisfied — serve the request normally.
@@ -3182,6 +3650,16 @@ fn strip_reserved_client_metadata(metadata: &mut Option<Metadata>) {
     }
 }
 
+/// Request-extension marker: an S4-internal caller needs the raw `s4-*`
+/// control metadata that `head_object` normally strips for client
+/// transparency. The inventory scanner's SSE classifier is the canonical
+/// consumer — gateway-default SSE-S4 is detected via the `s4-encrypted`
+/// marker, which the client must never see but the audit report must.
+/// Set via [`S4Service::head_object_unstripped`]; honored at the
+/// `head_object` exit so the client-facing path is unaffected.
+#[derive(Clone, Copy)]
+pub(crate) struct InternalUnstrippedHead;
+
 /// v1.2 audit R2 P2: snapshot of the metadata handed to the cross-bucket
 /// replication dispatcher. The dispatcher PUTs the replica directly
 /// against the backend (it never re-enters `put_object`), so replicas
@@ -3220,6 +3698,37 @@ fn is_framed_v2_object(metadata: &Option<Metadata>) -> bool {
         .and_then(|m| m.get(META_FRAMED))
         .map(|v| v == "true")
         .unwrap_or(false)
+}
+
+/// s3-compat Fix A (DATA SAFETY): classify a backend `S3Error` as
+/// "object genuinely not found" (404 / `NoSuchKey` / `NoSuchVersion`) vs a
+/// real failure (5xx, network, auth, throttling, …). A conditional write
+/// (`If-Match` / `If-None-Match`) MUST distinguish the two: mapping every
+/// HEAD error to "absent" let a `PUT If-None-Match: *` overwrite an existing
+/// object during a transient fault — a lost update. HEAD responses carry no
+/// body, so a missing object frequently surfaces as a bare 404 status with
+/// no modeled `NoSuchKey` code; match both the modeled code and the raw 404
+/// status so only a genuine absence is treated as `Ok(None)`.
+fn is_not_found_error(e: &S3Error) -> bool {
+    matches!(
+        e.code(),
+        &S3ErrorCode::NoSuchKey | &S3ErrorCode::NoSuchVersion
+    ) || e.status_code().map(|s| s.as_u16()) == Some(404)
+}
+
+/// s3-compat Fix C: an object whose client-visible ETag S4 owns — a
+/// single-object framed object (`extract_manifest`, incl. passthrough-codec),
+/// a framed-v2 single-PUT, or a multipart object. For all three the backend's
+/// ETag is the MD5 of the *compressed* bytes (or a compressed-bytes composite
+/// for multipart), which is meaningless to a client that uploaded plaintext.
+/// So a missing `s4-logical-etag` stamp on such an object means "no
+/// client-visible validator" → present NO ETag, never the backend value —
+/// keeping HEAD, GET and CompleteMultipartUpload consistent. Only consulted
+/// under `--logical-etag`; passthrough mode keeps the backend ETag everywhere.
+fn is_s4_logical_object(metadata: &Option<Metadata>) -> bool {
+    extract_manifest(metadata).is_some()
+        || is_multipart_object(metadata)
+        || is_framed_v2_object(metadata)
 }
 
 /// v0.4 #21: detect SSE-S4 by the metadata flag we set on PUT.
@@ -3555,6 +4064,37 @@ impl<B: S3> S3 for S4Service<B> {
                         "Access Denied because object protected by object lock",
                     ));
                 }
+            }
+        }
+        // Write-path ETag preconditions (conditional PUT). S4 owns these: the
+        // backend would compare the client's *logical* `If-Match` against the
+        // compressed-object ETag and reject every conditional write. Evaluate
+        // against the CURRENT object's logical ETag and strip them before
+        // forwarding. NOTE best-effort — this HEAD-then-PUT is not atomic
+        // (a concurrent writer between the check and the PUT is not serialised);
+        // run conditional writes on cold / quiescent keys.
+        if self.logical_etag && (req.input.if_match.is_some() || req.input.if_none_match.is_some())
+        {
+            let im = req.input.if_match.take();
+            let inm = req.input.if_none_match.take();
+            // Fix A: `?` — a non-404 HEAD error FAILS the conditional PUT
+            // (the precondition must not silently proceed and overwrite on a
+            // transient backend fault). The dest precondition is on the
+            // latest version, so probe with `None`.
+            let current = self
+                .current_logical_etag(&put_bucket, &put_key, None)
+                .await?;
+            // On the WRITE path both a failed `If-Match` and a matched
+            // `If-None-Match` mean 412 (a write is never "304 Not Modified").
+            if !matches!(
+                evaluate_etag_preconditions(im.as_ref(), inm.as_ref(), current.as_deref()),
+                EtagPrecondition::Proceed
+            ) {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::from_bytes(b"PreconditionFailed")
+                        .unwrap_or(S3ErrorCode::InvalidArgument),
+                    "At least one of the preconditions you specified did not hold",
+                ));
             }
         }
         // v0.5 #30: per-PUT explicit retention / legal hold (S3
@@ -5268,13 +5808,16 @@ impl<B: S3> S3 for S4Service<B> {
                 .and_then(|m| m.get(META_LOGICAL_ETAG))
                 .cloned();
             // The client-visible validator: the logical ETag when stamped;
-            // otherwise the backend ETag ONLY for non-S4 objects (no manifest →
-            // GET/HEAD expose the backend ETag). A framed / passthrough S4
+            // otherwise the backend ETag ONLY for non-S4 objects (GET/HEAD
+            // expose the backend ETag). A framed / passthrough / multipart S4
             // object hides its compressed-bytes ETag, so a missing stamp means
-            // "no validator", not the backend ETag.
+            // "no validator", not the backend ETag. (Fix C: multipart objects
+            // carry no single-object manifest, so classify them via the
+            // is-framed/multipart helpers too — keeps Range+precondition GET
+            // consistent with the no-ETag the body path returns below.)
             let current = match logical {
                 Some(ref l) => Some(l.as_str()),
-                None if manifest_opt.is_some() => None,
+                None if manifest_opt.is_some() || is_multipart || is_framed_v2 => None,
                 None => backend_etag.as_deref(),
             };
             match evaluate_etag_preconditions(
@@ -5311,6 +5854,7 @@ impl<B: S3> S3 for S4Service<B> {
         if !needs_frame_parse && manifest_opt.is_none() {
             // S4 が書いていないオブジェクトは透過 (raw bucket pre-existing object 等)
             debug!("S4 get_object: object lacks s4-codec metadata, returning as-is");
+            strip_reserved_client_metadata(&mut resp.output.metadata);
             return Ok(resp);
         }
 
@@ -5410,6 +5954,7 @@ impl<B: S3> S3 for S4Service<B> {
                         elapsed.as_secs_f64(),
                         true,
                     );
+                    strip_reserved_client_metadata(&mut resp.output.metadata);
                     return Ok(resp);
                 }
                 let plain = match crate::sse::peek_magic(&body) {
@@ -5523,13 +6068,20 @@ impl<B: S3> S3 for S4Service<B> {
                 // `--logical-etag`: echo the original-payload MD5 if the object
                 // was PUT with the flag (stamp present) — keeps GET consistent
                 // with PUT/HEAD. Falls back to None (pre-flag behaviour) when
-                // unstamped, regardless of this gateway's current flag state.
-                let logical_etag = resp
-                    .output
-                    .metadata
-                    .as_ref()
-                    .and_then(|mm| mm.get(META_LOGICAL_ETAG))
-                    .map(|hex| ETag::Strong(hex.clone()));
+                // unstamped. Fix C: gate on `self.logical_etag` so a
+                // `--physical-passthrough` gateway never echoes a previously
+                // stamped logical ETag — it clears the ETag for this framed
+                // object (the backend's compressed-bytes ETag is meaningless),
+                // matching the pre-logical behaviour bit-for-bit.
+                let logical_etag = if self.logical_etag {
+                    resp.output
+                        .metadata
+                        .as_ref()
+                        .and_then(|mm| mm.get(META_LOGICAL_ETAG))
+                        .map(|hex| ETag::Strong(hex.clone()))
+                } else {
+                    None
+                };
                 resp.output.e_tag = logical_etag;
                 resp.output.body = Some(verified_blob);
                 let elapsed = get_start.elapsed();
@@ -5551,6 +6103,7 @@ impl<B: S3> S3 for S4Service<B> {
                     setup_latency_ms = elapsed.as_millis() as u64,
                     "S4 get started (streaming)"
                 );
+                strip_reserved_client_metadata(&mut resp.output.metadata);
                 return Ok(resp);
             }
             // Passthrough: そのまま流す (Range なしの場合のみ streaming)
@@ -5568,6 +6121,7 @@ impl<B: S3> S3 for S4Service<B> {
                 resp.output.e_tag = None;
                 resp.output.body = Some(blob);
                 debug!("S4 get_object: passthrough streaming");
+                strip_reserved_client_metadata(&mut resp.output.metadata);
                 return Ok(resp);
             }
 
@@ -5641,12 +6195,18 @@ impl<B: S3> S3 for S4Service<B> {
             resp.output.checksum_sha256 = None;
             // `--logical-etag`: see the streaming path above — echo the
             // original-payload MD5 stamp if present so GET matches PUT/HEAD.
-            let logical_etag = resp
-                .output
-                .metadata
-                .as_ref()
-                .and_then(|mm| mm.get(META_LOGICAL_ETAG))
-                .map(|hex| ETag::Strong(hex.clone()));
+            // Fix C: gate on `self.logical_etag` so `--physical-passthrough`
+            // clears the ETag (no logical echo) for this framed / multipart
+            // object instead of returning a previously stamped logical value.
+            let logical_etag = if self.logical_etag {
+                resp.output
+                    .metadata
+                    .as_ref()
+                    .and_then(|mm| mm.get(META_LOGICAL_ETAG))
+                    .map(|hex| ETag::Strong(hex.clone()))
+            } else {
+                None
+            };
             resp.output.e_tag = logical_etag;
             let returned_size = final_bytes.len() as u64;
             let codec_label = manifest_opt
@@ -5681,6 +6241,11 @@ impl<B: S3> S3 for S4Service<B> {
                 status.as_aws_str().to_owned(),
             ));
         }
+        // Client-transparency: strip S4's reserved `s4-*` control metadata (see
+        // head_object) — every internal key has been consumed by here; the body
+        // returned is the original/decrypted content, so the client must see only
+        // its own user metadata.
+        strip_reserved_client_metadata(&mut resp.output.metadata);
         Ok(resp)
     }
 
@@ -5738,6 +6303,10 @@ impl<B: S3> S3 for S4Service<B> {
                 req.input.if_modified_since = None;
             }
         }
+        // S4-internal callers (the inventory SSE classifier) opt out of the
+        // client-facing `s4-*` strip via this request-extension marker, so the
+        // raw `s4-encrypted` / `s4-sse-*` markers survive for classification.
+        let keep_reserved_metadata = req.extensions.get::<InternalUnstrippedHead>().is_some();
         let mut resp = self.backend.head_object(req).await?;
         // The backend's own ETag (real for passthrough / non-S4 objects);
         // captured before the framed block clears it below.
@@ -5761,13 +6330,46 @@ impl<B: S3> S3 for S4Service<B> {
             // upload against. Objects PUT without the flag carry no
             // `s4-logical-etag` stamp → ETag stays `None` (pre-flag
             // behaviour, since the backend's compressed-bytes ETag is
-            // meaningless for a framed object).
-            resp.output.e_tag = resp
+            // meaningless for a framed object). Fix C: gate on
+            // `self.logical_etag` so `--physical-passthrough` never echoes a
+            // previously stamped logical ETag — it clears it (pre-logical
+            // behaviour), consistent with the GET paths and the multipart
+            // block below.
+            resp.output.e_tag = if self.logical_etag {
+                resp.output
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get(META_LOGICAL_ETAG))
+                    .map(|hex| ETag::Strong(hex.clone()))
+            } else {
+                None
+            };
+        }
+        // s3-compat fix #4 / Fix C: multipart objects carry no single-object
+        // manifest, so the `extract_manifest`-gated block above never echoes
+        // their logical ETag. Classify multipart / framed-v2 objects as S4
+        // objects here too: echo the `s4-logical-etag` composite stamp when it
+        // is present (single-PUT already set it above to the same value —
+        // idempotent; multipart sets it here for the first time), and present
+        // NO ETag when an S4 object has no stamp (e.g. a >5 GiB multipart whose
+        // stamp self-copy couldn't run) — the backend's compressed-bytes
+        // (composite) ETag is meaningless to the client and would diverge from
+        // the GET multi-frame path, which also clears it (L5977). Genuinely
+        // non-S4 / passthrough-to-backend objects keep the backend ETag.
+        if self.logical_etag {
+            let stamp = resp
                 .output
                 .metadata
                 .as_ref()
                 .and_then(|m| m.get(META_LOGICAL_ETAG))
-                .map(|hex| ETag::Strong(hex.clone()));
+                .cloned();
+            match stamp {
+                Some(s) => resp.output.e_tag = Some(ETag::Strong(s)),
+                None if is_s4_logical_object(&resp.output.metadata) => {
+                    resp.output.e_tag = None;
+                }
+                None => {}
+            }
         }
         // `--logical-etag`: evaluate the stripped ETag preconditions against
         // the object's logical ETag (or the backend ETag for passthrough /
@@ -5779,10 +6381,11 @@ impl<B: S3> S3 for S4Service<B> {
                 .as_ref()
                 .and_then(|m| m.get(META_LOGICAL_ETAG))
                 .cloned();
-            // See get_object: only a non-S4 object (no manifest) exposes the
-            // backend ETag; a framed / passthrough object without a logical
-            // stamp has no client-visible validator.
-            let is_s4_object = extract_manifest(&resp.output.metadata).is_some();
+            // See get_object: only a non-S4 object exposes the backend ETag; a
+            // framed / passthrough / multipart object without a logical stamp
+            // has no client-visible validator (Fix C: classify multipart /
+            // framed-v2 via the helper, not just the single-object manifest).
+            let is_s4_object = is_s4_logical_object(&resp.output.metadata);
             let current = match logical {
                 Some(ref l) => Some(l.as_str()),
                 None if is_s4_object => None,
@@ -5851,6 +6454,17 @@ impl<B: S3> S3 for S4Service<B> {
                     }
                 }
             }
+        }
+        // Client-transparency: strip S4's reserved `s4-*` control metadata from
+        // the response. By here every key S4 surfaces to the client has already
+        // been translated into a real response field (Content-Length from
+        // `s4-original-size`, the SSE indicators from `s4-sse-*`, the ETag from
+        // `s4-logical-etag`), so the client must not also see the raw `s4-*`
+        // user-metadata keys — they break metadata round-trip/copy and leak
+        // codec internals. Symmetric with the inbound `strip_reserved_client_metadata`.
+        // Skipped only for S4-internal callers that set `InternalUnstrippedHead`.
+        if !keep_reserved_metadata {
+            strip_reserved_client_metadata(&mut resp.output.metadata);
         }
         Ok(resp)
     }
@@ -6192,6 +6806,15 @@ impl<B: S3> S3 for S4Service<B> {
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        // S3 caps DeleteObjects at 1000 keys per request — reject an oversized
+        // batch up front with 400 (AWS returns MalformedXML) rather than
+        // processing it.
+        if req.input.delete.objects.len() > 1000 {
+            return Err(S3Error::with_message(
+                S3ErrorCode::from_bytes(b"MalformedXML").unwrap_or(S3ErrorCode::InvalidArgument),
+                "The number of keys in a DeleteObjects request exceeds the maximum of 1000",
+            ));
+        }
         // v0.6 #42: MFA Delete applies once to the whole batch (S3 spec:
         // when MFA-Delete is on the bucket, a missing / invalid token
         // fails the entire DeleteObjects request, not per-object).
@@ -6334,6 +6957,50 @@ impl<B: S3> S3 for S4Service<B> {
                 // the destination-side `s3:PutObject` gate above still
                 // applies).
                 self.check_not_reserved_key(key, ReservedKeyMode::Read)?;
+            }
+        }
+        // Copy-source ETag preconditions (`x-amz-copy-source-if-[none-]match`).
+        // Like the write-path If-Match, the backend would compare the client's
+        // logical condition against the SOURCE's compressed-object ETag, so S4
+        // evaluates it against the source's logical ETag and strips it before
+        // forwarding. Date conditions are left for the backend. AccessPoint
+        // sources fall through (bucket resolution is backend-specific).
+        if self.logical_etag
+            && (req.input.copy_source_if_match.is_some()
+                || req.input.copy_source_if_none_match.is_some())
+        {
+            // Fix B: capture the source `versionId` too — a copy of
+            // `src?versionId=<old>` must evaluate `copy_source_if_*` against
+            // THAT version's logical ETag, not the latest (pre-fix the probe
+            // hit the latest version → wrong-but-200). Cloned into the tuple
+            // so the immutable `copy_source` borrow ends before the `.take()`s.
+            let src = if let CopySource::Bucket {
+                bucket,
+                key,
+                version_id,
+            } = &req.input.copy_source
+            {
+                Some((bucket.to_string(), key.to_string(), version_id.clone()))
+            } else {
+                None
+            };
+            if let Some((sb, sk, svid)) = src {
+                let im = req.input.copy_source_if_match.take();
+                let inm = req.input.copy_source_if_none_match.take();
+                // Fix A: `?` — a non-404 source HEAD error FAILS the copy
+                // (don't turn a transient backend fault into a wrong-200 or a
+                // misleading 412).
+                let current = self.current_logical_etag(&sb, &sk, svid.as_deref()).await?;
+                if !matches!(
+                    evaluate_etag_preconditions(im.as_ref(), inm.as_ref(), current.as_deref()),
+                    EtagPrecondition::Proceed
+                ) {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::from_bytes(b"PreconditionFailed")
+                            .unwrap_or(S3ErrorCode::InvalidArgument),
+                        "At least one of the preconditions you specified did not hold",
+                    ));
+                }
             }
         }
         // S4-aware copy: source object に s4-* metadata がある場合、それを
@@ -6643,6 +7310,7 @@ impl<B: S3> S3 for S4Service<B> {
     ) -> S3Result<S3Response<ListObjectsOutput>> {
         self.enforce_rate_limit(&req, &req.input.bucket)?;
         self.enforce_policy(&req, "s3:ListBucket", &req.input.bucket, None)?;
+        let bucket = req.input.bucket.clone();
         let mut resp = self.backend.list_objects(req).await?;
         // S4 内部 object (`*.s4index` sidecar、`.__s4ver__/` shadow versions
         // — v0.5 #34) を顧客から隠す。
@@ -6658,6 +7326,8 @@ impl<B: S3> S3 for S4Service<B> {
                     .unwrap_or(true)
             });
         }
+        self.apply_accurate_list_size(&bucket, resp.output.contents.as_mut())
+            .await;
         Ok(resp)
     }
     async fn list_objects_v2(
@@ -6666,6 +7336,7 @@ impl<B: S3> S3 for S4Service<B> {
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         self.enforce_rate_limit(&req, &req.input.bucket)?;
         self.enforce_policy(&req, "s3:ListBucket", &req.input.bucket, None)?;
+        let bucket = req.input.bucket.clone();
         let mut resp = self.backend.list_objects_v2(req).await?;
         if let Some(contents) = resp.output.contents.as_mut() {
             let before = contents.len();
@@ -6684,6 +7355,8 @@ impl<B: S3> S3 for S4Service<B> {
                 *kc -= (before - contents.len()) as i32;
             }
         }
+        self.apply_accurate_list_size(&bucket, resp.output.contents.as_mut())
+            .await;
         Ok(resp)
     }
     /// v0.4 #17: filter S4-internal sidecars from versioned listings.
@@ -7088,6 +7761,13 @@ impl<B: S3> S3 for S4Service<B> {
             let _ = req.input.sse_customer_key_md5.take();
         }
         let _sse_ctx = sse_ctx;
+        // s3-compat fix #4: under `--logical-etag` we advertise
+        // `MD5(original part bytes)` as the part ETag (computed below from
+        // the pre-compression body) instead of the backend's
+        // `MD5(compressed part)`, so a client validating its upload sees
+        // the value AWS S3 would return. Captured here, recorded into the
+        // multipart side-table after the backend responds.
+        let mut logical_part_md5: Option<String> = None;
         if let Some(blob) = req.input.body.take() {
             let bytes = collect_blob(blob, self.max_body_bytes)
                 .await
@@ -7103,6 +7783,12 @@ impl<B: S3> S3 for S4Service<B> {
                 req.input.checksum_sha256.as_deref(),
                 req.input.checksum_crc64nvme.as_deref(),
             )?;
+            // s3-compat fix #4: stamp the ORIGINAL-part MD5 before the
+            // bytes are consumed by compression (mirrors the single-PUT
+            // logical-ETag computation). Only when `--logical-etag` is on.
+            if self.logical_etag {
+                logical_part_md5 = Some(md5_hex(&md5_of_bytes(&bytes)));
+            }
             let sample_len = bytes.len().min(SAMPLE_BYTES);
             // v0.8 #56: full part body is already in memory here; use its
             // length as the size hint so the dispatcher can promote to GPU
@@ -7165,7 +7851,39 @@ impl<B: S3> S3 for S4Service<B> {
                 "S4 upload_part: framed compressed payload"
             );
         }
-        self.backend.upload_part(req).await
+        // s3-compat fix #4: capture `(part_number, upload_id)` before the
+        // request is moved into the backend call. Only when we actually
+        // need them (logical ETag on AND a body was framed); the
+        // `--physical-passthrough` path takes the `_ => resp` arm below
+        // and is bit-for-bit unchanged.
+        let logical_capture = if self.logical_etag {
+            Some((req.input.part_number, req.input.upload_id.clone()))
+        } else {
+            None
+        };
+        let resp = self.backend.upload_part(req).await;
+        match (logical_capture, logical_part_md5) {
+            (Some((part_number, upload_id)), Some(original_md5)) => {
+                let mut resp = resp?;
+                // Record the backend's compressed-part ETag (strong,
+                // unquoted) against the original-part MD5 so Complete can
+                // reverse-map the manifest and compute the composite.
+                if let Some(backend_etag) =
+                    resp.output.e_tag.as_ref().map(|t| t.value().to_string())
+                {
+                    self.multipart_state.record_part(
+                        upload_id.as_str(),
+                        part_number,
+                        original_md5.clone(),
+                        backend_etag,
+                    );
+                }
+                // The client receives the logical (original-bytes) ETag.
+                resp.output.e_tag = Some(ETag::Strong(original_md5));
+                Ok(resp)
+            }
+            _ => resp,
+        }
     }
     async fn complete_multipart_upload(
         &self,
@@ -7230,6 +7948,155 @@ impl<B: S3> S3 for S4Service<B> {
         let _ = req.input.sse_customer_algorithm.take();
         let _ = req.input.sse_customer_key.take();
         let _ = req.input.sse_customer_key_md5.take();
+        // s3-compat fix #4 (+ P1 multi-gateway / restart regression fix):
+        // client-transparent multipart composite ETag.
+        //
+        // BEFORE the backend Complete (when `--logical-etag` is on) we must
+        // (a) reverse-map each client-sent logical part ETag in the manifest
+        // back to the backend's compressed-part ETag so the backend's part
+        // validation passes, and (b) best-effort compute the AWS composite
+        // ETag `MD5(concat(ORIGINAL-part-MD5s))-N`.
+        //
+        // fix #4 P1: the reverse-map's source of truth is the BACKEND's own
+        // `ListParts` (paginated, authoritative), NOT the in-memory side-table.
+        // The earlier campaign made Complete depend on the per-`upload_id`
+        // in-memory `part_etags` map populated by `upload_part`; that map only
+        // holds the parts THIS instance saw and only survives while the process
+        // does, so it broke two cases that worked pre-campaign: (1) a gateway
+        // restart mid-upload (map gone), and (2) multi-gateway HA — the
+        // RECOMMENDED ">=2 stateless S4 behind a health-checking LB" deployment
+        // — where parts land on different instances and the gateway handling
+        // Complete only has ITS parts. `ListParts` reflects every part the
+        // backend stored, so reverse-mapping by part number works regardless of
+        // gateway state; pre-campaign behaviour (Complete succeeds) is restored.
+        //
+        // The in-memory side-table is still consulted for TWO things:
+        //   * VALIDATION — when we recorded a part we require the client's
+        //     submitted ETag to equal the original-bytes MD5 we advertised
+        //     from UploadPart (Fix-1 behaviour preserved where possible).
+        //   * the backend-ETag FALLBACK when `ListParts` itself is unavailable
+        //     (the `backend_etag` field; see `multipart_state::PartEtags`).
+        //
+        // fix #4 P1 (retry-safety): use the NON-draining `get_parts` (clone)
+        // here, not `take_parts`. The side-table is dropped only AFTER the
+        // backend Complete returns `Ok` (below); if Complete fails
+        // (transient 5xx / `EntityTooSmall`) the map survives so the
+        // client's retry can still reverse-map its valid parts.
+        //
+        // Gated on `--logical-etag`; with it off neither `ListParts` nor
+        // `get_parts` is called and the manifest / composite are untouched
+        // (bit-for-bit unchanged Complete).
+        let logical_parts = if self.logical_etag {
+            self.multipart_state.get_parts(upload_id.as_str())
+        } else {
+            None
+        };
+        // Authoritative `part_number -> backend_etag` from the backend's
+        // ListParts (paged). `None` = ListParts unavailable ⇒ fall back to the
+        // in-memory `backend_etag`.
+        let listparts_etags: Option<std::collections::HashMap<i32, String>> = if self.logical_etag {
+            self.list_parts_backend_etags(&bucket, &key, upload_id.as_str())
+                .await
+        } else {
+            None
+        };
+        let logical_composite: Option<String> = if self.logical_etag {
+            // Reverse-map the manifest in place + collect completed part
+            // numbers for the composite.
+            let mut completed: Vec<i32> = Vec::new();
+            if let Some(mp) = req.input.multipart_upload.as_mut()
+                && let Some(parts) = mp.parts.as_mut()
+            {
+                for part in parts.iter_mut() {
+                    let Some(pn) = part.part_number else {
+                        continue;
+                    };
+                    completed.push(pn);
+                    let in_mem = logical_parts.as_ref().and_then(|m| m.get(&pn));
+                    // Authoritative backend ETag for this part, in the strong/
+                    // unquoted `value()` form the backend Complete validates
+                    // against. ListParts wins; the in-memory `backend_etag` is
+                    // the fallback when ListParts couldn't supply it.
+                    let backend_etag = listparts_etags
+                        .as_ref()
+                        .and_then(|m| m.get(&pn).cloned())
+                        .or_else(|| in_mem.map(|pe| pe.backend_etag.clone()));
+                    match in_mem {
+                        Some(pe) => {
+                            // Fix-1 validation preserved: only reverse-map when
+                            // the client actually submitted the logical part
+                            // ETag we advertised from `UploadPart` (= the
+                            // recorded ORIGINAL-bytes MD5). Normalise the
+                            // client's value to its strong, unquoted form
+                            // (`as_strong()` returns `None` for a weak
+                            // validator; surrounding quotes already stripped by
+                            // the s3s parser) and require an exact match. On a
+                            // mismatch we leave the client's value UNCHANGED so
+                            // the backend rejects it as `InvalidPart` (AWS
+                            // semantics) — an invalid Complete must NOT become a
+                            // 200 OK.
+                            let client_logical = part.e_tag.as_ref().and_then(|e| e.as_strong());
+                            if client_logical == Some(pe.original_md5.as_str())
+                                && let Some(be) = backend_etag
+                            {
+                                part.e_tag = Some(ETag::Strong(be));
+                            }
+                            // Mismatch ⇒ left unchanged ⇒ backend InvalidPart.
+                        }
+                        None => {
+                            // Restart / other-gateway: we never recorded this
+                            // part, so we can't validate it — reverse-map to the
+                            // authoritative ListParts backend ETag so Complete
+                            // still succeeds (pre-campaign behaviour). A part
+                            // absent from BOTH the in-memory map AND ListParts
+                            // has `backend_etag == None` and is left unchanged so
+                            // the backend rejects it as `InvalidPart` (correct).
+                            if let Some(be) = backend_etag {
+                                part.e_tag = Some(ETag::Strong(be));
+                            }
+                        }
+                    }
+                }
+            }
+            // Composite (best-effort): ONLY when the in-memory side-table holds
+            // the ORIGINAL-bytes MD5 for EVERY completed part — i.e. all parts
+            // went through THIS gateway and the state survived. If ANY part is
+            // missing its in-memory `original_md5` (restart / other gateway),
+            // we do NOT compute or stamp the composite: the object keeps the
+            // backend's ETag and HEAD/GET return no logical ETag for it,
+            // consistent with the existing >5 GiB unstamped multipart path.
+            completed.sort_unstable();
+            let mut concat: Vec<u8> = Vec::with_capacity(completed.len() * 16);
+            let mut all_known = !completed.is_empty();
+            for pn in &completed {
+                match logical_parts
+                    .as_ref()
+                    .and_then(|m| m.get(pn))
+                    .and_then(|pe| decode_md5_hex(&pe.original_md5))
+                {
+                    Some(raw) => concat.extend_from_slice(&raw),
+                    None => {
+                        // A completed part we don't have an original MD5 for
+                        // — can't produce a faithful composite, so skip the
+                        // stamp entirely (HEAD/GET fall back to no logical
+                        // ETag for this object).
+                        all_known = false;
+                        break;
+                    }
+                }
+            }
+            if all_known {
+                Some(format!(
+                    "{}-{}",
+                    md5_hex(&md5_of_bytes(&concat)),
+                    completed.len()
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         // v1.2 savings ledger: Complete assembles the parts at `<key>`,
         // destroying whatever lived there (even on versioning-Enabled
         // buckets the plain-`<key>` bytes are overwritten and — on the
@@ -7242,6 +8109,14 @@ impl<B: S3> S3 for S4Service<B> {
             None
         };
         let mut resp = self.backend.complete_multipart_upload(req).await?;
+        // fix #4 P1 (retry-safety): the backend Complete succeeded, so the
+        // per-part side-table is no longer needed for a retry — drop it now.
+        // (We deliberately read it above via the non-draining `get_parts`
+        // so a *failed* backend Complete — the `?` above — leaves the map
+        // intact for the client's retry.) The `remove(upload_id)` in the
+        // ctx post-processing block below also clears it; this is the
+        // explicit, ctx-independent success-path drop.
+        self.multipart_state.drop_parts(upload_id.as_str());
         // CompleteMultipartUpload 成功 → 完成した object を full fetch して frame
         // index を build、`<key>.s4index` sidecar として保存。これで Range GET の
         // partial fetch path が利用可能になる (Range request の帯域節約)。
@@ -7386,6 +8261,61 @@ impl<B: S3> S3 for S4Service<B> {
             .map(|mgr| mgr.state(&bucket))
             .map(|state| state == crate::versioning::VersioningState::Enabled)
             .unwrap_or(false);
+        // fix #4 P1 (b): track whether the composite logical-ETag stamp was
+        // actually PERSISTED onto the object (self-copy succeeded, OR the
+        // SSE/versioning re-PUT below wrote it into `new_metadata`). The
+        // client only receives the composite ETag in the response when the
+        // stamp persisted — otherwise a later HEAD/GET would return a
+        // different (backend-composite) ETag and the Complete response would
+        // be inconsistent. When the stamp does NOT persist (>5 GiB,
+        // self-copy/HEAD error, or no ctx for the re-PUT path) we leave the
+        // backend's composite ETag in `resp` so it matches what HEAD/GET
+        // return.
+        let mut stamped = false;
+        // s3-compat fix #4: for the common case (no SSE, no versioning —
+        // i.e. the same condition under which the `.s4index` sidecar is
+        // built below) stamp the composite logical ETag NOW, before the
+        // sidecar build, via a backend-level self-copy. The copy rewrites
+        // only the object's metadata; the stored framed bytes are
+        // unchanged, but it collapses the backend's multipart object into
+        // a single-part one, changing the backend ETag — so doing it
+        // first lets the sidecar build's HEAD bind to the post-copy ETag
+        // (otherwise the sidecar would be stale and Range GET would fall
+        // back to a full read). The SSE / versioning re-PUT path stamps
+        // via `new_metadata` instead (these two cases are disjoint). When
+        // `--logical-etag` is off, `logical_composite` is `None` and this
+        // is skipped entirely.
+        if !mp_will_encrypt
+            && !mp_skip_sidecar_for_versioning
+            && let Some(ref composite) = logical_composite
+        {
+            // fix #4 P1 (a): the 5 GiB CopyObject guard + the stored length
+            // are sourced from a backend HEAD inside the helper (the
+            // assembled plaintext length is `None` when the post-Complete
+            // GET couldn't be collected, which previously coerced to 0 and
+            // attempted an oversized copy). `Ok(true)` = stamp persisted;
+            // `Ok(false)` = >5 GiB skip (helper logged); `Err` = HEAD/copy
+            // failed. In every non-`Ok(true)` case the object keeps the
+            // backend composite ETag, so the response stays consistent.
+            match self
+                .stamp_logical_etag_via_self_copy(&bucket, &key, composite)
+                .await
+            {
+                Ok(true) => stamped = true,
+                Ok(false) => {
+                    // >5 GiB: helper already emitted the skip debug! log.
+                }
+                Err(e) => {
+                    debug!(
+                        bucket = %bucket,
+                        key = %key,
+                        error = %e,
+                        "fix #4: logical-ETag self-copy stamp failed (incl. HEAD failure); \
+                         HEAD/GET keep the backend composite ETag"
+                    );
+                }
+            }
+        }
         if let Some(ref body) = assembled_body
             && !mp_will_encrypt
             && !mp_skip_sidecar_for_versioning
@@ -7564,6 +8494,19 @@ impl<B: S3> S3 for S4Service<B> {
                         Ok(h) => h.output.metadata.unwrap_or_default(),
                         Err(_) => std::collections::HashMap::new(),
                     };
+                // s3-compat fix #4: this SSE / versioning re-PUT writes
+                // the assembled object's bytes + metadata, so the composite
+                // logical-ETag stamp rides along here (rather than via the
+                // common-case self-copy above, which is skipped for
+                // re-PUT objects). HEAD/GET then echo the composite.
+                // fix #4 P1 (b): mark the stamp persisted — this metadata
+                // map is PUT to the backend below (the `?` on that put_object
+                // means we only reach the response override if it succeeded),
+                // so the composite is durably on the object.
+                if let Some(ref composite) = logical_composite {
+                    new_metadata.insert(META_LOGICAL_ETAG.into(), composite.clone());
+                    stamped = true;
+                }
                 // v1.2 audit R1 P2: the re-PUT object is the one the
                 // ledger accounts — re-stamp the marker in case the
                 // upload was Created before the ledger flag was
@@ -7896,6 +8839,35 @@ impl<B: S3> S3 for S4Service<B> {
         // alive across this call; it's reaped on the next Complete or
         // the next caller-driven prune.
         self.multipart_state.prune_completion_locks();
+        // s3-compat fix #4: hand the client the AWS composite ETag
+        // computed from the ORIGINAL part bytes, so a client validating
+        // its multipart upload against the source data matches. The
+        // matching `s4-logical-etag` stamp was persisted above (self-copy
+        // for the common case, or the SSE/versioning re-PUT's metadata),
+        // so a later HEAD/GET echoes the same value. Set last so the
+        // backend's manifest ETag still flows into the versioning commit
+        // above (bit-for-bit unchanged); only the response the client
+        // sees carries the composite. No-op when `--logical-etag` is off.
+        //
+        // fix #4 P1 (b) / Fix C: under `--logical-etag` the Complete response
+        // ETag must match what a later HEAD/GET on this (always-multipart)
+        // object returns. When the composite stamp PERSISTED (`stamped` —
+        // common-case self-copy, or the SSE/versioning re-PUT's metadata) echo
+        // the AWS composite. When it did NOT persist (object >5 GiB, a copied
+        // part with no recorded original MD5, self-copy/HEAD error, or no
+        // captured ctx for the re-PUT path) present NO ETag: HEAD (the Fix C
+        // block ~L6114) and GET (L5977) both clear the ETag for an unstamped
+        // multipart/framed S4 object, so the backend's compressed-bytes
+        // composite must not leak through the Complete response either.
+        // `--physical-passthrough` (logical off) leaves the backend composite
+        // bit-for-bit unchanged.
+        if self.logical_etag {
+            if stamped && let Some(composite) = logical_composite {
+                resp.output.e_tag = Some(ETag::Strong(composite));
+            } else {
+                resp.output.e_tag = None;
+            }
+        }
         Ok(resp)
     }
     async fn abort_multipart_upload(
@@ -7932,6 +8904,11 @@ impl<B: S3> S3 for S4Service<B> {
         let upload_id = req.input.upload_id.as_str().to_owned();
         let resp = self.backend.abort_multipart_upload(req).await?;
         self.multipart_state.remove(&upload_id);
+        // s3-compat fix #4: drop any per-part logical/backend ETag state
+        // recorded by `upload_part` so an aborted upload doesn't leak it.
+        // (`remove` above already clears it; this is the explicit
+        // abort-path cleanup the design calls for.)
+        self.multipart_state.drop_parts(&upload_id);
         Ok(resp)
     }
     async fn list_multipart_uploads(
@@ -8145,6 +9122,36 @@ impl<B: S3> S3 for S4Service<B> {
             Err(_) => false,
         };
         if !needs_s4_copy {
+            // Fix A: a non-S4 (raw / passthrough-codec) source is server-side
+            // copied byte-for-byte, so the backend's part ETag already equals
+            // MD5(original) — record it (original_md5 == backend_etag) so the
+            // Complete composite reverse-maps + folds this copied part in, and
+            // return the backend ETag unchanged. The single (non-multipart)
+            // backend part ETag is a plain unquoted MD5 hex (`as_strong()`),
+            // exactly the 32-char lowercase the composite decoder expects.
+            // Only under `--logical-etag`; passthrough mode is bit-for-bit
+            // unchanged.
+            if self.logical_etag {
+                let part_number = req.input.part_number;
+                let copy_upload_id = req.input.upload_id.clone();
+                let resp = self.backend.upload_part_copy(req).await?;
+                if let Some(backend_etag) = resp
+                    .output
+                    .copy_part_result
+                    .as_ref()
+                    .and_then(|r| r.e_tag.as_ref())
+                    .and_then(|e| e.as_strong())
+                    .map(str::to_owned)
+                {
+                    self.multipart_state.record_part(
+                        copy_upload_id.as_str(),
+                        part_number,
+                        backend_etag.clone(),
+                        backend_etag,
+                    );
+                }
+                return Ok(resp);
+            }
             return self.backend.upload_part_copy(req).await;
         }
 
@@ -8189,6 +9196,16 @@ impl<B: S3> S3 for S4Service<B> {
         let bytes = collect_blob(blob, self.max_body_bytes)
             .await
             .map_err(internal("collect upload_part_copy source body"))?;
+        // Fix A: under `--logical-etag` the copied part's logical ETag is
+        // MD5(original copied bytes). These `bytes` ARE the source's original
+        // (decompressed, range-resolved) payload — the same value AWS computes
+        // for a CopyPart — so stamp the MD5 now, before `bytes` is consumed by
+        // compression below (mirrors `upload_part`'s pre-compression MD5).
+        let logical_part_md5: Option<String> = if self.logical_etag {
+            Some(md5_hex(&md5_of_bytes(&bytes)))
+        } else {
+            None
+        };
 
         // Compress + frame as a fresh part (mirrors upload_part path).
         let sample_len = bytes.len().min(SAMPLE_BYTES);
@@ -8244,9 +9261,37 @@ impl<B: S3> S3 for S4Service<B> {
         };
         let upload_resp = self.backend.upload_part(part_req).await?;
 
+        // Fix A: mirror `upload_part`'s logical-ETag tracking for the COPIED
+        // part. Record `(original_md5, backend_compressed_part_etag)` so the
+        // Complete composite (a) reverse-maps the client's logical part ETag to
+        // the backend's compressed-part ETag — the backend validates — and (b)
+        // folds MD5(original) into the AWS composite; hand the client the
+        // logical ETag so a client validating against the source data matches.
+        // Gated on `--logical-etag`; passthrough mode returns the backend
+        // (compressed-part) ETag unchanged.
+        let result_etag = match logical_part_md5 {
+            Some(original_md5) => {
+                if let Some(backend_etag) = upload_resp
+                    .output
+                    .e_tag
+                    .as_ref()
+                    .and_then(|e| e.as_strong())
+                    .map(str::to_owned)
+                {
+                    self.multipart_state.record_part(
+                        req.input.upload_id.as_str(),
+                        req.input.part_number,
+                        original_md5.clone(),
+                        backend_etag,
+                    );
+                }
+                Some(ETag::Strong(original_md5))
+            }
+            None => upload_resp.output.e_tag.clone(),
+        };
         let copy_output = UploadPartCopyOutput {
             copy_part_result: Some(CopyPartResult {
-                e_tag: upload_resp.output.e_tag.clone(),
+                e_tag: result_etag,
                 ..Default::default()
             }),
             ..Default::default()
@@ -10424,6 +11469,38 @@ mod tests {
     fn safe_object_uri_basic_ascii() {
         let uri = safe_object_uri("bucket", "key").expect("ascii must be safe");
         assert_eq!(uri.path(), "/bucket/key");
+    }
+
+    #[test]
+    fn is_not_found_error_classification() {
+        // s3-compat Fix A (DATA SAFETY): the conditional-write probe must
+        // treat ONLY a genuine absence as "object not found". A modeled
+        // `NoSuchKey` / `NoSuchVersion` and a bare 404 status (HEAD carries
+        // no body, so a missing object often surfaces code-less) are absent;
+        // everything else (5xx, throttling, auth, …) is a real failure that
+        // MUST propagate so the write does not silently overwrite.
+        assert!(is_not_found_error(&S3Error::new(S3ErrorCode::NoSuchKey)));
+        assert!(is_not_found_error(&S3Error::new(
+            S3ErrorCode::NoSuchVersion
+        )));
+
+        // Bare 404 with no modeled code (typical of a HEAD against a missing
+        // object) → still classified absent via the status code.
+        let mut bare_404 = S3Error::new(S3ErrorCode::InternalError);
+        bare_404.set_status_code(http::StatusCode::NOT_FOUND);
+        assert!(is_not_found_error(&bare_404));
+
+        // Transient / real failures MUST NOT be mistaken for absence.
+        assert!(!is_not_found_error(&S3Error::new(
+            S3ErrorCode::InternalError
+        )));
+        assert!(!is_not_found_error(&S3Error::new(S3ErrorCode::SlowDown)));
+        assert!(!is_not_found_error(&S3Error::new(
+            S3ErrorCode::AccessDenied
+        )));
+        let mut server_err = S3Error::new(S3ErrorCode::InternalError);
+        server_err.set_status_code(http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!is_not_found_error(&server_err));
     }
 
     #[test]
