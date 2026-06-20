@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-06-21
+
+**v1.4.0 — S3 client-transparency by default.** S4's compression (and
+gateway-default encryption) is now invisible to the client unless you opt
+out. This lands the "realistic S3-compatibility" target: no silent semantic
+divergences plus a client-transparent data plane, with the remaining gaps
+explicit (HTTP 501 / documented).
+
+### Changed
+
+- **ETag is now the logical ETag by default.** `GET`/`HEAD` return
+  `MD5(original payload)` (single-PUT) and the AWS composite ETag
+  (`MD5(concat(part-MD5s))-N`, best-effort) for multipart — matching what a
+  client computed before upload, not the backend's compressed-bytes ETag.
+- **`Content-Length` reflects the original (decompressed) size** on
+  `GET`/`HEAD`/range-`GET`.
+- **Reserved `s4-*` control metadata is stripped** from `GET`/`HEAD`/range
+  responses, so the client never sees codec internals and metadata
+  round-trips/copies cleanly.
+- **Conditional writes** (`If-Match` / `If-None-Match` on `PUT` / `CopyObject`)
+  are evaluated against the logical ETag (HTTP 412 on failure).
+- **Multipart `CompleteMultipartUpload`** reverse-maps part ETags via
+  paginated `ListParts` (robust across multiple gateways / restarts); the
+  composite-ETag stamp is best-effort (single-gateway) and documented.
+
+### Added
+
+- `--physical-passthrough` — opt out of client transparency and expose the
+  physical (compressed-bytes) view, restoring pre-1.4 behaviour.
+- `--accurate-list-size` — opt in to translate `ListObjects(V2)` `Size` **and**
+  `ETag` to the logical view (default is the hybrid: list stays fast/physical,
+  `HEAD`/`GET` are logical).
+- `DeleteObjects` with more than 1000 keys now returns `400 MalformedXML`
+  (AWS limit parity).
+
+### Fixed
+
+- The client-transparency strip silently broke the inventory scanner's SSE
+  classifier (gateway-default SSE-S4 is detected via the `s4-encrypted`
+  marker). The scanner now reads an unstripped internal `HEAD`, so SSE
+  classification is correct again while the client view is unchanged.
+
+Hardened over five Codex review rounds. `s3-tests` (Ceph conformance):
+S4-introduced regressions cut from **21 → 11**; the remaining 11 are the
+documented known limitations (mostly upstream `s3s`). See
+`docs/compatibility.md`.
+
+## [1.3.0] - 2026-06-19
+
+**v1.3.0 — logical-ETag + cold-Parquet recompaction.** Adds the
+off-by-default `s4 parquet-recompact` maintenance command (recompress cold
+Parquet objects in place) and the OpenSearch repo-s3 `--logical-etag`
+compatibility path, plus use-case articles #1–#5.
+
 ## [1.2.2] - 2026-06-16
 
 **v1.2.2 - AWS Marketplace metering fix (MeterUsage custom-dimension
