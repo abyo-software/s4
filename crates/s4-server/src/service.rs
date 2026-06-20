@@ -2170,6 +2170,23 @@ impl<B: S3> S4Service<B> {
         backend_resp.output.e_tag = None;
         backend_resp.output.body = Some(bytes_to_blob(sliced));
         backend_resp.status = Some(http::StatusCode::PARTIAL_CONTENT);
+        // s3-compat fix #4 (fix #5): this Range fast-path `return`s before
+        // the shared GET metadata strip, so it must (a) echo the object's
+        // logical (composite) ETag under `--logical-etag` instead of leaving
+        // it `None` — mirroring the buffered GET path (L~5891) — and (b)
+        // hide S4's internal `s4-*` control metadata. Without `--logical-etag`
+        // no stamp exists, so the ETag stays `None` (pre-flag behaviour) and
+        // the strip removes only gateway-internal keys.
+        if self.logical_etag
+            && let Some(stamp) = backend_resp
+                .output
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get(META_LOGICAL_ETAG))
+        {
+            backend_resp.output.e_tag = Some(ETag::Strong(stamp.clone()));
+        }
+        strip_reserved_client_metadata(&mut backend_resp.output.metadata);
 
         let elapsed = get_start.elapsed();
         crate::metrics::record_get(
@@ -2351,6 +2368,20 @@ impl<B: S3> S4Service<B> {
         backend_resp.output.e_tag = None;
         backend_resp.output.body = Some(bytes_to_blob(sliced));
         backend_resp.status = Some(http::StatusCode::PARTIAL_CONTENT);
+        // s3-compat fix #4 (fix #5): same as the unencrypted partial path —
+        // this fast-path `return`s before the shared GET metadata strip, so
+        // echo the object's logical (composite) ETag under `--logical-etag`
+        // and hide the internal `s4-*` control metadata.
+        if self.logical_etag
+            && let Some(stamp) = backend_resp
+                .output
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get(META_LOGICAL_ETAG))
+        {
+            backend_resp.output.e_tag = Some(ETag::Strong(stamp.clone()));
+        }
+        strip_reserved_client_metadata(&mut backend_resp.output.metadata);
 
         let elapsed = get_start.elapsed();
         // Use the encrypted bytes_in for the bandwidth-saved metric —
@@ -2541,12 +2572,20 @@ impl<B: S3> S4Service<B> {
     /// HEAD and the logical-ETag marker is layered on top. The
     /// `<key>.s4index` sidecar is keyed on the same `<key>` and the bytes
     /// are unchanged, so it continues to apply.
+    ///
+    /// Returns `Ok(true)` only when the self-copy actually persisted the
+    /// stamp. Returns `Ok(false)` when the stored object exceeds the
+    /// CopyObject 5 GiB limit (fix #4 P1 (a) — can't be self-copied; the
+    /// caller keeps the backend's composite ETag so HEAD/GET stay
+    /// consistent). A HEAD failure (length unknown) or a CopyObject error
+    /// surfaces as `Err`, which the caller treats the same way: leave the
+    /// object un-stamped and keep the backend composite ETag.
     async fn stamp_logical_etag_via_self_copy(
         &self,
         bucket: &str,
         key: &str,
         composite: &str,
-    ) -> S3Result<()> {
+    ) -> S3Result<bool> {
         let head_req = S3Request {
             input: HeadObjectInput {
                 bucket: bucket.to_owned(),
@@ -2562,8 +2601,27 @@ impl<B: S3> S4Service<B> {
             service: None,
             trailing_headers: None,
         };
+        // fix #4 P1 (a): a simple CopyObject can't rewrite an object larger
+        // than 5 GiB. Source the guard from the backend HEAD's
+        // `content_length` — the STORED (framed/compressed) size that
+        // CopyObject would actually copy — NOT the assembled plaintext
+        // length (which is `None` when the post-Complete GET couldn't be
+        // collected). HEAD failure ⇒ `?` ⇒ caller skips the stamp.
         let head = self.backend.head_object(head_req).await?;
-        let mut metadata = head.output.metadata.unwrap_or_default();
+        const COPY_OBJECT_MAX_BYTES: i64 = 5 * 1024 * 1024 * 1024;
+        if let Some(stored_len) = head.output.content_length
+            && stored_len > COPY_OBJECT_MAX_BYTES
+        {
+            debug!(
+                bucket = %bucket,
+                key = %key,
+                stored_len,
+                "fix #4: multipart object exceeds 5 GiB CopyObject limit; \
+                 skipping logical-ETag stamp (HEAD/GET keep the backend composite ETag)"
+            );
+            return Ok(false);
+        }
+        let mut metadata = head.output.metadata.clone().unwrap_or_default();
         metadata.insert(META_LOGICAL_ETAG.into(), composite.to_owned());
         let mut builder = CopyObjectInput::builder();
         builder.set_bucket(bucket.to_owned());
@@ -2577,9 +2635,29 @@ impl<B: S3> S4Service<B> {
             MetadataDirective::REPLACE,
         )));
         builder.set_metadata(Some(metadata));
-        // Preserve the object's content-type across the metadata rewrite
-        // (REPLACE would otherwise reset it).
+        // fix #4 P1: `MetadataDirective=REPLACE` drops EVERY system header
+        // the copy request doesn't re-supply. Carry over the full set of
+        // headers Create/Complete may have set, read off the same HEAD,
+        // so a multipart object's Cache-Control / Content-Disposition /
+        // Content-Encoding / Content-Language / Content-Type / Expires /
+        // website-redirect survive the stamp instead of silently
+        // regressing to unset.
         builder.set_content_type(head.output.content_type.clone());
+        builder.set_cache_control(head.output.cache_control.clone());
+        builder.set_content_disposition(head.output.content_disposition.clone());
+        builder.set_content_encoding(head.output.content_encoding.clone());
+        builder.set_content_language(head.output.content_language.clone());
+        builder.set_expires(head.output.expires);
+        builder.set_website_redirect_location(head.output.website_redirect_location.clone());
+        // Storage class: only carry a non-STANDARD class over (None /
+        // STANDARD are left unset so the copy takes the bucket default,
+        // mirroring the recompact PUT pattern).
+        builder.set_storage_class(
+            head.output
+                .storage_class
+                .clone()
+                .filter(|sc| sc.as_str() != StorageClass::STANDARD),
+        );
         let copy_input = builder
             .build()
             .map_err(internal("fix #4 logical-etag CopyObject build"))?;
@@ -2595,7 +2673,7 @@ impl<B: S3> S4Service<B> {
             trailing_headers: None,
         };
         self.backend.copy_object(copy_req).await?;
-        Ok(())
+        Ok(true)
     }
 
     /// `<key>.s4index` sidecar を backend から読み出す。なければ None。
@@ -7603,17 +7681,23 @@ impl<B: S3> S3 for S4Service<B> {
         let _ = req.input.sse_customer_key.take();
         let _ = req.input.sse_customer_key_md5.take();
         // s3-compat fix #4: client-transparent multipart composite ETag.
-        // Drain the per-part `(original_md5, backend_etag)` side-table
+        // Snapshot the per-part `(original_md5, backend_etag)` side-table
         // recorded by `upload_part`, then BEFORE the backend Complete (a)
         // reverse-map each client-sent logical part ETag in the manifest
         // back to the backend's compressed-part ETag so the backend's part
         // validation passes, and (b) compute the AWS composite ETag
         // `MD5(concat(ORIGINAL-part-MD5s))-N` over the completed parts in
         // ascending part-number order. Gated on `--logical-etag`; with it
-        // off `take_parts` is never called and the manifest / composite are
+        // off `get_parts` is never called and the manifest / composite are
         // untouched (bit-for-bit unchanged Complete).
+        //
+        // fix #4 P1 (retry-safety): use the NON-draining `get_parts` (clone)
+        // here, not `take_parts`. The side-table is dropped only AFTER the
+        // backend Complete returns `Ok` (below); if Complete fails
+        // (transient 5xx / `EntityTooSmall`) the map survives so the
+        // client's retry can still reverse-map its valid parts.
         let logical_parts = if self.logical_etag {
-            self.multipart_state.take_parts(upload_id.as_str())
+            self.multipart_state.get_parts(upload_id.as_str())
         } else {
             None
         };
@@ -7628,14 +7712,35 @@ impl<B: S3> S3 for S4Service<B> {
                     if let Some(pn) = part.part_number {
                         completed.push(pn);
                         if let Some(pe) = parts_map.get(&pn) {
-                            // Backend part ETags are strong MD5 hex; rebuild
-                            // in the same strong form the backend issued so
-                            // the wire value is identical to passthrough.
-                            part.e_tag = Some(ETag::Strong(pe.backend_etag.clone()));
+                            // fix #4 P1: only reverse-map when the client
+                            // actually submitted the logical part ETag we
+                            // advertised from `UploadPart` (= the recorded
+                            // ORIGINAL-bytes MD5). Normalise the client's
+                            // value to its strong, unquoted form
+                            // (`as_strong()` returns `None` for a weak
+                            // validator, surrounding quotes already stripped
+                            // by the s3s parser) and require an exact match.
+                            // ONLY on a match do we rewrite to the backend's
+                            // compressed-part ETag so the backend Complete
+                            // validates; on a mismatch we leave the client's
+                            // value UNCHANGED so the backend rejects it as
+                            // `InvalidPart` (AWS semantics) — an invalid
+                            // Complete must NOT become a 200 OK.
+                            let client_logical = part.e_tag.as_ref().and_then(|e| e.as_strong());
+                            if client_logical == Some(pe.original_md5.as_str()) {
+                                // Backend part ETags are strong MD5 hex;
+                                // rebuild in the same strong form the backend
+                                // issued so the wire value is identical to
+                                // passthrough.
+                                part.e_tag = Some(ETag::Strong(pe.backend_etag.clone()));
+                            }
+                            // Mismatch ⇒ left unchanged ⇒ backend InvalidPart.
                         }
-                        // A part missing from the map (abandoned / unknown)
-                        // is left as the client sent it — the backend
-                        // rejects it as InvalidPart, which is correct.
+                        // A part missing from the map (abandoned / unknown),
+                        // or one the client omitted an ETag for, is left as
+                        // the client sent it — the backend rejects it as
+                        // InvalidPart, which is correct. We never synthesize
+                        // an ETag for a part the client didn't validate.
                     }
                 }
             }
@@ -7683,6 +7788,14 @@ impl<B: S3> S3 for S4Service<B> {
             None
         };
         let mut resp = self.backend.complete_multipart_upload(req).await?;
+        // fix #4 P1 (retry-safety): the backend Complete succeeded, so the
+        // per-part side-table is no longer needed for a retry — drop it now.
+        // (We deliberately read it above via the non-draining `get_parts`
+        // so a *failed* backend Complete — the `?` above — leaves the map
+        // intact for the client's retry.) The `remove(upload_id)` in the
+        // ctx post-processing block below also clears it; this is the
+        // explicit, ctx-independent success-path drop.
+        self.multipart_state.drop_parts(upload_id.as_str());
         // CompleteMultipartUpload 成功 → 完成した object を full fetch して frame
         // index を build、`<key>.s4index` sidecar として保存。これで Range GET の
         // partial fetch path が利用可能になる (Range request の帯域節約)。
@@ -7827,6 +7940,17 @@ impl<B: S3> S3 for S4Service<B> {
             .map(|mgr| mgr.state(&bucket))
             .map(|state| state == crate::versioning::VersioningState::Enabled)
             .unwrap_or(false);
+        // fix #4 P1 (b): track whether the composite logical-ETag stamp was
+        // actually PERSISTED onto the object (self-copy succeeded, OR the
+        // SSE/versioning re-PUT below wrote it into `new_metadata`). The
+        // client only receives the composite ETag in the response when the
+        // stamp persisted — otherwise a later HEAD/GET would return a
+        // different (backend-composite) ETag and the Complete response would
+        // be inconsistent. When the stamp does NOT persist (>5 GiB,
+        // self-copy/HEAD error, or no ctx for the re-PUT path) we leave the
+        // backend's composite ETag in `resp` so it matches what HEAD/GET
+        // return.
+        let mut stamped = false;
         // s3-compat fix #4: for the common case (no SSE, no versioning —
         // i.e. the same condition under which the `.s4index` sidecar is
         // built below) stamp the composite logical ETag NOW, before the
@@ -7844,31 +7968,31 @@ impl<B: S3> S3 for S4Service<B> {
             && !mp_skip_sidecar_for_versioning
             && let Some(ref composite) = logical_composite
         {
-            // A simple CopyObject can't rewrite an object larger than
-            // 5 GiB. The backend object is the stored (framed/compressed)
-            // body — its length is `assembled_body.len()`. Over the limit,
-            // skip the stamp (HEAD/GET fall back to no logical ETag).
-            const COPY_OBJECT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
-            let stored_len = assembled_body.as_ref().map(|b| b.len() as u64).unwrap_or(0);
-            if stored_len > COPY_OBJECT_MAX_BYTES {
-                debug!(
-                    bucket = %bucket,
-                    key = %key,
-                    stored_len,
-                    "fix #4: multipart object exceeds 5 GiB CopyObject limit; \
-                     skipping logical-ETag stamp (HEAD/GET fall back to no logical ETag)"
-                );
-            } else if let Err(e) = self
+            // fix #4 P1 (a): the 5 GiB CopyObject guard + the stored length
+            // are sourced from a backend HEAD inside the helper (the
+            // assembled plaintext length is `None` when the post-Complete
+            // GET couldn't be collected, which previously coerced to 0 and
+            // attempted an oversized copy). `Ok(true)` = stamp persisted;
+            // `Ok(false)` = >5 GiB skip (helper logged); `Err` = HEAD/copy
+            // failed. In every non-`Ok(true)` case the object keeps the
+            // backend composite ETag, so the response stays consistent.
+            match self
                 .stamp_logical_etag_via_self_copy(&bucket, &key, composite)
                 .await
             {
-                debug!(
-                    bucket = %bucket,
-                    key = %key,
-                    error = %e,
-                    "fix #4: logical-ETag self-copy stamp failed; \
-                     HEAD/GET fall back to no logical ETag"
-                );
+                Ok(true) => stamped = true,
+                Ok(false) => {
+                    // >5 GiB: helper already emitted the skip debug! log.
+                }
+                Err(e) => {
+                    debug!(
+                        bucket = %bucket,
+                        key = %key,
+                        error = %e,
+                        "fix #4: logical-ETag self-copy stamp failed (incl. HEAD failure); \
+                         HEAD/GET keep the backend composite ETag"
+                    );
+                }
             }
         }
         if let Some(ref body) = assembled_body
@@ -8054,8 +8178,13 @@ impl<B: S3> S3 for S4Service<B> {
                 // logical-ETag stamp rides along here (rather than via the
                 // common-case self-copy above, which is skipped for
                 // re-PUT objects). HEAD/GET then echo the composite.
+                // fix #4 P1 (b): mark the stamp persisted — this metadata
+                // map is PUT to the backend below (the `?` on that put_object
+                // means we only reach the response override if it succeeded),
+                // so the composite is durably on the object.
                 if let Some(ref composite) = logical_composite {
                     new_metadata.insert(META_LOGICAL_ETAG.into(), composite.clone());
+                    stamped = true;
                 }
                 // v1.2 audit R1 P2: the re-PUT object is the one the
                 // ledger accounts — re-stamp the marker in case the
@@ -8398,7 +8527,14 @@ impl<B: S3> S3 for S4Service<B> {
         // backend's manifest ETag still flows into the versioning commit
         // above (bit-for-bit unchanged); only the response the client
         // sees carries the composite. No-op when `--logical-etag` is off.
-        if let Some(composite) = logical_composite {
+        //
+        // fix #4 P1 (b): ONLY override the response ETag when the stamp was
+        // actually persisted (`stamped`). If the stamp didn't persist
+        // (object >5 GiB, self-copy/HEAD error, or no captured ctx for the
+        // re-PUT path), we keep the backend's composite ETag in `resp` so
+        // the Complete response ETag matches what a later HEAD/GET returns
+        // (which read the absent stamp and fall back to the backend value).
+        if stamped && let Some(composite) = logical_composite {
             resp.output.e_tag = Some(ETag::Strong(composite));
         }
         Ok(resp)

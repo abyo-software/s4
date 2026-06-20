@@ -307,6 +307,37 @@ impl MultipartStateStore {
             .map(|(_, mutex)| mutex.into_inner().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// s3-compat fix #4 (retry-safety): clone the `part_number →
+    /// [`PartEtags`]` map for `upload_id` **without** removing it. Used by
+    /// `CompleteMultipartUpload` to drive the reverse-map + composite-ETag
+    /// computation; the side-table entry is dropped only once the backend
+    /// Complete returns `Ok` (via [`Self::drop_parts`]), so a transient
+    /// backend Complete failure (5xx / `EntityTooSmall`) leaves the map
+    /// intact and a client retry can still reverse-map its valid parts.
+    /// `None` when no parts were recorded (upload tracked no parts, or
+    /// `--logical-etag` was off).
+    ///
+    /// RESTART LIMITATION (honest note): this map — like
+    /// [`MultipartUploadContext`] / the `by_upload_id` side-table — lives
+    /// only in process memory. A gateway restart mid-upload loses it, so a
+    /// `CompleteMultipartUpload` arriving after a restart cannot reverse-map
+    /// the logical part ETags the gateway previously handed out from
+    /// `UploadPart`; the rewritten manifest is gone, so the backend's part
+    /// validation rejects the Complete (`InvalidPart`). This is the same
+    /// lifecycle/durability limitation the existing in-memory multipart
+    /// context already carries (SSE recipe, tags, object-lock) — multipart
+    /// uploads are not durable across a gateway restart by design.
+    #[must_use]
+    pub fn get_parts(&self, upload_id: &str) -> Option<HashMap<i32, PartEtags>> {
+        self.part_etags.get(upload_id).map(|entry| {
+            entry
+                .value()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
+    }
+
     /// s3-compat fix #4: drop the per-part ETag state for `upload_id`
     /// without returning it. Called from `AbortMultipartUpload`.
     pub fn drop_parts(&self, upload_id: &str) {
@@ -616,6 +647,37 @@ mod tests {
         assert!(
             store.take_parts("u-mp").is_none(),
             "take_parts must remove the entry"
+        );
+    }
+
+    /// s3-compat fix #4 (retry-safety): `get_parts` returns a CLONE of the
+    /// recorded parts and does NOT drain the entry — a second `get_parts`
+    /// (and a later `take_parts`) still sees the same parts. This is the
+    /// property that lets a `CompleteMultipartUpload` retry reverse-map its
+    /// valid parts after a transient backend-Complete failure (the entry is
+    /// only dropped once the backend Complete returns `Ok`).
+    #[test]
+    fn get_parts_clones_without_draining() {
+        let store = MultipartStateStore::new();
+        store.record_part("u-gp", 1, "a".repeat(32), "be-1".to_owned());
+        store.record_part("u-gp", 2, "b".repeat(32), "be-2".to_owned());
+        let first = store.get_parts("u-gp").expect("parts must be present");
+        assert_eq!(first.len(), 2, "both parts must be cloned out");
+        assert_eq!(first.get(&1).expect("part 1").original_md5, "a".repeat(32));
+        assert_eq!(first.get(&2).expect("part 2").backend_etag, "be-2");
+        // Non-draining: the entry is still there for a retry.
+        let second = store
+            .get_parts("u-gp")
+            .expect("get_parts must NOT remove the entry");
+        assert_eq!(second.len(), 2, "second get_parts still sees both parts");
+        // And `take_parts` (success-path drain) still works afterwards.
+        let taken = store
+            .take_parts("u-gp")
+            .expect("take_parts after get_parts must still return the parts");
+        assert_eq!(taken.len(), 2);
+        assert!(
+            store.get_parts("u-gp").is_none(),
+            "after take_parts the entry is gone"
         );
     }
 
