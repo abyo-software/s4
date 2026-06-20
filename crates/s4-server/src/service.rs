@@ -440,6 +440,13 @@ pub struct S4Service<B: S3> {
     /// original payload rather than the backend's MD5 of the compressed
     /// bytes (opt-in; see `--logical-etag`). Off by default.
     logical_etag: bool,
+    /// When set, `ListObjects(V2)` rewrites each entry's `Size` to the
+    /// **original** (pre-compression) size via a bounded-concurrency backend
+    /// HEAD per key (opt-in; see `--accurate-list-size`). Off by default — the
+    /// listing then reports the stored compressed size, which makes
+    /// `aws s3 sync`/`rclone` over-transfer (data is still correct). The N+1
+    /// HEAD cost is why it is opt-in.
+    accurate_list_size: bool,
     policy: Option<crate::policy::SharedPolicy>,
     /// v0.3 #13: surfaced as the `aws:SecureTransport` Condition key. Set
     /// to `true` when the listener is wrapped in TLS (or ACME), so policies
@@ -757,6 +764,7 @@ impl<B: S3> S4Service<B> {
             dispatcher,
             max_body_bytes: Self::DEFAULT_MAX_BODY_BYTES,
             logical_etag: false,
+            accurate_list_size: false,
             policy: None,
             secure_transport: false,
             rate_limits: None,
@@ -1748,6 +1756,91 @@ impl<B: S3> S4Service<B> {
     pub fn with_logical_etag(mut self, on: bool) -> Self {
         self.logical_etag = on;
         self
+    }
+
+    /// Opt in to rewriting `ListObjects(V2)` entry `Size` to the original
+    /// (pre-compression) size via a bounded-concurrency backend HEAD per key
+    /// (`--accurate-list-size`). Off by default. See the field docs.
+    #[must_use]
+    pub fn with_accurate_list_size(mut self, on: bool) -> Self {
+        self.accurate_list_size = on;
+        self
+    }
+
+    /// HEAD the backend object and read the `s4-original-size` stamp = the
+    /// object's original (pre-compression) size. `None` if the HEAD fails or the
+    /// object carries no stamp (a non-S4 / passthrough object, whose backend
+    /// size already IS the original).
+    async fn backend_original_size(&self, bucket: &str, key: &str) -> Option<i64> {
+        let uri = safe_object_uri(bucket, key).ok()?;
+        let head_req = S3Request {
+            input: HeadObjectInput {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                ..Default::default()
+            },
+            method: http::Method::HEAD,
+            uri,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let head = self.backend.head_object(head_req).await.ok()?;
+        head.output
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get(META_ORIGINAL_SIZE))
+            .and_then(|s| s.parse::<i64>().ok())
+    }
+
+    /// `--accurate-list-size`: map each key to its original (pre-compression)
+    /// size via a bounded-concurrency backend HEAD. Keys whose HEAD fails or
+    /// carry no `s4-original-size` stamp are absent from the map (the caller
+    /// keeps the listed size, which for a non-S4 object already IS the original).
+    async fn original_sizes(
+        &self,
+        bucket: &str,
+        keys: Vec<String>,
+    ) -> std::collections::HashMap<String, i64> {
+        use futures::StreamExt as _;
+        const LIST_SIZE_HEAD_CONCURRENCY: usize = 32;
+        futures::stream::iter(keys)
+            .map(|key| async move {
+                let sz = self.backend_original_size(bucket, &key).await;
+                (key, sz)
+            })
+            .buffer_unordered(LIST_SIZE_HEAD_CONCURRENCY)
+            .filter_map(|(k, sz)| async move { sz.map(|s| (k, s)) })
+            .collect()
+            .await
+    }
+
+    /// Rewrite a listing page's entry sizes to original (no-op unless
+    /// `--accurate-list-size`). Shared by `list_objects` / `list_objects_v2`
+    /// (both page over `Object`). Runs AFTER the internal-key filter so it only
+    /// HEADs the keys the client will actually see.
+    async fn apply_accurate_list_size(&self, bucket: &str, contents: Option<&mut Vec<Object>>) {
+        if !self.accurate_list_size {
+            return;
+        }
+        let Some(contents) = contents else {
+            return;
+        };
+        let keys: Vec<String> = contents.iter().filter_map(|o| o.key.clone()).collect();
+        if keys.is_empty() {
+            return;
+        }
+        let sizes = self.original_sizes(bucket, keys).await;
+        for o in contents.iter_mut() {
+            if let Some(k) = o.key.as_deref()
+                && let Some(&s) = sizes.get(k)
+            {
+                o.size = Some(s);
+            }
+        }
     }
 
     /// Attach an optional bucket policy (v0.2 #7). When `Some(...)`, every
@@ -6660,6 +6753,7 @@ impl<B: S3> S3 for S4Service<B> {
     ) -> S3Result<S3Response<ListObjectsOutput>> {
         self.enforce_rate_limit(&req, &req.input.bucket)?;
         self.enforce_policy(&req, "s3:ListBucket", &req.input.bucket, None)?;
+        let bucket = req.input.bucket.clone();
         let mut resp = self.backend.list_objects(req).await?;
         // S4 内部 object (`*.s4index` sidecar、`.__s4ver__/` shadow versions
         // — v0.5 #34) を顧客から隠す。
@@ -6675,6 +6769,8 @@ impl<B: S3> S3 for S4Service<B> {
                     .unwrap_or(true)
             });
         }
+        self.apply_accurate_list_size(&bucket, resp.output.contents.as_mut())
+            .await;
         Ok(resp)
     }
     async fn list_objects_v2(
@@ -6683,6 +6779,7 @@ impl<B: S3> S3 for S4Service<B> {
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         self.enforce_rate_limit(&req, &req.input.bucket)?;
         self.enforce_policy(&req, "s3:ListBucket", &req.input.bucket, None)?;
+        let bucket = req.input.bucket.clone();
         let mut resp = self.backend.list_objects_v2(req).await?;
         if let Some(contents) = resp.output.contents.as_mut() {
             let before = contents.len();
@@ -6701,6 +6798,8 @@ impl<B: S3> S3 for S4Service<B> {
                 *kc -= (before - contents.len()) as i32;
             }
         }
+        self.apply_accurate_list_size(&bucket, resp.output.contents.as_mut())
+            .await;
         Ok(resp)
     }
     /// v0.4 #17: filter S4-internal sidecars from versioned listings.

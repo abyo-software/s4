@@ -460,6 +460,16 @@ struct Opt {
     #[clap(long, hide = true)]
     logical_etag: bool,
 
+    /// Report the **original** (pre-compression) object size in `ListObjects(V2)`
+    /// instead of the stored compressed size. Off by default: the listing then
+    /// reports the compressed size, which makes `aws s3 sync` / `rclone`
+    /// over-transfer (data is still correct on GET). Enabling this makes listings
+    /// match the size a client downloads, at the cost of one bounded-concurrency
+    /// backend HEAD per listed key (N+1) — use it where listing-size accuracy
+    /// matters more than listing latency.
+    #[clap(long)]
+    accurate_list_size: bool,
+
     /// v0.8.5 #84 (audit H-6): max HTTP/1 header buffer size in
     /// bytes. AWS S3 max header size is 8 KiB per header * ~50
     /// headers; 64 KiB total is safe margin. Reject larger to bound
@@ -2328,6 +2338,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // The deprecated `--logical-etag` flag is a no-op now (already the default).
     let _ = opt.logical_etag;
     s4 = s4.with_logical_etag(!opt.physical_passthrough);
+    s4 = s4.with_accurate_list_size(opt.accurate_list_size);
     info!(
         max_body_bytes = opt.max_body_bytes,
         "S4 max-body-bytes cap (v0.8.19 D-1: now CLI-tunable; default 5 GiB = AWS S3 single-PUT max)"
