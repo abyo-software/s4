@@ -114,24 +114,24 @@ the text values. All text here is ASCII-clean (verify with the grep at the top
 of this file). The final Draft -> Limited publish is done by the portal.
 
 --------------------------------------------------------------------------------
-FIELD: Container image (already pushed; select tag 1.2.0)
+FIELD: Container image (already pushed; select tag 1.4.0-1)
 --------------------------------------------------------------------------------
-709825985650.dkr.ecr.us-east-1.amazonaws.com/abyo-software/s4:1.2.0
+709825985650.dkr.ecr.us-east-1.amazonaws.com/abyo-software/s4:1.4.0-1
 
 --------------------------------------------------------------------------------
 FIELD: Helm chart URI (already pushed)
 --------------------------------------------------------------------------------
-709825985650.dkr.ecr.us-east-1.amazonaws.com/abyo-software/s4-helm:0.3.1
+709825985650.dkr.ecr.us-east-1.amazonaws.com/abyo-software/s4-helm:0.3.6
 
 --------------------------------------------------------------------------------
 FIELD: Version title
 --------------------------------------------------------------------------------
-1.2.0
+1.4.0
 
 --------------------------------------------------------------------------------
 FIELD: Release notes (ASCII only - this is where the MockAPI publish failed)
 --------------------------------------------------------------------------------
-S4 v1.2.0. Drop-in S3-compatible compression gateway. Transparent per-object compression (CPU zstd or GPU nvCOMP) cuts S3 storage bytes 50-80 percent for compressible data with zero application changes. Includes pre-deployment savings estimation (s4 estimate), retro-compression (s4 migrate), background recompaction (s4 recompact), policy-driven maintenance (s4 maintain), and measured-savings reporting (s4 savings) with Prometheus metrics and a Grafana dashboard. Billed per pod per hour.
+S4 v1.4.0. Client-transparent S3-compatibility campaign: by default the gateway is invisible to S3 clients (compression is server-side, the ETag your client sees is MD5 of the original payload, multipart uploads return the composite ETag S3 returns, and the reserved s4-* user-metadata used internally is stripped from client views). All v1.2.x metering behavior is preserved: S4 confirms entitlement at startup (fail-closed) and reports one metered pod-hour every hour via the AWS Marketplace MeterUsage API. Same drop-in S3-compatible transparent compression gateway (CPU zstd or GPU nvCOMP compression, pre-deployment savings estimation, retro-compression, policy-driven maintenance, and measured-savings reporting).
 
 --------------------------------------------------------------------------------
 FIELD: Delivery option title
@@ -161,7 +161,7 @@ S4 deploys on Amazon EKS via the provided Helm chart.
 
 1. Subscribe, then follow the AWS Marketplace launch steps for this product to install the Helm chart on your EKS cluster.
 
-2. Metered billing is automatic. The chart carries the Marketplace product code and runs under the service account AWS Marketplace provisions with the aws-marketplace:RegisterUsage permission. S4 calls RegisterUsage once at startup; if the pod is not entitled, the container exits instead of serving traffic.
+2. Metered billing is automatic. The chart carries the Marketplace product code and runs under the service account AWS Marketplace provisions with the aws-marketplace:MeterUsage permission. S4 confirms entitlement at startup (the container exits if the pod is not entitled) and then reports one metered pod-hour every hour to the AWS Marketplace Metering Service.
 
 3. Set your S3 backend endpoint at install time. Override backend.endpointUrl, for example https://s3.us-east-1.amazonaws.com - use the regional S3 endpoint for the bucket you put behind S4.
 

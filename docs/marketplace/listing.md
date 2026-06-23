@@ -1,23 +1,28 @@
 # AWS Marketplace listing — source of truth
 
-Status (verified 2026-06-19 via Marketplace Catalog API, seller account
-393886308285) — the earlier "draft blocked on seller public profile /
-AccessDeniedException" state is **resolved**; both products now exist as
-catalog entities:
+Status (verified 2026-06-23 via Marketplace Catalog API, seller account
+393886308285) — **both products Public / live**:
 
 - **GPU AMI** — `prod-l5my73chs43y6` ("S4 - Squished S3: GPU S3 Compression
-  Gateway (EC2 AMI)"): **Public / live** →
+  Gateway (EC2 AMI)"): **Public / live, v1.4.0 latest** →
   https://aws.amazon.com/marketplace/pp/prodview-yvesl7lunql6i
 - **Container** — `prod-nimrbd77e4xfs` ("S4 - Squished S3: Transparent S3
-  Compression Gateway"): **Limited visibility / live via direct URL**
-  (subscribable at
-  https://aws.amazon.com/marketplace/pp/prodview-kwpxxoeciis7e — not yet in
-  public catalog search). The change set to broaden it,
-  `fzadtfuuq65wav865rp2g9us`, has been in `PREPARING` since 2026-06-16; poll
-  with `aws --profile as marketplace-catalog describe-change-set --catalog
-  AWSMarketplace --change-set-id fzadtfuuq65wav865rp2g9us`.
+  Compression Gateway"): **Public / live, v1.4.0 latest** →
+  https://aws.amazon.com/marketplace/pp/prodview-kwpxxoeciis7e
+- **CPU AMI** — `prod-4opohg7jaqo24` ("S4 - Squished S3: CPU S3 Compression
+  Gateway (EC2 AMI)"): created 2026-06-23, **Limited / live for targeted
+  buyers**, `$0.05/instance-hour` on t3 / t3a / m6i / m7i / c6i / c7i
+  families (44 instance types, x86_64 only). Public-availability change
+  set `95wlqe3za88a3c3gc8zzt4dlf` submitted same day and awaiting AWS
+  review (~1-2 weeks). The GPU AMI listing remains the right choice for
+  integer/columnar workloads at high throughput; the CPU AMI listing
+  exists so the AMI flavor matches the gateway's CPU sales pitch for
+  buyers who don't want GPU drivers or who run on general-purpose /
+  compute families.
 - **Cleanup**: a stale duplicate container draft `prod-xhip4gvojbuuy`
-  (Visibility: Draft) should be removed.
+  (Visibility: Draft) is harmless — Catalog API rejects `DeleteResources`
+  for `ContainerProduct@1.0`, so it can only be purged by AWS
+  Marketplace Support.
 
 All claims below are grep-verified against the README / code at the
 commit that last touched this file. Do not add numbers that are not
@@ -89,11 +94,15 @@ measured in the repo.
   `marketplace.productCode`)
 - UsageInstructions (draft):
   1. Create an IAM role for the service account (IRSA) allowing
-     `aws-marketplace:RegisterUsage` (policy JSON in chart README).
+     `aws-marketplace:MeterUsage` (the live product uses the custom-
+     dimension MeterUsage route — see `crates/s4-server/src/marketplace.rs`
+     and `docs/marketplace/metering.md`; chart README has the policy
+     JSON).
   2. `helm install s4 oci://<marketplace-ecr>/abyo-software/s4-helm \
        --version <chart-version> \
        --set backend.endpointUrl=https://s3.<region>.amazonaws.com \
        --set marketplace.productCode=<injected by Marketplace> \
+       --set marketplace.usageDimension=PID1 \
        --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=<role-arn>`
   3. Point S3 clients at the S4 service endpoint.
 - `MarketplaceServiceAccountName`: `s4`
@@ -103,8 +112,9 @@ measured in the repo.
 
 ## Pricing
 
-- Model: **hourly, per pod** (RegisterUsage integration shipped in
-  commit ae93271; fail-closed on entitlement failure).
+- Model: **hourly, per pod** (custom-dimension MeterUsage route since
+  chart 0.3.4 / s4 v1.2.2; one MeterUsage record per pod-hour on dimension
+  `PID1`; fail-closed on entitlement DryRun at boot).
 - Dimension: per-pod/hour. Price point: operator decision at submit
   time (comparable infra tools list at roughly $0.05-0.30/pod/hour).
 - Paid listing prerequisites on the seller account: completed tax
@@ -112,12 +122,57 @@ measured in the repo.
 
 ## Submission checklist (Catalog API, us-east-1)
 
-1. [BLOCKED→user] Seller registration + public profile in AMMP.
-2. `CreateProduct` (ContainerProduct@1.0) — draft.
-3. `UpdateInformation` with the copy above.
-4. `AddRepositories` — `s4` (image) + `s4-helm` (chart).
-5. `docker pull ghcr.io/.../s4:<v>` → tag → push to marketplace ECR;
-   `helm package` → OCI push (must pass Marketplace CVE scan).
-6. `AddDeliveryOptions` (Helm delivery, usage instructions above).
-7. Pricing/offer terms (hourly dimension) — needs tax+banking complete.
-8. `ReleaseProduct` → AWS review → public.
+Initial submission (done — `prod-nimrbd77e4xfs` / `prod-l5my73chs43y6`
+are both Public/live as of 2026-06-23):
+
+1. [done] Seller registration + public profile in AMMP.
+2. [done] `CreateProduct` (ContainerProduct@1.0 / AmiProduct@1.0).
+3. [done] `UpdateInformation` with the copy above.
+4. [done] `AddRepositories` — `s4` (image) + `s4-helm` (chart) [Container].
+5. [done] Image + chart push to Marketplace ECR (must pass CVE scan).
+6. [done] `AddDeliveryOptions` (Helm delivery / Ami delivery).
+7. [done] Pricing/offer terms (hourly dimension, tax+banking complete).
+8. [done] `ReleaseProduct` + `UpdateVisibility` → Public.
+
+Per-release update (each new s4 vX.Y.Z):
+
+1. Marketplace ECR push of `s4:<X.Y.Z>-1` (clean multi-arch, attestation
+   excluded via `imagetools create` on the per-platform manifest digests
+   from `docker manifest inspect ghcr.io/abyo-software/s4:<X.Y.Z>`).
+2. Build marketplace chart variant (rename to `s4-helm`, bake
+   `image.repository` / `image.tag` to marketplace ECR, set
+   `backend.endpointUrl` default so `helm template` renders cleanly,
+   `serviceAccount.create=false`, `marketplace.productCode` +
+   `marketplace.usageDimension=PID1`) and `helm push` to
+   `oci://<marketplace-ecr>/abyo-software` as `s4-helm:<chart-version>`.
+3. GPU AMI: launch a CPU `t3.large` from the latest DL Base GPU AMI
+   (`/aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-amazon-linux-2023/latest/ami-id`),
+   `docker pull ghcr.io/abyo-software/s4:<X.Y.Z>-gpu`, install the
+   systemd unit + `/etc/s4/s4.env` (uses `S4_BACKEND_ENDPOINT`,
+   `AWS_REGION`, `S4_HOST=0.0.0.0`, `S4_PORT=8014`,
+   `S4_CODEC=nvcomp-zstd`, `S4_DISPATCHER=sampling`,
+   `S4_LOG_FORMAT=json`), install the operator README at
+   `/home/ec2-user/README-S4.txt`, harden (drop authorized_keys,
+   regenerate SSH host keys on next boot, clear logs / bash history /
+   cloud-init state), stop the instance, and `create-image` with
+   `--no-reboot`. **EC2 keypair fingerprint pre-flight is mandatory.**
+3b. CPU AMI (same image, no `-gpu` suffix): launch a `t3.medium` from
+    the latest stock Amazon Linux 2023 AMI
+    (`/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64`),
+    `dnf install -y docker`, then `docker pull
+    ghcr.io/abyo-software/s4:<X.Y.Z>`. Same systemd unit / env file as
+    the GPU AMI but with `S4_CODEC=cpu-zstd` and without `--gpus all`
+    on the `docker run`. Same hardening / snapshot path. 20 GB root
+    volume is enough (CPU image is ~150 MB vs ~2.5 GB for GPU).
+4. `AddDeliveryOptions` for the Container listing (Helm delivery, image
+   + chart URIs from steps 1-2), the GPU AMI listing (AmiDeliveryOption
+   pointing at the new GPU AMI id), and the CPU AMI listing
+   (AmiDeliveryOption pointing at the new CPU AMI id). Each kicks off a
+   CVE / AMI scan (~40 min Container, ~60 min AMI). All text fields
+   must be ASCII-clean (verify with
+   `LC_ALL=C grep -P '[^\x09\x0a\x0d\x20-\x7e]'`).
+5. Once the new version is `SUCCEEDED`, restrict the prior public
+   version with `RestrictDeliveryOptions` so only the latest is
+   subscribable.
+6. Terminate the AMI-build EC2 instance + delete the ephemeral SG
+   immediately. Deregister/snapshot-delete any intermediate AMIs.

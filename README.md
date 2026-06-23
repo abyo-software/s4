@@ -154,7 +154,7 @@ Other install paths — cargo, pip, WASM, build-from-source: **[docs/install.md]
 
 ## Deploy
 
-- **Container (EKS / ECS / Fargate)** — published image + Helm chart, runs on any CPU node, AWS-billed **per pod-hour** → **[Marketplace listing](https://aws.amazon.com/marketplace/pp/prodview-kwpxxoeciis7e)**. Same binary as the free `ghcr.io` image; metering is opt-in via `--marketplace-product-code` ([how it works](docs/marketplace/metering.md)). Marketplace pods need an entitlement + `aws-marketplace:RegisterUsage` and **fail closed at boot** if not entitled.
+- **Container (EKS / ECS / Fargate)** — published image + Helm chart, runs on any CPU node, AWS-billed **per pod-hour** → **[Marketplace listing](https://aws.amazon.com/marketplace/pp/prodview-kwpxxoeciis7e)**. Same binary as the free `ghcr.io` image; metering is opt-in via `--marketplace-product-code` (+ `--marketplace-usage-dimension` for custom-dimension products, see [how it works](docs/marketplace/metering.md)). Marketplace pods need an entitlement + `aws-marketplace:MeterUsage` and **fail closed at boot** if not entitled.
 - **EC2 GPU AMI** — self-contained Amazon Linux 2023 image (NVIDIA drivers + S4 preinstalled), AWS-billed **per instance-hour** on g4dn / g5 / g6 / g6e; for integer/columnar data at high throughput. Launch, point your S3 clients at it, done → **[Marketplace listing](https://aws.amazon.com/marketplace/pp/prodview-yvesl7lunql6i)**.
 - **Self-managed Kubernetes** — `ghcr.io/abyo-software/s4` image + Helm chart: **[docs/deployment.md](docs/deployment.md)**.
 

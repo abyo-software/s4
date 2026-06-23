@@ -154,7 +154,7 @@ ls -la big.log big.log.compressed big.log.roundtrip
 
 ## デプロイ
 
-- **コンテナ (EKS / ECS / Fargate)** — 公開イメージ + Helm チャート、任意の CPU ノードで動作、AWS による **pod-hour 課金** → **[Marketplace リスティング](https://aws.amazon.com/marketplace/pp/prodview-kwpxxoeciis7e)**。無料の `ghcr.io` イメージと同じバイナリです。メータリングは `--marketplace-product-code` によるオプトインです ([仕組み](docs/marketplace/metering.md))。Marketplace の pod はエンタイトルメント + `aws-marketplace:RegisterUsage` を必要とし、エンタイトルメントがない場合は**起動時にフェイルクローズ**します。
+- **コンテナ (EKS / ECS / Fargate)** — 公開イメージ + Helm チャート、任意の CPU ノードで動作、AWS による **pod-hour 課金** → **[Marketplace リスティング](https://aws.amazon.com/marketplace/pp/prodview-kwpxxoeciis7e)**。無料の `ghcr.io` イメージと同じバイナリです。メータリングは `--marketplace-product-code` (+ カスタムディメンション製品では `--marketplace-usage-dimension`、[仕組み](docs/marketplace/metering.md)) によるオプトインです。Marketplace の pod はエンタイトルメント + `aws-marketplace:MeterUsage` を必要とし、エンタイトルメントがない場合は**起動時にフェイルクローズ**します。
 - **EC2 GPU AMI** — 自己完結型の Amazon Linux 2023 イメージ (NVIDIA ドライバ + S4 がプリインストール済み)、g4dn / g5 / g6 / g6e での AWS による **instance-hour 課金**。整数/カラムナデータを高スループットで処理する場合向け。起動し、S3 クライアントを向けるだけで完了 → **[Marketplace リスティング](https://aws.amazon.com/marketplace/pp/prodview-yvesl7lunql6i)**。
 - **セルフマネージド Kubernetes** — `ghcr.io/abyo-software/s4` イメージ + Helm チャート: **[docs/deployment.md](docs/deployment.md)**。
 
