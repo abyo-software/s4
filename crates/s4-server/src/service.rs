@@ -6241,6 +6241,24 @@ impl<B: S3> S3 for S4Service<B> {
                 status.as_aws_str().to_owned(),
             ));
         }
+        // v1.4.1 fix (Marketplace E2E Bug 4): mirror the head_object strip —
+        // multipart / framed-v2 / s4-encrypted objects' backend checksums
+        // describe the compressed bytes on storage, not the original payload
+        // we just decoded above. Returning them lets AWS CLI ≥ 2.30's default
+        // `--checksum-mode ENABLED` validation compute crc64nvme over the
+        // DECOMPRESSED body it received and fail with `Expected full object
+        // checksum (crc64nvme) X did not match combined checksum: Y`. The
+        // earlier sidecar-partial / SSE-S4-chunked branches already clear
+        // these; clear them here for the buffered / multi-frame full-GET path
+        // too. ETag (logical = MD5(original)) stays as the validator.
+        if is_s4_logical_object(&resp.output.metadata) {
+            resp.output.checksum_crc32 = None;
+            resp.output.checksum_crc32c = None;
+            resp.output.checksum_crc64nvme = None;
+            resp.output.checksum_sha1 = None;
+            resp.output.checksum_sha256 = None;
+            resp.output.checksum_type = None;
+        }
         // Client-transparency: strip S4's reserved `s4-*` control metadata (see
         // head_object) — every internal key has been consumed by here; the body
         // returned is the original/decrypted content, so the client must see only
@@ -6370,6 +6388,25 @@ impl<B: S3> S3 for S4Service<B> {
                 }
                 None => {}
             }
+        }
+        // v1.4.1 fix (Marketplace E2E Bug 4): multipart / framed-v2 / s4-encrypted
+        // objects' backend checksums describe the *compressed* bytes on storage,
+        // not the original payload — echoing them lets AWS CLI ≥ 2.30's default
+        // `--checksum-mode ENABLED` validation compute crc64nvme over the
+        // DECOMPRESSED body it received, find a different value, and fail GET
+        // with `Expected full object checksum (crc64nvme) X did not match
+        // combined checksum: Y`. The single-object framed block above already
+        // strips them when `extract_manifest` succeeds; multipart objects have
+        // no single-object manifest, so we mirror the strip here for any S4
+        // object. ETag (logical = MD5(original)) stays as the validator the
+        // client uses.
+        if is_s4_logical_object(&resp.output.metadata) {
+            resp.output.checksum_crc32 = None;
+            resp.output.checksum_crc32c = None;
+            resp.output.checksum_crc64nvme = None;
+            resp.output.checksum_sha1 = None;
+            resp.output.checksum_sha256 = None;
+            resp.output.checksum_type = None;
         }
         // `--logical-etag`: evaluate the stripped ETag preconditions against
         // the object's logical ETag (or the backend ETag for passthrough /
