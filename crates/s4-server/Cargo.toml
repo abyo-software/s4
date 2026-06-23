@@ -11,7 +11,15 @@ documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
-description = "S4 — Squished S3 — GPU-accelerated transparent compression S3-compatible storage gateway (cargo install s4-server installs the `s4` binary)."
+# v1.4.1: `s4-server` now depends on the vendored `crates/s3s/` fork
+# (`s3s = 0.13.0-s4.1`, `publish = false`), so it can no longer be
+# published to crates.io. The supported distribution channels for the
+# gateway are the Docker image (`ghcr.io/abyo-software/s4`), the
+# Marketplace AMI listings (CPU + GPU), and the Marketplace Container
+# Helm chart. `s4-codec`, `s4-codec-py` (PyPI), and `s4-config`
+# continue to publish from this workspace.
+publish = false
+description = "S4 — Squished S3 — GPU-accelerated transparent compression S3-compatible storage gateway. Distribution channel is Docker / AWS Marketplace AMI (not crates.io since v1.4.1)."
 include = [
     "src/**/*.rs",
     "Cargo.toml",

@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-06-24
+
+**v1.4.1 — Marketplace E2E findings closed.** Three regressions surfaced
+running v1.4.0 on a real Marketplace AMI against a live AWS S3 backend;
+each was breaking the "drop-in S3 client" promise on a fresh AWS CLI 2.30+
+install. All three are fixed in this release.
+
+### Fixed
+
+- **(Bug 1, critical) Authentication: external clients used to get
+  `403 NotSignedUp`.** Upstream `s3s::auth::SimpleAuth` verified every
+  SigV4 signature against the single AKID/secret pair the gateway happened
+  to have loaded — which on EC2 / EKS is the gateway's IRSA or
+  instance-role **STS** access key, rotated by the SDK every ~1 h. Any
+  external client whose `AKIA…` / `ASIA…` didn't match was rejected by
+  the gateway itself (the request never reached the backend). The fix
+  vendors `s3s` 0.13.0 as `crates/s3s/` (v0.13.0-s4.1) and adds a NoVerify
+  mode (`S3ServiceBuilder::set_skip_signature_verification` +
+  `auth::AcceptAnyAuth`); the gateway now accepts any SigV4-signed request,
+  decodes the streaming body framing, and re-signs to the real backend
+  with its own SDK credentials. Per-chunk and trailer signature compares
+  are skipped under NoVerify too. **This is a trusted-network gateway
+  posture** — keep the gateway behind a security group.
+- **(Bug 2, critical) Multipart upload of files ≥ 8 MiB used to fail with
+  `InvalidRequest: Checksum Type mismatch occurred, expected checksum
+  Type: crc64nvme, actual checksum Type: crc32`.** AWS CLI ≥ 2.30 (and
+  matching Java/Python SDKs) default to `CRC64NVME` on multipart and
+  send `x-amz-checksum-algorithm: CRC64NVME` on `CreateMultipartUpload`,
+  pinning the session algorithm. The gateway's per-part frame
+  recomputes integrity for the compressed body, so it strips client
+  per-part checksums before forwarding — but then the gateway's backend
+  SDK (1.124) reapplied its own default (`CRC32`) on `UploadPart`,
+  contradicting the session pin. The fix strips
+  `checksum_algorithm`/`checksum_type` at `CreateMultipartUpload` time
+  too, letting the backend SDK pick the same default at both Create
+  and UploadPart. Round-trip integrity continues to be guarded by the
+  per-part frame CRC32C and the full-object logical MD5 ETag on
+  Complete.
+- **(Bug 3, listing inconsistency) `ListObjectsV2` is now client-
+  transparent by default.** `HEAD`/`GET` already returned
+  `MD5(original)` + original size, but listings still leaked the
+  compressed bytes' size + backend ETag — so `aws s3 sync` and `rclone`
+  declared the local copy newer/larger and re-transferred objects on
+  every run. v1.4.0 documented this as an opt-in (`--accurate-list-size`);
+  v1.4.1 flips the default. Pass `--physical-listings` to opt back into
+  the v1.4.0 fast-but-inconsistent listings (saves the N+1 backend HEAD
+  per listed key). The deprecated `--accurate-list-size` is kept as a
+  hidden no-op alias.
+
+### Changed
+
+- `crates/s3s/` and `crates/s3s-aws/` are vendored from upstream s3s
+  0.13.0 as version `0.13.0-s4.1` (both `publish = false`). The fork is
+  source-compatible at the call-site level — only an additive
+  `S3ServiceBuilder::set_skip_signature_verification` (default false) and
+  an additive `AwsChunkedStream::new` `skip_verify` parameter — so an
+  external embedder pinning upstream `s3s = "0.13"` is unaffected; only
+  this workspace consumes the fork. Patch will be offered upstream
+  separately.
+- `crates/s4-server` is now `publish = false`: the gateway's distribution
+  channels are Docker (`ghcr.io/abyo-software/s4`), the Marketplace AMIs
+  (CPU + GPU), and the Marketplace Container chart; the vendored s3s
+  fork can't ship to `crates.io`. `s4-codec`, `s4-codec-py` (PyPI), and
+  `s4-config` are unaffected and still publish.
+- Helm chart bumped to `0.3.7` (appVersion `1.4.1`); chart shape
+  unchanged so existing `helm upgrade` is a drop-in.
+
+### Marketplace
+
+The CPU AMI (`prod-4opohg7jaqo24`), GPU AMI (`prod-l5my73chs43y6`), and
+Helm chart container (`prod-nimrbd77e4xfs`) will be rebuilt against
+`v1.4.1` and a new `AddDeliveryOption` pushed to each listing; the
+v1.4.0 versions of all three will then be restricted via
+`RestrictDeliveryOptions` so only the fixed build is subscribable.
+
 ## [1.4.0] - 2026-06-21
 
 **v1.4.0 — S3 client-transparency by default.** S4's compression (and

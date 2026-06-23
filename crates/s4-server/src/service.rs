@@ -7485,6 +7485,28 @@ impl<B: S3> S3 for S4Service<B> {
         // closed, re-opened through the multipart wire path). The
         // gateway re-stamps its own `s4-*` keys right below.
         strip_reserved_client_metadata(&mut req.input.metadata);
+        // v1.4.1 fix (Marketplace E2E Bug 2): when AWS CLI 2.30+ (or any
+        // newer SDK that defaults to CRC64NVME) calls CreateMultipartUpload
+        // with `x-amz-checksum-algorithm: CRC64NVME`, the backend records
+        // CRC64NVME as the session-wide algorithm. The per-part bytes the
+        // gateway writes are FRAMED-COMPRESSED — their wire checksum has
+        // to be recomputed by the SDK at UploadPart time (we always
+        // wipe client-supplied checksums on parts at L7838-L7844), and the
+        // backend SDK's `request_checksum_calculation` default in
+        // aws-sdk-s3 1.124 reapplies CRC32 (not CRC64NVME). That mismatch
+        // is exactly the `InvalidRequest: Checksum Type mismatch
+        // occurred, expected checksum Type: crc64nvme, actual checksum
+        // Type: crc32` we observed in the v1.4.0 Marketplace AMI E2E.
+        //
+        // Fix: strip the client's checksum_algorithm + checksum_type here so
+        // backend's CreateMultipartUpload picks whatever its own SDK defaults
+        // to; UploadPart below uses the same SDK so the two stay aligned.
+        // The client still gets the original full-object MD5 ETag on
+        // Complete (logical-etag path) and the savings ledger reports
+        // measured compressed sizes — only the per-part wire checksum
+        // is no longer pinned to the client-declared algorithm.
+        req.input.checksum_algorithm = None;
+        req.input.checksum_type = None;
         // Multipart object は per-part 圧縮 + frame 形式で書く。GET 時に
         // frame parse を起動するため、object metadata に flag を立てる。
         // codec は dispatcher の default kind を採用 (per-part 別 codec は Phase 2)。
@@ -11854,6 +11876,13 @@ mod tests {
         /// the access-point REPLACE strip asserts on what reaches the
         /// backend wire).
         copy_metadata: std::sync::Mutex<Vec<Option<Metadata>>>,
+        /// v1.4.1 fix (Marketplace E2E Bug 2): every
+        /// `CreateMultipartUpload`'s checksum_algorithm / checksum_type
+        /// that reaches the backend wire, so the regression test can
+        /// assert both are stripped (or the session would pin
+        /// CRC64NVME and the gateway's UploadPart-time SDK default
+        /// would then disagree → `Checksum Type mismatch`).
+        mp_checksum: std::sync::Mutex<Vec<(Option<ChecksumAlgorithm>, Option<ChecksumType>)>>,
     }
 
     #[derive(Clone, Default)]
@@ -11872,6 +11901,10 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .push(req.input.metadata.clone());
+            self.state.mp_checksum.lock().expect("lock").push((
+                req.input.checksum_algorithm.clone(),
+                req.input.checksum_type.clone(),
+            ));
             Ok(S3Response::new(CreateMultipartUploadOutput {
                 upload_id: Some("upload-1".into()),
                 ..Default::default()
@@ -11982,6 +12015,72 @@ mod tests {
         // The gateway's own stamps are re-applied after the strip.
         assert_eq!(meta.get(META_MULTIPART).map(String::as_str), Some("true"));
         assert_eq!(meta.get(META_CODEC).map(String::as_str), Some("cpu-zstd"));
+    }
+
+    /// v1.4.1 fix (Marketplace E2E Bug 2): `CreateMultipartUpload` must NOT
+    /// forward the client's `checksum_algorithm` / `checksum_type` to the
+    /// backend.
+    ///
+    /// Pre-fix, AWS CLI 2.30+ defaults the multipart session checksum to
+    /// `CRC64NVME` by sending `x-amz-checksum-algorithm: CRC64NVME` on
+    /// Create. The backend records the session as CRC64NVME-pinned. The
+    /// gateway's per-part frame then strips client per-part checksums (so
+    /// the integrity envelope of the COMPRESSED body is not crc64-of-
+    /// PLAINTEXT). The gateway's own SDK reapplies its default (`CRC32` on
+    /// aws-sdk-s3 1.124) at UploadPart time → backend rejects:
+    /// `InvalidRequest: Checksum Type mismatch occurred, expected checksum
+    /// Type: crc64nvme, actual checksum Type: crc32`. The fix is to drop
+    /// both fields at Create so both sides converge on the SDK default at
+    /// both Create and UploadPart.
+    #[tokio::test]
+    async fn create_multipart_strips_client_checksum_algorithm() {
+        let (svc, state) = recording_service();
+        let mut builder = CreateMultipartUploadInput::builder();
+        builder.set_bucket("bkt".to_owned());
+        builder.set_key("obj.bin".to_owned());
+        // CRC64NVME is the AWS CLI 2.30+ / Java SDK 2.30+ default for
+        // multipart upload checksums, which is what was triggering the
+        // mismatch in production. Cover the regression at THAT exact algo.
+        builder.set_checksum_algorithm(Some(ChecksumAlgorithm::from_static(
+            ChecksumAlgorithm::CRC64NVME,
+        )));
+        builder.set_checksum_type(Some(ChecksumType::from_static(ChecksumType::FULL_OBJECT)));
+        let input = builder.build().expect("input");
+        svc.create_multipart_upload(synthetic_req(input, http::Method::POST))
+            .await
+            .expect("create_multipart_upload");
+
+        let recorded = state.mp_checksum.lock().expect("lock");
+        assert_eq!(recorded.len(), 1, "exactly one backend forward");
+        let (algo, ctype) = &recorded[0];
+        assert!(
+            algo.is_none(),
+            "checksum_algorithm must be stripped before the backend forward, got {algo:?}"
+        );
+        assert!(
+            ctype.is_none(),
+            "checksum_type must be stripped before the backend forward, got {ctype:?}"
+        );
+    }
+
+    /// v1.4.1 sanity test: a Create with NO client-supplied checksum
+    /// algorithm (the AWS CLI ≤ 2.29 / `AWS_REQUEST_CHECKSUM_CALCULATION=
+    /// when_required` v1.4.0 workaround path) is still recorded as None on
+    /// the backend wire — i.e., the strip is idempotent and doesn't
+    /// regress the previously-working "no algo" path.
+    #[tokio::test]
+    async fn create_multipart_no_algo_stays_none() {
+        let (svc, state) = recording_service();
+        let mut builder = CreateMultipartUploadInput::builder();
+        builder.set_bucket("bkt".to_owned());
+        builder.set_key("obj.bin".to_owned());
+        let input = builder.build().expect("input");
+        svc.create_multipart_upload(synthetic_req(input, http::Method::POST))
+            .await
+            .expect("create_multipart_upload");
+        let recorded = state.mp_checksum.lock().expect("lock");
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].0.is_none() && recorded[0].1.is_none());
     }
 
     /// v1.0.1 audit R2 P2: both copy_object source HEAD probes (REPLACE

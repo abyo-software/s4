@@ -1125,10 +1125,13 @@ checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
  "bytes",
+ "form_urlencoded",
  "futures-util",
  "http 1.4.1",
  "http-body 1.0.1",
  "http-body-util",
+ "hyper 1.10.1",
+ "hyper-util",
  "itoa",
  "matchit",
  "memchr",
@@ -1136,10 +1139,15 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "serde_core",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
  "sync_wrapper",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -1158,6 +1166,7 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -2314,6 +2323,21 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
+name = "foreign-types"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6f339eb8adc052cd2ca78910fda869aefa38d22d5cb648e6485e4d3fc06f3b1"
+dependencies = [
+ "foreign-types-shared",
+]
+
+[[package]]
+name = "foreign-types-shared"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "form_urlencoded"
@@ -3585,10 +3609,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "openssl"
+version = "0.10.81"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77823a27f0babb03091cb9ed9ef80af3b39dbc82f97e8fa530374b7dafd87a45"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "foreign-types",
+ "libc",
+ "openssl-macros",
+ "openssl-sys",
+]
+
+[[package]]
+name = "openssl-macros"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a948666b637a0f465e8564c73e89d4dde00d72d4d473cc972f390fc3dcee7d9c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
+
+[[package]]
+name = "openssl-sys"
+version = "0.9.117"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b47e7e6bb2c38cd930d25a23b40fa52e068c10e85f3e03a7f5ba5aaca5713695"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+ "vcpkg",
+]
 
 [[package]]
 name = "opentelemetry"
@@ -4622,19 +4683,19 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "s3s"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcf5572ca9bae5fd92d4e5a3e934c73793ab743bcbc761cd5e86a622c2a5e98a"
+version = "0.13.0-s4.1"
 dependencies = [
  "arc-swap",
  "arrayvec",
  "async-trait",
  "atoi",
+ "axum",
  "base64-simd",
  "bytes",
  "bytestring",
  "cfg-if",
  "chrono",
+ "clap",
  "crc-fast",
  "futures",
  "hex-simd",
@@ -4644,12 +4705,14 @@ dependencies = [
  "http-body-util",
  "httparse",
  "hyper 1.10.1",
+ "hyper-util",
  "itoa",
  "md-5 0.11.0-rc.5",
  "memchr",
  "mime",
  "nom 8.0.0",
  "numeric_cast",
+ "openssl",
  "pin-project-lite",
  "quick-xml",
  "serde",
@@ -4664,8 +4727,11 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-util",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "transform-stream",
  "url",
  "urlencoding",
@@ -4674,9 +4740,7 @@ dependencies = [
 
 [[package]]
 name = "s3s-aws"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "142081764e5b7fbdcab53cc5dbaf7b79d10cd8b589c3c4ad8c8ed6a070d21431"
+version = "0.13.0-s4.1"
 dependencies = [
  "async-trait",
  "aws-sdk-s3",
@@ -4693,7 +4757,7 @@ dependencies = [
 
 [[package]]
 name = "s4-codec"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4714,7 +4778,7 @@ dependencies = [
 
 [[package]]
 name = "s4-codec-py"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "bytes",
  "crc32c",
@@ -4726,7 +4790,7 @@ dependencies = [
 
 [[package]]
 name = "s4-codec-wasm"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "bytes",
  "console_error_panic_hook",
@@ -4741,7 +4805,7 @@ dependencies = [
 
 [[package]]
 name = "s4-config"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -4749,7 +4813,7 @@ dependencies = [
 
 [[package]]
 name = "s4-server"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4985,6 +5049,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -5730,6 +5805,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
@@ -5808,6 +5884,7 @@ dependencies = [
  "sharded-slab",
  "smallvec",
  "thread_local",
+ "time",
  "tracing",
  "tracing-core",
  "tracing-log",
@@ -5967,6 +6044,12 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version_check"

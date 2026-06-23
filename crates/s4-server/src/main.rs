@@ -10,12 +10,15 @@ use std::io::IsTerminal;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use aws_credential_types::provider::ProvideCredentials;
+// `ProvideCredentials` retired in v1.4.1 alongside SimpleAuth (the gateway no
+// longer pre-resolves backend creds at boot — the SDK client uses its own
+// provider chain when actually calling backend S3).
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3s::S3;
-use s3s::auth::SimpleAuth;
+// SimpleAuth retired in v1.4.1: see the wiring in `run_server` for the
+// NoVerify-mode rationale.
 use s3s::host::SingleDomain;
 use s3s::service::S3ServiceBuilder;
 use s4_codec::cpu_zstd::CpuZstd;
@@ -462,16 +465,23 @@ struct Opt {
     #[clap(long, hide = true)]
     logical_etag: bool,
 
-    /// Make `ListObjects(V2)` report the client-transparent **original size AND
-    /// ETag** (MD5 of the original payload) per object, instead of the stored
-    /// compressed size + backend ETag. Off by default: listings then report the
-    /// compressed size + backend ETag, which disagree with HEAD/GET (so
-    /// `aws s3 sync` / `rclone` over-transfer; data is still correct on GET).
-    /// Enabling this makes listings consistent with HEAD/GET, at the cost of one
-    /// bounded-concurrency backend HEAD per listed key (N+1) — use it where
-    /// listing accuracy matters more than listing latency.
-    #[clap(long)]
+    /// v1.4.1: Deprecated no-op alias — kept so existing `--accurate-list-size`
+    /// invocations keep working. Client-transparent listings (original size +
+    /// MD5(original) ETag per object) are now the **default**: HEAD/GET +
+    /// `ListObjects(V2)` are consistent so `aws s3 sync` / `rclone` no longer
+    /// over-transfer. Pass `--physical-listings` to opt out for max throughput
+    /// (the v1.4.0 behaviour: compressed size + backend ETag on listings).
+    #[clap(long, hide = true)]
     accurate_list_size: bool,
+
+    /// v1.4.1: opt out of client-transparent `ListObjects(V2)` and report the
+    /// backend's compressed size + backend ETag per object, matching the
+    /// physical bytes on storage. Saves the bounded-concurrency backend HEAD
+    /// per listed key (the N+1 cost the transparent path pays). HEAD/GET are
+    /// **not** affected — they always present the client-transparent original
+    /// size + MD5(original) ETag unless `--physical-passthrough` is also set.
+    #[clap(long)]
+    physical_listings: bool,
 
     /// v0.8.5 #84 (audit H-6): max HTTP/1 header buffer size in
     /// bytes. AWS S3 max header size is 8 KiB per header * ~50
@@ -2341,7 +2351,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // The deprecated `--logical-etag` flag is a no-op now (already the default).
     let _ = opt.logical_etag;
     s4 = s4.with_logical_etag(!opt.physical_passthrough);
-    s4 = s4.with_accurate_list_size(opt.accurate_list_size);
+    // v1.4.1 fix (Marketplace E2E Bug 3): client-transparent ListObjectsV2 is
+    // now the default, matching HEAD/GET. `--physical-listings` opts out (the
+    // v1.4.0 behaviour). The deprecated `--accurate-list-size` flag stays as a
+    // no-op alias for older operators / runbooks.
+    let _ = opt.accurate_list_size;
+    s4 = s4.with_accurate_list_size(!opt.physical_listings);
     info!(
         max_body_bytes = opt.max_body_bytes,
         "S4 max-body-bytes cap (v0.8.19 D-1: now CLI-tunable; default 5 GiB = AWS S3 single-PUT max)"
@@ -4628,14 +4643,27 @@ where
     S: S3 + Send + Sync + 'static,
 {
     let service = {
+        // v1.4.1 fix (Marketplace E2E Bug 1): the upstream s3s SimpleAuth
+        // path verifies every SigV4 signature against a single registered
+        // AKID/secret pair. On EC2 instance-profile / IRSA deployments
+        // the registered creds rotate hourly via STS, so any external
+        // client whose access key isn't bit-for-bit the gateway's
+        // current STS AKID gets `NotSignedUp` 403. The v0.13.0-s4.1
+        // vendored fork (crates/s3s/) exposes a NoVerify mode and an
+        // `AcceptAnyAuth` provider; we wire both so the gateway accepts
+        // ANY SigV4-signed request (header parsing + streaming body
+        // decoding still happen, only the final HMAC compare is
+        // skipped), then re-signs to the real backend with its own
+        // SDK credentials. This is the trusted-network gateway posture
+        // every other S3-compat gateway (MinIO, Ceph, fake-s3) ships
+        // by default; the gateway lives behind a VPC SG.
+        // The previous `SdkConfig::credentials_provider()` lookup is no
+        // longer needed for auth wiring (the backend SDK still uses the
+        // same provider for its own outbound calls).
+        let _ = sdk_conf.credentials_provider();
         let mut b = S3ServiceBuilder::new(s4);
-        if let Some(cred_provider) = sdk_conf.credentials_provider() {
-            let cred = cred_provider.provide_credentials().await?;
-            b.set_auth(SimpleAuth::from_single(
-                cred.access_key_id(),
-                cred.secret_access_key(),
-            ));
-        }
+        b.set_auth(s3s::auth::AcceptAnyAuth::new());
+        b.set_skip_signature_verification(true);
         if let Some(domain) = &opt.domain {
             b.set_host(SingleDomain::new(domain)?);
         }

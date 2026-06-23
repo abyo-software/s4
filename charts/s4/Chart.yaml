@@ -40,9 +40,19 @@ type: application
 #        the client view, multipart composite ETag, write-path conditionals).
 #        Server-side only; no chart-shape change, default rendering
 #        byte-identical to 0.3.5.
-version: 0.3.6
+# 0.3.7: s4 v1.4.1 — Marketplace E2E findings closed (appVersion-only bump):
+#        NoVerify auth (gateway now accepts ANY signed client, not just the
+#        gateway's own IRSA/instance-role STS AKID — fixes the 403
+#        NotSignedUp on every external client); UploadPart no longer pins
+#        the session checksum algorithm at CreateMultipartUpload time
+#        (fixes the `aws s3 cp` 8 MiB+ crc64nvme mismatch on CLI ≥ 2.30);
+#        ListObjects(V2) is client-transparent by default (matches
+#        HEAD/GET so `aws s3 sync` / `rclone` no longer over-transfer —
+#        opt out with `--physical-listings`). Server-side only; no
+#        chart-shape change, default rendering byte-identical to 0.3.6.
+version: 0.3.7
 # appVersion tracks the s4-server release shipped on crates.io / ghcr.io.
-appVersion: "1.4.0"
+appVersion: "1.4.1"
 kubeVersion: ">=1.24.0-0"
 home: https://github.com/abyo-software/s4
 sources:
