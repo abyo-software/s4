@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781972739355,
+  "lastUpdate": 1782230056424,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -18321,6 +18321,232 @@ window.BENCHMARK_DATA = {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
             "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "8b4c68cf2bb9062f5f7a265605d113e2b08cacd8",
+          "message": "fix(server,multipart,listings,vendor-s3s): v1.4.1 — Marketplace E2E findings closed\n\nCloses three regressions surfaced running the v1.4.0 CPU AMI on a live\nAWS S3 backend against AWS CLI 2.33; each was breaking the \"drop-in S3\nclient\" promise on a fresh install.\n\nBug 1 (critical) — external clients used to get `403 NotSignedUp`.\nUpstream `s3s::auth::SimpleAuth::from_single(...)` verified every SigV4\nsignature against the one AKID/secret pair the gateway happened to have\nloaded — on EC2 IRSA/instance-role that's the gateway's STS access key,\nrotated by the SDK every ~1 h. Vendor s3s 0.13.0 + s3s-aws 0.13.0 as\n`crates/s3s/` and `crates/s3s-aws/` (version `0.13.0-s4.1`, both\n`publish = false`) and add a NoVerify mode:\n  * `S3ServiceBuilder::set_skip_signature_verification(bool)` (default\n    false) propagates through `S3Service` → `CallContext` →\n    `SignatureContext::skip_verification`. SigV2/SigV4 header parsing\n    and streaming-body chunk decoding still run, so canonicalisation +\n    body framing keep working — but the final HMAC compare in\n    `v4_check_header_auth`, `v4_check_post_signature`,\n    `v4_check_presigned_url`, `v2_check_header_auth`,\n    `v2_check_post_signature`, and `v2_check_presigned_url` is skipped\n    when the flag is on.\n  * `AwsChunkedStream::new` gains a `skip_verify: bool` arg; signed\n    chunks whose HMAC doesn't match are accepted (only `prev_signature`\n    is left untouched so the rolling state stays consistent for the\n    next non-NoVerify decode). Trailer signature compare honours\n    `skip_verify` too.\n  * `auth::AcceptAnyAuth` — a new provider that returns a fixed\n    \"s4-no-verify-mode-fake-secret-do-not-trust\" marker for any access\n    key. `crates/s4-server/src/main.rs` wires\n    `b.set_auth(AcceptAnyAuth::new())` + `b.set_skip_signature_verification(true)`,\n    matching the trusted-network gateway posture every other S3-compat\n    gateway ships in by default; the gateway re-signs to the real\n    backend with its own SDK credentials. Both `SimpleAuth` and the\n    upstream-strict path remain reachable for embedders who want them.\n  Coverage: `accept_any_auth_returns_ok_for_any_key`,\n  `accept_any_auth_default_matches_new` in\n  `crates/s3s/src/auth/simple_auth.rs`.\n\nBug 2 (critical) — `aws s3 cp` of files ≥ 8 MiB used to fail with\n`InvalidRequest: Checksum Type mismatch occurred, expected checksum\nType: crc64nvme, actual checksum Type: crc32`. AWS CLI ≥ 2.30 (and the\nmatching Java/Python SDKs) default to `CRC64NVME` on\n`CreateMultipartUpload`, pinning the session algorithm at the backend.\nThe gateway's per-part frame strips client per-part checksums before\nforwarding (the compressed payload has a fresh integrity envelope), so\nthe gateway's backend SDK (aws-sdk-s3 1.124) reapplied its own default\n(`CRC32`) on `UploadPart` and the backend rejected the mismatch.\nStrip `checksum_algorithm` + `checksum_type` at\n`CreateMultipartUpload` too (`crates/s4-server/src/service.rs:7487`)\nso backend's Create and UploadPart converge on the SDK default at both\nends. Per-part round-trip integrity is still guarded by the frame\nCRC32C and the full-object logical MD5 ETag returned on Complete.\nCoverage:\n`create_multipart_strips_client_checksum_algorithm`,\n`create_multipart_no_algo_stays_none` in `service.rs`.\n\nBug 3 — `ListObjectsV2` is now client-transparent by default.\nHEAD/GET already returned MD5(original) + original size, but listings\nstill reported the compressed bytes' size + backend ETag, so `aws s3\nsync` and `rclone` declared the local copy newer/larger and\nre-transferred objects on every run. v1.4.0 documented the fix as an\nopt-in (`--accurate-list-size`); v1.4.1 flips the default. New\n`--physical-listings` opts back into v1.4.0 behaviour for max\nthroughput (skips the N+1 backend HEAD per listed key). The\ndeprecated `--accurate-list-size` is kept as a hidden no-op alias.\n\nRelease plumbing:\n  * workspace + chart bumped to `1.4.1` / `0.3.7`.\n  * `crates/s4-server` switches to `publish = false`: the vendored s3s\n    fork can't ship to crates.io. The gateway's distribution channels\n    are Docker (ghcr.io/abyo-software/s4), the Marketplace AMIs\n    (CPU + GPU), and the Marketplace Container Helm chart.\n    `s4-codec`, `s4-codec-py` (PyPI), and `s4-config` still publish.\n  * CHANGELOG.md v1.4.1 entry documents all three fixes + the\n    vendor-s3s / publish-strategy change.\n\nVerification (this commit):\n  * `cargo fmt --all --check` clean.\n  * `cargo clippy --workspace --all-targets --exclude s4-codec-py\n    --exclude s4-codec-wasm -- -D warnings` clean.\n  * `cargo test --workspace --exclude s4-codec-py --exclude\n    s4-codec-wasm --lib --bins --tests` green\n    (419 s3s + 632 s4-server-lib + 9 s4-server-bin + the others).\n  * `cargo build --release -p s4-server` green.\n\nMarketplace re-roll (separate from this commit): AMI rebuild for CPU\n+ GPU, marketplace ECR image + Helm chart push, AddDeliveryOptions on\nall three listings, RestrictDeliveryOptions on the v1.4.0 versions.\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+          "timestamp": "2026-06-24T00:39:45+09:00",
+          "tree_id": "a2055b96bb33a525fed5e0e0fa6c6fc9651af54e",
+          "url": "https://github.com/abyo-software/s4/commit/8b4c68cf2bb9062f5f7a265605d113e2b08cacd8"
+        },
+        "date": 1782230055911,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 49413,
+            "range": "± 1580",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 56102,
+            "range": "± 1087",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 430,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2197154,
+            "range": "± 71737",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50609633,
+            "range": "± 122978",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201644,
+            "range": "± 209",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 49522932,
+            "range": "± 1260368",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 923636986,
+            "range": "± 1824097",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3218247,
+            "range": "± 6073",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 28156,
+            "range": "± 1042",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 32788,
+            "range": "± 1024",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 422,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 577227,
+            "range": "± 2638",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1640280,
+            "range": "± 10188",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201645,
+            "range": "± 470",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12526851,
+            "range": "± 159112",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 28844621,
+            "range": "± 97257",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3219366,
+            "range": "± 11618",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1454037,
+            "range": "± 30629",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2292787,
+            "range": "± 12642",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 315500977,
+            "range": "± 1890692",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 136,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 9204,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 903,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13993,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 3070,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 23907,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 95285,
+            "range": "± 235",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 596,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4791,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 18973,
+            "range": "± 76",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
+            "range": "± 1",
             "unit": "ns/iter"
           }
         ]
