@@ -1,0 +1,75 @@
+# AWS Marketplace Quick Launch template - LIVE copy.
+# Served to buyers from s3://abyo-mp-cft-393886308285/cft/gpu-gw.yaml
+# (referenced by the product's CloudFormation delivery option).
+# If you change this file, re-upload to that S3 key AND publish a new
+# product version - Marketplace pins the template per version.
+# Marketplace policy constraints validated 2026-07-05: ASCII only,
+# no default 0.0.0.0/0 CIDR, no external code download in UserData,
+# instance types must be in the product's supported list.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  S4 - AWS Marketplace Quick Launch. Launches a single EC2 instance from
+  the Marketplace AMI with a least-privilege security group (tcp 22, 8014).
+Parameters:
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: The S4 AMI id (supplied by AWS Marketplace Quick Launch).
+  InstanceType:
+    Type: String
+    Default: g4dn.xlarge
+    Description: EC2 instance type (must match the AMI architecture).
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to launch into.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet for the instance (must be in VpcId).
+  AllowedCidr:
+    Type: String
+    Default: 10.0.0.0/8
+    AllowedPattern: "^\\d+\\.\\d+\\.\\d+\\.\\d+/\\d+$"
+    Description: CIDR allowed to reach the application ports.
+  KeyName:
+    Type: String
+    Default: ""
+    Description: Optional EC2 key pair name for SSH access (leave empty for none).
+Conditions:
+  HasKey: !Not [!Equals [!Ref KeyName, ""]]
+Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "S4 ingress (${AWS::StackName})"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCidr
+        - IpProtocol: tcp
+          FromPort: 8014
+          ToPort: 8014
+          CidrIp: !Ref AllowedCidr
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      KeyName: !If [HasKey, !Ref KeyName, !Ref "AWS::NoValue"]
+      SecurityGroupIds: [!Ref SecurityGroup]
+      MetadataOptions:
+        HttpTokens: required
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}"
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+  PrivateIp:
+    Value: !GetAtt Instance.PrivateIp
