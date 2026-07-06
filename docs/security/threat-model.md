@@ -151,13 +151,14 @@ nonces, DEKs, and version IDs.
 These items are acknowledged and tracked, not silently hidden:
 
 1. **`rustls-webpki 0.101.7` CVE chain via `aws-config`** —
-   pinned by the `s3s 0.13` + `aws-sdk-s3 1.124` dependency
-   constraint. The vulnerabilities (RUSTSEC-2026-0098 / 0099 /
-   0104) live in certificate name-constraint / CRL parsing
-   on the **backend** TLS path, which talks only to the
-   operator-trusted backend endpoint. Mitigation: pin to a
-   trusted backend; upgrade path follows the s3s + aws-sdk-s3
-   release schedule. Tracked in issue #91.
+   **resolved 2026-07-06** (issue #91). The legacy rustls 0.21 /
+   rustls-webpki 0.101.7 chain was pulled only by the aws-sdk
+   crates' default `rustls` feature, not by the active TLS
+   client (`default-https-client`, rustls 0.23). Disabling
+   default features on the aws-sdk-* deps removed the
+   vulnerable chain from `Cargo.lock` entirely; the CI audit
+   ignores for RUSTSEC-2026-0098 / 0099 / 0104 are dropped.
+   See [cargo-audit-ignores.md](cargo-audit-ignores.md).
 2. **Streaming PUT now verifies client checksums (v0.9 #106)** —
    the v0.8.13 #127 attempt regressed sidecar correctness
    (v0.8.14 #129). v0.9 #106 lands true streaming verify

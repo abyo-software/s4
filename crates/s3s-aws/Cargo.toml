@@ -41,8 +41,17 @@ path = "src/lib.rs"
 [dependencies.async-trait]
 version = "0.1.89"
 
+# default-features = false drops the legacy `rustls` feature (EOL rustls 0.21
+# chain, RUSTSEC-2026-0098/0099/0104); see workspace Cargo.toml.
 [dependencies.aws-sdk-s3]
 version = "1.124.0"
+default-features = false
+features = [
+    "sigv4a",
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+]
 
 [dependencies.aws-smithy-runtime-api]
 version = "1.11.5"

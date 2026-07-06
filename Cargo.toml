@@ -38,7 +38,16 @@ categories = ["compression", "network-programming", "web-programming"]
 s3s = { path = "crates/s3s", version = "0.13.0-s4.1", default-features = false }
 s3s-aws = { path = "crates/s3s-aws", version = "0.13.0-s4.1", default-features = false }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1.124"
+# default-features = false drops the legacy `rustls` feature, which pulls the
+# EOL rustls 0.21 / rustls-webpki 0.101 chain (RUSTSEC-2026-0098/0099/0104,
+# issue #91). The remaining features mirror the crate's defaults minus that
+# legacy TLS stack; TLS is served by `default-https-client` (rustls 0.23).
+aws-sdk-s3 = { version = "1.124", default-features = false, features = [
+    "sigv4a",
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-credential-types = "1"
 tokio = { version = "1", features = ["full"] }
 hyper = "1.8"

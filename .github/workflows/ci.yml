@@ -105,9 +105,6 @@ jobs:
       - name: cargo audit (CVE + yanked + unmaintained)
         run: |
           cargo audit \
-            --ignore RUSTSEC-2026-0098 \
-            --ignore RUSTSEC-2026-0099 \
-            --ignore RUSTSEC-2026-0104 \
             --ignore RUSTSEC-2025-0134
 
   e2e:

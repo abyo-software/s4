@@ -5,9 +5,6 @@
 
 ```
 cargo audit \
-  --ignore RUSTSEC-2026-0098 \
-  --ignore RUSTSEC-2026-0099 \
-  --ignore RUSTSEC-2026-0104 \
   --ignore RUSTSEC-2025-0134
 ```
 
@@ -20,41 +17,21 @@ The titles below match `cargo audit` output exactly; the
 "Reachable from S4" line cites the actual dep path verified with
 `cargo tree -i <crate>@<version>`.
 
-## RUSTSEC-2026-0098 — Name constraints for URI names were incorrectly accepted
+## Resolved ignores
 
-| Field | Value |
-|---|---|
-| Crate | `rustls-webpki 0.101.7` |
-| Severity | Medium (X.509 name-constraint extension parsing bug). |
-| Reachable from S4 | Yes, via `s4-server` → `aws-config 1.8.15` → `aws-smithy-runtime 1.11.3` → `aws-smithy-http-client 1.1.13` → `rustls 0.21.12` → `rustls-webpki 0.101.7` (TLS path against backends + KMS). The newer rustls-webpki 0.103.13 is also in the graph via `rustls 0.23.40` (also pulled by aws-smithy-http-client), but the 0.21/0.101.7 path remains because the AWS SDK still depends on it transitively. |
-| Why ignored | Bumping rustls-webpki in isolation would require forking `rustls 0.21` (the API broke between 0.21 and 0.22+, and AWS SDK still references the 0.21 path through multiple intermediate crates). Waiting on the AWS SDK to drop the legacy rustls 0.21 path. |
-| Mitigation | The vulnerable code path is reached only when validating a server certificate whose URI-typed Subject Alternative Names use name-constraint extensions. S4's outbound TLS is to operator-controlled S3 endpoints + KMS endpoints; cert provenance is controlled by the deployment. Production deployments terminate inbound TLS at an ingress (cert-manager / ALB) that is also operator-controlled. There is no adversary-controlled cert path. |
-| Upstream tracking | Open AWS SDK migration issues track the rustls 0.21 → 0.23 cutover. Re-evaluate when `cargo tree -i rustls-webpki@0.101.7` returns no path. |
-| Re-evaluate by | Each release cycle: re-run the tree command above; drop the ignore the day the path is gone. |
-
-## RUSTSEC-2026-0099 — Name constraints were accepted for certificates asserting a wildcard name
-
-| Field | Value |
-|---|---|
-| Crate | `rustls-webpki 0.101.7` |
-| Severity | Medium (X.509 name-constraint + wildcard name interaction bug). |
-| Reachable from S4 | Same transitive path as RUSTSEC-2026-0098 (rustls 0.21.12). |
-| Why ignored | Same AWS SDK transitive blockage as 2026-0098. |
-| Mitigation | Same operator-controlled cert provenance argument as 2026-0098 — the wildcard-cert path requires an adversary-controlled certificate authority in the cert chain, which is not part of any S4-shipped deployment topology. |
-| Upstream tracking | Same as 2026-0098 (AWS SDK rustls 0.21 → 0.23 migration). |
-| Re-evaluate by | Same as 2026-0098. |
-
-## RUSTSEC-2026-0104 — Reachable panic in certificate revocation list parsing
-
-| Field | Value |
-|---|---|
-| Crate | `rustls-webpki 0.101.7` |
-| Severity | Low (panic, not memory unsafety). |
-| Reachable from S4 | Same transitive path as 2026-0098 / 2026-0099. |
-| Why ignored | Same AWS SDK transitive blockage. |
-| Mitigation | S4 does not configure rustls with CRL checking enabled — `rustls 0.21` requires opt-in to CRL validation (via `WebPkiClientVerifier::with_crls`), and `aws-smithy-http-client` does not opt in. The panic path is therefore unreachable in the S4-shipped deployments. |
-| Upstream tracking | Same as 2026-0098. |
-| Re-evaluate by | Same as 2026-0098. |
+- **RUSTSEC-2026-0098 / 2026-0099 / 2026-0104** (`rustls-webpki 0.101.7`, three
+  CVEs on the legacy rustls 0.21 TLS path pulled transitively by the AWS SDK) —
+  **removed 2026-07-06** (issue #91). The legacy path turned out to be
+  feature-gated, not hard-wired: the aws-sdk crates' default `rustls` feature
+  maps to `aws-smithy-runtime/tls-rustls` (rustls 0.21 / hyper 0.14 legacy
+  connector), while TLS is actually served by `default-https-client`
+  (rustls 0.23). Setting `default-features = false` on `aws-sdk-s3` (workspace
+  + `crates/s3s-aws`), `aws-sdk-kms`, `aws-sdk-sns`, `aws-sdk-sqs` and
+  `aws-sdk-marketplacemetering` — keeping their remaining default features —
+  drops rustls 0.21 / rustls-webpki 0.101.7 / hyper-rustls 0.24 /
+  tokio-rustls 0.24 from `Cargo.lock` entirely. Verified:
+  `cargo tree -i rustls-webpki@0.101.7` → no matching package; only
+  rustls-webpki 0.103.x remains.
 
 ## RUSTSEC-2025-0134 — rustls-pemfile is unmaintained
 
