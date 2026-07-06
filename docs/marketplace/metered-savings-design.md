@@ -95,7 +95,32 @@ no new crates:
    and an hourly-loop test with a scripted client asserting the sent
    quantities.
 
-## Listing attempt result (2026-07-06): blocked by platform rule
+## Listing status (2026-07-06): dedicated Limited product created
+
+Path 1 below was chosen (seller decision, 2026-07-06) and executed
+full-API (no portal mixing, per `feedback-marketplace-repo-order`):
+**`prod-w2k57p6nnnoq4` — "S4 - Squished S3: Compression Gateway
+(Metered Savings)"**, visibility **Limited**, with public offer
+`offer-wi4jshxzkntk6` (UsageBasedPricingTerm `GBSavedHours` =
+**$0.00001/GB-saved-hour** — the 5-decimal price was accepted —
+StandardEula 2022-07-14, adapted refund policy). ECR repos
+`s4-metered` / `s4-metered-helm` were created by the same change set
+(`20wm2hskypqcrniyi3zgxl04h`).
+
+**Delivery options are intentionally NOT added yet**: the flag ships in
+v1.5.0; the published v1.4.1 images do not contain
+`--marketplace-metered-savings`. Remaining sequence:
+1. v1.5.0 release cut (QA gate final round) → multi-arch image build.
+2. Helm chart: add `marketplace.meteredSavings` values (flag + dimension
+   `GBSavedHours` + ledger state-file PVC — single metering replica).
+3. Push image + chart to `abyo-software/s4-metered{,-helm}` ECR repos,
+   then `AddDeliveryOptions` change set with metered-savings usage
+   instructions.
+4. Validate a Limited-visibility deployment end to end (seller test
+   account; confirm hourly `MeterUsage` records match `s4 savings`).
+5. Public visibility change set (AWS review) — final seller gate.
+
+## Original blocker record (2026-07-06): existing listing path is closed
 
 Submission was approved and attempted (change sets
 `aym10q5u2n4aepsnay66ztd0e`, `97gvwbhics2hsdn7i38s7todp` on
