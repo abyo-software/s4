@@ -331,10 +331,14 @@ pub(crate) fn is_versioning_shadow_key(key: &str) -> bool {
 
 /// `true` for keys the offline tools (estimate / migrate / recompact)
 /// must never list as work items: `.s4index` sidecars, `.s4dict/`
-/// shared dictionaries, and `.__s4ver__/` versioning shadow keys.
-/// `pub(crate)` for `estimate` / `recompact`.
+/// shared dictionaries, `.__s4ver__/` versioning shadow keys, and
+/// `.s4mpu/` durable multipart part-state records. `pub(crate)` for
+/// `estimate` / `recompact`.
 pub(crate) fn is_internal_key(key: &str) -> bool {
-    key.ends_with(SIDECAR_SUFFIX) || crate::dict::is_dict_key(key) || is_versioning_shadow_key(key)
+    key.ends_with(SIDECAR_SUFFIX)
+        || crate::dict::is_dict_key(key)
+        || is_versioning_shadow_key(key)
+        || crate::mpu_durable::is_mpu_state_key(key)
 }
 
 #[derive(Debug, Clone)]

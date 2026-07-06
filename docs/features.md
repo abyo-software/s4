@@ -76,6 +76,25 @@ envelopes are v0.11+ roadmap candidates, not promised features.
   access-key match). Denials are bumped on
   `s4_policy_denials_total{action,bucket}`.
 
+### Durable multipart state
+- Every successful `UploadPart` / `UploadPartCopy` persists that part's
+  `(original MD5, backend ETag)` pair as one small JSON record at
+  `.s4mpu/<hex(uploadId)>/<partNumber>` in the backend bucket (**default**;
+  opt out with `--no-durable-multipart-state`). A `CompleteMultipartUpload`
+  handled by a **restarted** gateway — or a **different instance** of a
+  multi-gateway deployment — therefore still returns the client-transparent
+  composite ETag `MD5(concat(original-part-MD5s))-N` with strict part-ETag
+  validation. Cost: one extra small backend PUT per part + record cleanup
+  (prefix LIST + per-record DELETE) on Complete/Abort; record writes are
+  best-effort (failures degrade that part to the pre-durable `ListParts`
+  fallback, warned as `S4 durable multipart state` in the logs).
+- Records contain **no SSE key material** — only content fingerprints. The
+  per-upload SSE recipe remains in-memory-only (see
+  [compatibility.md](compatibility.md#client-transparency-compression-is-invisible-to-the-client)).
+- Orphaned records (gateway crashed between the backend Complete/Abort and
+  its own cleanup) are reaped by an `s4 maintain` rule with
+  `action = "mpu-state-gc"` — see [`s4 maintain`](ops/maintenance.md).
+
 ### Data Integrity
 - **CRC32C** stored per-object (single PUT) or per-frame (multipart), verified on GET
 - **`copy_object` S4-aware**: source's `s4-*` metadata is preserved across

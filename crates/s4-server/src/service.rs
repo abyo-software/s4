@@ -452,6 +452,23 @@ pub struct S4Service<B: S3> {
     /// `aws s3 sync`/`rclone` over-transfer (data is still correct). The N+1
     /// HEAD cost is why it is opt-in.
     accurate_list_size: bool,
+    /// Durable multipart part-state: when set (default, and only
+    /// effective while `logical_etag` is on), every successful
+    /// `UploadPart` / `UploadPartCopy` additionally persists its
+    /// `(original_md5, backend_etag)` pair as one small JSON object at
+    /// `.s4mpu/<hex(uploadId)>/<partNumber>` in the backend bucket, so
+    /// `CompleteMultipartUpload` on a RESTARTED gateway — or on a
+    /// DIFFERENT instance of a multi-gateway deployment — can still
+    /// compute the client-transparent composite ETag and strictly
+    /// validate the client's submitted part ETags. Costs one extra
+    /// small backend PUT per part plus a prefix-list + per-record
+    /// DELETE on Complete/Abort. Opt out via
+    /// `--no-durable-multipart-state` /
+    /// [`S4Service::with_durable_multipart_state`]`(false)` to restore
+    /// the in-memory-only behaviour (composite stamped only when all
+    /// parts went through this live process). See
+    /// [`crate::mpu_durable`].
+    durable_multipart_state: bool,
     policy: Option<crate::policy::SharedPolicy>,
     /// v0.3 #13: surfaced as the `aws:SecureTransport` Condition key. Set
     /// to `true` when the listener is wrapped in TLS (or ACME), so policies
@@ -789,6 +806,12 @@ impl<B: S3> S4Service<B> {
             // same default instead of the old physical-passthrough behaviour.
             logical_etag: true,
             accurate_list_size: false,
+            // Durable multipart part-state records are on by default
+            // (matching the shipped binary; `--no-durable-multipart-state`
+            // opts out). Inert unless `logical_etag` is also on — the
+            // per-part state only exists for the client-transparent
+            // composite ETag.
+            durable_multipart_state: true,
             policy: None,
             secure_transport: false,
             rate_limits: None,
@@ -1791,6 +1814,17 @@ impl<B: S3> S4Service<B> {
         self
     }
 
+    /// Durable multipart part-state records (`.s4mpu/` backend objects,
+    /// see [`crate::mpu_durable`]). **On by default**; pass `false`
+    /// (the `--no-durable-multipart-state` CLI flag) to restore the
+    /// in-memory-only per-part state. See the field docs for the
+    /// cost/behaviour trade.
+    #[must_use]
+    pub fn with_durable_multipart_state(mut self, on: bool) -> Self {
+        self.durable_multipart_state = on;
+        self
+    }
+
     /// HEAD the backend object and read the `s4-original-size` stamp = the
     /// object's original (pre-compression) size. `None` if the HEAD fails or the
     /// object carries no stamp (a non-S4 / passthrough object, whose backend
@@ -2021,6 +2055,25 @@ impl<B: S3> S4Service<B> {
                     "object key {key:?} is reserved (prefix `{}` holds S4 shared-dictionary \
                      objects; use `s4 train-dict` against the backend to manage them)",
                     crate::dict::DICT_KEY_PREFIX,
+                ),
+            ));
+        }
+        // Durable multipart part-state records: same Mutating-only guard
+        // shape as `.s4dict/` — a client PUT/Copy/Delete into the
+        // namespace could forge a part's original-MD5 record and skew a
+        // later Complete's composite/validation. Reads stay passthrough
+        // (records contain only content fingerprints, no secrets),
+        // mirroring the dict-prefix posture.
+        if matches!(mode, ReservedKeyMode::Mutating) && crate::mpu_durable::is_mpu_state_key(key) {
+            let code = S3ErrorCode::from_bytes(b"InvalidObjectName")
+                .unwrap_or(S3ErrorCode::InvalidArgument);
+            return Err(S3Error::with_message(
+                code,
+                format!(
+                    "object key {key:?} is reserved (prefix `{}` holds S4 durable multipart \
+                     part-state records; they are managed by the gateway and GC'd via \
+                     `s4 maintain` action = \"mpu-state-gc\")",
+                    crate::mpu_durable::MPU_STATE_PREFIX,
                 ),
             ));
         }
@@ -2828,7 +2881,10 @@ impl<B: S3> S4Service<B> {
         key: &str,
         version_id: Option<&str>,
     ) -> Option<LedgerFootprint> {
-        if crate::dict::is_dict_key(key) || s4_codec::index::is_reserved_sidecar_key(key) {
+        if crate::dict::is_dict_key(key)
+            || s4_codec::index::is_reserved_sidecar_key(key)
+            || crate::mpu_durable::is_mpu_state_key(key)
+        {
             return None;
         }
         let uri = safe_object_uri(bucket, key).ok()?;
@@ -3402,6 +3458,233 @@ impl<B: S3> S4Service<B> {
             }
         }
         Some(map)
+    }
+
+    /// Durable multipart state: persist one part's `(original_md5,
+    /// backend_etag)` pair as a small JSON object at
+    /// `.s4mpu/<hex(uploadId)>/<partNumber>` in the backend bucket.
+    /// Best-effort — a failed record PUT degrades this part to the
+    /// pre-durable in-memory-only behaviour (warned, never fails the
+    /// UploadPart the client already paid for).
+    async fn write_durable_part_record(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        original_md5: &str,
+        backend_etag: &str,
+    ) {
+        let record = crate::mpu_durable::DurablePartRecord {
+            v: crate::mpu_durable::DurablePartRecord::VERSION,
+            upload_id: upload_id.to_owned(),
+            part_number,
+            original_md5: original_md5.to_owned(),
+            backend_etag: backend_etag.to_owned(),
+            key: key.to_owned(),
+        };
+        let bytes = record.encode();
+        let len = bytes.len() as i64;
+        let record_key = crate::mpu_durable::record_key(upload_id, part_number);
+        let uri = match safe_object_uri(bucket, &record_key) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!(
+                    bucket,
+                    upload_id,
+                    part_number,
+                    "S4 durable multipart state: record key not URI-encodable, \
+                     part falls back to in-memory-only state: {e}"
+                );
+                return;
+            }
+        };
+        let put_req = S3Request {
+            input: PutObjectInput {
+                bucket: bucket.into(),
+                key: record_key,
+                body: Some(bytes_to_blob(bytes.into())),
+                content_length: Some(len),
+                content_type: Some("application/json".into()),
+                ..Default::default()
+            },
+            method: http::Method::PUT,
+            uri,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        if let Err(e) = self.backend.put_object(put_req).await {
+            tracing::warn!(
+                bucket,
+                upload_id,
+                part_number,
+                "S4 durable multipart state: record PUT failed, part falls back \
+                 to in-memory-only state (composite ETag degrades to best-effort \
+                 across restart/multi-gateway): {e}"
+            );
+        }
+    }
+
+    /// Durable multipart state: fetch + decode the records for
+    /// `part_numbers` (bounded-concurrency backend GETs). Missing or
+    /// invalid records are silently skipped — the caller merges what
+    /// survives and the composite stays best-effort for the rest.
+    async fn read_durable_part_records(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        part_numbers: &[i32],
+    ) -> std::collections::HashMap<i32, crate::multipart_state::PartEtags> {
+        use futures::StreamExt as _;
+        /// Concurrent record GETs per Complete — small objects, so the
+        /// bound exists to protect the backend, not the gateway.
+        const RECORD_GET_CONCURRENCY: usize = 16;
+        let fetched: Vec<(i32, Option<crate::multipart_state::PartEtags>)> =
+            futures::stream::iter(part_numbers.iter().copied())
+                .map(|pn| async move {
+                    let record_key = crate::mpu_durable::record_key(upload_id, pn);
+                    let Ok(uri) = safe_object_uri(bucket, &record_key) else {
+                        return (pn, None);
+                    };
+                    let get_req = S3Request {
+                        input: GetObjectInput {
+                            bucket: bucket.to_owned(),
+                            key: record_key,
+                            ..Default::default()
+                        },
+                        method: http::Method::GET,
+                        uri,
+                        headers: http::HeaderMap::new(),
+                        extensions: http::Extensions::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                        trailing_headers: None,
+                    };
+                    let body = match self.backend.get_object(get_req).await {
+                        Ok(resp) => match resp.output.body {
+                            Some(blob) => collect_blob(blob, self.max_body_bytes).await.ok(),
+                            None => None,
+                        },
+                        Err(e) => {
+                            // NoSuchKey = the part predates the feature /
+                            // its record PUT was lost — expected, stay
+                            // quiet. Anything else is worth a warn.
+                            if !matches!(e.code(), &S3ErrorCode::NoSuchKey) {
+                                tracing::warn!(
+                                    bucket,
+                                    upload_id,
+                                    part_number = pn,
+                                    "S4 durable multipart state: record GET failed, \
+                                     part treated as unrecorded: {e}"
+                                );
+                            }
+                            None
+                        }
+                    };
+                    let parsed = body.and_then(|b| {
+                        crate::mpu_durable::DurablePartRecord::decode(&b, upload_id, pn)
+                    });
+                    (
+                        pn,
+                        parsed.map(|r| crate::multipart_state::PartEtags {
+                            original_md5: r.original_md5,
+                            backend_etag: r.backend_etag,
+                        }),
+                    )
+                })
+                .buffer_unordered(RECORD_GET_CONCURRENCY)
+                .collect()
+                .await;
+        fetched
+            .into_iter()
+            .filter_map(|(pn, pe)| pe.map(|p| (pn, p)))
+            .collect()
+    }
+
+    /// Durable multipart state: best-effort delete of every record
+    /// under `.s4mpu/<hex(uploadId)>/`. Called after a SUCCESSFUL
+    /// backend Complete/Abort; failures are logged and left for the
+    /// `s4 maintain` `mpu-state-gc` action to reap.
+    async fn cleanup_durable_mpu_records(&self, bucket: &str, upload_id: &str) {
+        let prefix = crate::mpu_durable::upload_prefix(upload_id);
+        let mut continuation: Option<String> = None;
+        loop {
+            let Ok(list_uri) = safe_object_uri(bucket, &prefix) else {
+                return;
+            };
+            let list_req = S3Request {
+                input: ListObjectsV2Input {
+                    bucket: bucket.to_owned(),
+                    prefix: Some(prefix.clone()),
+                    continuation_token: continuation.clone(),
+                    ..Default::default()
+                },
+                method: http::Method::GET,
+                uri: list_uri,
+                headers: http::HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            let out = match self.backend.list_objects_v2(list_req).await {
+                Ok(resp) => resp.output,
+                Err(e) => {
+                    tracing::warn!(
+                        bucket,
+                        upload_id,
+                        "S4 durable multipart state: record cleanup LIST failed; \
+                         leftover records will be reaped by `s4 maintain` \
+                         (action = \"mpu-state-gc\"): {e}"
+                    );
+                    return;
+                }
+            };
+            for obj in out.contents.unwrap_or_default() {
+                let Some(k) = obj.key else { continue };
+                let Ok(del_uri) = safe_object_uri(bucket, &k) else {
+                    continue;
+                };
+                let del_req = S3Request {
+                    input: DeleteObjectInput {
+                        bucket: bucket.to_owned(),
+                        key: k.clone(),
+                        ..Default::default()
+                    },
+                    method: http::Method::DELETE,
+                    uri: del_uri,
+                    headers: http::HeaderMap::new(),
+                    extensions: http::Extensions::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                    trailing_headers: None,
+                };
+                if let Err(e) = self.backend.delete_object(del_req).await {
+                    tracing::warn!(
+                        bucket,
+                        upload_id,
+                        record_key = %k,
+                        "S4 durable multipart state: record cleanup DELETE failed; \
+                         leftover record will be reaped by `s4 maintain` \
+                         (action = \"mpu-state-gc\"): {e}"
+                    );
+                }
+            }
+            if !out.is_truncated.unwrap_or(false) {
+                return;
+            }
+            match out.next_continuation_token {
+                Some(t) if Some(&t) != continuation.as_ref() => continuation = Some(t),
+                _ => return,
+            }
+        }
     }
 }
 
@@ -7359,6 +7642,7 @@ impl<B: S3> S3 for S4Service<B> {
                         !k.ends_with(".s4index")
                             && !is_versioning_shadow_key(k)
                             && !crate::dict::is_dict_key(k)
+                            && !crate::mpu_durable::is_mpu_state_key(k)
                     })
                     .unwrap_or(true)
             });
@@ -7384,6 +7668,7 @@ impl<B: S3> S3 for S4Service<B> {
                         !k.ends_with(".s4index")
                             && !is_versioning_shadow_key(k)
                             && !crate::dict::is_dict_key(k)
+                            && !crate::mpu_durable::is_mpu_state_key(k)
                     })
                     .unwrap_or(true)
             });
@@ -7478,6 +7763,7 @@ impl<B: S3> S3 for S4Service<B> {
                         !k.ends_with(".s4index")
                             && !is_versioning_shadow_key(k)
                             && !crate::dict::is_dict_key(k)
+                            && !crate::mpu_durable::is_mpu_state_key(k)
                     })
                     .unwrap_or(true)
             });
@@ -7490,6 +7776,7 @@ impl<B: S3> S3 for S4Service<B> {
                         !k.ends_with(".s4index")
                             && !is_versioning_shadow_key(k)
                             && !crate::dict::is_dict_key(k)
+                            && !crate::mpu_durable::is_mpu_state_key(k)
                     })
                     .unwrap_or(true)
             });
@@ -7934,8 +8221,23 @@ impl<B: S3> S3 for S4Service<B> {
                         upload_id.as_str(),
                         part_number,
                         original_md5.clone(),
-                        backend_etag,
+                        backend_etag.clone(),
                     );
+                    // Durable multipart state: persist the same pair to
+                    // the backend so a restarted / different gateway can
+                    // complete with the full composite (best-effort —
+                    // see the helper).
+                    if self.durable_multipart_state {
+                        self.write_durable_part_record(
+                            &part_bucket,
+                            &part_key,
+                            upload_id.as_str(),
+                            part_number,
+                            &original_md5,
+                            &backend_etag,
+                        )
+                        .await;
+                    }
                 }
                 // The client receives the logical (original-bytes) ETag.
                 resp.output.e_tag = Some(ETag::Strong(original_md5));
@@ -8049,6 +8351,46 @@ impl<B: S3> S3 for S4Service<B> {
             self.multipart_state.get_parts(upload_id.as_str())
         } else {
             None
+        };
+        // Durable multipart state: for manifest parts the in-memory map
+        // does NOT hold (gateway restarted mid-upload, or the part went
+        // through a different instance), fetch the `.s4mpu/` records
+        // this — or any other — gateway persisted at UploadPart time and
+        // merge them under the in-memory map (in-memory wins; see
+        // `mpu_durable::merge_parts`). With a full merged map, Complete
+        // computes the same client-transparent composite and applies the
+        // same strict part-ETag validation a single surviving gateway
+        // would. Records that are missing / unreadable degrade those
+        // parts to the pre-durable behaviour: ListParts reverse-map, no
+        // composite stamp.
+        let logical_parts = if self.logical_etag && self.durable_multipart_state {
+            // `BTreeSet` dedups repeated part numbers (an invalid-but-
+            // possible manifest shape must not multiply the record GETs).
+            let missing: Vec<i32> = req
+                .input
+                .multipart_upload
+                .as_ref()
+                .and_then(|mp| mp.parts.as_ref())
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|p| p.part_number)
+                        .filter(|pn| logical_parts.as_ref().is_none_or(|m| !m.contains_key(pn)))
+                        .collect::<std::collections::BTreeSet<i32>>()
+                        .into_iter()
+                        .collect()
+                })
+                .unwrap_or_default();
+            if missing.is_empty() {
+                logical_parts
+            } else {
+                let durable = self
+                    .read_durable_part_records(&bucket, upload_id.as_str(), &missing)
+                    .await;
+                crate::mpu_durable::merge_parts(logical_parts, durable)
+            }
+        } else {
+            logical_parts
         };
         // Authoritative `part_number -> backend_etag` from the backend's
         // ListParts (paged). `None` = ListParts unavailable ⇒ fall back to the
@@ -8176,6 +8518,16 @@ impl<B: S3> S3 for S4Service<B> {
         // ctx post-processing block below also clears it; this is the
         // explicit, ctx-independent success-path drop.
         self.multipart_state.drop_parts(upload_id.as_str());
+        // Durable multipart state: the upload is committed, so its
+        // `.s4mpu/` records are dead weight — best-effort delete (a
+        // failure is logged inside the helper and left for the
+        // `mpu-state-gc` maintain action). Deliberately AFTER the
+        // backend Complete `?` above: a failed Complete keeps the
+        // records so the client's retry can still merge them.
+        if self.logical_etag && self.durable_multipart_state {
+            self.cleanup_durable_mpu_records(&bucket, upload_id.as_str())
+                .await;
+        }
         // CompleteMultipartUpload 成功 → 完成した object を full fetch して frame
         // index を build、`<key>.s4index` sidecar として保存。これで Range GET の
         // partial fetch path が利用可能になる (Range request の帯域節約)。
@@ -8968,6 +9320,14 @@ impl<B: S3> S3 for S4Service<B> {
         // (`remove` above already clears it; this is the explicit
         // abort-path cleanup the design calls for.)
         self.multipart_state.drop_parts(&upload_id);
+        // Durable multipart state: reap the aborted upload's `.s4mpu/`
+        // records (best-effort; same after-backend-success ordering as
+        // the in-memory cleanup above so a failed Abort keeps the
+        // records for a clean client retry).
+        if self.logical_etag && self.durable_multipart_state {
+            self.cleanup_durable_mpu_records(&abort_bucket, &upload_id)
+                .await;
+        }
         Ok(resp)
     }
     async fn list_multipart_uploads(
@@ -9206,8 +9566,22 @@ impl<B: S3> S3 for S4Service<B> {
                         copy_upload_id.as_str(),
                         part_number,
                         backend_etag.clone(),
-                        backend_etag,
+                        backend_etag.clone(),
                     );
+                    // Durable multipart state: same persistence as
+                    // `upload_part` (original_md5 == backend_etag for a
+                    // byte-for-byte copied raw part).
+                    if self.durable_multipart_state {
+                        self.write_durable_part_record(
+                            &dst_bucket,
+                            &dst_key,
+                            copy_upload_id.as_str(),
+                            part_number,
+                            &backend_etag,
+                            &backend_etag,
+                        )
+                        .await;
+                    }
                 }
                 return Ok(resp);
             }
@@ -9341,8 +9715,21 @@ impl<B: S3> S3 for S4Service<B> {
                         req.input.upload_id.as_str(),
                         req.input.part_number,
                         original_md5.clone(),
-                        backend_etag,
+                        backend_etag.clone(),
                     );
+                    // Durable multipart state: same persistence as
+                    // `upload_part` for the re-framed copied part.
+                    if self.durable_multipart_state {
+                        self.write_durable_part_record(
+                            &dst_bucket,
+                            &dst_key,
+                            req.input.upload_id.as_str(),
+                            req.input.part_number,
+                            &original_md5,
+                            &backend_etag,
+                        )
+                        .await;
+                    }
                 }
                 Some(ETag::Strong(original_md5))
             }
@@ -11462,6 +11849,34 @@ mod tests {
         assert!(
             svc.check_not_reserved_key("normal/key.json", ReservedKeyMode::Mutating)
                 .is_ok()
+        );
+    }
+
+    /// Durable multipart state: gateway-side mutations of `.s4mpu/…`
+    /// record keys are rejected (a client PUT could forge a part's
+    /// original-MD5 record and skew a later Complete's composite /
+    /// validation), while reads stay passthrough — same posture as the
+    /// `.s4dict/` prefix.
+    #[test]
+    fn reserved_key_guard_blocks_mpu_state_prefix_mutations() {
+        struct NullBackend;
+        impl S3 for NullBackend {}
+        let svc = S4Service::new(
+            NullBackend,
+            Arc::new(CodecRegistry::new(CodecKind::CpuZstd)),
+            Arc::new(s4_codec::dispatcher::AlwaysDispatcher(CodecKind::CpuZstd)),
+        );
+        let err = svc
+            .check_not_reserved_key(".s4mpu/6d70752d31/1", ReservedKeyMode::Mutating)
+            .expect_err("mutating an mpu state record must be rejected");
+        assert!(
+            format!("{err:?}").contains("reserved"),
+            "error must explain the reserved prefix: {err:?}"
+        );
+        assert!(
+            svc.check_not_reserved_key(".s4mpu/6d70752d31/1", ReservedKeyMode::Read)
+                .is_ok(),
+            "reading an mpu state record stays passthrough (content fingerprints only)"
         );
     }
 

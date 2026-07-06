@@ -11,7 +11,7 @@ rows you need.
 | Surface | Status | Notes |
 |---|---|---|
 | PUT / GET object | ✅ Full | single-PUT + range-GET (see below). **Client-transparent ETag** = `MD5(original)` by default (see [§ Client transparency](#client-transparency-compression-is-invisible-to-the-client)) |
-| Multipart upload (create / part / complete / abort) | ✅ Full | per-part framing + final-part padding trim. Composite object ETag is the AWS `MD5(concat(original-part-MD5s))-N` form — **best-effort** (see § Client transparency) |
+| Multipart upload (create / part / complete / abort) | ✅ Full | per-part framing + final-part padding trim. Composite object ETag is the AWS `MD5(concat(original-part-MD5s))-N` form — held across restart / multi-gateway via durable per-part state records (default; see § Client transparency) |
 | HEAD object | ✅ Full | returns the **original** `Content-Length` and the client-transparent ETag; S4's `s4-*` control metadata is not exposed |
 | Range GET | ✅ S3 spec | `bytes=N-M`, `bytes=-N` (suffix), `bytes=N-` (open-ended); range maps through the S4IX sidecar; `s4-*` stripped + logical ETag echoed on the partial response |
 | Conditional GET / PUT / Copy (`If-Match` / `If-None-Match` / `If-Modified-Since`) | ✅ read-path full; write-path best-effort | read-path is fully evaluated against the logical ETag. Write-path (`If-Match` on PUT, `x-amz-copy-source-if-*` on Copy) is evaluated against the logical ETag too, but **non-atomically** (HEAD-then-write) — see § Client transparency |
@@ -47,23 +47,53 @@ upload integrity (AWS SDK v2, OpenSearch `repository-s3`, …) work unchanged.
 | **Single-object ETag** (PUT / HEAD / GET) | `MD5(original payload)` — what a client computes from the bytes it uploaded/downloaded | `--physical-passthrough` presents the backend's compressed-object ETag instead |
 | **Content-Length & GET body** | the original (decompressed) size / bytes | — |
 | **`s4-*` control metadata** | stripped from GET / HEAD (incl. Range GET) responses | use a direct backend read to inspect S4's internal markers |
-| **Multipart composite ETag** | AWS `MD5(concat(original-part-MD5s))-N` — **best-effort** (see below) | `--physical-passthrough` keeps the backend composite |
+| **Multipart composite ETag** | AWS `MD5(concat(original-part-MD5s))-N`, backed by **durable per-part state records** (`.s4mpu/…` on the backend) so it survives restart / multi-gateway (see below) | `--no-durable-multipart-state` restores in-memory-only best-effort; `--physical-passthrough` keeps the backend composite |
 | **`ListObjects(V2)` Size & ETag** | the **original** size + logical ETag, matching HEAD/GET (v1.4.1+; resolved via bounded-concurrency backend HEADs, N+1) | **`--physical-listings`** opts out (backend compressed size + ETag, the v1.4.0 behavior, max list throughput); `--accurate-list-size` remains as a deprecated no-op alias |
 | **Write-path `If-Match` / `If-None-Match`** (PUT) and **`x-amz-copy-source-if-*`** (Copy) | evaluated by S4 against the logical ETag | **non-atomic** (HEAD-then-write); a concurrent writer between the check and the write is not serialised — run conditional writes on cold / quiescent keys. A non-404 backend HEAD error fails the write (never silently proceeds) |
 
-**Multipart composite ETag is best-effort.** Computing the AWS composite needs
-every part's original-payload MD5, which S4 records in **in-memory** per-upload
-state. When the full set is present (single gateway, state survived) the object
-gets the client-transparent composite, stamped so HEAD/GET return it. When it is
-not — a **gateway restart mid-upload** or a **multi-gateway deployment** where
-parts landed on different instances — `CompleteMultipartUpload` still **succeeds**
-(parts are reverse-mapped authoritatively via the backend's `ListParts` by part
-number), but the object keeps the **backend** composite ETag with no logical
-stamp, and HEAD / GET / List return that same value consistently. In that
-recovery path S4 does not strictly re-validate the client's submitted part ETags
-(it assembles by part number); durable per-part state (which would restore both
-the composite and strict validation everywhere) is a roadmap item. Use
-`--physical-passthrough` if you require uniform backend-ETag behavior.
+**Multipart composite ETag and durable per-part state.** Computing the AWS
+composite needs every part's original-payload MD5. S4 records that twice per
+part: in **in-memory** per-upload state, and — by default — as one small
+**durable state record** on the backend at `.s4mpu/<hex(uploadId)>/<partNumber>`
+(one JSON object per successful `UploadPart` / `UploadPartCopy`; last write per
+part number wins, matching S3 part-overwrite semantics). At
+`CompleteMultipartUpload` the in-memory map is used when complete; any manifest
+part it is missing is filled from the durable records (in-memory wins on
+overlap). A **gateway restarted mid-upload**, or **any instance of a
+multi-gateway deployment**, therefore completes with the same client-transparent
+composite ETag — stamped so HEAD/GET return it — and the same strict part-ETag
+validation as a single surviving gateway. The upload's records are best-effort
+deleted on Complete/Abort; leftovers from crashes are reaped by an `s4 maintain`
+rule with `action = "mpu-state-gc"` (see [ops/maintenance.md](ops/maintenance.md)).
+
+Costs and remaining limitations:
+
+- **Per-part cost**: one extra small backend PUT per part, plus one prefix LIST
+  + per-record DELETE at Complete/Abort. `--no-durable-multipart-state` opts
+  out (no records, no extra requests); `--physical-passthrough` disables
+  per-part state entirely.
+- **The record PUT is best-effort**: a failed record write is logged (grep
+  `S4 durable multipart state` in the gateway logs) and that part silently
+  degrades to the fallback below — the UploadPart itself still succeeds.
+- **Fallback (flag off / pre-upgrade uploads / lost records)**: Complete still
+  **succeeds** — parts are reverse-mapped authoritatively via the backend's
+  `ListParts` by part number — but the object gets **no** logical stamp, and
+  the Complete response / HEAD / GET present **no ETag** for it (the backend's
+  compressed-bytes composite would be meaningless to the client). In that
+  recovery path S4 does not strictly re-validate the client's submitted ETags
+  for the unrecorded parts (it assembles by part number). Uploads **started
+  before an upgrade** to a durable-state build have no records for
+  already-uploaded parts and complete through this same fallback.
+- **SSE multipart**: records carry only content fingerprints (original-payload
+  MD5 + backend part ETag) — **never SSE key material**. The per-upload SSE
+  recipe stays in-memory-only, so an SSE multipart upload still needs its
+  Create and Complete handled by the same live gateway instance for the
+  encrypt-on-Complete post-processing.
+- **Namespace**: `.s4mpu/` keys are hidden from `ListObjects(V2)` /
+  `ListObjectVersions` and blocked for client writes; a direct GET/HEAD of an
+  exact record key passes through to the backend (same posture as `.s4dict/`).
+
+Use `--physical-passthrough` if you require uniform backend-ETag behavior.
 
 **Known minor gaps** (low-impact; mostly upstream of S4):
 - Whitespace-only object keys (`" "` / `"\t"` / `"\n"`) return `500` — emitted by
@@ -154,4 +184,4 @@ S3-API-shape divergences would surface (PutObject without
 - Range GET: full S3 spec (`bytes=N-M`, `bytes=-N`, `bytes=N-`)
 - Multipart: `create_multipart_upload`, `upload_part`, `complete_multipart_upload`, `abort_multipart_upload`, `list_parts`, `list_multipart_uploads`
 - Phase 2 delegations (passthrough): ACL, Tagging, Lifecycle, Versioning, Replication, CORS, Encryption, Logging, Notification, Website, Object Lock, Public Access Block, ...
-- Hidden: `*.s4index` sidecars are filtered from `list_objects[_v2]` responses
+- Hidden: `*.s4index` sidecars and `.s4mpu/` durable multipart state records are filtered from `list_objects[_v2]` responses

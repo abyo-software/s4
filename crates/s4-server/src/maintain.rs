@@ -11,7 +11,7 @@
 //! name = "compress-new-logs"       # required, unique
 //! bucket = "prod-logs"             # required
 //! prefix = "app/"                  # optional
-//! action = "migrate"               # migrate | recompact | transition
+//! action = "migrate"               # migrate | recompact | transition | mpu-state-gc
 //! older-than = "7d"                # optional, all actions
 //!
 //! [[rule]]
@@ -56,6 +56,12 @@
 //!   splits the way a size- or suffix-filtered lifecycle rule can.
 //!   Sidecars are never transitioned on their own — an orphan sidecar
 //!   is `s4 sweep-orphan-sidecars` territory, not ours.
+//! - `mpu-state-gc` reaps durable multipart part-state records
+//!   (`.s4mpu/…`, [`crate::mpu_durable`]) whose upload id no longer
+//!   appears in the backend's `ListMultipartUploads` — the leftovers of
+//!   a gateway that crashed between the backend Complete/Abort and its
+//!   own best-effort record cleanup. Takes no action-specific params;
+//!   `older-than` gates per record (recommended `"24h"`).
 //!
 //! ## Honesty constraints
 //!
@@ -212,6 +218,15 @@ pub enum RuleAction {
     Migrate(MigrateRule),
     Recompact(RecompactRule),
     Transition(TransitionRule),
+    /// GC durable multipart part-state records (`.s4mpu/…`, see
+    /// [`crate::mpu_durable`]) whose upload id no longer appears in the
+    /// backend's `ListMultipartUploads` — i.e. records left behind when
+    /// a gateway crashed between the backend Complete/Abort and its
+    /// best-effort record cleanup. No action-specific params; the
+    /// rule-level `older-than` gate applies per record (recommended:
+    /// `older-than = "24h"`, matching the gateway's in-memory
+    /// abandoned-upload TTL default).
+    MpuStateGc,
 }
 
 impl RuleAction {
@@ -221,6 +236,7 @@ impl RuleAction {
             RuleAction::Migrate(_) => "migrate",
             RuleAction::Recompact(_) => "recompact",
             RuleAction::Transition(_) => "transition",
+            RuleAction::MpuStateGc => "mpu-state-gc",
         }
     }
 }
@@ -448,9 +464,22 @@ pub fn parse_policy(text: &str) -> Result<MaintainPolicy, MaintainError> {
                     }
                 }
             }
+            Some("mpu-state-gc") => {
+                reject_inapplicable("mpu-state-gc", &[]);
+                // `prefix` is not in `set_keys` (it is a common rule
+                // field), but it makes no sense here: the records all
+                // live under the reserved `.s4mpu/` prefix.
+                if r.prefix.is_some() {
+                    errors.push(format!(
+                        "{label}: key `prefix` does not apply to action = \"mpu-state-gc\""
+                    ));
+                }
+                Some(RuleAction::MpuStateGc)
+            }
             Some(other) => {
                 errors.push(format!(
-                    "{label}: unknown action {other:?} (valid: migrate, recompact, transition)"
+                    "{label}: unknown action {other:?} (valid: migrate, recompact, transition, \
+                     mpu-state-gc)"
                 ));
                 None
             }
@@ -1069,6 +1098,280 @@ pub(crate) async fn run_transition(
 }
 
 // ---------------------------------------------------------------------------
+// mpu-state-gc action
+// ---------------------------------------------------------------------------
+
+/// One per-record hard failure during an mpu-state-gc rule.
+#[derive(Debug, Clone, Serialize)]
+pub struct MpuStateGcFailure {
+    pub key: String,
+    pub op: String,
+    pub cause: String,
+}
+
+/// Full result of one `mpu-state-gc` rule. Serializes into the maintain
+/// `--format json` output verbatim.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct MpuStateGcReport {
+    pub bucket: String,
+    /// `true` = nothing was deleted (default mode).
+    pub dry_run: bool,
+    /// `older-than` cutoff in seconds (`null` = no age filter).
+    pub older_than_secs: Option<u64>,
+    /// Record objects listed under the `.s4mpu/` reserved prefix.
+    pub records_listed: u64,
+    /// Distinct in-flight uploads the backend's `ListMultipartUploads`
+    /// reported (records of these are always kept).
+    pub live_uploads: u64,
+    /// Records whose upload id is not in flight anymore (dry-run: would
+    /// delete; execute: attempted delete).
+    pub orphaned: u64,
+    /// Records actually deleted (execute mode only).
+    pub deleted: u64,
+    /// Orphaned records younger than the `older-than` cutoff — kept for
+    /// this run (also counts records without a `LastModified`, which
+    /// are conservatively treated as too recent when a cutoff is set).
+    pub skipped_too_recent: u64,
+    /// Keys under `.s4mpu/` that do not parse as record keys — left in
+    /// place and reported instead of deleted blindly.
+    pub skipped_unparseable: u64,
+    pub failed: u64,
+    /// Per-key failure details, sorted by key.
+    pub failures: Vec<MpuStateGcFailure>,
+    pub notes: Vec<String>,
+}
+
+/// What an mpu-state-gc rule decided for one `.s4mpu/` record key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MpuGcDecision {
+    /// Not a well-formed record key — leave in place, report.
+    Unparseable,
+    /// The upload is still in flight — keep.
+    Live,
+    /// Orphaned but younger than the cutoff — keep this run.
+    TooRecent,
+    /// Orphaned and old enough — delete.
+    Orphaned,
+}
+
+/// Pure per-record decision. `live_upload_ids` is the
+/// `ListMultipartUploads` snapshot taken AFTER the record listing:
+/// every listed record's upload predates that snapshot, so an upload
+/// absent from it has genuinely finished (or was aborted) — its records
+/// are safe to reap. Age gating reuses `recompact`'s conservative
+/// "unknown age = too recent" semantics.
+pub(crate) fn classify_mpu_record(
+    key: &str,
+    live_upload_ids: &std::collections::HashSet<String>,
+    last_modified_epoch_secs: Option<i64>,
+    cutoff_epoch_secs: Option<i64>,
+) -> MpuGcDecision {
+    let Some((upload_id, _part_number)) = crate::mpu_durable::parse_record_key(key) else {
+        return MpuGcDecision::Unparseable;
+    };
+    if live_upload_ids.contains(&upload_id) {
+        return MpuGcDecision::Live;
+    }
+    if crate::recompact::is_too_recent(last_modified_epoch_secs, cutoff_epoch_secs) {
+        return MpuGcDecision::TooRecent;
+    }
+    MpuGcDecision::Orphaned
+}
+
+/// One listed `.s4mpu/` record object.
+struct MpuRecordObject {
+    key: String,
+    last_modified_epoch_secs: Option<i64>,
+}
+
+/// Paginate `ListObjectsV2` over the `.s4mpu/` reserved prefix.
+async fn list_mpu_records(
+    client: &Client,
+    bucket: &str,
+) -> Result<Vec<MpuRecordObject>, MaintainError> {
+    let mut records: Vec<MpuRecordObject> = Vec::new();
+    let mut continuation: Option<String> = None;
+    loop {
+        let mut req = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(crate::mpu_durable::MPU_STATE_PREFIX);
+        if let Some(c) = continuation.as_ref() {
+            req = req.continuation_token(c);
+        }
+        let resp = req.send().await.map_err(|e| MaintainError::Backend {
+            op: "ListObjectsV2",
+            bucket: bucket.into(),
+            key: String::new(),
+            cause: format!("{e}"),
+        })?;
+        for obj in resp.contents() {
+            let Some(k) = obj.key() else { continue };
+            records.push(MpuRecordObject {
+                key: k.to_owned(),
+                last_modified_epoch_secs: obj.last_modified().map(|t| t.secs()),
+            });
+        }
+        if resp.is_truncated().unwrap_or(false) {
+            continuation = resp.next_continuation_token().map(str::to_owned);
+            if continuation.is_none() {
+                // Defensive: truncated response without a continuation
+                // token is a backend bug; bail rather than infinite-loop.
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    Ok(records)
+}
+
+/// Paginate `ListMultipartUploads` into the set of in-flight upload
+/// ids.
+async fn list_live_upload_ids(
+    client: &Client,
+    bucket: &str,
+) -> Result<std::collections::HashSet<String>, MaintainError> {
+    let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut key_marker: Option<String> = None;
+    let mut upload_id_marker: Option<String> = None;
+    loop {
+        let mut req = client.list_multipart_uploads().bucket(bucket);
+        if let Some(k) = key_marker.as_ref() {
+            req = req.key_marker(k);
+        }
+        if let Some(u) = upload_id_marker.as_ref() {
+            req = req.upload_id_marker(u);
+        }
+        let resp = req.send().await.map_err(|e| MaintainError::Backend {
+            op: "ListMultipartUploads",
+            bucket: bucket.into(),
+            key: String::new(),
+            cause: format!("{e}"),
+        })?;
+        for upload in resp.uploads() {
+            if let Some(id) = upload.upload_id() {
+                live.insert(id.to_owned());
+            }
+        }
+        if resp.is_truncated().unwrap_or(false) {
+            key_marker = resp.next_key_marker().map(str::to_owned);
+            upload_id_marker = resp.next_upload_id_marker().map(str::to_owned);
+            if key_marker.is_none() && upload_id_marker.is_none() {
+                // Defensive, same as the record listing above.
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    Ok(live)
+}
+
+/// Execute one `mpu-state-gc` rule: list the `.s4mpu/` records FIRST,
+/// then snapshot the in-flight uploads (this order makes the
+/// classification race-free — see [`classify_mpu_record`]), then delete
+/// each orphaned record (dry-run: count only).
+pub(crate) async fn run_mpu_state_gc(
+    client: &Client,
+    bucket: &str,
+    older_than: Option<Duration>,
+    execute: bool,
+) -> Result<MpuStateGcReport, MaintainError> {
+    let cutoff = cutoff_epoch_secs(older_than);
+    // Record listing BEFORE the upload snapshot — see the doc above.
+    let records = list_mpu_records(client, bucket).await?;
+    let live = list_live_upload_ids(client, bucket).await?;
+
+    let mut report = MpuStateGcReport {
+        bucket: bucket.to_owned(),
+        dry_run: !execute,
+        older_than_secs: older_than.map(|d| d.as_secs()),
+        records_listed: records.len() as u64,
+        live_uploads: live.len() as u64,
+        orphaned: 0,
+        deleted: 0,
+        skipped_too_recent: 0,
+        skipped_unparseable: 0,
+        failed: 0,
+        failures: Vec::new(),
+        notes: Vec::new(),
+    };
+
+    for rec in &records {
+        match classify_mpu_record(&rec.key, &live, rec.last_modified_epoch_secs, cutoff) {
+            MpuGcDecision::Live => {}
+            MpuGcDecision::TooRecent => report.skipped_too_recent += 1,
+            MpuGcDecision::Unparseable => report.skipped_unparseable += 1,
+            MpuGcDecision::Orphaned => {
+                report.orphaned += 1;
+                if !execute {
+                    continue;
+                }
+                match client
+                    .delete_object()
+                    .bucket(bucket)
+                    .key(&rec.key)
+                    .send()
+                    .await
+                {
+                    Ok(_) => report.deleted += 1,
+                    Err(e) => {
+                        report.failed += 1;
+                        report.failures.push(MpuStateGcFailure {
+                            key: rec.key.clone(),
+                            op: "DeleteObject".to_owned(),
+                            cause: format!("{e}"),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    report.failures.sort_by(|a, b| a.key.cmp(&b.key));
+
+    if report.records_listed == 0 {
+        report.notes.push(format!(
+            "no records found under the `{}` prefix",
+            crate::mpu_durable::MPU_STATE_PREFIX,
+        ));
+    }
+    if report.dry_run {
+        report.notes.push(
+            "dry-run: nothing was deleted; counts are selected from the live listing — pass \
+             --execute to reap"
+                .into(),
+        );
+    }
+    report.notes.push(
+        "a record is orphaned when its upload id is absent from the backend's \
+         ListMultipartUploads (snapshotted after the record listing, so an upload that was \
+         still in flight when its records were listed is never mis-classified); the gateway \
+         normally deletes records itself on Complete/Abort — this rule reaps what crashes \
+         left behind"
+            .into(),
+    );
+    if report.skipped_unparseable > 0 {
+        report.notes.push(format!(
+            "{} key(s) under the reserved prefix did not parse as record keys and were left \
+             in place — inspect them manually",
+            report.skipped_unparseable,
+        ));
+    }
+    if report.failed > 0 {
+        report.notes.push(format!(
+            "{} record(s) failed to delete — see `failures`; re-running resumes \
+             automatically (still-orphaned records are re-selected)",
+            report.failed,
+        ));
+    }
+
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------------
 // maintain engine
 // ---------------------------------------------------------------------------
 
@@ -1113,6 +1416,9 @@ pub enum RuleOutcome {
     Transition {
         report: TransitionReport,
     },
+    MpuStateGc {
+        report: MpuStateGcReport,
+    },
     /// The rule aborted before producing a report (listing failure,
     /// backend unreachable, …). Later rules still run.
     Error {
@@ -1128,6 +1434,7 @@ impl RuleOutcome {
             RuleOutcome::Migrate { report, .. } => report.failed > 0,
             RuleOutcome::Recompact { report } => report.failed > 0,
             RuleOutcome::Transition { report } => report.failed > 0,
+            RuleOutcome::MpuStateGc { report } => report.failed > 0,
             RuleOutcome::Error { .. } => true,
         }
     }
@@ -1272,6 +1579,15 @@ pub async fn run_maintain(
                     },
                 }
             }
+            RuleAction::MpuStateGc => {
+                match run_mpu_state_gc(client, &rule.bucket, rule.older_than, params.execute).await
+                {
+                    Ok(report) => RuleOutcome::MpuStateGc { report },
+                    Err(e) => RuleOutcome::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
         };
         report.rules_run += 1;
         if outcome.failed() {
@@ -1315,7 +1631,7 @@ pub async fn run_maintain(
     if report.rules_failed > 0 {
         report.notes.push(format!(
             "{} rule(s) failed — see the per-rule reports; re-running resumes \
-             automatically (all three actions are idempotent)",
+             automatically (all actions are idempotent)",
             report.rules_failed,
         ));
     }
@@ -1394,6 +1710,65 @@ pub fn render_transition_human(report: &TransitionReport) -> String {
     out
 }
 
+/// Render one mpu-state-gc report for `--format table`, same shape
+/// family as [`render_transition_human`].
+pub fn render_mpu_state_gc_human(report: &MpuStateGcReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let mode = if report.dry_run {
+        "dry-run (pass --execute to reap)"
+    } else {
+        "execute"
+    };
+    let _ = writeln!(out, "S4 mpu-state-gc {} — {mode}", report.bucket);
+    if let Some(secs) = report.older_than_secs {
+        let _ = writeln!(
+            out,
+            "  older-than: {}",
+            crate::recompact::human_duration_secs(secs)
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  records: {}   live uploads: {}",
+        report.records_listed, report.live_uploads,
+    );
+    let verb = if report.dry_run {
+        "would delete"
+    } else {
+        "deleted"
+    };
+    let _ = writeln!(
+        out,
+        "  orphaned: {}   {verb}: {}",
+        report.orphaned,
+        if report.dry_run {
+            report.orphaned
+        } else {
+            report.deleted
+        },
+    );
+    let _ = writeln!(
+        out,
+        "  skipped: {} too-recent, {} unparseable",
+        report.skipped_too_recent, report.skipped_unparseable,
+    );
+    let _ = writeln!(out, "  failed: {}", report.failed);
+    if !report.failures.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Failures:");
+        for f in &report.failures {
+            let _ = writeln!(out, "  - {} [{}]: {}", f.key, f.op, f.cause);
+        }
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Notes:");
+    for n in &report.notes {
+        let _ = writeln!(out, "  - {n}");
+    }
+    out
+}
+
 /// Render the full maintain run for `--format table`: a one-line run
 /// header, one titled section per rule (embedding the action's own
 /// human renderer), and the run-level notes.
@@ -1448,6 +1823,9 @@ pub fn render_human(report: &MaintainReport) -> String {
             }
             RuleOutcome::Transition { report } => {
                 out.push_str(&render_transition_human(report));
+            }
+            RuleOutcome::MpuStateGc { report } => {
+                out.push_str(&render_mpu_state_gc_human(report));
             }
             RuleOutcome::Error { message } => {
                 let _ = writeln!(out, "  ERROR: {message}");
@@ -1888,5 +2266,93 @@ older-than = "soon"
             "NoSuchKey"
         ));
         assert!(!copy_error_is_precondition(None, None, "timeout"));
+    }
+
+    /// `action = "mpu-state-gc"` parses with the rule-level common
+    /// fields (name / bucket / older-than) and no action params.
+    #[test]
+    fn mpu_state_gc_action_parses() {
+        let policy = parse_policy(
+            r#"
+[[rule]]
+name = "reap-mpu-state"
+bucket = "prod-logs"
+action = "mpu-state-gc"
+older-than = "24h"
+"#,
+        )
+        .expect("valid mpu-state-gc policy");
+        assert_eq!(policy.rules.len(), 1);
+        let r = &policy.rules[0];
+        assert_eq!(r.name, "reap-mpu-state");
+        assert_eq!(r.bucket, "prod-logs");
+        assert_eq!(r.older_than, Some(Duration::from_secs(24 * 3600)));
+        assert!(matches!(r.action, RuleAction::MpuStateGc));
+        assert_eq!(r.action.as_str(), "mpu-state-gc");
+    }
+
+    /// Action params from other rules (and the common `prefix` field,
+    /// which is meaningless for the reserved `.s4mpu/` namespace) are
+    /// rejected on an mpu-state-gc rule.
+    #[test]
+    fn mpu_state_gc_rejects_inapplicable_keys() {
+        let errors = invalid_errors(
+            r#"
+[[rule]]
+name = "x"
+bucket = "b"
+prefix = "app/"
+action = "mpu-state-gc"
+storage-class = "GLACIER_IR"
+concurrency = 8
+"#,
+        );
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert!(errors.iter().any(|e| e.contains("`storage-class`")));
+        assert!(errors.iter().any(|e| e.contains("`concurrency`")));
+        assert!(errors.iter().any(|e| e.contains("`prefix`")));
+    }
+
+    /// Pure per-record GC decision: live uploads keep their records,
+    /// unparseable keys are never deleted, the `older-than` gate holds
+    /// back young (or unknown-age) orphans, and only old orphans reap.
+    #[test]
+    fn mpu_gc_classification() {
+        let live: std::collections::HashSet<String> =
+            std::collections::HashSet::from(["upload-live".to_owned()]);
+        let live_key = crate::mpu_durable::record_key("upload-live", 1);
+        let orphan_key = crate::mpu_durable::record_key("upload-done", 2);
+
+        // Live upload ⇒ keep, regardless of age.
+        assert_eq!(
+            classify_mpu_record(&live_key, &live, Some(0), Some(1_000)),
+            MpuGcDecision::Live
+        );
+        // Garbage under the prefix ⇒ report, never delete.
+        assert_eq!(
+            classify_mpu_record(".s4mpu/not-hex/1", &live, Some(0), None),
+            MpuGcDecision::Unparseable
+        );
+        // Orphan younger than the cutoff ⇒ kept this run.
+        assert_eq!(
+            classify_mpu_record(&orphan_key, &live, Some(2_000), Some(1_000)),
+            MpuGcDecision::TooRecent
+        );
+        // Orphan with unknown age under an active cutoff ⇒ conservative
+        // keep (same rule as recompact's age gate).
+        assert_eq!(
+            classify_mpu_record(&orphan_key, &live, None, Some(1_000)),
+            MpuGcDecision::TooRecent
+        );
+        // Old orphan ⇒ reap.
+        assert_eq!(
+            classify_mpu_record(&orphan_key, &live, Some(500), Some(1_000)),
+            MpuGcDecision::Orphaned
+        );
+        // No cutoff configured ⇒ every orphan reaps immediately.
+        assert_eq!(
+            classify_mpu_record(&orphan_key, &live, None, None),
+            MpuGcDecision::Orphaned
+        );
     }
 }

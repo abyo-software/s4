@@ -232,7 +232,7 @@ into a single declarative TOML policy that also adds a third action,
 name = "compress-new-logs"        # required, unique
 bucket = "prod-logs"              # required
 prefix = "app/"                   # optional
-action = "migrate"                # migrate | recompact | transition
+action = "migrate"                # migrate | recompact | transition | mpu-state-gc
 older-than = "7d"                 # optional age gate, all actions
 
 [[rule]]
@@ -250,6 +250,12 @@ prefix = "app/"
 action = "transition"
 older-than = "90d"
 storage-class = "GLACIER_IR"      # required for transition
+
+[[rule]]
+name = "reap-mpu-state"
+bucket = "prod-logs"
+action = "mpu-state-gc"           # no action params; prefix does not apply
+older-than = "24h"                # keep young orphans one more cycle
 ```
 
 ```bash
@@ -288,6 +294,20 @@ report notes): a backend-SSE original is re-encrypted under the bucket
 default key, and a multipart-uploaded original becomes single-part
 (backend recomputes the checksum, the ETag changes, and an existing
 sidecar's ETag binding falls back to full-read until the next rewrite).
+
+The `mpu-state-gc` action reaps the gateway's **durable multipart
+part-state records** (`.s4mpu/<hex(uploadId)>/<partNumber>` — see
+[`../features.md`](../features.md#durable-multipart-state)): a record
+is orphaned when its upload id no longer appears in the backend's
+`ListMultipartUploads`. The gateway normally deletes its records
+itself on Complete/Abort — this rule reaps what crashes left behind.
+The record listing is snapshotted **before** the in-flight-upload
+listing, so an upload that was still in flight when its records were
+listed is never mis-classified as orphaned; `older-than` (recommended
+`"24h"`) additionally keeps young orphans for a later cycle
+(`too-recent`, with unknown-age records conservatively kept). Keys
+under the reserved prefix that do not parse as record keys are left in
+place and counted `unparseable` instead of deleted blindly.
 
 Example run against MinIO (the `maintain_minio` e2e seed shape: two
 plain text logs under `app/`, one zstd-3-framed log under `archive/`).
@@ -331,7 +351,7 @@ Notes:
   - rules run sequentially against the bucket's current state; a dry-run cannot simulate the effects of earlier rules in the same policy (e.g. a transition rule's dry-run does not see the sidecars a preceding migrate rule would create)
 ```
 
-A second `--execute` run skips everything — all three actions are
+A second `--execute` run skips everything — all actions are
 idempotent with no checkpoint file (same run, output verbatim):
 
 ```
@@ -348,7 +368,8 @@ resident mode are logged and the loop keeps cycling (idempotence makes
 the next cycle the retry); in one-shot mode any failed rule exits 1.
 `--format json` emits the full structured report
 (`s4_server::maintain::MaintainReport` serde shape, per-rule
-`MigrateReport` / `RecompactReport` / `TransitionReport` nested).
+`MigrateReport` / `RecompactReport` / `TransitionReport` /
+`MpuStateGcReport` nested).
 
 Honest limitations:
 

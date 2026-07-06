@@ -483,6 +483,24 @@ struct Opt {
     #[clap(long)]
     physical_listings: bool,
 
+    /// Opt out of DURABLE multipart part-state. By default (and only while
+    /// the client-transparent ETag is on, i.e. no `--physical-passthrough`)
+    /// every successful UploadPart / UploadPartCopy also persists that part's
+    /// `(original MD5, backend ETag)` pair as one small JSON object at
+    /// `.s4mpu/<hex(uploadId)>/<partNumber>` in the backend bucket, so a
+    /// RESTARTED gateway — or a DIFFERENT instance of a multi-gateway
+    /// deployment — can still complete the upload with the full
+    /// client-transparent composite ETag and strict part-ETag validation.
+    /// Cost: one extra small backend PUT per part, plus a prefix LIST +
+    /// per-record DELETE on Complete/Abort. With this flag the gateway keeps
+    /// per-part state in memory only (the pre-durable behaviour): Complete
+    /// still succeeds across restart/multi-gateway via the backend's
+    /// ListParts, but the object keeps the backend composite ETag with no
+    /// logical stamp. Orphaned records (gateway crashed mid-cleanup) are
+    /// reaped by `s4 maintain` with an `action = "mpu-state-gc"` rule.
+    #[clap(long = "no-durable-multipart-state")]
+    no_durable_multipart_state: bool,
+
     /// v0.8.5 #84 (audit H-6): max HTTP/1 header buffer size in
     /// bytes. AWS S3 max header size is 8 KiB per header * ~50
     /// headers; 64 KiB total is safe margin. Reject larger to bound
@@ -2357,6 +2375,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // no-op alias for older operators / runbooks.
     let _ = opt.accurate_list_size;
     s4 = s4.with_accurate_list_size(!opt.physical_listings);
+    // Durable multipart part-state records are on by default;
+    // `--no-durable-multipart-state` restores the in-memory-only
+    // per-part state (composite ETag then degrades to best-effort
+    // across restart / multi-gateway).
+    s4 = s4.with_durable_multipart_state(!opt.no_durable_multipart_state);
     info!(
         max_body_bytes = opt.max_body_bytes,
         "S4 max-body-bytes cap (v0.8.19 D-1: now CLI-tunable; default 5 GiB = AWS S3 single-PUT max)"
