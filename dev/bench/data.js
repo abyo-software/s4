@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783319122732,
+  "lastUpdate": 1783319458108,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -21032,6 +21032,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "74f66159749fd77680fc718ab790dd1c12e62034",
+          "message": "feat(codec): standalone s4-codec decoder CLI — offline escape hatch, no gateway required\n\nThe README long claimed an \"s4-codec CLI\" that never existed (caught by\nthe trust-page audit and reworded); this ships the real thing. Three\nsubcommands over the same library paths the gateway/WASM use:\n\n- decode <IN> [-o OUT] [--dict FILE] — S4F2 frame walk, per-frame codec\n  dispatch (passthrough / cpu-zstd / cpu-gzip / cpu-zstd-dict), CRC32C\n  of the original bytes verified per frame; refuses binary→tty; padding\n  (S4P1) skipped; summary on stderr so piped stdout stays byte-pure.\n- inspect <IN> [--json] — per-frame table + totals without decoding\n  (works on GPU-coded objects, which is how you find out they are).\n- index <IN.s4index> [--json] — S4IX sidecar layout (v1/v2/v3 incl.\n  SSE geometry), source-etag binding.\n\nGPU (nvcomp-*/dietgpu) frames and SSE bodies (S4E1–S4E6 magics, KEEP IN\nSYNC with s4-server/src/sse.rs) are hard errors naming the codec and\npointing at the s4 binary — never silently wrong bytes.\n\nDeps: clap only (already a workspace dependency); JSON is hand-\nformatted. wasm32 build of s4-codec-wasm stays green.\n\nTests: 9 CLI integration tests via CARGO_BIN_EXE (roundtrip file+pipe,\ncorrupted CRC → nonzero exit, GPU frame names codec, dict decode,\nindex on real sidecar, tty refusal); s4-codec total 137 passed / 0\nfailed; clippy 0 warnings; fmt clean.\n\nDocs: trust.md §1 leads with the CLI as the simplest escape hatch;\nREADME \"No lock-in\" bullet re-gains \"CLI\" now that it exists;\ninstall.md gains cargo install s4-codec (bin ships with the NEXT\ncrates.io release; current 1.4.1 predates it).\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-06T15:23:04+09:00",
+          "tree_id": "74a40b0c1e0f778555875abe1e8515578c042103",
+          "url": "https://github.com/abyo-software/s4/commit/74f66159749fd77680fc718ab790dd1c12e62034"
+        },
+        "date": 1783319457020,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 53730,
+            "range": "± 3611",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 52574,
+            "range": "± 3576",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 366,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2567848,
+            "range": "± 50756",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 42359774,
+            "range": "± 44180",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192083,
+            "range": "± 1721",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 51524725,
+            "range": "± 791743",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 768225350,
+            "range": "± 2505384",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3062022,
+            "range": "± 9859",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 31075,
+            "range": "± 2244",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 38092,
+            "range": "± 2862",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 376,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 597166,
+            "range": "± 8619",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1557412,
+            "range": "± 35557",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192056,
+            "range": "± 350",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12413409,
+            "range": "± 373788",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 26229910,
+            "range": "± 105865",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3066594,
+            "range": "± 6798",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1525414,
+            "range": "± 13940",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2548100,
+            "range": "± 13524",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 340713856,
+            "range": "± 3616810",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 137,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 7996,
+            "range": "± 151",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 816,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13040,
+            "range": "± 428",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 3196,
+            "range": "± 59",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 24943,
+            "range": "± 480",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 99941,
+            "range": "± 1470",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 598,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4584,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 18166,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 28,
             "range": "± 0",
             "unit": "ns/iter"
           }
