@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-07-06
+
+**v1.5.0 — HA multipart, value-based Marketplace billing, the offline
+decoder CLI, and R2 validation.** Headline: the client-transparent
+multipart composite ETag now survives gateway restarts and multi-gateway
+deployments; a new opt-in Marketplace billing mode meters measured
+savings instead of pod-hours; `s4-codec` becomes a real standalone
+binary; Cloudflare R2 was validated live (with one honest incompatibility
+found, worked around, and fixed via an opt-in mode).
+
+### Added
+
+- **Durable multipart part-state (`.s4mpu/` backend records).**
+  UploadPart / UploadPartCopy persist each part's
+  `(original_md5, backend_etag)` pair as one small JSON record on the
+  backend; CompleteMultipartUpload merges records for parts missing from
+  the in-memory map (in-memory wins), so ANY gateway instance — or a
+  restarted one — completes with the exact client-transparent composite
+  ETag and strict part-ETag validation. Default ON with the
+  client-transparent ETag mode; `--no-durable-multipart-state` opts out.
+  Records carry content fingerprints only (never SSE material); cleanup
+  on Complete/Abort plus a new `s4 maintain` action `mpu-state-gc` for
+  crash leftovers. Stale records (a delayed writer racing a part
+  re-upload) are cross-checked against ListParts and ignored.
+- **`--marketplace-metered-savings` — value-based billing quantity.**
+  The hourly MeterUsage quantity becomes the storage currently avoided
+  on the backend (integer GiB from the savings ledger) instead of the
+  constant 1 pod-hour — pay in proportion to measured savings. Stock
+  semantics ("rent on savings"): backfilled hours bill the quantity
+  captured at that hour; a lost ledger under-meters (customer's favor),
+  never over-meters. SINGLE metering gateway per deployment (boot WARN +
+  chart guard). Requires `--marketplace-usage-dimension` and
+  `--savings-ledger-state-file`. Helm chart 0.4.0 adds the
+  `marketplace.meteredSavings` block (PVC-backed ledger, render-time
+  single-replica guard).
+- **`s4-codec` standalone decoder CLI** (`decode` / `inspect` / `index`):
+  decode S4-framed objects pulled straight off the backend with no
+  gateway anywhere — per-frame CRC32C verified, `--dict` for shared-
+  dictionary frames, `--json` machine output, hard errors (never wrong
+  bytes) for GPU-codec frames and SSE objects. The escape-hatch story in
+  docs/trust.md now leads with it.
+- **`--uniform-multipart-parts`** (opt-in): pad non-final backend parts
+  to a deterministic per-part target so multipart works against backends
+  that require uniform non-trailing part lengths (Cloudflare R2, #143).
+  Trade-off documented: multipart at-rest savings are deferred until a
+  recompact/migrate rewrite.
+- **docs/trust.md** — the "why trust S4 with your data" evidence page:
+  offline escape hatch, byte-integrity design, verification tooling,
+  testing evidence, honest limitations. Linked from the README.
+- **docs/use-cases/s3-compatible-backends.md** (series #6) — MinIO /
+  Cloudflare R2 / Backblaze B2 / Wasabi cost math, provider caveats, and
+  a pre-production validation checklist. R2 section carries live
+  validation results (2026-07-06).
+
+### Fixed
+
+- **Multipart HEAD reported the stored compressed ContentLength** while
+  GET / Range GET reported original sizes (#144, validated on R2 +
+  MinIO). Complete now stamps `s4-original-size`; HEAD falls back to the
+  sidecar for pre-v1.5 objects. A pre-v1.5 SSE multipart object (no
+  stamp, no sidecar) keeps the stored size — documented.
+- **quick-xml 0.37.5 → 0.41.0** (RUSTSEC-2026-0194/0195, two High DoS
+  advisories reachable from request XML). The vendored s3s XML layer was
+  ported to the new entity-reference event model, including a fix for an
+  upstream bug that rejected supplementary-plane character references.
+- **Legacy rustls 0.21 chain dropped** (RUSTSEC-2026-0098/0099/0104,
+  issue #91): the aws-sdk crates' default `rustls` feature pulled the
+  EOL rustls 0.21 / rustls-webpki 0.101 stack alongside the actually-
+  used rustls 0.23 client. `default-features = false` across the aws-sdk
+  dependencies removes it from the lockfile entirely; the CI audit
+  ignore list shrank from 4 entries to 1.
+
+### Known limitations
+
+- Cloudflare R2 without `--uniform-multipart-parts`: multipart uploads
+  with ≥3 parts of mixed compressibility fail at Complete on R2's
+  uniform-part-size rule (#143) — keep client chunk sizes large enough
+  for ≤2 parts, or enable the flag.
+- SSE multipart still requires Create→Complete on one live gateway (the
+  SSE recipe is deliberately never persisted).
+- Metered savings is single-gateway; fleet-accurate aggregation is a
+  documented follow-up.
+
 ## [1.4.1] - 2026-06-24
 
 **v1.4.1 — Marketplace E2E findings closed.** Three regressions surfaced

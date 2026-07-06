@@ -61,7 +61,7 @@ type: application
 #        byte-identical to 0.3.7 (verified with helm template diff).
 version: 0.4.0
 # appVersion tracks the s4-server release shipped on crates.io / ghcr.io.
-appVersion: "1.4.1"
+appVersion: "1.5.0"
 kubeVersion: ">=1.24.0-0"
 home: https://github.com/abyo-software/s4
 sources:
