@@ -26,14 +26,27 @@ Apache-2.0 format**, and the decoders ship independently of the gateway:
   stream another v1.x server has written, in either direction"
   ([stability.md](stability.md)).
 
-**Offline decode, no gateway anywhere** (Python bindings of the same
-Apache-2.0 [`s4-codec`](../crates/s4-codec) crate the gateway uses):
+**Offline decode, no gateway anywhere** — the standalone CLI shipped in
+the same Apache-2.0 [`s4-codec`](../crates/s4-codec) crate the gateway
+uses (per-frame CRC32C verification is always on):
 
 ```bash
-pip install s4-codec
+cargo install s4-codec
 # fetch the raw stored bytes straight from the backend (not through S4)
 aws s3api get-object --endpoint-url https://s3.example.com \
     --bucket my-bucket --key big.log /tmp/big.log.s4f2
+s4-codec decode /tmp/big.log.s4f2 -o /tmp/big.log    # original bytes, CRC32C-verified
+s4-codec inspect /tmp/big.log.s4f2 --json            # per-frame codec / size / CRC table
+s4-codec index /tmp/big.log.s4f2.s4index             # decode the S4IX sidecar layout
+```
+
+(`cpu-zstd-dict` frames take `--dict <FILE>` — the raw dictionary bytes
+stored at `.s4dict/<dict-id>` in the bucket.)
+
+**The same decode from Python** (pip bindings of the same crate):
+
+```bash
+pip install s4-codec
 ```
 
 ```python
@@ -73,9 +86,10 @@ presigned URL with no server in the read path. Shared zstd dictionaries
 
 Honest caveats on the escape hatch:
 
-- The pip / WASM / s4fs decoders cover the CPU codec subset
-  (`passthrough`, `cpu-zstd`, `cpu-gzip`; `cpu-zstd-dict` in the Python
-  paths). GPU-codec (`nvcomp-*`) frames and SSE-encrypted objects
+- The CLI / pip / WASM / s4fs decoders cover the CPU codec subset
+  (`passthrough`, `cpu-zstd`, `cpu-gzip`; `cpu-zstd-dict` in the CLI
+  (`--dict`) and Python paths). GPU-codec (`nvcomp-*`) frames and
+  SSE-encrypted objects
   **raise a hard error rather than decode wrong**; decode those through
   the `s4` binary — which is itself Apache-2.0, so the worst case is
   "run the open-source gateway once to drain", not vendor lock-in.

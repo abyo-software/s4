@@ -5,6 +5,8 @@
 ```bash
 cargo install s4-server                                  # CPU build
 s4 --endpoint-url https://s3.us-east-1.amazonaws.com     # binary is `s4`, not `s4-server`
+cargo install s4-codec                                   # standalone offline decoder CLI
+s4-codec decode stored-object.s4f2 -o original.bin       # decode without any gateway (docs/trust.md §1)
 ```
 
 **Caveats** (v0.8.8, #98):

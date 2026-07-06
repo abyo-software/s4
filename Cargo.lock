@@ -4677,6 +4677,7 @@ dependencies = [
  "async-trait",
  "bolero",
  "bytes",
+ "clap",
  "crc32c",
  "criterion",
  "csv",

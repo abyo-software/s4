@@ -32,6 +32,14 @@ include = [
 [lints]
 workspace = true
 
+# v1.5 escape-hatch CLI (`s4-codec decode / inspect / index`) — standalone
+# offline decoder for S4F2 objects + S4IX sidecars pulled straight off the
+# backend bucket, no gateway required (docs/trust.md §1). CPU codecs only;
+# builds with default features (no GPU deps).
+[[bin]]
+name = "s4-codec"
+path = "src/bin/s4-codec.rs"
+
 [features]
 default = []
 # Opt-in GPU backend via NVIDIA nvCOMP. Requires CUDA toolchain (nvcc) and
@@ -53,6 +61,13 @@ tracing.workspace = true
 serde.workspace = true
 crc32c.workspace = true
 zstd.workspace = true
+# v1.5 escape-hatch CLI (`[[bin]] s4-codec` above). Kept as a plain (non-
+# optional) dependency so `cargo install s4-codec` / `cargo build --bin
+# s4-codec` work with default features — clap 4 compiles cleanly on every
+# target this crate supports, including `wasm32-unknown-unknown`
+# (s4-codec-wasm path-depends on this crate; dependents don't build our
+# bin, but they do share the lib dep graph).
+clap.workspace = true
 # tokio: only `rt` is needed at runtime (spawn_blocking + JoinError). The
 # workspace dep is `features = ["full"]` which drags in mio / sockets / signal
 # and prevents `s4-codec-wasm` (a path-dep on this crate) from building for

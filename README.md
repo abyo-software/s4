@@ -23,7 +23,7 @@ changes is the endpoint URL.
 
 - **No app changes** — same S3 wire protocol, SigV4 auth, and SDK calls; just change `--endpoint-url`. (GET returns the original bytes; `HEAD` reports the stored compressed size, with the original in `x-amz-meta-s4-original-size`.)
 - **Per-object smart codec** — CPU zstd for text/logs, GPU nvCOMP (Bitcomp/zstd/GDeflate) for integer/columnar data, passthrough for already-compressed inputs. You almost never need a GPU.
-- **No lock-in** — stop the gateway and the compressed objects + S4IX sidecars stay S3-native, decodable by the Apache-2.0 `s4-codec` library (`pip` / WASM / Rust). ([format](docs/wire-format.md))
+- **No lock-in** — stop the gateway and the compressed objects + S4IX sidecars stay S3-native, decodable by the Apache-2.0 `s4-codec` CLI / library (`pip` / WASM / Rust). ([format](docs/wire-format.md))
 - **Range GET for framed objects** — sidecar-indexed byte ranges serve Parquet/ORC readers; some SSE / multipart-SSE modes use a buffered fallback.
 
 > ☁️ **Run it on AWS Marketplace — AWS-billed hourly, no app changes:**
