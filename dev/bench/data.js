@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783324495241,
+  "lastUpdate": 1783325057353,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -22162,6 +22162,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "62792a52b75671c85b0fb95d614161a5805d09ba",
+          "message": "fix(server): multipart HEAD reports original ContentLength (#144)\n\nHEAD of a multipart object leaked the stored compressed size while GET\nand Range GET report original sizes on the same object (validated live\non R2 and reproduced on MinIO — backend-agnostic).\n\n- CompleteMultipartUpload now stamps s4-original-size alongside the\n  logical-ETag stamp (self-copy path), sourced from the assembled\n  body's frame walk; the SSE/versioning re-PUT path writes the same\n  stamp un-gated from the ledger flag (it is a HEAD-correctness\n  feature now, not just ledger accounting). The frame scan's gate\n  widened from ledger-only to ledger-or-logical-etag.\n- head_object: for S4 objects without a single-object manifest\n  (multipart / framed-v2), ContentLength comes from the stamp, falling\n  back to the sidecar's total_original_size for pre-v1.5 objects; a\n  pre-v1.5 SSE multipart object (no stamp, no sidecar) keeps the\n  stored size — documented in compatibility.md.\n- Regression test proven failing before the fix; covers both the\n  stamped path and the stamp-stripped sidecar fallback.\n- README line 24 corrected (claimed HEAD reports compressed size — the\n  v1.4 campaign made HEAD transparent); compatibility.md HEAD row now\n  states the multipart mechanics + the honest pre-v1.5 SSE caveat.\n\nCloses #144\n\ns4-server: 746 passed / 0 failed; clippy 0 warnings; fmt clean.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-06T16:56:26+09:00",
+          "tree_id": "fc7085e4565c86e7db13466bec2da1a0dac093d8",
+          "url": "https://github.com/abyo-software/s4/commit/62792a52b75671c85b0fb95d614161a5805d09ba"
+        },
+        "date": 1783325056402,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 55325,
+            "range": "± 3730",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 55826,
+            "range": "± 3204",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 363,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2578841,
+            "range": "± 86129",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 42384449,
+            "range": "± 492845",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192351,
+            "range": "± 275",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 51499062,
+            "range": "± 1116496",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 769600617,
+            "range": "± 1717280",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3104630,
+            "range": "± 18772",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 32216,
+            "range": "± 1994",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 37420,
+            "range": "± 2565",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 375,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 579061,
+            "range": "± 8251",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1626660,
+            "range": "± 28507",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192283,
+            "range": "± 308",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 13566038,
+            "range": "± 363316",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27443507,
+            "range": "± 106677",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3103805,
+            "range": "± 17769",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1529664,
+            "range": "± 29232",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2571705,
+            "range": "± 22784",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 362827986,
+            "range": "± 5225754",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 137,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 7462,
+            "range": "± 67",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 891,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 14161,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 3194,
+            "range": "± 71",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 23049,
+            "range": "± 696",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 95924,
+            "range": "± 2241",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 661,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 5022,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19728,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
             "range": "± 0",
             "unit": "ns/iter"
           }
