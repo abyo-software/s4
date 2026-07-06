@@ -1796,13 +1796,11 @@ impl SerializeContent for AnalyticsS3ExportFileFormat {
 }
 impl<'xml> DeserializeContent<'xml> for AnalyticsS3ExportFileFormat {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"CSV" => Ok(Self::from_static(AnalyticsS3ExportFileFormat::CSV)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -1963,14 +1961,12 @@ impl SerializeContent for BucketAccelerateStatus {
 }
 impl<'xml> DeserializeContent<'xml> for BucketAccelerateStatus {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Enabled" => Ok(Self::from_static(BucketAccelerateStatus::ENABLED)),
                 b"Suspended" => Ok(Self::from_static(BucketAccelerateStatus::SUSPENDED)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -2047,8 +2043,8 @@ impl SerializeContent for BucketLocationConstraint {
 }
 impl<'xml> DeserializeContent<'xml> for BucketLocationConstraint {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"EU" => Ok(Self::from_static(BucketLocationConstraint::EU)),
                 b"af-south-1" => Ok(Self::from_static(BucketLocationConstraint::AF_SOUTH_1)),
@@ -2101,9 +2097,7 @@ impl<'xml> DeserializeContent<'xml> for BucketLocationConstraint {
                 b"us-gov-west-1" => Ok(Self::from_static(BucketLocationConstraint::US_GOV_WEST_1)),
                 b"us-west-1" => Ok(Self::from_static(BucketLocationConstraint::US_WEST_1)),
                 b"us-west-2" => Ok(Self::from_static(BucketLocationConstraint::US_WEST_2)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -2140,15 +2134,13 @@ impl SerializeContent for BucketLogsPermission {
 }
 impl<'xml> DeserializeContent<'xml> for BucketLogsPermission {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"FULL_CONTROL" => Ok(Self::from_static(BucketLogsPermission::FULL_CONTROL)),
                 b"READ" => Ok(Self::from_static(BucketLogsPermission::READ)),
                 b"WRITE" => Ok(Self::from_static(BucketLogsPermission::WRITE)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -2160,13 +2152,11 @@ impl SerializeContent for BucketType {
 }
 impl<'xml> DeserializeContent<'xml> for BucketType {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Directory" => Ok(Self::from_static(BucketType::DIRECTORY)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -2178,14 +2168,12 @@ impl SerializeContent for BucketVersioningStatus {
 }
 impl<'xml> DeserializeContent<'xml> for BucketVersioningStatus {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Enabled" => Ok(Self::from_static(BucketVersioningStatus::ENABLED)),
                 b"Suspended" => Ok(Self::from_static(BucketVersioningStatus::SUSPENDED)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -2565,17 +2553,15 @@ impl SerializeContent for ChecksumAlgorithm {
 }
 impl<'xml> DeserializeContent<'xml> for ChecksumAlgorithm {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"CRC32" => Ok(Self::from_static(ChecksumAlgorithm::CRC32)),
                 b"CRC32C" => Ok(Self::from_static(ChecksumAlgorithm::CRC32C)),
                 b"CRC64NVME" => Ok(Self::from_static(ChecksumAlgorithm::CRC64NVME)),
                 b"SHA1" => Ok(Self::from_static(ChecksumAlgorithm::SHA1)),
                 b"SHA256" => Ok(Self::from_static(ChecksumAlgorithm::SHA256)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -2587,14 +2573,12 @@ impl SerializeContent for ChecksumType {
 }
 impl<'xml> DeserializeContent<'xml> for ChecksumType {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"COMPOSITE" => Ok(Self::from_static(ChecksumType::COMPOSITE)),
                 b"FULL_OBJECT" => Ok(Self::from_static(ChecksumType::FULL_OBJECT)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -2789,15 +2773,13 @@ impl SerializeContent for CompressionType {
 }
 impl<'xml> DeserializeContent<'xml> for CompressionType {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"BZIP2" => Ok(Self::from_static(CompressionType::BZIP2)),
                 b"GZIP" => Ok(Self::from_static(CompressionType::GZIP)),
                 b"NONE" => Ok(Self::from_static(CompressionType::NONE)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -3186,16 +3168,14 @@ impl SerializeContent for DataRedundancy {
 }
 impl<'xml> DeserializeContent<'xml> for DataRedundancy {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"SingleAvailabilityZone" => {
                     Ok(Self::from_static(DataRedundancy::SINGLE_AVAILABILITY_ZONE))
                 }
                 b"SingleLocalZone" => Ok(Self::from_static(DataRedundancy::SINGLE_LOCAL_ZONE)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -3392,14 +3372,12 @@ impl SerializeContent for DeleteMarkerReplicationStatus {
 }
 impl<'xml> DeserializeContent<'xml> for DeleteMarkerReplicationStatus {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Disabled" => Ok(Self::from_static(DeleteMarkerReplicationStatus::DISABLED)),
                 b"Enabled" => Ok(Self::from_static(DeleteMarkerReplicationStatus::ENABLED)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -3448,14 +3426,12 @@ impl SerializeContent for DeleteReplicationStatus {
 }
 impl<'xml> DeserializeContent<'xml> for DeleteReplicationStatus {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Disabled" => Ok(Self::from_static(DeleteReplicationStatus::DISABLED)),
                 b"Enabled" => Ok(Self::from_static(DeleteReplicationStatus::ENABLED)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -3627,13 +3603,11 @@ impl SerializeContent for EncodingType {
 }
 impl<'xml> DeserializeContent<'xml> for EncodingType {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"url" => Ok(Self::from_static(EncodingType::URL)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -3907,14 +3881,12 @@ impl SerializeContent for ExistingObjectReplicationStatus {
 }
 impl<'xml> DeserializeContent<'xml> for ExistingObjectReplicationStatus {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Disabled" => Ok(Self::from_static(ExistingObjectReplicationStatus::DISABLED)),
                 b"Enabled" => Ok(Self::from_static(ExistingObjectReplicationStatus::ENABLED)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -3926,14 +3898,12 @@ impl SerializeContent for ExpirationStatus {
 }
 impl<'xml> DeserializeContent<'xml> for ExpirationStatus {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Disabled" => Ok(Self::from_static(ExpirationStatus::DISABLED)),
                 b"Enabled" => Ok(Self::from_static(ExpirationStatus::ENABLED)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -3945,13 +3915,11 @@ impl SerializeContent for ExpressionType {
 }
 impl<'xml> DeserializeContent<'xml> for ExpressionType {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"SQL" => Ok(Self::from_static(ExpressionType::SQL)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -3963,15 +3931,13 @@ impl SerializeContent for FileHeaderInfo {
 }
 impl<'xml> DeserializeContent<'xml> for FileHeaderInfo {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"IGNORE" => Ok(Self::from_static(FileHeaderInfo::IGNORE)),
                 b"NONE" => Ok(Self::from_static(FileHeaderInfo::NONE)),
                 b"USE" => Ok(Self::from_static(FileHeaderInfo::USE)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -4019,14 +3985,12 @@ impl SerializeContent for FilterRuleName {
 }
 impl<'xml> DeserializeContent<'xml> for FilterRuleName {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"prefix" => Ok(Self::from_static(FilterRuleName::PREFIX)),
                 b"suffix" => Ok(Self::from_static(FilterRuleName::SUFFIX)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -4608,7 +4572,7 @@ impl<'xml> DeserializeContent<'xml> for Grant {
                     };
                     if attr.key.as_ref() == b"xsi:type" {
                         type_ = Some(
-                            attr.unescape_value()
+                            attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
                                 .map_err(DeError::InvalidXml)?
                                 .into_owned()
                                 .into(),
@@ -4823,8 +4787,8 @@ impl SerializeContent for IntelligentTieringAccessTier {
 }
 impl<'xml> DeserializeContent<'xml> for IntelligentTieringAccessTier {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"ARCHIVE_ACCESS" => Ok(Self::from_static(
                     IntelligentTieringAccessTier::ARCHIVE_ACCESS,
@@ -4832,9 +4796,7 @@ impl<'xml> DeserializeContent<'xml> for IntelligentTieringAccessTier {
                 b"DEEP_ARCHIVE_ACCESS" => Ok(Self::from_static(
                     IntelligentTieringAccessTier::DEEP_ARCHIVE_ACCESS,
                 )),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -4985,14 +4947,12 @@ impl SerializeContent for IntelligentTieringStatus {
 }
 impl<'xml> DeserializeContent<'xml> for IntelligentTieringStatus {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Disabled" => Ok(Self::from_static(IntelligentTieringStatus::DISABLED)),
                 b"Enabled" => Ok(Self::from_static(IntelligentTieringStatus::ENABLED)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -5179,15 +5139,13 @@ impl SerializeContent for InventoryFormat {
 }
 impl<'xml> DeserializeContent<'xml> for InventoryFormat {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"CSV" => Ok(Self::from_static(InventoryFormat::CSV)),
                 b"ORC" => Ok(Self::from_static(InventoryFormat::ORC)),
                 b"Parquet" => Ok(Self::from_static(InventoryFormat::PARQUET)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -5199,14 +5157,12 @@ impl SerializeContent for InventoryFrequency {
 }
 impl<'xml> DeserializeContent<'xml> for InventoryFrequency {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Daily" => Ok(Self::from_static(InventoryFrequency::DAILY)),
                 b"Weekly" => Ok(Self::from_static(InventoryFrequency::WEEKLY)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -5218,14 +5174,12 @@ impl SerializeContent for InventoryIncludedObjectVersions {
 }
 impl<'xml> DeserializeContent<'xml> for InventoryIncludedObjectVersions {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"All" => Ok(Self::from_static(InventoryIncludedObjectVersions::ALL)),
                 b"Current" => Ok(Self::from_static(InventoryIncludedObjectVersions::CURRENT)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -5237,8 +5191,8 @@ impl SerializeContent for InventoryOptionalField {
 }
 impl<'xml> DeserializeContent<'xml> for InventoryOptionalField {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"BucketKeyStatus" => {
                     Ok(Self::from_static(InventoryOptionalField::BUCKET_KEY_STATUS))
@@ -5277,9 +5231,7 @@ impl<'xml> DeserializeContent<'xml> for InventoryOptionalField {
                 )),
                 b"Size" => Ok(Self::from_static(InventoryOptionalField::SIZE)),
                 b"StorageClass" => Ok(Self::from_static(InventoryOptionalField::STORAGE_CLASS)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -5437,14 +5389,12 @@ impl SerializeContent for JSONType {
 }
 impl<'xml> DeserializeContent<'xml> for JSONType {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"DOCUMENT" => Ok(Self::from_static(JSONType::DOCUMENT)),
                 b"LINES" => Ok(Self::from_static(JSONType::LINES)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -6425,14 +6375,12 @@ impl SerializeContent for LocationType {
 }
 impl<'xml> DeserializeContent<'xml> for LocationType {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"AvailabilityZone" => Ok(Self::from_static(LocationType::AVAILABILITY_ZONE)),
                 b"LocalZone" => Ok(Self::from_static(LocationType::LOCAL_ZONE)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -6503,14 +6451,12 @@ impl SerializeContent for MFADelete {
 }
 impl<'xml> DeserializeContent<'xml> for MFADelete {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Disabled" => Ok(Self::from_static(MFADelete::DISABLED)),
                 b"Enabled" => Ok(Self::from_static(MFADelete::ENABLED)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -6522,14 +6468,12 @@ impl SerializeContent for MFADeleteStatus {
 }
 impl<'xml> DeserializeContent<'xml> for MFADeleteStatus {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Disabled" => Ok(Self::from_static(MFADeleteStatus::DISABLED)),
                 b"Enabled" => Ok(Self::from_static(MFADeleteStatus::ENABLED)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -6775,14 +6719,12 @@ impl SerializeContent for MetricsStatus {
 }
 impl<'xml> DeserializeContent<'xml> for MetricsStatus {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Disabled" => Ok(Self::from_static(MetricsStatus::DISABLED)),
                 b"Enabled" => Ok(Self::from_static(MetricsStatus::ENABLED)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -7200,8 +7142,8 @@ impl SerializeContent for ObjectCannedACL {
 }
 impl<'xml> DeserializeContent<'xml> for ObjectCannedACL {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"authenticated-read" => Ok(Self::from_static(ObjectCannedACL::AUTHENTICATED_READ)),
                 b"aws-exec-read" => Ok(Self::from_static(ObjectCannedACL::AWS_EXEC_READ)),
@@ -7212,9 +7154,7 @@ impl<'xml> DeserializeContent<'xml> for ObjectCannedACL {
                 b"private" => Ok(Self::from_static(ObjectCannedACL::PRIVATE)),
                 b"public-read" => Ok(Self::from_static(ObjectCannedACL::PUBLIC_READ)),
                 b"public-read-write" => Ok(Self::from_static(ObjectCannedACL::PUBLIC_READ_WRITE)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -7338,13 +7278,11 @@ impl SerializeContent for ObjectLockEnabled {
 }
 impl<'xml> DeserializeContent<'xml> for ObjectLockEnabled {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Enabled" => Ok(Self::from_static(ObjectLockEnabled::ENABLED)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -7381,14 +7319,12 @@ impl SerializeContent for ObjectLockLegalHoldStatus {
 }
 impl<'xml> DeserializeContent<'xml> for ObjectLockLegalHoldStatus {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"OFF" => Ok(Self::from_static(ObjectLockLegalHoldStatus::OFF)),
                 b"ON" => Ok(Self::from_static(ObjectLockLegalHoldStatus::ON)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -7439,14 +7375,12 @@ impl SerializeContent for ObjectLockRetentionMode {
 }
 impl<'xml> DeserializeContent<'xml> for ObjectLockRetentionMode {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"COMPLIANCE" => Ok(Self::from_static(ObjectLockRetentionMode::COMPLIANCE)),
                 b"GOVERNANCE" => Ok(Self::from_static(ObjectLockRetentionMode::GOVERNANCE)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -7483,8 +7417,8 @@ impl SerializeContent for ObjectOwnership {
 }
 impl<'xml> DeserializeContent<'xml> for ObjectOwnership {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"BucketOwnerEnforced" => {
                     Ok(Self::from_static(ObjectOwnership::BUCKET_OWNER_ENFORCED))
@@ -7493,9 +7427,7 @@ impl<'xml> DeserializeContent<'xml> for ObjectOwnership {
                     Ok(Self::from_static(ObjectOwnership::BUCKET_OWNER_PREFERRED))
                 }
                 b"ObjectWriter" => Ok(Self::from_static(ObjectOwnership::OBJECT_WRITER)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -7606,8 +7538,8 @@ impl SerializeContent for ObjectStorageClass {
 }
 impl<'xml> DeserializeContent<'xml> for ObjectStorageClass {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"DEEP_ARCHIVE" => Ok(Self::from_static(ObjectStorageClass::DEEP_ARCHIVE)),
                 b"EXPRESS_ONEZONE" => Ok(Self::from_static(ObjectStorageClass::EXPRESS_ONEZONE)),
@@ -7624,9 +7556,7 @@ impl<'xml> DeserializeContent<'xml> for ObjectStorageClass {
                 b"SNOW" => Ok(Self::from_static(ObjectStorageClass::SNOW)),
                 b"STANDARD" => Ok(Self::from_static(ObjectStorageClass::STANDARD)),
                 b"STANDARD_IA" => Ok(Self::from_static(ObjectStorageClass::STANDARD_IA)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -7783,13 +7713,11 @@ impl SerializeContent for ObjectVersionStorageClass {
 }
 impl<'xml> DeserializeContent<'xml> for ObjectVersionStorageClass {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"STANDARD" => Ok(Self::from_static(ObjectVersionStorageClass::STANDARD)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -7898,13 +7826,11 @@ impl SerializeContent for OwnerOverride {
 }
 impl<'xml> DeserializeContent<'xml> for OwnerOverride {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Destination" => Ok(Self::from_static(OwnerOverride::DESTINATION)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -8101,14 +8027,12 @@ impl SerializeContent for PartitionDateSource {
 }
 impl<'xml> DeserializeContent<'xml> for PartitionDateSource {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"DeliveryTime" => Ok(Self::from_static(PartitionDateSource::DELIVERY_TIME)),
                 b"EventTime" => Ok(Self::from_static(PartitionDateSource::EVENT_TIME)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -8147,14 +8071,12 @@ impl SerializeContent for Payer {
 }
 impl<'xml> DeserializeContent<'xml> for Payer {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"BucketOwner" => Ok(Self::from_static(Payer::BUCKET_OWNER)),
                 b"Requester" => Ok(Self::from_static(Payer::REQUESTER)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -8166,17 +8088,15 @@ impl SerializeContent for Permission {
 }
 impl<'xml> DeserializeContent<'xml> for Permission {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"FULL_CONTROL" => Ok(Self::from_static(Permission::FULL_CONTROL)),
                 b"READ" => Ok(Self::from_static(Permission::READ)),
                 b"READ_ACP" => Ok(Self::from_static(Permission::READ_ACP)),
                 b"WRITE" => Ok(Self::from_static(Permission::WRITE)),
                 b"WRITE_ACP" => Ok(Self::from_static(Permission::WRITE_ACP)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -8264,14 +8184,12 @@ impl SerializeContent for Protocol {
 }
 impl<'xml> DeserializeContent<'xml> for Protocol {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"http" => Ok(Self::from_static(Protocol::HTTP)),
                 b"https" => Ok(Self::from_static(Protocol::HTTPS)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -8406,14 +8324,12 @@ impl SerializeContent for QuoteFields {
 }
 impl<'xml> DeserializeContent<'xml> for QuoteFields {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"ALWAYS" => Ok(Self::from_static(QuoteFields::ALWAYS)),
                 b"ASNEEDED" => Ok(Self::from_static(QuoteFields::ASNEEDED)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -8562,14 +8478,12 @@ impl SerializeContent for ReplicaModificationsStatus {
 }
 impl<'xml> DeserializeContent<'xml> for ReplicaModificationsStatus {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Disabled" => Ok(Self::from_static(ReplicaModificationsStatus::DISABLED)),
                 b"Enabled" => Ok(Self::from_static(ReplicaModificationsStatus::ENABLED)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -8834,14 +8748,12 @@ impl SerializeContent for ReplicationRuleStatus {
 }
 impl<'xml> DeserializeContent<'xml> for ReplicationRuleStatus {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Disabled" => Ok(Self::from_static(ReplicationRuleStatus::DISABLED)),
                 b"Enabled" => Ok(Self::from_static(ReplicationRuleStatus::ENABLED)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -8888,14 +8800,12 @@ impl SerializeContent for ReplicationTimeStatus {
 }
 impl<'xml> DeserializeContent<'xml> for ReplicationTimeStatus {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Disabled" => Ok(Self::from_static(ReplicationTimeStatus::DISABLED)),
                 b"Enabled" => Ok(Self::from_static(ReplicationTimeStatus::ENABLED)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -9081,13 +8991,11 @@ impl SerializeContent for RestoreRequestType {
 }
 impl<'xml> DeserializeContent<'xml> for RestoreRequestType {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"SELECT" => Ok(Self::from_static(RestoreRequestType::SELECT)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -9601,15 +9509,13 @@ impl SerializeContent for ServerSideEncryption {
 }
 impl<'xml> DeserializeContent<'xml> for ServerSideEncryption {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"AES256" => Ok(Self::from_static(ServerSideEncryption::AES256)),
                 b"aws:kms" => Ok(Self::from_static(ServerSideEncryption::AWS_KMS)),
                 b"aws:kms:dsse" => Ok(Self::from_static(ServerSideEncryption::AWS_KMS_DSSE)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -9854,14 +9760,12 @@ impl SerializeContent for SseKmsEncryptedObjectsStatus {
 }
 impl<'xml> DeserializeContent<'xml> for SseKmsEncryptedObjectsStatus {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Disabled" => Ok(Self::from_static(SseKmsEncryptedObjectsStatus::DISABLED)),
                 b"Enabled" => Ok(Self::from_static(SseKmsEncryptedObjectsStatus::ENABLED)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -9924,8 +9828,8 @@ impl SerializeContent for StorageClass {
 }
 impl<'xml> DeserializeContent<'xml> for StorageClass {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"DEEP_ARCHIVE" => Ok(Self::from_static(StorageClass::DEEP_ARCHIVE)),
                 b"EXPRESS_ONEZONE" => Ok(Self::from_static(StorageClass::EXPRESS_ONEZONE)),
@@ -9938,9 +9842,7 @@ impl<'xml> DeserializeContent<'xml> for StorageClass {
                 b"SNOW" => Ok(Self::from_static(StorageClass::SNOW)),
                 b"STANDARD" => Ok(Self::from_static(StorageClass::STANDARD)),
                 b"STANDARD_IA" => Ok(Self::from_static(StorageClass::STANDARD_IA)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -10012,13 +9914,11 @@ impl SerializeContent for StorageClassAnalysisSchemaVersion {
 }
 impl<'xml> DeserializeContent<'xml> for StorageClassAnalysisSchemaVersion {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"V_1" => Ok(Self::from_static(StorageClassAnalysisSchemaVersion::V_1)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -10119,7 +10019,7 @@ impl<'xml> DeserializeContent<'xml> for TargetGrant {
                     };
                     if attr.key.as_ref() == b"xsi:type" {
                         type_ = Some(
-                            attr.unescape_value()
+                            attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
                                 .map_err(DeError::InvalidXml)?
                                 .into_owned()
                                 .into(),
@@ -10231,15 +10131,13 @@ impl SerializeContent for Tier {
 }
 impl<'xml> DeserializeContent<'xml> for Tier {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"Bulk" => Ok(Self::from_static(Tier::BULK)),
                 b"Expedited" => Ok(Self::from_static(Tier::EXPEDITED)),
                 b"Standard" => Ok(Self::from_static(Tier::STANDARD)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -10397,8 +10295,8 @@ impl SerializeContent for TransitionStorageClass {
 }
 impl<'xml> DeserializeContent<'xml> for TransitionStorageClass {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"DEEP_ARCHIVE" => Ok(Self::from_static(TransitionStorageClass::DEEP_ARCHIVE)),
                 b"GLACIER" => Ok(Self::from_static(TransitionStorageClass::GLACIER)),
@@ -10408,9 +10306,7 @@ impl<'xml> DeserializeContent<'xml> for TransitionStorageClass {
                 )),
                 b"ONEZONE_IA" => Ok(Self::from_static(TransitionStorageClass::ONEZONE_IA)),
                 b"STANDARD_IA" => Ok(Self::from_static(TransitionStorageClass::STANDARD_IA)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }
@@ -10422,15 +10318,13 @@ impl SerializeContent for Type {
 }
 impl<'xml> DeserializeContent<'xml> for Type {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let b: &[u8] = &t;
+        d.text(|s| {
+            let b: &[u8] = s.as_bytes();
             match b {
                 b"AmazonCustomerByEmail" => Ok(Self::from_static(Type::AMAZON_CUSTOMER_BY_EMAIL)),
                 b"CanonicalUser" => Ok(Self::from_static(Type::CANONICAL_USER)),
                 b"Group" => Ok(Self::from_static(Type::GROUP)),
-                _ => Ok(Self::from(
-                    t.unescape().map_err(DeError::InvalidXml)?.into_owned(),
-                )),
+                _ => Ok(Self::from(s.to_owned())),
             }
         })
     }

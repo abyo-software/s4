@@ -8,8 +8,8 @@ use crate::dto::{self, List, Timestamp, TimestampFormat};
 use std::fmt;
 
 use quick_xml::Reader;
+use quick_xml::escape::resolve_xml_entity;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
-use stdx::str::StrExt;
 
 /// A data type that can be deserialized with AWS restXml deserializer
 pub trait Deserialize<'xml>: Sized {
@@ -127,6 +127,23 @@ impl<'xml> Deserializer<'xml> {
                     // translate `<CSV/>` to `<CSV></CSV>`
                     self.next_slot = Some(DeEvent::End(x.to_end().into_owned()));
                     DeEvent::Start(x)
+                }
+
+                // Since quick-xml 0.38, entity and character references (e.g.
+                // `&quot;` / `&#34;`) are no longer expanded inside `Text`
+                // events; they arrive as separate `GeneralRef` events. Resolve
+                // them here and re-emit as text so that `text()` can
+                // accumulate the pieces into one string.
+                Event::GeneralRef(r) => {
+                    let name =
+                        std::str::from_utf8(r.as_ref()).map_err(|_| DeError::InvalidContent)?;
+                    let value: String = resolve_xml_entity(name)
+                        .map(str::to_owned)
+                        .or_else(|| resolve_char_ref(name))
+                        .ok_or(DeError::InvalidContent)?;
+                    // `from_escaped` stores the value verbatim, so the later
+                    // `decode()` in `text()` returns it unchanged.
+                    DeEvent::Text(BytesText::from_escaped(value))
                 }
 
                 // ignore the others
@@ -303,26 +320,40 @@ impl<'xml> Deserializer<'xml> {
 
     /// Deserializes text
     ///
+    /// Accumulates all consecutive text and entity-reference events into a
+    /// single `&str` (e.g. `a&amp;b` arrives as three events since
+    /// quick-xml 0.38).
+    ///
     /// # Errors
     /// Returns an error if the deserialization fails.
-    pub fn text<T>(&mut self, f: impl FnOnce(BytesText<'xml>) -> DeResult<T>) -> DeResult<T> {
-        match self.peek_event()? {
-            DeEvent::Start(_) => {
-                self.consume_peeked();
-                Err(unexpected_start())
-            }
-            DeEvent::End(_) => {
-                f(BytesText::from_escaped("")) //
-            }
-            DeEvent::Text(x) => {
-                self.consume_peeked();
-                f(x)
-            }
-            DeEvent::Eof => {
-                self.consume_peeked();
-                Err(unexpected_eof())
+    pub fn text<T>(&mut self, f: impl FnOnce(&str) -> DeResult<T>) -> DeResult<T> {
+        let mut buf: Option<String> = None;
+        loop {
+            match self.peek_event()? {
+                DeEvent::Start(_) => {
+                    self.consume_peeked();
+                    return Err(unexpected_start());
+                }
+                // `End` terminates text accumulation without being consumed,
+                // so callers can still match it (e.g. `expect_end`).
+                DeEvent::End(_) => break,
+                DeEvent::Eof => {
+                    if buf.is_none() {
+                        return Err(unexpected_eof());
+                    }
+                    break;
+                }
+                DeEvent::Text(x) => {
+                    self.consume_peeked();
+                    let s = x.decode().map_err(Into::into).map_err(invalid_xml)?;
+                    match &mut buf {
+                        None => buf = Some(s.into_owned()),
+                        Some(b) => b.push_str(&s),
+                    }
+                }
             }
         }
+        f(buf.as_deref().unwrap_or(""))
     }
 
     /// Deserializes the content of a field
@@ -346,10 +377,7 @@ impl<'xml> Deserializer<'xml> {
     }
 
     pub fn timestamp(&mut self, fmt: TimestampFormat) -> DeResult<Timestamp> {
-        self.text(|t| {
-            let string = str::from_ascii_simd(t.as_ref()).map_err(|_| DeError::InvalidContent)?;
-            Timestamp::parse(fmt, string).map_err(|_| DeError::InvalidContent)
-        })
+        self.text(|s| Timestamp::parse(fmt, s).map_err(|_| DeError::InvalidContent))
     }
 }
 
@@ -384,11 +412,39 @@ const fn unexpected_start() -> DeError {
     DeError::UnexpectedStart
 }
 
+/// Resolves a numeric character reference such as `#34` (decimal) or `#x22` (hex).
+///
+/// Returns `None` if the input is not a valid character reference:
+/// missing `#` prefix, empty number part, invalid digits, or a codepoint
+/// outside the XML 1.0 `Char` production.
+fn resolve_char_ref(name: &str) -> Option<String> {
+    let entity = name.strip_prefix('#')?;
+    if entity.is_empty() {
+        return None;
+    }
+    let codepoint = if let Some(hex) = entity.strip_prefix('x') {
+        u32::from_str_radix(hex, 16).ok()?
+    } else {
+        entity.parse::<u32>().ok()?
+    };
+
+    // XML 1.0 valid character ranges:
+    // (#x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF])
+    if !matches!(
+        codepoint,
+        0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x1_0000..=0x10_FFFF
+    ) {
+        return None;
+    }
+
+    char::from_u32(codepoint).map(|c| c.to_string())
+}
+
 impl<'xml> DeserializeContent<'xml> for bool {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| match t.as_ref() {
-            b"true" | b"TRUE" => Ok(true),
-            b"false" | b"FALSE" => Ok(false),
+        d.text(|s| match s {
+            "true" | "TRUE" => Ok(true),
+            "false" | "FALSE" => Ok(false),
             _ => Err(DeError::InvalidContent),
         })
     }
@@ -396,22 +452,19 @@ impl<'xml> DeserializeContent<'xml> for bool {
 
 impl<'xml> DeserializeContent<'xml> for String {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| {
-            let string = t.unescape().map_err(invalid_xml)?;
-            Ok(string.into())
-        })
+        d.text(|s| Ok(s.to_owned()))
     }
 }
 
 impl<'xml> DeserializeContent<'xml> for i32 {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| atoi::atoi::<Self>(t.as_ref()).ok_or(DeError::InvalidContent))
+        d.text(|s| atoi::atoi::<Self>(s.as_bytes()).ok_or(DeError::InvalidContent))
     }
 }
 
 impl<'xml> DeserializeContent<'xml> for i64 {
     fn deserialize_content(d: &mut Deserializer<'xml>) -> DeResult<Self> {
-        d.text(|t| atoi::atoi::<Self>(t.as_ref()).ok_or(DeError::InvalidContent))
+        d.text(|s| atoi::atoi::<Self>(s.as_bytes()).ok_or(DeError::InvalidContent))
     }
 }
 

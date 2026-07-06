@@ -156,6 +156,37 @@ mod tests {
         );
     }
 
+    /// Deserializes `<Key>...</Key>` into a `String` via the full parser path.
+    fn de_string(xml: &str) -> DeResult<String> {
+        let mut d = Deserializer::new(xml.as_bytes());
+        let val = d.named_element("Key", |d| d.content::<String>())?;
+        d.expect_eof()?;
+        Ok(val)
+    }
+
+    // quick-xml 0.38+ emits entity / character references as separate events
+    // (RUSTSEC-2026-0194/0195 upgrade); they must be resolved and merged back
+    // into one string.
+    #[test]
+    fn text_entity_references_are_resolved() {
+        assert_eq!(
+            de_string("<Key>a&amp;b&lt;c&gt;d&quot;e&apos;f</Key>").unwrap(),
+            "a&b<c>d\"e'f"
+        );
+        assert_eq!(de_string("<Key>&#34;x&#x22;</Key>").unwrap(), "\"x\"");
+        // supplementary-plane character reference ([#x10000-#x10FFFF])
+        assert_eq!(de_string("<Key>&#x1F600;</Key>").unwrap(), "😀");
+        assert_eq!(de_string("<Key>plain</Key>").unwrap(), "plain");
+        assert_eq!(de_string("<Key></Key>").unwrap(), "");
+    }
+
+    #[test]
+    fn text_invalid_references_are_rejected() {
+        assert!(de_string("<Key>&nosuch;</Key>").is_err());
+        // surrogate code points are not valid XML characters
+        assert!(de_string("<Key>&#xD800;</Key>").is_err());
+    }
+
     #[test]
     fn create_session_output_xml_serialization() {
         use crate::dto::{CreateSessionOutput, SessionCredentials, Timestamp, TimestampFormat};

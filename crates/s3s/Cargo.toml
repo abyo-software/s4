@@ -157,7 +157,7 @@ version = "0.3.0"
 version = "0.2.17"
 
 [dependencies.quick-xml]
-version = "0.37.5"
+version = "0.41.0"
 features = ["serialize"]
 
 [dependencies.serde]
