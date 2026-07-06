@@ -8,6 +8,8 @@ Product overview, pitch, and quick start live in the top-level
 - [use-cases/opensearch-searchable-snapshots.md](use-cases/opensearch-searchable-snapshots.md) — S4 as an OpenSearch searchable-snapshot backend: −16–28% across `default` / `best_compression` / `zstd` / `zstd_no_dict` index codecs; requires `--logical-etag`
 - [use-cases/grafana-loki-chunks.md](use-cases/grafana-loki-chunks.md) — S4 in front of Grafana Loki chunk storage: −18.4% on the immutable snappy backlog, with an honest split vs Loki-native `zstd` (−38% for new chunks) and a measured ~1.7 ms read overhead per chunk fetch
 - [use-cases/kafka-tiered-storage.md](use-cases/kafka-tiered-storage.md) — S4 in front of Kafka tiered storage (KIP-405): −74.7% on uncompressed (`none`) tiered segments / ~20% over snappy/lz4 / ~0% over producer-`zstd`, with an honest split vs producer-side compression; no consistent cold-fetch penalty; works without `--logical-etag`
+- [use-cases/cold-parquet.md](use-cases/cold-parquet.md) — `s4 parquet-recompact` rewrites cold lake Parquet to native zstd: −36.6% over snappy / −51.7% over uncompressed, value-verified, no S4 in the read path
+- [use-cases/s3-compatible-backends.md](use-cases/s3-compatible-backends.md) — S4 in front of S3-compatible stores: MinIO (the CI-verified backend, with the series' measured results), plus Cloudflare R2 / Backblaze B2 / Wasabi pricing math and an honest not-yet-validated checklist
 
 ## Getting started
 - [install.md](install.md) — cargo / pip / WASM / build from source / supported targets
@@ -32,6 +34,7 @@ Product overview, pitch, and quick start live in the top-level
 - [features.md](features.md) — SSE Range GET, observability, data integrity, storage class
 
 ## Proof & trust
+- [trust.md](trust.md) — why trust S4 with your data: the escape hatch, byte-integrity design, verification tooling, and the testing evidence in one page
 - [benchmarks.md](benchmarks.md) — full codec / throughput / SSE tables + reproduction
 - [testing.md](testing.md) — test & validation matrix
 - [stability.md](stability.md) — v1.x SemVer freeze contract

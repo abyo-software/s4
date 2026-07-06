@@ -23,7 +23,7 @@ changes is the endpoint URL.
 
 - **No app changes** — same S3 wire protocol, SigV4 auth, and SDK calls; just change `--endpoint-url`. (GET returns the original bytes; `HEAD` reports the stored compressed size, with the original in `x-amz-meta-s4-original-size`.)
 - **Per-object smart codec** — CPU zstd for text/logs, GPU nvCOMP (Bitcomp/zstd/GDeflate) for integer/columnar data, passthrough for already-compressed inputs. You almost never need a GPU.
-- **No lock-in** — stop the gateway and the compressed objects + S4IX sidecars stay S3-native, decodable by the Apache-2.0 `s4-codec` CLI / `pip` / WASM. ([format](docs/wire-format.md))
+- **No lock-in** — stop the gateway and the compressed objects + S4IX sidecars stay S3-native, decodable by the Apache-2.0 `s4-codec` library (`pip` / WASM / Rust). ([format](docs/wire-format.md))
 - **Range GET for framed objects** — sidecar-indexed byte ranges serve Parquet/ORC readers; some SSE / multipart-SSE modes use a buffered fallback.
 
 > ☁️ **Run it on AWS Marketplace — AWS-billed hourly, no app changes:**
@@ -89,6 +89,7 @@ on the integer/columnar side, not a blanket "compress with GPU" claim:
 
 - **Compatibility** — S3-compatible for core object workflows, with 45+ S3 ops implemented (not a complete S3 API); MinIO is per-PR verified and AWS S3 E2E is opt-in. Full S3 / SDK / backend matrices: **[docs/compatibility.md](docs/compatibility.md)**; comparison vs MinIO / Garage / Wasabi / B2 below.
 - **Trust signals** — 714+ workspace tests, a 24/7 fuzz farm (7 bolero targets), and adversarial Opus+Codex audit rounds; CVE-clean `cargo audit`. Details: **[docs/testing.md](docs/testing.md)** · **[docs/status.md](docs/status.md)** · **[full benchmarks](docs/benchmarks.md)**.
+- **"A proxy that rewrites my bytes?"** — the escape hatch (decode your data offline, no gateway), the byte-integrity design, and the verification tooling you can run yourself, in one evidence page: **[docs/trust.md](docs/trust.md)**.
 
 ### How it compares
 
@@ -189,7 +190,7 @@ rely on it not shifting under you. Full freeze contract: **[docs/stability.md](d
 | Area | Docs |
 |---|---|
 | Get started | [install](docs/install.md) · [GPU](docs/gpu.md) · [deploy (Helm)](docs/deployment.md) · [configuration](docs/configuration.md) |
-| Use cases | [Elasticsearch frozen tier](docs/use-cases/elasticsearch-frozen-tier.md) — storage/throughput/frozen-search across LogsDB + zstd levels · [OpenSearch searchable snapshots](docs/use-cases/opensearch-searchable-snapshots.md) — −16–28% across index codecs (needs `--logical-etag`) · [Grafana Loki chunks](docs/use-cases/grafana-loki-chunks.md) — −18.4% on the immutable snappy backlog (honest split vs Loki-native zstd; ~1.7 ms read overhead) · [Kafka tiered storage](docs/use-cases/kafka-tiered-storage.md) — −74.7% on uncompressed (KIP-405) tiered segments / ~20% snappy-lz4 / ~0% producer-zstd (honest split vs producer-side compression) · [Cold Parquet recompaction](docs/use-cases/cold-parquet.md) — `s4 parquet-recompact` rewrites cold lake Parquet to native zstd: −36.6% over snappy / −51.7% over uncompressed, value-verified, no S4 in the read path |
+| Use cases | [Elasticsearch frozen tier](docs/use-cases/elasticsearch-frozen-tier.md) — storage/throughput/frozen-search across LogsDB + zstd levels · [OpenSearch searchable snapshots](docs/use-cases/opensearch-searchable-snapshots.md) — −16–28% across index codecs (needs `--logical-etag`) · [Grafana Loki chunks](docs/use-cases/grafana-loki-chunks.md) — −18.4% on the immutable snappy backlog (honest split vs Loki-native zstd; ~1.7 ms read overhead) · [Kafka tiered storage](docs/use-cases/kafka-tiered-storage.md) — −74.7% on uncompressed (KIP-405) tiered segments / ~20% snappy-lz4 / ~0% producer-zstd (honest split vs producer-side compression) · [Cold Parquet recompaction](docs/use-cases/cold-parquet.md) — `s4 parquet-recompact` rewrites cold lake Parquet to native zstd: −36.6% over snappy / −51.7% over uncompressed, value-verified, no S4 in the read path · [S3-compatible backends](docs/use-cases/s3-compatible-backends.md) — MinIO (CI-verified) / Cloudflare R2 / Backblaze B2 / Wasabi: per-provider savings math + validation checklist |
 | Cost & operations | [savings & estimate](docs/savings.md) · [maintenance](docs/ops/maintenance.md) · [dictionaries](docs/ops/dictionaries.md) · [repair & durability](docs/ops/repair.md) · [runbook](docs/ops/runbook.md) · [observability](docs/observability.md) · [storage-class transitions](docs/storage-class-transitions.md) |
 | Reference | [compatibility matrices](docs/compatibility.md) · [architecture](docs/architecture.md) · [on-the-wire format](docs/wire-format.md) · [production features](docs/features.md) |
 | Proof & trust | [benchmarks](docs/benchmarks.md) · [testing & validation](docs/testing.md) · [stability contract](docs/stability.md) · [project status](docs/status.md) · [threat model](docs/security/threat-model.md) · [security overview](docs/security/overview.md) |

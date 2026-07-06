@@ -48,7 +48,7 @@ upload integrity (AWS SDK v2, OpenSearch `repository-s3`, …) work unchanged.
 | **Content-Length & GET body** | the original (decompressed) size / bytes | — |
 | **`s4-*` control metadata** | stripped from GET / HEAD (incl. Range GET) responses | use a direct backend read to inspect S4's internal markers |
 | **Multipart composite ETag** | AWS `MD5(concat(original-part-MD5s))-N` — **best-effort** (see below) | `--physical-passthrough` keeps the backend composite |
-| **`ListObjects(V2)` Size & ETag** | the backend **compressed** size + ETag (so they disagree with HEAD/GET) | **`--accurate-list-size`** rewrites both to the original values via one bounded-concurrency backend HEAD per key (N+1) |
+| **`ListObjects(V2)` Size & ETag** | the **original** size + logical ETag, matching HEAD/GET (v1.4.1+; resolved via bounded-concurrency backend HEADs, N+1) | **`--physical-listings`** opts out (backend compressed size + ETag, the v1.4.0 behavior, max list throughput); `--accurate-list-size` remains as a deprecated no-op alias |
 | **Write-path `If-Match` / `If-None-Match`** (PUT) and **`x-amz-copy-source-if-*`** (Copy) | evaluated by S4 against the logical ETag | **non-atomic** (HEAD-then-write); a concurrent writer between the check and the write is not serialised — run conditional writes on cold / quiescent keys. A non-404 backend HEAD error fails the write (never silently proceeds) |
 
 **Multipart composite ETag is best-effort.** Computing the AWS composite needs
@@ -138,6 +138,9 @@ when operators provide credentials).
 | [Backblaze B2](https://www.backblaze.com/b2/cloud-storage.html) | 🔧 Configurable in operator CI (real backend; requires `vars.B2_BUCKET` / `B2_ENDPOINT` / `B2_REGION` + `secrets.B2_KEY_ID` / `B2_APPLICATION_KEY`) | weekly when configured, silent skip otherwise |
 | [Cloudflare R2](https://www.cloudflare.com/products/r2/) | 🔧 Configurable in operator CI (real backend; requires `vars.R2_BUCKET` / `R2_ENDPOINT` / `R2_REGION` + `secrets.R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY`) | weekly when configured, silent skip otherwise |
 | [Wasabi](https://wasabi.com/) | 🔧 Configurable in operator CI (real backend; requires `vars.WASABI_BUCKET` / `WASABI_ENDPOINT` / `WASABI_REGION` + `secrets.WASABI_ACCESS_KEY_ID` / `WASABI_SECRET_ACCESS_KEY`) | weekly when configured, silent skip otherwise |
+
+Per-provider cost math + a pre-production validation checklist for
+these backends: [use-cases/s3-compatible-backends.md](use-cases/s3-compatible-backends.md).
 
 Each compat-matrix job runs a 1 PUT + 1 GET + sidecar HEAD against
 the live backend through an `s4 --codec cpu-zstd --dispatcher always`
