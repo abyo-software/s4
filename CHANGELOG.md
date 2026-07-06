@@ -89,6 +89,9 @@ found, worked around, and fixed via an opt-in mode).
   SSE recipe is deliberately never persisted).
 - Metered savings is single-gateway; fleet-accurate aggregation is a
   documented follow-up.
+- `HeadObject` with `Range` or `partNumber` returns the full logical
+  ContentLength for S4 objects rather than the selected range/part
+  length (pre-existing pattern, round-6 review Minor).
 
 ## [1.4.1] - 2026-06-24
 
