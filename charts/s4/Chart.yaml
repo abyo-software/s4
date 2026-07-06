@@ -50,7 +50,16 @@ type: application
 #        HEAD/GET so `aws s3 sync` / `rclone` no longer over-transfer —
 #        opt out with `--physical-listings`). Server-side only; no
 #        chart-shape change, default rendering byte-identical to 0.3.6.
-version: 0.3.7
+# 0.4.0: s4 v1.5 — additive `marketplace.meteredSavings` block (default
+#        enabled=false): wires --marketplace-metered-savings +
+#        --savings-ledger-state-file=/var/lib/s4/ledger.json (PVC-backed by
+#        default, emptyDir opt-out) for the value-based GBSavedHours
+#        billing mode ("S4 Metered Savings" listing). Template guards
+#        enforce the single-metering-writer contract (fails render with
+#        replicas > 1 or without marketplace.usageDimension). Minor bump
+#        because the values.yaml key set changed; the default rendering is
+#        byte-identical to 0.3.7 (verified with helm template diff).
+version: 0.4.0
 # appVersion tracks the s4-server release shipped on crates.io / ghcr.io.
 appVersion: "1.4.1"
 kubeVersion: ">=1.24.0-0"

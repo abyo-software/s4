@@ -103,6 +103,27 @@ marketplace:
   # rejected with InvalidUsageDimension). Requires `aws-marketplace:MeterUsage`
   # (see IAM note above). Only honored when productCode is also set.
   usageDimension: ""
+  # -- Value-based Marketplace metering (chart 0.4.0, s4 v1.5): meter the
+  # storage the gateway is currently avoiding on the backend (integer GiB
+  # from the savings ledger) as the hourly MeterUsage quantity, instead of
+  # the constant 1 pod-hour. Use ONLY with a product dimension priced per
+  # GiB-saved-hour (e.g. `GBSavedHours` on the "S4 Metered Savings"
+  # listing) — requires productCode AND usageDimension to be set too.
+  #
+  # SINGLE METERING GATEWAY ONLY: every metering replica bills the full
+  # stock its ledger reports and AWS does not dedup MeterUsage across
+  # callers, so the chart REFUSES to render with replicas > 1 while this
+  # is enabled. The ledger state file lives on a PVC by default — with
+  # persistence disabled a pod restart resets the ledger and under-meters
+  # (your favor, but inaccurate) until the counters rebuild.
+  meteredSavings:
+    enabled: false
+    persistence:
+      # -- Persist the savings ledger (/var/lib/s4/ledger.json) on a PVC.
+      enabled: true
+      size: 1Gi
+      # -- Empty = cluster default StorageClass.
+      storageClass: ""
 
 # -- Default compression codec. One of: cpu-zstd, nvcomp-zstd, nvcomp-bitcomp,
 # nvcomp-gdeflate, identity. nvcomp-* require gpu.enabled=true and a GPU build

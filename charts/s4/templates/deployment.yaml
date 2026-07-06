@@ -1,6 +1,12 @@
 {{- if not .Values.backend.endpointUrl -}}
 {{- fail "backend.endpointUrl is required (e.g. --set backend.endpointUrl=https://s3.us-east-1.amazonaws.com)" -}}
 {{- end -}}
+{{- if and .Values.marketplace.meteredSavings.enabled (gt (int .Values.replicas) 1) -}}
+{{- fail "marketplace.meteredSavings requires exactly ONE replica (every metering replica bills the full ledger stock and AWS does not dedup MeterUsage across callers) — set replicas=1" -}}
+{{- end -}}
+{{- if and .Values.marketplace.meteredSavings.enabled (not .Values.marketplace.usageDimension) -}}
+{{- fail "marketplace.meteredSavings requires marketplace.usageDimension (the GiB-saved-hour dimension key, e.g. GBSavedHours)" -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -63,6 +69,10 @@ spec:
             - --marketplace-product-code={{ .Values.marketplace.productCode }}
             {{- if .Values.marketplace.usageDimension }}
             - --marketplace-usage-dimension={{ .Values.marketplace.usageDimension }}
+            {{- end }}
+            {{- if .Values.marketplace.meteredSavings.enabled }}
+            - --marketplace-metered-savings
+            - --savings-ledger-state-file=/var/lib/s4/ledger.json
             {{- end }}
             {{- end }}
             {{- if .Values.otlpEndpoint }}
@@ -132,6 +142,10 @@ spec:
             # readOnlyRootFilesystem=true ⇒ give the process a writable tmp.
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.marketplace.meteredSavings.enabled }}
+            - name: ledger
+              mountPath: /var/lib/s4
+            {{- end }}
             {{- if include "s4.policyActive" . }}
             - name: policy
               mountPath: /etc/s4/policy
@@ -146,6 +160,17 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
       volumes:
+        {{- if .Values.marketplace.meteredSavings.enabled }}
+        - name: ledger
+          {{- if .Values.marketplace.meteredSavings.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "s4.fullname" . }}-ledger
+          {{- else }}
+          # No PVC: a pod restart resets the ledger and under-meters until
+          # the counters rebuild (documented in docs/marketplace/metering.md).
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
         - name: tmp
           emptyDir: {}
         {{- if include "s4.policyActive" . }}

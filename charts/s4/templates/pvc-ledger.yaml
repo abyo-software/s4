@@ -1,0 +1,21 @@
+{{- if and .Values.marketplace.meteredSavings.enabled .Values.marketplace.meteredSavings.persistence.enabled }}
+# Savings-ledger state for the metered-savings billing mode
+# (marketplace.meteredSavings). One PVC, one metering replica — the chart
+# refuses replicas > 1 while metered savings is enabled (deployment.yaml
+# guard), so ReadWriteOnce is always sufficient.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "s4.fullname" . }}-ledger
+  labels:
+    {{- include "s4.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.marketplace.meteredSavings.persistence.size }}
+  {{- with .Values.marketplace.meteredSavings.persistence.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+{{- end }}
