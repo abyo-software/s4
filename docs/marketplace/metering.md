@@ -44,3 +44,38 @@ Customer setup on EKS (IRSA):
 Without `marketplace.productCode` (the default), no Marketplace code runs
 at all and the gateway behaves bit-for-bit like the free OSS distribution
 it is.
+
+## Custom-dimension metering (`MeterUsage`) and metered savings
+
+Products whose pricing defines a **custom ("externally metered")
+dimension** (catalog `Dimensions[].Types` = `ExternallyMetered`) take the
+`MeterUsage` route instead: pass `--marketplace-usage-dimension <KEY>`
+(the dimension's API identifier, e.g. `PID1` — not the display name)
+together with `--marketplace-product-code`. Boot performs a `DryRun`
+`MeterUsage` entitlement check (fail-closed), then a background loop
+sends one record per pod per hour (fail-open with ≤6 h backfill; see
+`s4_server::marketplace` for the retry/backlog semantics and the
+`s4_marketplace_meter_usage_total{result}` counter). The IAM policy
+needs `aws-marketplace:MeterUsage`.
+
+**Metered savings (v1.5, opt-in)** — `--marketplace-metered-savings`
+switches the hourly quantity from the constant `1` pod-hour to the
+storage the gateway is currently avoiding on the backend, in integer
+GiB (`original_bytes − stored_bytes` from the savings ledger — the same
+counters behind `s4 savings`). Requirements and semantics:
+
+- Requires `--marketplace-usage-dimension` (a dimension priced per
+  GiB-saved-hour) and `--savings-ledger-state-file` (the measurement
+  source; the flag refuses to parse without it rather than silently
+  metering 0 forever).
+- It is a *stock* measure ("rent on savings"), captured once per hour;
+  a backfilled hour bills the quantity captured at that hour, not the
+  value at retry time.
+- Failure modes err in the **customer's favor**: a lost/reset ledger
+  (ephemeral pod storage) under-meters until the counters rebuild —
+  give the ledger a persistent volume for accurate metering. Sub-GiB
+  savings floor to 0.
+- Design rationale, pricing arithmetic, and the listing-side rollout
+  plan: [metered-savings-design.md](metered-savings-design.md). The
+  listing change (new dimension) is a separate, seller-approved step —
+  shipping this flag does not alter any live listing.

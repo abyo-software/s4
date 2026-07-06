@@ -880,23 +880,23 @@ pub const METER_USAGE_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// check and the `send()`.
 pub const MAX_METER_BACKLOG: Duration = Duration::from_secs(6 * 3600 - 600);
 
-/// Drop pod-hour timestamps from the front of `pending` that are older than
-/// `max_age` (AWS will reject them, so retrying is pointless). Returns how
-/// many were dropped — the caller MUST log a non-zero count: those are
-/// pod-hours that will never be billed (a sustained metering outage), and
-/// silently discarding billable usage would be a revenue bug hiding as a
-/// no-op.
+/// Drop pending pod-hour records (`(timestamp, quantity)`) from the front of
+/// `pending` that are older than `max_age` (AWS will reject them, so retrying
+/// is pointless). Returns how many were dropped — the caller MUST log a
+/// non-zero count: those are pod-hours that will never be billed (a sustained
+/// metering outage), and silently discarding billable usage would be a
+/// revenue bug hiding as a no-op.
 ///
 /// `pending` is kept oldest-first (the hourly loop pushes `now` to the back),
 /// so this only ever pops from the front. A timestamp in the future relative
 /// to `now` (clock skew) is treated as "recent" and kept.
 pub fn drop_stale_pending(
-    pending: &mut VecDeque<SystemTime>,
+    pending: &mut VecDeque<(SystemTime, i32)>,
     now: SystemTime,
     max_age: Duration,
 ) -> usize {
     let mut dropped = 0;
-    while let Some(&front) = pending.front() {
+    while let Some(&(front, _)) = pending.front() {
         match now.duration_since(front) {
             Ok(age) if age > max_age => {
                 pending.pop_front();
@@ -907,6 +907,24 @@ pub fn drop_stale_pending(
         }
     }
     dropped
+}
+
+/// Quantity for the value-based `GBSavedHours` metering mode
+/// (`--marketplace-metered-savings`, see
+/// `docs/marketplace/metered-savings-design.md`): the storage the gateway
+/// is currently avoiding on the backend, in integer GiB — a *stock*
+/// measure ("rent on savings"), metered once per pod-hour.
+///
+/// - `stored >= original` (negative-compression drift, ledger reset mid-
+///   upload) clamps to 0 — never a negative record.
+/// - Saturates at `i32::MAX` GiB (`MeterUsage` quantity is `i32`).
+/// - A fresh/empty ledger yields 0: hours where the gateway cannot prove
+///   savings bill nothing (errs in the customer's favor).
+#[must_use]
+pub fn metered_savings_quantity(original_bytes: u64, stored_bytes: u64) -> i32 {
+    const GIB: u64 = 1 << 30;
+    let avoided_gib = original_bytes.saturating_sub(stored_bytes) / GIB;
+    i32::try_from(avoided_gib).unwrap_or(i32::MAX)
 }
 
 #[cfg(test)]
@@ -1562,10 +1580,10 @@ mod tests {
     fn drop_stale_pending_drops_only_too_old_front_entries() {
         let base = SystemTime::UNIX_EPOCH;
         let hour = Duration::from_secs(3600);
-        let mut pending: VecDeque<SystemTime> = VecDeque::new();
+        let mut pending: VecDeque<(SystemTime, i32)> = VecDeque::new();
         // Hours at t=0,1,2,3,4,5,6,7 relative to base.
         for h in 0..8u32 {
-            pending.push_back(base + hour * h);
+            pending.push_back((base + hour * h, 1));
         }
         // "now" = t=7h. With MAX_METER_BACKLOG ~5h50m, entries at 0h and 1h
         // (ages 7h, 6h) are stale; 2h (age 5h) is within the window.
@@ -1573,7 +1591,7 @@ mod tests {
         let dropped = drop_stale_pending(&mut pending, now, MAX_METER_BACKLOG);
         assert_eq!(dropped, 2, "the 7h-old and 6h-old hours must be dropped");
         assert_eq!(
-            *pending.front().expect("queue not empty"),
+            pending.front().expect("queue not empty").0,
             base + hour * 2,
             "oldest surviving entry is the 5h-old hour"
         );
@@ -1583,11 +1601,31 @@ mod tests {
     #[test]
     fn drop_stale_pending_keeps_future_and_recent_entries() {
         let base = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 3600);
-        let mut pending: VecDeque<SystemTime> = VecDeque::new();
-        pending.push_back(base); // exactly now
-        pending.push_back(base + Duration::from_secs(60)); // 1 min in the future (skew)
+        let mut pending: VecDeque<(SystemTime, i32)> = VecDeque::new();
+        pending.push_back((base, 1)); // exactly now
+        pending.push_back((base + Duration::from_secs(60), 1)); // 1 min in the future (skew)
         let dropped = drop_stale_pending(&mut pending, base, MAX_METER_BACKLOG);
         assert_eq!(dropped, 0, "nothing recent/future may be dropped");
         assert_eq!(pending.len(), 2);
+    }
+
+    // ---- metered-savings quantity ----------------------------------------
+
+    #[test]
+    fn metered_savings_quantity_floors_clamps_and_saturates() {
+        const GIB: u64 = 1 << 30;
+        // Empty ledger / no savings yet.
+        assert_eq!(metered_savings_quantity(0, 0), 0);
+        // Sub-GiB savings floor to 0 (bill nothing until a full GiB).
+        assert_eq!(metered_savings_quantity(GIB - 1, 0), 0);
+        assert_eq!(metered_savings_quantity(3 * GIB - 1, 2 * GIB), 0);
+        // Exact and mid-range values.
+        assert_eq!(metered_savings_quantity(GIB, 0), 1);
+        assert_eq!(metered_savings_quantity(10 * GIB, 3 * GIB), 7);
+        // Negative-compression drift (stored > original) clamps to 0,
+        // never a negative record.
+        assert_eq!(metered_savings_quantity(GIB, 5 * GIB), 0);
+        // Saturation at i32::MAX GiB (MeterUsage quantity is i32).
+        assert_eq!(metered_savings_quantity(u64::MAX, 0), i32::MAX);
     }
 }

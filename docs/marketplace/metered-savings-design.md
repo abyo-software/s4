@@ -1,8 +1,10 @@
 # Design: value-based Marketplace metering — `GBSavedHours` dimension
 
-Status: **design accepted, implementation pending** (2026-07-06).
-Code lands behind a new opt-in flag; the listing-side dimension is NOT
-submitted to AWS Marketplace until explicitly approved by the seller.
+Status: **code shipped** (2026-07-06) — `--marketplace-metered-savings`,
+off by default, inert without the flag; operator docs in
+[metering.md](metering.md). The listing-side dimension is NOT submitted
+to AWS Marketplace until explicitly approved by the seller (rollout
+§ below).
 
 ## Problem
 
@@ -76,9 +78,10 @@ no new crates:
    `meter_one_hour` already takes `quantity: i32`; no signature change.
 3. The boot-time `DryRun` entitlement check is unchanged.
 4. Log line gains the metered quantity; metrics: reuse
-   `s4_marketplace_meter_usage_total{result}` and add a gauge for the
-   last metered GB quantity (name to be fixed at implementation time
-   and grep-verified into docs).
+   `s4_marketplace_meter_usage_total{result}`. No new gauge — the
+   quantity is derivable from the existing ledger gauges
+   (`s4_ledger_original_bytes − s4_ledger_stored_bytes`), and the
+   per-record value is in the success log line.
 5. Tests: quantity derivation from a ledger snapshot (incl. zero /
    negative-drift → 0, saturation), flag-gating (off ⇒ constant 1),
    and an hourly-loop test with a scripted client asserting the sent

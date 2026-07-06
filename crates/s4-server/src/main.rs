@@ -909,6 +909,27 @@ struct Opt {
     #[clap(long, value_name = "NAME", requires = "marketplace_product_code")]
     marketplace_usage_dimension: Option<String>,
 
+    /// v1.5: value-based Marketplace metering — meter the storage the
+    /// gateway is currently avoiding on the backend (integer GiB, from
+    /// the savings ledger's `original_bytes - stored_bytes`) as the
+    /// hourly `MeterUsage` quantity, instead of the constant `1`
+    /// pod-hour. A *stock* measure ("rent on savings"): restart-safe
+    /// with no double-billing risk — a lost ledger under-meters (errs in
+    /// the customer's favor), never over-meters. Use with a Marketplace
+    /// dimension priced per GiB-saved-hour (see
+    /// `docs/marketplace/metered-savings-design.md`). Requires
+    /// `--marketplace-usage-dimension` (the dimension being metered) and
+    /// `--savings-ledger-state-file` (the measurement source; refusing
+    /// to boot without it beats silently metering 0 forever). Off
+    /// (default) keeps the constant-quantity pod-hour behavior
+    /// bit-for-bit.
+    #[clap(
+        long,
+        requires = "marketplace_usage_dimension",
+        requires = "savings_ledger_state_file"
+    )]
+    marketplace_metered_savings: bool,
+
     /// v0.5 #31: optional subcommand. When omitted, runs the gateway
     /// (existing v0.4 behaviour). Available subcommands:
     /// `verify-audit-log <FILE> --hmac-key <SPEC>` walks an audit-log
@@ -1860,6 +1881,34 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // entitlement check runs here (fail-closed) but the hourly metering loop
     // can only be spawned later, once `shutdown_notify` + `background_handles`
     // exist — so stash the client + code + dimension and spawn below.
+    // v1.2 savings ledger, created HERE (before the metering setup) because
+    // the v1.5 `--marketplace-metered-savings` hourly loop reads it as the
+    // quantity source; it is attached to the service further down at the
+    // existing `with_savings_ledger` site. Same load shape as the other
+    // state-file managers (empty / missing path starts fresh, corrupted
+    // snapshot WARNs + bumps
+    // `s4_state_file_load_failures_total{manager="savings_ledger"}` and
+    // starts fresh, file left in place). Unlike the other managers the
+    // ledger also flushes itself to this path on every counter mutation, so
+    // a crash loses at most the in-flight event.
+    let savings_ledger: Option<std::sync::Arc<s4_server::ledger::SavingsLedger>> =
+        opt.savings_ledger_state_file.as_ref().map(|path| {
+            let snapshot = s4_server::state_loader::load_or_fresh(
+                "savings_ledger",
+                path,
+                s4_server::ledger::LedgerSnapshot::from_json,
+            );
+            info!(
+                path = %path.display(),
+                "S4 savings ledger attached (v1.2; gateway-traversing writes only — \
+                 read offline with `s4 savings --state-file <PATH>`)"
+            );
+            std::sync::Arc::new(s4_server::ledger::SavingsLedger::attach(
+                snapshot,
+                path.clone(),
+            ))
+        });
+
     let mut marketplace_metering: Option<(
         s4_server::marketplace::SdkMeteringClient,
         String,
@@ -1954,8 +2003,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // lifecycle / inventory scanners below.
     if let Some((metering_client, product_code, dimension)) = marketplace_metering {
         let shutdown_cl = Arc::clone(&shutdown_notify);
+        // v1.5 metered-savings mode: quantity source. `None` = constant
+        // 1 pod-hour (the pre-v1.5 behavior). Clap enforces that the flag
+        // comes with `--savings-ledger-state-file`, so flag ⇒ Some(ledger).
+        let metered_savings_ledger = if opt.marketplace_metered_savings {
+            savings_ledger.clone()
+        } else {
+            None
+        };
         let handle = tokio::spawn(async move {
-            use s4_server::marketplace::{MeterOutcome, drop_stale_pending, meter_one_hour};
+            use s4_server::marketplace::{
+                MeterOutcome, drop_stale_pending, meter_one_hour, metered_savings_quantity,
+            };
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
             // Skip (don't burst) ticks missed while the host was suspended or
             // the clock jumped — those hours weren't really served, and a
@@ -1964,8 +2023,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             // in normal operation, so ticks are never missed for ordinary
             // metering latency and we don't need per-hour-bucket catch-up.
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Pod-hours awaiting a successful record, oldest-first.
-            let mut pending: std::collections::VecDeque<std::time::SystemTime> =
+            // Pod-hours awaiting a successful record, oldest-first, each
+            // carrying the quantity captured AT ITS OWN HOUR — a backfilled
+            // hour bills the savings that existed then, not the value at
+            // retry time.
+            let mut pending: std::collections::VecDeque<(std::time::SystemTime, i32)> =
                 std::collections::VecDeque::new();
             loop {
                 tokio::select! {
@@ -1979,7 +2041,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
                     _ = ticker.tick() => {}
                 }
                 let now = std::time::SystemTime::now();
-                pending.push_back(now);
+                let quantity = match &metered_savings_ledger {
+                    Some(ledger) => {
+                        let totals = ledger.snapshot().global_totals();
+                        metered_savings_quantity(totals.original_bytes, totals.stored_bytes)
+                    }
+                    None => 1,
+                };
+                pending.push_back((now, quantity));
                 let dropped = drop_stale_pending(
                     &mut pending,
                     now,
@@ -1997,12 +2066,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
                 }
                 // Drain oldest-first; stop at the first failure so ordering is
                 // preserved and the failed hour is backfilled next tick.
-                while let Some(&ts) = pending.front() {
+                while let Some(&(ts, qty)) = pending.front() {
                     match meter_one_hour(
                         &metering_client,
                         &product_code,
                         &dimension,
-                        1,
+                        qty,
                         ts,
                         s4_server::marketplace::METER_USAGE_CALL_TIMEOUT,
                     )
@@ -2013,6 +2082,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
                             tracing::info!(
                                 product_code,
                                 dimension,
+                                quantity = qty,
                                 record_id = record_id.as_deref().unwrap_or("(none)"),
                                 "AWS Marketplace MeterUsage recorded one pod-hour"
                             );
@@ -2777,27 +2847,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             None
         };
     // v1.2: wire the measured-savings ledger when
-    // --savings-ledger-state-file is supplied. Same load shape as the
-    // other state-file managers (empty / missing path starts fresh,
-    // corrupted snapshot WARNs + bumps
-    // `s4_state_file_load_failures_total{manager="savings_ledger"}`
-    // and starts fresh, file left in place). Unlike the other
-    // managers the ledger also flushes itself to this path on every
-    // counter mutation, so a crash loses at most the in-flight event.
-    if let Some(ref path) = opt.savings_ledger_state_file {
-        let snapshot = s4_server::state_loader::load_or_fresh(
-            "savings_ledger",
-            path,
-            s4_server::ledger::LedgerSnapshot::from_json,
-        );
-        info!(
-            path = %path.display(),
-            "S4 savings ledger attached (v1.2; gateway-traversing writes only — \
-             read offline with `s4 savings --state-file <PATH>`)"
-        );
-        s4 = s4.with_savings_ledger(std::sync::Arc::new(
-            s4_server::ledger::SavingsLedger::attach(snapshot, path.clone()),
-        ));
+    // --savings-ledger-state-file is supplied. Created earlier (before the
+    // Marketplace metering setup) because the v1.5 metered-savings loop
+    // shares it as the quantity source — see the load site for the
+    // state-file semantics.
+    if let Some(ref ledger) = savings_ledger {
+        s4 = s4.with_savings_ledger(std::sync::Arc::clone(ledger));
     }
     if matches!(opt.compliance_mode, Some(ComplianceMode::Strict)) {
         s4 = s4.with_compliance_strict(true);
@@ -5413,5 +5468,62 @@ mod sigusr1_dump_tests {
             "Hours",
         ])
         .expect_err("--marketplace-usage-dimension requires --marketplace-product-code");
+    }
+
+    /// v1.5 `--marketplace-metered-savings`: opt-in value-based metering.
+    /// Default off; requires BOTH the custom dimension (what gets
+    /// metered) and the savings ledger state file (the quantity source —
+    /// booting without a ledger would silently meter 0 forever).
+    #[test]
+    fn marketplace_metered_savings_flag_parses_and_requires_sources() {
+        use clap::Parser as _;
+        let default =
+            super::Opt::try_parse_from(["s4-server", "--endpoint-url", "http://127.0.0.1:9000"])
+                .expect("minimal Opt must parse");
+        assert!(
+            !default.marketplace_metered_savings,
+            "default must be off (constant 1 pod-hour quantity)"
+        );
+
+        let full = super::Opt::try_parse_from([
+            "s4-server",
+            "--endpoint-url",
+            "http://127.0.0.1:9000",
+            "--marketplace-product-code",
+            "1a2b3c4d5e6f7g8h9i0jEXAMPLE",
+            "--marketplace-usage-dimension",
+            "GBSavedHours",
+            "--savings-ledger-state-file",
+            "/tmp/ledger.json",
+            "--marketplace-metered-savings",
+        ])
+        .expect("Opt with dimension + ledger + metered-savings must parse");
+        assert!(full.marketplace_metered_savings);
+
+        // Without the dimension it must be rejected …
+        super::Opt::try_parse_from([
+            "s4-server",
+            "--endpoint-url",
+            "http://127.0.0.1:9000",
+            "--marketplace-product-code",
+            "1a2b3c4d5e6f7g8h9i0jEXAMPLE",
+            "--savings-ledger-state-file",
+            "/tmp/ledger.json",
+            "--marketplace-metered-savings",
+        ])
+        .expect_err("--marketplace-metered-savings requires --marketplace-usage-dimension");
+
+        // … and without the ledger state file too.
+        super::Opt::try_parse_from([
+            "s4-server",
+            "--endpoint-url",
+            "http://127.0.0.1:9000",
+            "--marketplace-product-code",
+            "1a2b3c4d5e6f7g8h9i0jEXAMPLE",
+            "--marketplace-usage-dimension",
+            "GBSavedHours",
+            "--marketplace-metered-savings",
+        ])
+        .expect_err("--marketplace-metered-savings requires --savings-ledger-state-file");
     }
 }
