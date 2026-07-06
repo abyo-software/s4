@@ -5,10 +5,14 @@
 > the "E2E (MinIO Docker)" job, the weekly
 > [compat-matrix workflow](../../.github/workflows/compat-matrix.yml) round-trips
 > against it, and every measured benchmark in this series (#1–#5) ran against a
-> MinIO backend. **Cloudflare R2, Backblaze B2, and Wasabi are wire-compatible
-> targets that this project has *not* yet validated against** — their sections
-> below say exactly why they should work, what to verify first, and how to run
-> the same smoke test our CI runs.
+> MinIO backend. **Cloudflare R2 was live-validated on 2026-07-06** (single
+> PUT/GET, range GET, stamping, ≤2-part multipart all pass with byte-identity
+> verified; ≥3-part mixed-compressibility multipart fails on R2's
+> uniform-part-size rule — see the R2 section and
+> [#143](https://github.com/abyo-software/s4/issues/143)) and is in the weekly
+> compat-matrix CI. **Backblaze B2 and Wasabi remain not yet validated** —
+> their sections say exactly why they should work, what to verify first, and
+> how to run the same smoke test our CI runs.
 > Companion to [#1 Elasticsearch frozen tier](elasticsearch-frozen-tier.md) /
 > [#2 OpenSearch searchable snapshots](opensearch-searchable-snapshots.md) /
 > [#3 Grafana Loki chunks](grafana-loki-chunks.md) /
@@ -176,19 +180,32 @@ and minus a small operations delta:
   $0.36/million, negligible for most workloads, but list-heavy traffic can opt
   out with `--physical-listings`.
 
-**The single most important thing to test on R2: multipart.** Cloudflare
-[documents](https://developers.cloudflare.com/r2/objects/multipart-objects/)
-that "all parts except the last must be the same size." S4 compresses each
-part before it reaches the backend, so backend-side part sizes are
-content-dependent: highly compressible parts get padded up to the 5 MiB S3
-minimum (uniform), but parts that compress to *different* sizes above that
-floor will arrive at R2 **non-uniform** — exactly what R2 says it rejects.
-Until this project or you have validated multipart against R2, treat large
-multipart uploads through S4 → R2 as **unproven and likely to fail for mixed
-compressibility data**. Single-PUT objects don't have this constraint.
+**Validated against live R2 (2026-07-06).** What works and what doesn't:
+
+- ✅ **Single PUT / GET**: byte-identity verified (sha256 exact through
+  S4 → R2 → S4), sidecar written and readable, client-transparent
+  logical-ETag stamp (metadata self-copy) works on R2.
+- ✅ **Range GET** via the sidecar index: correct bytes + correct
+  `ContentRange` total.
+- ✅ **Multipart with ≤ 2 parts**: works end to end (88 MiB, CRT 64 MiB
+  chunking); the stamped composite ETag was independently recomputed and
+  matched exactly. R2's uniform-size rule is vacuous below 3 parts.
+- ❌ **Multipart with ≥ 3 parts of mixed compressibility FAILS**:
+  Cloudflare [enforces](https://developers.cloudflare.com/r2/objects/multipart-objects/)
+  "all parts except the last must be the same size", and S4's backend
+  parts are content-dependent (compressed per part, padded only to the
+  5 MiB floor). Measured repro (11 × 8 MiB parts alternating text/random):
+  `CompleteMultipartUpload → InvalidPart: All non-trailing parts must
+  have the same length.` Tracked with fix directions in
+  [#143](https://github.com/abyo-software/s4/issues/143).
+  **Workaround**: raise the client's `multipart_threshold` /
+  `multipart_chunksize` so uploads stay at ≤ 2 parts, or avoid multipart
+  for mixed-compressibility data until #143 lands.
 
 R2's 10 GB free tier makes it the cheapest of the three hosted providers to
-validate — the full smoke test below fits inside it.
+validate — the full smoke test below fits inside it (it is how the results
+above were produced; this repo's weekly compat-matrix CI now also
+round-trips R2).
 
 ```bash
 export AWS_ACCESS_KEY_ID=<r2-access-key-id>
