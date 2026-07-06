@@ -1024,3 +1024,59 @@ async fn stale_durable_record_is_ignored_not_stamped() {
         "GET must return the bytes the backend actually holds"
     );
 }
+
+/// #144: HEAD of a multipart object must present the ORIGINAL
+/// (decompressed) ContentLength, not the stored compressed size —
+/// GET and Range GET already report original sizes, and HEAD was the
+/// odd one out (validated live on R2 + MinIO, 2026-07-06).
+#[tokio::test]
+async fn multipart_head_reports_original_content_length() {
+    let state = Arc::new(Mutex::new(InnerState::default()));
+    let (p1, p2) = part_bodies();
+    let original_total = (p1.len() + p2.len()) as i64;
+
+    let svc = make_service(&state);
+    let (upload_id, etag1, etag2) =
+        create_and_upload_two_parts(&svc, "b", "headlen/obj.bin", p1, p2).await;
+    svc.complete_multipart_upload(complete_mpu_req(
+        "b",
+        "headlen/obj.bin",
+        &upload_id,
+        vec![(1, etag1.as_str()), (2, etag2.as_str())],
+    ))
+    .await
+    .expect("complete");
+
+    let head = svc
+        .head_object(head_req("b", "headlen/obj.bin"))
+        .await
+        .expect("head");
+    assert_eq!(
+        head.output.content_length,
+        Some(original_total),
+        "HEAD must report the original size (stored compressed size leaked?)"
+    );
+
+    // Pre-v1.5 objects have no `s4-original-size` stamp — strip it from the
+    // backend metadata and HEAD again: the sidecar fallback must still
+    // resolve the original size.
+    {
+        let mut st = state.lock().unwrap();
+        let obj = st
+            .objects
+            .get_mut(&("b".to_owned(), "headlen/obj.bin".to_owned()))
+            .expect("object on backend");
+        let md = obj.metadata.as_mut().expect("stamped metadata");
+        md.remove("s4-original-size")
+            .expect("stamp must have been written by Complete");
+    }
+    let head = svc
+        .head_object(head_req("b", "headlen/obj.bin"))
+        .await
+        .expect("head (fallback)");
+    assert_eq!(
+        head.output.content_length,
+        Some(original_total),
+        "sidecar fallback must resolve the original size for unstamped multipart objects"
+    );
+}

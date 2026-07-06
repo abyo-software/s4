@@ -2726,6 +2726,7 @@ impl<B: S3> S4Service<B> {
         bucket: &str,
         key: &str,
         composite: &str,
+        original_size: Option<u64>,
     ) -> S3Result<bool> {
         let head_req = S3Request {
             input: HeadObjectInput {
@@ -2764,6 +2765,12 @@ impl<B: S3> S4Service<B> {
         }
         let mut metadata = head.output.metadata.clone().unwrap_or_default();
         metadata.insert(META_LOGICAL_ETAG.into(), composite.to_owned());
+        // #144: stamp the assembled original size alongside the composite so
+        // HEAD can present the original ContentLength without a sidecar read
+        // (multipart objects carry no single-object manifest).
+        if let Some(size) = original_size {
+            metadata.insert(META_ORIGINAL_SIZE.into(), size.to_string());
+        }
         let mut builder = CopyObjectInput::builder();
         builder.set_bucket(bucket.to_owned());
         builder.set_key(key.to_owned());
@@ -6690,6 +6697,35 @@ impl<B: S3> S3 for S4Service<B> {
             resp.output.checksum_sha1 = None;
             resp.output.checksum_sha256 = None;
             resp.output.checksum_type = None;
+            // #144: multipart / framed-v2 objects carry no single-object
+            // manifest, so the `extract_manifest`-gated block above never
+            // fixed their ContentLength — HEAD leaked the stored compressed
+            // size while GET / Range GET report original sizes (validated
+            // live on R2 + MinIO, 2026-07-06). Present the original size
+            // from the `s4-original-size` stamp Complete writes (v1.5+);
+            // for older multipart objects without the stamp fall back to
+            // the sidecar's `total_original_size` (one backend GET). An
+            // object with neither (e.g. pre-v1.5 SSE multipart, which
+            // suppresses the sidecar) keeps the stored size — documented
+            // in compatibility.md.
+            if extract_manifest(&resp.output.metadata).is_none() {
+                let stamped_size = resp
+                    .output
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get(META_ORIGINAL_SIZE))
+                    .and_then(|v| v.parse::<i64>().ok());
+                match stamped_size {
+                    Some(size) => resp.output.content_length = Some(size),
+                    None => {
+                        if let Some(idx) = self.read_sidecar(&head_bucket, &head_key).await
+                            && let Ok(size) = i64::try_from(idx.total_original_size())
+                        {
+                            resp.output.content_length = Some(size);
+                        }
+                    }
+                }
+            }
         }
         // `--logical-etag`: evaluate the stripped ETag preconditions against
         // the object's logical ETag (or the backend ETag for passthrough /
@@ -8653,11 +8689,14 @@ impl<B: S3> S3 for S4Service<B> {
         // Complete with a WARN — never guess.
         //
         // v1.2 audit R1 P2 (CPU regression): the frame scan
-        // (`build_index_from_body`) exists ONLY when the ledger flag
-        // is on — flag-off deployments must not pay an O(body) walk
-        // per Complete for counters nobody is keeping.
+        // (`build_index_from_body`) is gated — deployments with BOTH the
+        // ledger and `--logical-etag` off must not pay a per-Complete
+        // header walk for values nobody reads. #144 widened the gate:
+        // the scan's `total_original_size` now also feeds the
+        // `s4-original-size` HEAD-ContentLength stamp, which exists
+        // whenever `--logical-etag` (the default) is on.
         let ledger_on = self.savings_ledger.is_some();
-        let ledger_new_original: Option<u64> = if ledger_on {
+        let assembled_original: Option<u64> = if ledger_on || self.logical_etag {
             assembled_body.as_ref().map(|b| {
                 build_index_from_body(b)
                     .map(|idx| idx.total_original_size())
@@ -8666,6 +8705,7 @@ impl<B: S3> S3 for S4Service<B> {
         } else {
             None
         };
+        let ledger_new_original: Option<u64> = if ledger_on { assembled_original } else { None };
         let mut ledger_new_stored: Option<u64> = if ledger_on {
             assembled_body.as_ref().map(|b| b.len() as u64)
         } else {
@@ -8739,7 +8779,7 @@ impl<B: S3> S3 for S4Service<B> {
             // failed. In every non-`Ok(true)` case the object keeps the
             // backend composite ETag, so the response stays consistent.
             match self
-                .stamp_logical_etag_via_self_copy(&bucket, &key, composite)
+                .stamp_logical_etag_via_self_copy(&bucket, &key, composite, assembled_original)
                 .await
             {
                 Ok(true) => stamped = true,
@@ -8979,6 +9019,14 @@ impl<B: S3> S3 for S4Service<B> {
                         new_metadata.insert(META_ORIGINAL_SIZE.into(), original.to_string());
                         new_metadata.insert(META_COMPRESSED_SIZE.into(), body.len().to_string());
                     }
+                }
+                // #144: the original-size stamp is a HEAD-ContentLength
+                // correctness feature, not just ledger accounting — write it
+                // whenever it was computed (i.e. `--logical-etag` on too),
+                // independent of the ledger-gated pair above (idempotent
+                // overwrite when both apply).
+                if let Some(original) = assembled_original {
+                    new_metadata.insert(META_ORIGINAL_SIZE.into(), original.to_string());
                 }
                 let new_body = match &ctx.sse {
                     crate::multipart_state::MultipartSseMode::SseC { key, key_md5 } => {
