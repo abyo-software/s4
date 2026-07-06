@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783318092066,
+  "lastUpdate": 1783318549168,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -20580,6 +20580,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "2ebf01f86b472524d97d49a1f63fa87f410c4657",
+          "message": "feat(server): --marketplace-metered-savings — value-based GBSavedHours metering\n\nSwitches the hourly MeterUsage quantity from the constant 1 pod-hour to\nthe storage the gateway is currently avoiding on the backend, in\ninteger GiB (original_bytes − stored_bytes from the savings ledger).\nStock semantics (\"rent on savings\"): captured once per hour at enqueue\ntime, so a backfilled hour bills the savings that existed then; a\nlost/reset ledger under-meters (customer's favor), never over-meters —\nno durable checkpoint needed, no double-billing window.\n\n- Flag is opt-in (default off = pre-v1.5 constant quantity, bit-for-\n  bit) and clap-requires both --marketplace-usage-dimension and\n  --savings-ledger-state-file (booting without a ledger would silently\n  meter 0 forever).\n- pending backlog entries carry (timestamp, quantity);\n  drop_stale_pending updated accordingly.\n- metered_savings_quantity(): saturating_sub, GiB floor, i32 saturation\n  — unit-tested incl. drift (stored > original → 0) and u64::MAX.\n- Ledger construction hoisted above the metering setup so the loop and\n  with_savings_ledger share one Arc; load semantics unchanged.\n- docs: metering.md gains the MeterUsage route + metered-savings\n  section; design doc marked code-shipped. The listing-side dimension\n  submission remains a separate seller-approved step — nothing about a\n  live listing changes by shipping this flag.\n\nTests: lib 642 passed (27 marketplace incl. new quantity test), bin\nflag-requirements test, clippy 0 warnings, fmt clean.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-06T15:07:40+09:00",
+          "tree_id": "62e605c26166ec402c2bfb899abb1d275aa01a07",
+          "url": "https://github.com/abyo-software/s4/commit/2ebf01f86b472524d97d49a1f63fa87f410c4657"
+        },
+        "date": 1783318548517,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 48314,
+            "range": "± 1663",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 55755,
+            "range": "± 631",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 428,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2221662,
+            "range": "± 79891",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50656012,
+            "range": "± 97981",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201248,
+            "range": "± 1278",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 49583324,
+            "range": "± 340643",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 924925171,
+            "range": "± 4836244",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3223447,
+            "range": "± 47803",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 27464,
+            "range": "± 1117",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 32457,
+            "range": "± 739",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 420,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 572461,
+            "range": "± 3448",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1635037,
+            "range": "± 13620",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201313,
+            "range": "± 285",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12261098,
+            "range": "± 60187",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 28573047,
+            "range": "± 456406",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3224854,
+            "range": "± 14294",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1433130,
+            "range": "± 24841",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2219940,
+            "range": "± 21628",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 313418083,
+            "range": "± 6497942",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 147,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 8578,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 947,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 14466,
+            "range": "± 58",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2702,
+            "range": "± 66",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 20983,
+            "range": "± 104",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 83698,
+            "range": "± 140",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 632,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 5225,
+            "range": "± 112",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 20932,
+            "range": "± 387",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
             "range": "± 0",
             "unit": "ns/iter"
           }
