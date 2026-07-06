@@ -95,7 +95,34 @@ no new crates:
    and an hourly-loop test with a scripted client asserting the sent
    quantities.
 
-## Listing shape (requires seller approval — do NOT submit unilaterally)
+## Listing attempt result (2026-07-06): blocked by platform rule
+
+Submission was approved and attempted (change sets
+`aym10q5u2n4aepsnay66ztd0e`, `97gvwbhics2hsdn7i38s7todp` on
+`prod-nimrbd77e4xfs` + `offer-quy32knls4zlk`): AWS rejects
+`AddDimensions` with **"New dimension cannot be added to product having
+hourly pricing"**. The live container product is registered under the
+hourly-with-annual pricing model (its `Hours`/PID1 dimension is
+`ExternallyMetered` only because container hourly meters via
+`MeterUsage`), and that model's dimension set is fixed — this is a
+model-level rule, so the seller portal cannot do it either. Two
+validation details learned: dimension `Description` ≤ 90 chars;
+`ChangeSetName` must match `^[\w\s+=.:@-]{1,100}$`.
+
+Remaining paths (decision pending):
+1. **New dedicated container listing** under the custom-metering model
+   with `GBSavedHours` — clean but costs a full portal creation flow
+   (repos must be created BY the portal, see
+   `feedback-marketplace-repo-order`), AWS review, and splits the
+   product's Marketplace presence.
+2. **Hold until demand** — the gateway flag ships regardless; create
+   the dedicated listing when a real customer asks for value-based
+   pricing.
+3. **Seller-support case** asking whether an existing hourly container
+   product can be converted / gain a usage dimension (days of latency,
+   likely "no").
+
+## Listing shape (superseded by the above — kept for the dedicated-listing path)
 
 - New custom dimension, catalog type `ExternallyMetered`, key e.g.
   `GBSavedHours`, unit-priced as a fraction of S3 Standard GB-month
