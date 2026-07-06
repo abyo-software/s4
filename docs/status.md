@@ -41,9 +41,11 @@
   pre-auth state-machine bugs, HTTP wire hardening, GPU codec safety,
   binding correctness, background-task lifecycle, README claim
   accuracy, and v1.0 freeze surface completeness. CVE clean
-  (`cargo audit`, see CI `security-audit` job); 4 advisories accepted
+  (`cargo audit`, see CI `security-audit` job); 1 advisory accepted
   as risk-with-mitigation per
-  [`security/cargo-audit-ignores.md`](security/cargo-audit-ignores.md).
+  [`security/cargo-audit-ignores.md`](security/cargo-audit-ignores.md)
+  (down from 4 — the rustls-webpki trio was resolved 2026-07-06 by
+  dropping the legacy rustls 0.21 chain, issue #91).
 - **Continuous fuzz farm** (since v0.8.6) — 7 bolero targets running 24/7
   under a `systemd-user` slice budgeted at 8 cores / 30 GiB (1/4 of the
   build host). Coverage compounds across `Restart=always` wakeups; any

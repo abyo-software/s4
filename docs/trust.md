@@ -186,8 +186,8 @@ reproducible with the command shown.
 
 **Conformance.** Against the Ceph `s3-tests` suite (N=784 tests), S4
 introduces **11 regressions vs MinIO-direct** (down from 21 before the
-client-transparency campaign); every one of the 11 is individually
-enumerated in [compatibility.md § Known minor gaps](compatibility.md#client-transparency-compression-is-invisible-to-the-client).
+client-transparency campaign); the remaining gaps are listed in
+[compatibility.md § Known minor gaps](compatibility.md#client-transparency-compression-is-invisible-to-the-client).
 
 **Per-push CI** ([ci.yml](../.github/workflows/ci.yml)): `cargo fmt` +
 `clippy` + workspace tests, a 10K-cases-per-property proptest stress
