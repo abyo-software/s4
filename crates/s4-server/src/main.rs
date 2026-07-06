@@ -922,7 +922,11 @@ struct Opt {
     /// `--savings-ledger-state-file` (the measurement source; refusing
     /// to boot without it beats silently metering 0 forever). Off
     /// (default) keeps the constant-quantity pod-hour behavior
-    /// bit-for-bit.
+    /// bit-for-bit. SINGLE-GATEWAY deployments only: run exactly one
+    /// replica with this flag — every metering replica bills the full
+    /// stock its ledger reports and AWS does not dedup across callers,
+    /// so N metering replicas = N× billing. Fleet-accurate aggregation
+    /// is a documented follow-up (design doc § rollout).
     #[clap(
         long,
         requires = "marketplace_usage_dimension",
@@ -2007,6 +2011,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         // 1 pod-hour (the pre-v1.5 behavior). Clap enforces that the flag
         // comes with `--savings-ledger-state-file`, so flag ⇒ Some(ledger).
         let metered_savings_ledger = if opt.marketplace_metered_savings {
+            // Single-metering-writer requirement (2026-07-06 review
+            // finding): every replica running with this flag meters the
+            // full stock its ledger reports, and AWS-side dedup is
+            // per-caller — N replicas sharing one ledger file would bill
+            // the same GiB-hours N times. The process cannot see its
+            // siblings, so this is a loud contract statement, not a
+            // detection.
+            tracing::warn!(
+                "--marketplace-metered-savings assumes a SINGLE metering gateway per \
+                 savings ledger: run exactly one replica with this flag (and do not \
+                 share one --savings-ledger-state-file between metering replicas), \
+                 or the same saved GiB-hours are billed once per replica"
+            );
             savings_ledger.clone()
         } else {
             None

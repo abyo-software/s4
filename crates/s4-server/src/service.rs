@@ -8401,6 +8401,36 @@ impl<B: S3> S3 for S4Service<B> {
         } else {
             None
         };
+        // Stale-state guard (2026-07-06 review finding): trust a recorded
+        // per-part entry (in-memory OR durable) only while its backend ETag
+        // matches the authoritative ListParts ETag for that part. A delayed
+        // `UploadPart`'s state write can land AFTER a re-upload of the same
+        // part number, and trusting the stale `original_md5` would stamp a
+        // composite for bytes the backend no longer holds (or fail a valid
+        // manifest as InvalidPart). Dropped entries degrade that part to the
+        // unrecorded fallback below: reverse-map to the ListParts ETag,
+        // Complete succeeds, no composite stamp. Parts ListParts doesn't
+        // return are kept — there is nothing to cross-check against.
+        let logical_parts = match (logical_parts, listparts_etags.as_ref()) {
+            (Some(mut map), Some(lp)) => {
+                map.retain(|pn, pe| {
+                    let fresh = lp.get(pn).is_none_or(|be| *be == pe.backend_etag);
+                    if !fresh {
+                        tracing::warn!(
+                            bucket,
+                            key,
+                            part_number = pn,
+                            "S4 multipart: recorded part state is stale (backend ETag \
+                             changed since it was written — concurrent re-upload of this \
+                             part number?); ignoring it for validation/composite"
+                        );
+                    }
+                    fresh
+                });
+                Some(map)
+            }
+            (map, _) => map,
+        };
         let logical_composite: Option<String> = if self.logical_etag {
             // Reverse-map the manifest in place + collect completed part
             // numbers for the composite.

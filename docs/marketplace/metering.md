@@ -75,6 +75,12 @@ counters behind `s4 savings`). Requirements and semantics:
   (ephemeral pod storage) under-meters until the counters rebuild —
   give the ledger a persistent volume for accurate metering. Sub-GiB
   savings floor to 0.
+- **Single metering gateway only.** Run exactly one replica with this
+  flag: every metering replica bills the full stock its ledger reports,
+  and AWS does not dedup `MeterUsage` across callers — N metering
+  replicas means N× billing (the gateway WARNs about this at metering
+  start). Multi-replica fleets should stay on per-pod hourly pricing
+  until the fleet-aggregation follow-up lands.
 - Design rationale, pricing arithmetic, and the listing-side rollout
   plan: [metered-savings-design.md](metered-savings-design.md). The
   listing change (new dimension) is a separate, seller-approved step —

@@ -44,9 +44,17 @@ Why stock, not flow:
   fraction of S3 Standard (`$0.023/GB-month ÷ 730 h ≈ $0.0000315/GB-h`);
   e.g. a 30% take is ~`$0.00001/GB-h` — the customer always keeps the
   majority of the savings.
-- **Multi-gateway additive.** Each instance's ledger counts only the
-  traffic it processed, so N gateways metering independently sum to the
-  fleet total without coordination.
+- **Single metering gateway (v1.5 constraint).** ~~Multi-gateway
+  additive~~ — withdrawn after review (2026-07-06): per-instance
+  ledgers do sum for writes, but cross-pod DELETEs drift the per-pod
+  stocks (the deleting pod's ledger never held the object), and a
+  *shared* ledger file would bill the same stock once per replica (AWS
+  does not dedup `MeterUsage` across callers). v1.5 therefore requires
+  **exactly one metering replica** (the flag docs + a boot WARN state
+  this); the primary target is the single-instance AMI deployment.
+  Fleet-accurate aggregation (backend-scan derivation or a leader
+  lease) is the documented follow-up before recommending the flag on
+  multi-replica fleets.
 
 ### Known honest caveats
 

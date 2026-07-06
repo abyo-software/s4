@@ -940,3 +940,87 @@ async fn mpu_records_hidden_from_listing_and_write_blocked() {
         "err: {err:?}"
     );
 }
+
+/// Stale-state guard (2026-07-06 review finding): a durable record whose
+/// `backend_etag` no longer matches the authoritative ListParts ETag for
+/// that part (a delayed `UploadPart`'s state write landing AFTER a
+/// re-upload of the same part number) must be IGNORED — completing with
+/// it would stamp a composite for bytes the backend no longer holds.
+/// The part degrades to the unrecorded fallback: Complete succeeds
+/// (reverse-mapped to the ListParts ETag) but nothing is stamped, and
+/// GET returns the real bytes with no logical ETag.
+#[tokio::test]
+async fn stale_durable_record_is_ignored_not_stamped() {
+    let state = Arc::new(Mutex::new(InnerState::default()));
+    let (p1, p2) = part_bodies();
+
+    let svc_a = make_service(&state);
+    let (upload_id, _etag1, etag2) =
+        create_and_upload_two_parts(&svc_a, "b", "stale/obj.bin", p1.clone(), p2.clone()).await;
+
+    // Simulate the delayed writer: overwrite part 1's durable record with
+    // state from an EARLIER upload attempt — an original_md5 of different
+    // bytes and a backend_etag that no longer matches what ListParts
+    // reports for the part actually stored.
+    let stale_md5 = md5_hex(b"the earlier, superseded part-1 bytes");
+    let stale = mpu_durable::DurablePartRecord {
+        v: mpu_durable::DurablePartRecord::VERSION,
+        upload_id: upload_id.clone(),
+        part_number: 1,
+        original_md5: stale_md5.clone(),
+        backend_etag: "d41d8cd98f00b204e9800998ecf8427e".to_owned(), // not the stored part
+        key: "stale/obj.bin".to_owned(),
+    };
+    state.lock().unwrap().objects.insert(
+        ("b".to_owned(), mpu_durable::record_key(&upload_id, 1)),
+        StoredObject {
+            body: Bytes::from(stale.encode()),
+            metadata: None,
+            content_type: None,
+        },
+    );
+
+    // A FRESH instance (no in-memory state) completes with a manifest
+    // citing the STALE part-1 ETag — exactly what the delayed client
+    // would submit.
+    let svc_b = make_service(&state);
+    let complete = svc_b
+        .complete_multipart_upload(complete_mpu_req(
+            "b",
+            "stale/obj.bin",
+            &upload_id,
+            vec![(1, stale_md5.as_str()), (2, etag2.as_str())],
+        ))
+        .await
+        .expect("Complete must still succeed via the unrecorded fallback");
+    assert!(
+        complete.output.e_tag.is_none(),
+        "a composite computed from a stale record must NOT be stamped; got {:?}",
+        complete.output.e_tag
+    );
+
+    // HEAD reflects the unstamped state, and GET returns the REAL bytes.
+    let head = svc_b
+        .head_object(head_req("b", "stale/obj.bin"))
+        .await
+        .expect("head");
+    assert!(
+        head.output.e_tag.is_none(),
+        "unstamped multipart object must present no ETag; got {:?}",
+        head.output.e_tag
+    );
+    let got = svc_b
+        .get_object(get_req("b", "stale/obj.bin"))
+        .await
+        .expect("get");
+    let body = collect_blob(got.output.body.expect("body"), MAX_BODY)
+        .await
+        .expect("collect");
+    let mut expected_bytes = p1.to_vec();
+    expected_bytes.extend_from_slice(&p2);
+    assert_eq!(
+        md5_hex(&body),
+        md5_hex(&expected_bytes),
+        "GET must return the bytes the backend actually holds"
+    );
+}

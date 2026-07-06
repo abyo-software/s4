@@ -2,7 +2,7 @@
 
 | Tier | What runs | Where | Pass count |
 |---|---|---|---|
-| **Unit + integration** | parsers, registry, blob helpers, S3 trait, policy, TLS | every push (CI) | 70+ |
+| **Unit + integration** | parsers, registry, blob helpers, S3 trait, policy, TLS | every push (CI) | 1,300+ |
 | **Chaos / fault-injection** | mid-stream GET error, HEAD timeout fail-close, concurrent overwrite, SSE keyring rotation, MPU complete failure (deterministic, in-memory) | every push (CI) | 6 |
 | **proptest fuzz** | 39 properties × 256–10K cases (push), × 1M (nightly) | every push + nightly | 39 |
 | **bolero coverage-guided** | 7 targets, libfuzzer engine | nightly (matrix, 30 min × 5) | 7 |
@@ -13,9 +13,11 @@
 | **Real AWS S3 E2E** | OIDC role + actual S3, single-PUT / multipart / Range GET | nightly (`aws-e2e.yml`, opt-in) | 3 |
 | **Soak / load** | 24h sustained load, RSS / FD / connection leak detection | manual (`scripts/soak/run.sh`) | continuous |
 
-**125 default tests + 15 ignored (Docker / GPU / AWS env required) = 140 tests**,
-plus PROPTEST_CASES=10000 stress run on every push (~73 sec, 380K fuzz cases),
-1M cases × 38 properties nightly (~6 h, 38M+ fuzz cases).
+**1,355 default tests + 86 ignored (Docker / GPU / AWS env required) =
+1,441 test functions** (measured 2026-07-06 on the workspace with
+`cargo test --workspace -- --list`; the table above is the tier
+structure, not a census), plus a PROPTEST_CASES=10000 stress run on
+every push and 1M cases × 39 properties nightly (39M+ fuzz cases).
 
 Two real bugs already caught by fuzz infrastructure:
 1. `FrameIter` infinite-loop on 1-byte input (DoS) — fixed with `fused: bool`

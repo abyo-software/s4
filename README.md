@@ -88,7 +88,7 @@ on the integer/columnar side, not a blanket "compress with GPU" claim:
 *These are single-pass codec ceilings measured offline; realistic production savings track the cost table above (50–80%). Multipart uploads at the default 4 MiB frame size compress repetitive logs far less than 155× until client chunk sizes are tuned — see [docs/benchmarks.md](docs/benchmarks.md).*
 
 - **Compatibility** — S3-compatible for core object workflows, with 45+ S3 ops implemented (not a complete S3 API); MinIO is per-PR verified and AWS S3 E2E is opt-in. Full S3 / SDK / backend matrices: **[docs/compatibility.md](docs/compatibility.md)**; comparison vs MinIO / Garage / Wasabi / B2 below.
-- **Trust signals** — 714+ workspace tests, a 24/7 fuzz farm (7 bolero targets), and adversarial Opus+Codex audit rounds; CVE-clean `cargo audit`. Details: **[docs/testing.md](docs/testing.md)** · **[docs/status.md](docs/status.md)** · **[full benchmarks](docs/benchmarks.md)**.
+- **Trust signals** — 1,400+ workspace tests, a 24/7 fuzz farm (7 bolero targets), and adversarial Opus+Codex audit rounds; CVE-clean `cargo audit`. Details: **[docs/testing.md](docs/testing.md)** · **[docs/status.md](docs/status.md)** · **[full benchmarks](docs/benchmarks.md)**.
 - **"A proxy that rewrites my bytes?"** — the escape hatch (decode your data offline, no gateway), the byte-integrity design, and the verification tooling you can run yourself, in one evidence page: **[docs/trust.md](docs/trust.md)**.
 
 ### How it compares
