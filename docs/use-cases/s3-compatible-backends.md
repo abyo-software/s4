@@ -203,7 +203,11 @@ and minus a small operations delta:
   deterministic per-part target
   (`max(5 MiB, original + original/128 + 4096)`), so clients uploading
   uniform original part sizes — every AWS SDK / aws-cli chunker —
-  produce uniform backend parts and R2 accepts the Complete. **The honest
+  produce uniform backend parts and R2 accepts the Complete.
+  **Live-re-validated on R2 (2026-07-06)**: the exact failing 11-part
+  repro completes with the flag; GET sha256 exact, composite ETag
+  `…-11` independently recomputed and exact, HEAD reports the original
+  ContentLength. **The honest
   trade-off**: while the object stays in multipart form its at-rest
   savings are ~zero (each non-final part is stored at ≈ its original
   size); a later `s4 recompact` / `s4 migrate` rewrite drops the padding
