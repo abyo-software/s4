@@ -501,6 +501,22 @@ struct Opt {
     #[clap(long = "no-durable-multipart-state")]
     no_durable_multipart_state: bool,
 
+    /// v1.5 (#143): pad every non-final multipart part up to a DETERMINISTIC
+    /// per-part target — `max(5 MiB, original_size + original_size/128 + 4096)`
+    /// — so clients that upload uniform ORIGINAL part sizes (every AWS SDK /
+    /// aws-cli chunker does) produce uniform BACKEND part sizes. Required for
+    /// backends that enforce "all non-trailing parts must have the same
+    /// length" at CompleteMultipartUpload (Cloudflare R2 rejects mixed-
+    /// compressibility uploads of ≥3 parts with InvalidPart otherwise).
+    /// Trade-off: at-rest multipart savings are ~zero while the object stays
+    /// in multipart form (each non-final part is stored at ≈ its original
+    /// size); a later `s4 recompact` / `s4 migrate` rewrite drops the padding
+    /// and reclaims the savings. Single-PUT objects are unaffected. Default
+    /// off — backend part sizes then stay content-dependent (AWS S3 / MinIO
+    /// accept that), bit-for-bit the pre-v1.5 behaviour.
+    #[clap(long = "uniform-multipart-parts")]
+    uniform_multipart_parts: bool,
+
     /// v0.8.5 #84 (audit H-6): max HTTP/1 header buffer size in
     /// bytes. AWS S3 max header size is 8 KiB per header * ~50
     /// headers; 64 KiB total is safe margin. Reject larger to bound
@@ -2467,6 +2483,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // per-part state (composite ETag then degrades to best-effort
     // across restart / multi-gateway).
     s4 = s4.with_durable_multipart_state(!opt.no_durable_multipart_state);
+    // v1.5 (#143): opt-in deterministic per-part padding for backends
+    // that enforce uniform non-trailing multipart part sizes (R2).
+    s4 = s4.with_uniform_multipart_parts(opt.uniform_multipart_parts);
     info!(
         max_body_bytes = opt.max_body_bytes,
         "S4 max-body-bytes cap (v0.8.19 D-1: now CLI-tunable; default 5 GiB = AWS S3 single-PUT max)"
@@ -5485,6 +5504,31 @@ mod sigusr1_dump_tests {
             "Hours",
         ])
         .expect_err("--marketplace-usage-dimension requires --marketplace-product-code");
+    }
+
+    /// v1.5 (#143) `--uniform-multipart-parts`: opt-in deterministic
+    /// per-part padding for uniform-part-size backends (Cloudflare R2).
+    /// Default off — flag-off multipart padding must stay bit-for-bit
+    /// the 5 MiB-floor-only behaviour.
+    #[test]
+    fn uniform_multipart_parts_flag_parses() {
+        use clap::Parser as _;
+        let default =
+            super::Opt::try_parse_from(["s4-server", "--endpoint-url", "http://127.0.0.1:9000"])
+                .expect("minimal Opt must parse");
+        assert!(
+            !default.uniform_multipart_parts,
+            "default must be off (content-dependent backend part sizes)"
+        );
+
+        let set = super::Opt::try_parse_from([
+            "s4-server",
+            "--endpoint-url",
+            "http://127.0.0.1:9000",
+            "--uniform-multipart-parts",
+        ])
+        .expect("Opt with --uniform-multipart-parts must parse");
+        assert!(set.uniform_multipart_parts);
     }
 
     /// v1.5 `--marketplace-metered-savings`: opt-in value-based metering.

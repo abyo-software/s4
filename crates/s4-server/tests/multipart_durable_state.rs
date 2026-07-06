@@ -22,6 +22,12 @@
 //! - cleanup: Complete/Abort delete exactly their own upload's records.
 //! - transparency: `.s4mpu/` keys are hidden from ListObjectsV2 and
 //!   blocked for client writes.
+//!
+//! The `--uniform-multipart-parts` (#143) tests at the bottom reuse the
+//! same in-memory multipart harness: they inspect the framed BACKEND
+//! part sizes directly (`InnerState::mpu_parts`) to prove the flag
+//! makes non-final parts byte-identical in length (Cloudflare R2's
+//! uniform-part-size rule), with the durable-state default left ON.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -1023,6 +1029,273 @@ async fn stale_durable_record_is_ignored_not_stamped() {
         md5_hex(&expected_bytes),
         "GET must return the bytes the backend actually holds"
     );
+}
+
+// =========================================================================
+// #143 `--uniform-multipart-parts`: deterministic per-part padding for
+// uniform-part-size backends (Cloudflare R2).
+// =========================================================================
+
+/// Deterministic pseudo-random (xorshift64) bytes — incompressible for
+/// zstd, no `rand` dependency, reproducible across runs.
+fn pseudo_random_bytes(len: usize, seed: u64) -> Bytes {
+    let mut x = seed | 1;
+    let mut v = Vec::with_capacity(len + 8);
+    while v.len() < len {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    v.truncate(len);
+    Bytes::from(v)
+}
+
+/// #143 flag ON: 8 MiB parts of alternating compressibility must land
+/// on the backend with IDENTICAL framed lengths (== the deterministic
+/// per-part target), the smaller final part stays smaller (trailing
+/// part may differ), Complete succeeds with the exact client-
+/// transparent composite (durable-state default ON), and GET
+/// round-trips byte-identical (FrameIter skips the S4P1 padding).
+#[tokio::test]
+async fn uniform_parts_flag_on_produces_identical_nonfinal_backend_parts() {
+    let state = Arc::new(Mutex::new(InnerState::default()));
+    let svc = make_service(&state).with_uniform_multipart_parts(true);
+
+    let eight_mib = 8 * 1024 * 1024;
+    // Alternating compressibility: text-like vs xorshift random.
+    let p1 = Bytes::from(vec![b'a'; eight_mib]);
+    let p2 = pseudo_random_bytes(eight_mib, 0x1437_c0de);
+    let p3 = Bytes::from(vec![b'b'; eight_mib]);
+    // Final part: smaller AND incompressible — its (smaller) target is
+    // allowed to differ from the non-final parts' shared target.
+    let p4 = pseudo_random_bytes(3 * 1024 * 1024, 0xfeed_beef);
+    let parts: [&Bytes; 4] = [&p1, &p2, &p3, &p4];
+    let expected = expected_composite(&[&p1, &p2, &p3, &p4]);
+
+    let create = svc
+        .create_multipart_upload(create_mpu_req("b", "uniform/obj.bin"))
+        .await
+        .expect("create");
+    let upload_id = create.output.upload_id.expect("upload id");
+    let mut etags = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let pn = (i + 1) as i32;
+        let up = svc
+            .upload_part(upload_part_req(
+                "b",
+                "uniform/obj.bin",
+                &upload_id,
+                pn,
+                (*part).clone(),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("part {pn}: {e:?}"));
+        etags.push(up.output.e_tag.expect("part etag").into_value());
+    }
+
+    // ALL non-final backend part bodies must have IDENTICAL length ==
+    // the deterministic target for their shared 8 MiB original size.
+    let backend_lens: Vec<usize> = {
+        let st = state.lock().unwrap();
+        let stored = st.mpu_parts.get(&upload_id).expect("parts on backend");
+        (1..=4)
+            .map(|pn| stored.get(&pn).expect("part").len())
+            .collect()
+    };
+    let target = usize::try_from(s4_server::service::uniform_part_target(eight_mib as u64))
+        .expect("target fits usize");
+    assert_eq!(
+        &backend_lens[..3],
+        &[target, target, target],
+        "non-final backend parts must all equal the 8 MiB target"
+    );
+    assert!(
+        backend_lens[3] < target,
+        "smaller final part must stay below the non-final target \
+         (got {} vs {target})",
+        backend_lens[3]
+    );
+
+    // Complete succeeds; the composite ETag is exact (durable-state
+    // default is ON in this harness — padding sits below the frame
+    // layer and must not disturb the records or the stamp).
+    let manifest: Vec<(i32, &str)> = etags
+        .iter()
+        .enumerate()
+        .map(|(i, e)| ((i + 1) as i32, e.as_str()))
+        .collect();
+    let resp = svc
+        .complete_multipart_upload(complete_mpu_req(
+            "b",
+            "uniform/obj.bin",
+            &upload_id,
+            manifest,
+        ))
+        .await
+        .expect("complete");
+    assert_eq!(
+        resp.output.e_tag.expect("composite").into_value(),
+        expected,
+        "composite ETag must stay exact under uniform padding"
+    );
+
+    // GET round-trips byte-identical (frame-iter skips S4P1 padding).
+    let get = svc
+        .get_object(get_req("b", "uniform/obj.bin"))
+        .await
+        .expect("get");
+    let body = collect_blob(get.output.body.expect("body"), MAX_BODY)
+        .await
+        .expect("collect");
+    let mut want: Vec<u8> = Vec::new();
+    for p in parts {
+        want.extend_from_slice(p);
+    }
+    assert_eq!(body.len(), want.len(), "roundtrip length");
+    assert_eq!(
+        md5_hex(&body),
+        md5_hex(&want),
+        "GET body must round-trip byte-identical through the padded parts"
+    );
+}
+
+/// #143 flag OFF (default): the same mixed-compressibility parts land
+/// with DIFFERENT backend lengths — proving the flag-off behaviour is
+/// content-dependent (and hence that the flag matters for R2).
+#[tokio::test]
+async fn uniform_parts_flag_off_backend_part_sizes_stay_content_dependent() {
+    let state = Arc::new(Mutex::new(InnerState::default()));
+    let svc = make_service(&state);
+
+    let eight_mib = 8 * 1024 * 1024;
+    let compressible = Bytes::from(vec![b'a'; eight_mib]);
+    let incompressible = pseudo_random_bytes(eight_mib, 0x1437_c0de);
+
+    let create = svc
+        .create_multipart_upload(create_mpu_req("b", "nonuniform/obj.bin"))
+        .await
+        .expect("create");
+    let upload_id = create.output.upload_id.expect("upload id");
+    for (pn, body) in [(1, compressible), (2, incompressible)] {
+        svc.upload_part(upload_part_req(
+            "b",
+            "nonuniform/obj.bin",
+            &upload_id,
+            pn,
+            body,
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("part {pn}: {e:?}"));
+    }
+
+    let (len1, len2) = {
+        let st = state.lock().unwrap();
+        let stored = st.mpu_parts.get(&upload_id).expect("parts on backend");
+        (
+            stored.get(&1).expect("part 1").len(),
+            stored.get(&2).expect("part 2").len(),
+        )
+    };
+    // Flag off: compressible part pads only to the 5 MiB floor, the
+    // incompressible one stays ≈ 8 MiB — non-uniform, exactly what R2
+    // rejects at Complete for ≥3-part uploads.
+    assert_eq!(
+        len1,
+        5 * 1024 * 1024,
+        "flag-off compressible part must pad to exactly the 5 MiB floor"
+    );
+    assert!(
+        len2 >= eight_mib,
+        "flag-off incompressible part must stay ≈ original size (got {len2})"
+    );
+    assert_ne!(
+        len1, len2,
+        "flag-off backend part sizes must stay content-dependent"
+    );
+}
+
+/// #143 adversarial bound test: random INCOMPRESSIBLE bytes forced
+/// through the real cpu-zstd framing path (worst case: zstd can EXPAND
+/// incompressible input by ~n/256 + constants; the `AlwaysDispatcher`
+/// registry config used by the service harness picks cpu-zstd
+/// unconditionally). The framed output plus the 12-byte padding header
+/// must fit the deterministic target, padding must land EXACTLY on the
+/// target, and the padded part must decode byte-identical (FrameIter
+/// skips the S4P1 padding frame). This pins the `original + original/128
+/// + 4096` bound so the WARN fallback in `pad_framed_part` stays
+/// theoretical.
+#[tokio::test]
+async fn uniform_target_bound_holds_for_incompressible_zstd() {
+    use bytes::BytesMut;
+    use s4_codec::multipart::{
+        FRAME_HEADER_BYTES, FrameHeader, FrameIter, PADDING_HEADER_BYTES, pad_to_minimum,
+        write_frame,
+    };
+
+    let registry = make_registry();
+    let sizes: [usize; 3] = [5 * 1024 * 1024 + 1, 8 * 1024 * 1024, 64 * 1024 * 1024];
+    for (i, size) in sizes.into_iter().enumerate() {
+        let original = pseudo_random_bytes(size, 0xa5a5_0000 + i as u64);
+        let (compressed, manifest) = registry
+            .compress(original.clone(), CodecKind::CpuZstd)
+            .await
+            .expect("cpu-zstd compress");
+        let header = FrameHeader {
+            codec: CodecKind::CpuZstd,
+            original_size: size as u64,
+            compressed_size: compressed.len() as u64,
+            crc32c: manifest.crc32c,
+        };
+        let mut framed = BytesMut::with_capacity(FRAME_HEADER_BYTES + compressed.len());
+        write_frame(&mut framed, header, &compressed);
+
+        let target = usize::try_from(s4_server::service::uniform_part_target(size as u64))
+            .expect("target fits usize");
+        assert!(
+            framed.len() + PADDING_HEADER_BYTES <= target,
+            "size {size}: framed incompressible part ({}) + padding header must \
+             fit the target ({target})",
+            framed.len()
+        );
+
+        // Padding lands EXACTLY on the target (uniformity needs exact).
+        pad_to_minimum(&mut framed, target);
+        assert_eq!(framed.len(), target, "size {size}: exact-target padding");
+
+        // Padded roundtrip decodes byte-identical.
+        let mut frames = FrameIter::new(framed.freeze());
+        let (hdr, payload) = frames
+            .next()
+            .expect("one data frame")
+            .expect("frame parses");
+        assert!(
+            frames.next().is_none(),
+            "padding frame must be skipped, no second data frame"
+        );
+        let decoded = registry
+            .decompress(
+                payload,
+                &s4_codec::ChunkManifest {
+                    codec: hdr.codec,
+                    original_size: hdr.original_size,
+                    compressed_size: hdr.compressed_size,
+                    crc32c: hdr.crc32c,
+                },
+            )
+            .await
+            .expect("decompress");
+        assert_eq!(
+            decoded.len(),
+            original.len(),
+            "size {size}: roundtrip length"
+        );
+        assert_eq!(
+            md5_hex(&decoded),
+            md5_hex(&original),
+            "size {size}: padded roundtrip must be byte-identical"
+        );
+    }
 }
 
 /// #144: HEAD of a multipart object must present the ORIGINAL

@@ -36,8 +36,8 @@ use s3s::dto::*;
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use s4_codec::index::{FrameIndex, build_index_from_body, decode_index, encode_index, sidecar_key};
 use s4_codec::multipart::{
-    FRAME_HEADER_BYTES, FrameHeader, FrameIter, S3_MULTIPART_MIN_PART_BYTES, pad_to_minimum,
-    write_frame,
+    FRAME_HEADER_BYTES, FrameHeader, FrameIter, PADDING_HEADER_BYTES, S3_MULTIPART_MIN_PART_BYTES,
+    pad_to_minimum, write_frame,
 };
 use s4_codec::{ChunkManifest, CodecDispatcher, CodecKind, CodecRegistry, CompressTelemetry};
 use std::time::Instant;
@@ -54,6 +54,79 @@ use crate::streaming::{
 
 /// PUT body の先頭 sampling で渡す最大 byte 数。
 const SAMPLE_BYTES: usize = 4096;
+
+/// v1.5 (#143): fixed byte term of the `--uniform-multipart-parts`
+/// worst-case codec-overhead bound (see [`uniform_part_target`]).
+///
+/// It must absorb every size-independent term the upload_part framing
+/// path can add on top of the original part bytes:
+///
+/// - S4 frame header: [`FRAME_HEADER_BYTES`] = 28.
+/// - Room for the exact-size padding frame appended afterwards:
+///   [`PADDING_HEADER_BYTES`] = 12 (padding to an EXACT total requires
+///   at least those 12 spare bytes; `pad_to_minimum` otherwise
+///   overshoots by up to 11 bytes, which would break uniformity).
+/// - Codec constants: libzstd's documented bound
+///   `ZSTD_compressBound(n) = n + n/256 + ((n < 128 KiB) ? (128 KiB - n) >> 11 : 0)`
+///   contributes at most 64 fixed bytes; the gzip wrapper is 18 bytes;
+///   passthrough adds nothing.
+///
+/// 28 + 12 + 64 = 104 needed; 4096 leaves a wide margin for codec
+/// framing drift (zstd frame epilogue, nvcomp batch metadata).
+const UNIFORM_PART_FIXED_OVERHEAD_BYTES: u64 = 4096;
+
+/// v1.5 (#143): deterministic backend-part size target for
+/// `--uniform-multipart-parts`:
+///
+/// ```text
+/// target(part) = max(5 MiB floor, original_size + original_size/128 + 4096)
+/// ```
+///
+/// Cloudflare R2 rejects `CompleteMultipartUpload` when non-trailing
+/// parts have different lengths ("All non-trailing parts must have the
+/// same length"), and S4's compressed part sizes are content-dependent.
+/// Padding every non-final part up to this target restores uniformity
+/// because S3 clients (aws-cli / SDK chunkers) upload uniform ORIGINAL
+/// non-final part sizes: uniform inputs ⇒ uniform targets ⇒ uniform
+/// backend parts.
+///
+/// **Why the bound holds** — the upload_part framing path emits exactly
+/// one data frame per part: `28-byte header + compress(original)`, then
+/// a padding frame. Worst-case `compress` output over every codec the
+/// dispatcher can pick:
+///
+/// - `Passthrough`: exactly `n` bytes.
+/// - `CpuZstd` / `CpuZstdDict` / GPU zstd family: libzstd guarantees
+///   `ZSTD_compressBound(n) = n + n/256 + (≤64)` — incompressible input
+///   is emitted as raw blocks (3 bytes per 128 KiB block ≈ `n/43690`),
+///   far below that bound.
+/// - `CpuGzip`: stored deflate blocks are 5 bytes per 64 KiB
+///   (≈ `n/13107`) + 18-byte wrapper.
+///
+/// The proportional term `n/128` is 2× the zstd bound's `n/256` and the
+/// fixed term is [`UNIFORM_PART_FIXED_OVERHEAD_BYTES`]; both are pinned
+/// by the adversarial test `uniform_target_bound_holds_for_incompressible_zstd`
+/// (tests/multipart_durable_state.rs), which forces random incompressible
+/// bytes through the real cpu-zstd framing and asserts
+/// `framed + padding-header ≤ target`.
+///
+/// **Determinism without ordering**: parts arrive concurrently and out
+/// of order, so the target intentionally depends ONLY on the part's own
+/// original size — no cross-part coordination, no per-upload state.
+///
+/// **Final part**: at UploadPart time S4 cannot know which part number
+/// Complete will treat as last, so EVERY part ≥ the 5 MiB floor is
+/// padded to its own target. That is correct: a full-size final part
+/// gets the same target as its siblings (same length — allowed), and a
+/// smaller final part gets a smaller target (trailing part may differ —
+/// allowed). Parts below the floor keep the v0.2 #5 likely-final skip.
+#[must_use]
+pub fn uniform_part_target(original_size: u64) -> u64 {
+    let overhead = (original_size / 128).saturating_add(UNIFORM_PART_FIXED_OVERHEAD_BYTES);
+    original_size
+        .saturating_add(overhead)
+        .max(S3_MULTIPART_MIN_PART_BYTES as u64)
+}
 
 /// v0.8 #55: stamp the GPU pipeline metrics (`s4_gpu_compress_seconds`,
 /// `s4_gpu_throughput_bytes_per_sec`, `s4_gpu_oom_total`) from a
@@ -469,6 +542,20 @@ pub struct S4Service<B: S3> {
     /// parts went through this live process). See
     /// [`crate::mpu_durable`].
     durable_multipart_state: bool,
+    /// v1.5 (#143): opt-in `--uniform-multipart-parts`. When set, every
+    /// non-final multipart part (original size ≥ the 5 MiB floor) is
+    /// padded up to the deterministic per-part target
+    /// [`uniform_part_target`]`(original_size)` instead of only the
+    /// 5 MiB floor, so clients uploading uniform ORIGINAL part sizes
+    /// produce uniform BACKEND part sizes — required by backends that
+    /// enforce "all non-trailing parts must have the same length" at
+    /// CompleteMultipartUpload (Cloudflare R2). Trade-off: at-rest
+    /// multipart savings are ~zero while the object stays in multipart
+    /// form (each non-final part is stored at ≈ its original size);
+    /// `s4 recompact` / `s4 migrate` rewrites drop the padding and
+    /// reclaim the savings. Off by default — flag-off behaviour is
+    /// bit-for-bit the 5 MiB-floor-only padding.
+    uniform_multipart_parts: bool,
     policy: Option<crate::policy::SharedPolicy>,
     /// v0.3 #13: surfaced as the `aws:SecureTransport` Condition key. Set
     /// to `true` when the listener is wrapped in TLS (or ACME), so policies
@@ -812,6 +899,11 @@ impl<B: S3> S4Service<B> {
             // per-part state only exists for the client-transparent
             // composite ETag.
             durable_multipart_state: true,
+            // v1.5 (#143): uniform backend part sizes are opt-in
+            // (`--uniform-multipart-parts`) — only backends enforcing
+            // the uniform-part rule (R2) need them, and they cost the
+            // at-rest multipart savings until a recompact rewrite.
+            uniform_multipart_parts: false,
             policy: None,
             secure_transport: false,
             rate_limits: None,
@@ -1823,6 +1915,84 @@ impl<B: S3> S4Service<B> {
     pub fn with_durable_multipart_state(mut self, on: bool) -> Self {
         self.durable_multipart_state = on;
         self
+    }
+
+    /// v1.5 (#143): opt in to deterministic per-part padding
+    /// (`--uniform-multipart-parts`) so uniform ORIGINAL part sizes
+    /// produce uniform BACKEND part sizes — required by backends that
+    /// enforce "all non-trailing parts must have the same length" at
+    /// CompleteMultipartUpload (Cloudflare R2). Off by default. See the
+    /// field docs and [`uniform_part_target`] for the target derivation
+    /// and the savings trade-off.
+    #[must_use]
+    pub fn with_uniform_multipart_parts(mut self, on: bool) -> Self {
+        self.uniform_multipart_parts = on;
+        self
+    }
+
+    /// v1.5 (#143): shared padding step for the `upload_part` /
+    /// `upload_part_copy` framing paths.
+    ///
+    /// v0.2 #5 heuristic (unchanged, both modes): a raw part below S3's
+    /// 5 MiB multipart minimum is overwhelmingly the FINAL part (AWS
+    /// SDK / aws-cli / boto3 send only the final part below the
+    /// configured part size), and the final part is exempt from both
+    /// the 5 MiB minimum and R2's uniform-size rule — skip padding
+    /// entirely. If a misbehaving client sends a tiny non-final part,
+    /// the backend rejects with EntityTooSmall at Complete, same as
+    /// vanilla S3.
+    ///
+    /// Flag off: pad to the 5 MiB floor only (bit-for-bit the pre-v1.5
+    /// behaviour). Flag on: pad to the exact deterministic target
+    /// [`uniform_part_target`]`(original_size)`; if the framed output
+    /// somehow exceeds `target - PADDING_HEADER_BYTES` (bound
+    /// violation — theoretical, see the adversarial test), do NOT
+    /// truncate: WARN and fall through to the flag-off floor padding
+    /// for that part. A uniform-size-enforcing backend may then reject
+    /// at Complete exactly as it does today; on AWS S3 / MinIO nothing
+    /// breaks.
+    fn pad_framed_part(
+        &self,
+        framed: &mut BytesMut,
+        original_size: u64,
+        part_number: i32,
+        upload_id: &str,
+    ) {
+        if original_size < S3_MULTIPART_MIN_PART_BYTES as u64 {
+            // Likely-final part (v0.2 #5): exempt from padding.
+            return;
+        }
+        if self.uniform_multipart_parts {
+            let target = uniform_part_target(original_size);
+            // Exact-size padding needs room for the 12-byte padding
+            // frame header — `pad_to_minimum` can otherwise overshoot
+            // by up to 11 bytes, which would itself break uniformity.
+            let fits = (framed.len() as u64).saturating_add(PADDING_HEADER_BYTES as u64) <= target;
+            match (fits, usize::try_from(target)) {
+                (true, Ok(target_usize)) => {
+                    pad_to_minimum(framed, target_usize);
+                    debug_assert_eq!(
+                        framed.len(),
+                        target_usize,
+                        "uniform padding must land on the exact target"
+                    );
+                    return;
+                }
+                _ => {
+                    warn!(
+                        part_number,
+                        upload_id,
+                        framed_len = framed.len(),
+                        original_size,
+                        target,
+                        "uniform-multipart-parts: framed part exceeds its worst-case \
+                         target; falling back to 5 MiB-floor padding for this part \
+                         (a uniform-part-size backend like R2 may reject at Complete)"
+                    );
+                }
+            }
+        }
+        pad_to_minimum(framed, S3_MULTIPART_MIN_PART_BYTES);
     }
 
     /// HEAD the backend object and read the `s4-original-size` stamp = the
@@ -8196,23 +8366,16 @@ impl<B: S3> S3 for S4Service<B> {
             };
             let mut framed = BytesMut::with_capacity(FRAME_HEADER_BYTES + compressed.len());
             write_frame(&mut framed, header, &compressed);
-            // v0.2 #5: heuristic-based padding skip for likely-final parts.
-            //
-            // AWS SDK / aws-cli / boto3 always send the final (and only the
-            // final) part below the configured part_size. So if the raw user
-            // part is already smaller than S3's 5 MiB multipart minimum, this
-            // is overwhelmingly likely to be the final part — and the final
-            // part is exempt from S3's size constraint. Skipping padding here
-            // saves up to ~5 MiB per object on highly compressible workloads.
-            //
-            // If a misbehaving client sends a tiny **non-final** part, S3
-            // itself rejects with EntityTooSmall at CompleteMultipartUpload —
-            // identical outcome to a vanilla S3 PUT, just earlier than
-            // padding-then-complete would catch it.
-            let likely_final = original_size < S3_MULTIPART_MIN_PART_BYTES as u64;
-            if !likely_final {
-                pad_to_minimum(&mut framed, S3_MULTIPART_MIN_PART_BYTES);
-            }
+            // Padding: 5 MiB floor by default, exact deterministic
+            // per-part target under `--uniform-multipart-parts` (v1.5
+            // #143). The v0.2 #5 likely-final skip for sub-5 MiB parts
+            // lives inside the helper — see `pad_framed_part`.
+            self.pad_framed_part(
+                &mut framed,
+                original_size,
+                req.input.part_number,
+                req.input.upload_id.as_str(),
+            );
             let framed_bytes = framed.freeze();
             let new_len = framed_bytes.len() as i64;
             // 同じ wire 互換問題が multipart にもある (content-length / checksum)
@@ -9742,10 +9905,15 @@ impl<B: S3> S3 for S4Service<B> {
         };
         let mut framed = BytesMut::with_capacity(FRAME_HEADER_BYTES + compressed.len());
         write_frame(&mut framed, header, &compressed);
-        let likely_final = original_size < S3_MULTIPART_MIN_PART_BYTES as u64;
-        if !likely_final {
-            pad_to_minimum(&mut framed, S3_MULTIPART_MIN_PART_BYTES);
-        }
+        // Same padding policy as `upload_part` (v1.5 #143: the copied
+        // part lands in the same backend multipart upload, so it must
+        // follow the same uniform-size rule).
+        self.pad_framed_part(
+            &mut framed,
+            original_size,
+            req.input.part_number,
+            req.input.upload_id.as_str(),
+        );
         let framed_bytes = framed.freeze();
         let framed_len = framed_bytes.len() as i64;
 
@@ -11775,6 +11943,45 @@ impl SigV4aGateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v1.5 (#143): `uniform_part_target` formula — floor interaction,
+    /// exact values at representative part sizes, and integer edges.
+    #[test]
+    fn uniform_part_target_formula() {
+        const FLOOR: u64 = S3_MULTIPART_MIN_PART_BYTES as u64; // 5 MiB
+
+        // Small parts: original + overhead stays under the 5 MiB floor,
+        // so the floor wins (only reachable for sub-floor originals,
+        // which the likely-final skip exempts from padding anyway —
+        // the max() keeps the helper total on its own).
+        assert_eq!(uniform_part_target(0), FLOOR);
+        assert_eq!(uniform_part_target(1), FLOOR);
+        assert_eq!(uniform_part_target(64 * 1024), FLOOR);
+        // Largest sub-floor case: 5_000_000 + 39_062 + 4_096 < 5 MiB.
+        assert_eq!(uniform_part_target(5_000_000), FLOOR);
+
+        // At and above the floor the formula term wins:
+        // target = original + original/128 + 4096.
+        assert_eq!(uniform_part_target(FLOOR), FLOOR + FLOOR / 128 + 4096);
+        let eight_mib: u64 = 8 * 1024 * 1024;
+        assert_eq!(uniform_part_target(eight_mib), 8_458_240);
+        // AWS max part size (5 GiB).
+        let five_gib: u64 = 5 * 1024 * 1024 * 1024;
+        assert_eq!(uniform_part_target(five_gib), 5_410_656_256);
+
+        // Integer edges: i64::MAX (the widest ContentLength a client
+        // can claim) must not overflow, and u64::MAX must saturate.
+        let imax = i64::MAX as u64;
+        assert_eq!(uniform_part_target(imax), imax + imax / 128 + 4096);
+        assert_eq!(uniform_part_target(u64::MAX), u64::MAX);
+
+        // Determinism: the target depends only on the part's own
+        // original size — same size in, same target out.
+        assert_eq!(
+            uniform_part_target(eight_mib),
+            uniform_part_target(eight_mib)
+        );
+    }
 
     #[test]
     fn etag_preconditions_evaluate_against_logical_etag() {

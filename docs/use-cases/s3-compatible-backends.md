@@ -190,17 +190,28 @@ and minus a small operations delta:
 - ✅ **Multipart with ≤ 2 parts**: works end to end (88 MiB, CRT 64 MiB
   chunking); the stamped composite ETag was independently recomputed and
   matched exactly. R2's uniform-size rule is vacuous below 3 parts.
-- ❌ **Multipart with ≥ 3 parts of mixed compressibility FAILS**:
-  Cloudflare [enforces](https://developers.cloudflare.com/r2/objects/multipart-objects/)
+- ⚠️ **Multipart with ≥ 3 parts of mixed compressibility needs
+  `--uniform-multipart-parts` (v1.5)**: Cloudflare
+  [enforces](https://developers.cloudflare.com/r2/objects/multipart-objects/)
   "all parts except the last must be the same size", and S4's backend
-  parts are content-dependent (compressed per part, padded only to the
-  5 MiB floor). Measured repro (11 × 8 MiB parts alternating text/random):
+  parts are otherwise content-dependent (compressed per part, padded only
+  to the 5 MiB floor). Measured repro without the flag (11 × 8 MiB parts
+  alternating text/random):
   `CompleteMultipartUpload → InvalidPart: All non-trailing parts must
-  have the same length.` Tracked with fix directions in
-  [#143](https://github.com/abyo-software/s4/issues/143).
-  **Workaround**: raise the client's `multipart_threshold` /
-  `multipart_chunksize` so uploads stay at ≤ 2 parts, or avoid multipart
-  for mixed-compressibility data until #143 lands.
+  have the same length.` ([#143](https://github.com/abyo-software/s4/issues/143))
+  With `--uniform-multipart-parts`, S4 pads every non-final part to a
+  deterministic per-part target
+  (`max(5 MiB, original + original/128 + 4096)`), so clients uploading
+  uniform original part sizes — every AWS SDK / aws-cli chunker —
+  produce uniform backend parts and R2 accepts the Complete. **The honest
+  trade-off**: while the object stays in multipart form its at-rest
+  savings are ~zero (each non-final part is stored at ≈ its original
+  size); a later `s4 recompact` / `s4 migrate` rewrite drops the padding
+  and reclaims the savings. Single-PUT objects are unaffected.
+  **Without the flag**: raise the client's `multipart_threshold` /
+  `multipart_chunksize` so uploads stay at ≤ 2 parts (the rule is
+  vacuous below 3 parts), or avoid multipart for mixed-compressibility
+  data.
 
 R2's 10 GB free tier makes it the cheapest of the three hosted providers to
 validate — the full smoke test below fits inside it (it is how the results
