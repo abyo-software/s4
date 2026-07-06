@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783325269509,
+  "lastUpdate": 1783326059632,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -22614,6 +22614,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "c885888f71a020793dfd3f1f04f966185faaf421",
+          "message": "feat(server): --uniform-multipart-parts — deterministic per-part padding for uniform-part-size backends (#143)\n\nCloudflare R2 rejects CompleteMultipartUpload when non-trailing parts\ndiffer in length (validated live 2026-07-06); S4's backend parts are\ncontent-dependent, so >=3-part mixed-compressibility uploads failed.\n\nOpt-in flag (default OFF = bit-for-bit today): pad every non-final\nbackend part to the deterministic per-part target\n\n    max(5 MiB floor, original + original/128 + 4096)\n\nderived from the real framing path worst cases (single data frame per\npart; zstd bound n + n/256 + <=64; passthrough n + headers; 12-byte\nexact-pad room so pad_to_minimum cannot overshoot into non-uniformity).\nTarget depends only on the part's own original size — concurrent /\nout-of-order part uploads need no coordination, and uniform client\nchunking (every AWS SDK/cli) yields uniform backend parts. The trailing\npart is naturally exempt. Bound violation (theoretical; adversarially\ntested with incompressible parts at 5 MiB+1 / 8 MiB / 64 MiB through\nreal cpu-zstd) WARNs and falls back to floor padding, never truncates.\nApplied to UploadPart and UploadPartCopy via a shared helper.\n\nTrade-off (measured, 8 MiB parts): flag ON stores non-final parts at\n+0.83% over original regardless of compressibility — multipart at-rest\nsavings are deferred until a recompact/migrate rewrite; single-PUT\nobjects unaffected. Documented in compatibility.md and use-case #6.\n\nTests: 751 passed / 0 failed — includes flag-ON exact part-size\nequality + exact composite + GET byte-identity with durable-state\ndefault ON, flag-OFF difference proof, adversarial bound, target\nformula unit tests, flag parse test. Clippy 0 warnings; fmt clean.\n\nRefs #143 (kept open pending a live R2 re-validation with the flag)\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-06T17:12:59+09:00",
+          "tree_id": "32e8d0335ed6eab4f1dfda9ec39fbfda9d942411",
+          "url": "https://github.com/abyo-software/s4/commit/c885888f71a020793dfd3f1f04f966185faaf421"
+        },
+        "date": 1783326059075,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 48753,
+            "range": "± 6392",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 57825,
+            "range": "± 1142",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 428,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2233579,
+            "range": "± 28934",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50535213,
+            "range": "± 1084851",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201586,
+            "range": "± 2430",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 50515212,
+            "range": "± 1444833",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 922355094,
+            "range": "± 3537959",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3221079,
+            "range": "± 44359",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 28259,
+            "range": "± 1831",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 33352,
+            "range": "± 2140",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 418,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 575127,
+            "range": "± 2336",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1652019,
+            "range": "± 26173",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201519,
+            "range": "± 374",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12381808,
+            "range": "± 102783",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 28970333,
+            "range": "± 690208",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3223934,
+            "range": "± 69718",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1460273,
+            "range": "± 26316",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2156646,
+            "range": "± 20388",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 323977332,
+            "range": "± 7261682",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 134,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 9217,
+            "range": "± 99",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 961,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 14535,
+            "range": "± 95",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2892,
+            "range": "± 76",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 22408,
+            "range": "± 163",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 89477,
+            "range": "± 269",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 598,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4738,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 20053,
+            "range": "± 558",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
             "range": "± 0",
             "unit": "ns/iter"
           }
