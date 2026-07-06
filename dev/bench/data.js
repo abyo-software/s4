@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783317158394,
+  "lastUpdate": 1783318092066,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -20354,6 +20354,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "3b388513675b8841ec39edb2c55245d019e75056",
+          "message": "feat(server): durable multipart part-state — composite ETag survives restart / multi-gateway\n\nThe client-transparent multipart composite ETag was backed by in-memory\nper-upload state only: a gateway restart mid-upload, or parts landing on\ndifferent instances behind a load balancer, silently degraded Complete\nto the unstamped ListParts fallback. That made \"N gateways behind an\nNLB\" — the standard HA topology — second-class.\n\nUploadPart / UploadPartCopy now additionally persist each part's\n(original_md5, backend_etag) pair as one small JSON record on the\nbackend at `.s4mpu/<hex(uploadId)>/<partNumber>` (hex because backends\nmint opaque upload ids; one object per part = no read-modify-write\nbetween gateways, last-writer-wins per part matches S3 part-overwrite\nsemantics). CompleteMultipartUpload fills any manifest parts missing\nfrom the in-memory map from the records (in-memory wins; bounded 16-way\nGETs), so ANY instance completes with the full composite and strict\npart-ETag validation. Records are best-effort deleted after a\nsuccessful Complete/Abort; crash leftovers are reaped by the new\n`s4 maintain` action `mpu-state-gc` (race-free classification: records\nlisted before the ListMultipartUploads snapshot).\n\n- Default ON with `--logical-etag` mode; `--no-durable-multipart-state`\n  opts out (no records, no extra backend requests).\n- No SSE material is persisted — records carry content fingerprints\n  only; the SSE recipe (incl. SSE-C keys) stays in-memory with its\n  Zeroizing lifetime. SSE multipart still needs Create/Complete on one\n  live gateway (now documented explicitly).\n- `.s4mpu/` joins the reserved namespaces: hidden from ListObjects/V2/\n  Versions, client mutations rejected (InvalidObjectName), skipped by\n  ledger probes and migrate.\n- Record decode fails closed (version/key-mismatch/malformed-MD5 →\n  ListParts fallback, never a wrong composite).\n\nTests: 742 passed / 0 failed (25 binaries) including new integration\ncoverage — restart with exact composite asserted on Complete+HEAD+GET,\ntwo-instance split parts (+ wrong-ETag InvalidPart from the instance\nthat never saw the part), flag-off = pre-durable behavior, per-upload\nrecord reaping on Complete/Abort, listing hidden + write blocked.\nClippy 0 warnings, fmt clean.\n\nDocs: compatibility.md multipart best-effort section rewritten around\ndurable state (costs + remaining limitations listed honestly),\nfeatures.md, ops/maintenance.md (mpu-state-gc).\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-06T15:00:25+09:00",
+          "tree_id": "2fa7b0080135d5aaffefb4ab3c451487d14a63ab",
+          "url": "https://github.com/abyo-software/s4/commit/3b388513675b8841ec39edb2c55245d019e75056"
+        },
+        "date": 1783318091154,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 53558,
+            "range": "± 3561",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 52784,
+            "range": "± 2981",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 366,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2550424,
+            "range": "± 81607",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 42465031,
+            "range": "± 162811",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192272,
+            "range": "± 367",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 51608369,
+            "range": "± 1277342",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 769617184,
+            "range": "± 3637872",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3066094,
+            "range": "± 27526",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 32412,
+            "range": "± 2767",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 36924,
+            "range": "± 2585",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 377,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 569688,
+            "range": "± 21234",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1584389,
+            "range": "± 41562",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192426,
+            "range": "± 1752",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12140458,
+            "range": "± 180912",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27034953,
+            "range": "± 620597",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3069726,
+            "range": "± 12789",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1571147,
+            "range": "± 31054",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2448595,
+            "range": "± 8904",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 341483627,
+            "range": "± 2511665",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 143,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 7100,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 818,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13055,
+            "range": "± 75",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2873,
+            "range": "± 172",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 21446,
+            "range": "± 660",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 89880,
+            "range": "± 4826",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 589,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4700,
+            "range": "± 50",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 17854,
+            "range": "± 55",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
             "range": "± 0",
             "unit": "ns/iter"
           }
