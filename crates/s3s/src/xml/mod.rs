@@ -159,7 +159,7 @@ mod tests {
     /// Deserializes `<Key>...</Key>` into a `String` via the full parser path.
     fn de_string(xml: &str) -> DeResult<String> {
         let mut d = Deserializer::new(xml.as_bytes());
-        let val = d.named_element("Key", |d| d.content::<String>())?;
+        let val = d.named_element("Key", Deserializer::content::<String>)?;
         d.expect_eof()?;
         Ok(val)
     }
