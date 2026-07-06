@@ -232,6 +232,16 @@ fn cmd_decode(input: &Path, output: Option<&Path>, dict: Option<&Path>) -> Resul
         decoded.extend_from_slice(&bytes);
         frames += 1;
     }
+    // A non-empty input that yielded no data frames (padding-only /
+    // corrupted) must not "succeed" into empty output — with `-o` that
+    // would overwrite the destination with 0 bytes.
+    if frames == 0 {
+        bail!(
+            "no S4F2 data frames found in {} — not an S4-framed object \
+             (or padding-only / corrupted); refusing to write empty output",
+            input.display()
+        );
+    }
 
     match output {
         Some(path) => {

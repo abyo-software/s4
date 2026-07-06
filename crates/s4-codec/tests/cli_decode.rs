@@ -390,3 +390,36 @@ fn index_decodes_a_real_sidecar() {
         stderr_of(&out)
     );
 }
+
+/// Round-2 review finding: a non-empty input containing only an S4P1
+/// padding frame (no data frames) must FAIL decode — silently
+/// "succeeding" into empty output would overwrite `-o` destinations
+/// with 0 bytes on corrupted / non-S4 input.
+#[test]
+fn decode_rejects_padding_only_object() {
+    let dir = TempDir::new("padding-only");
+    let mut buf = BytesMut::new();
+    pad_to_minimum(&mut buf, 256); // padding frame only, no data frames
+    let input = dir.file("padding.s4f2", &buf);
+    let output = dir.path("padding.decoded");
+    std::fs::write(&output, b"precious pre-existing bytes").expect("seed output file");
+
+    let out = bin()
+        .args(["decode"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("spawn");
+    assert!(!out.status.success(), "padding-only decode must not exit 0");
+    assert!(
+        stderr_of(&out).contains("no S4F2 data frames"),
+        "error should say why: {}",
+        stderr_of(&out)
+    );
+    assert_eq!(
+        std::fs::read(&output).expect("output survives"),
+        b"precious pre-existing bytes",
+        "the -o destination must not be clobbered"
+    );
+}
