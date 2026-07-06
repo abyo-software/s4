@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783318549168,
+  "lastUpdate": 1783319122732,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -20806,6 +20806,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "ba89a785bce9e9fd6729fbab12afe264d988fba5",
+          "message": "fix(server): close 2 High review findings — stale part-state guard + metered-savings single-writer contract\n\nAdversarial review (Codex, 2026-07-06) on the durable-multipart and\nmetered-savings features surfaced two High findings; both closed with\nthe repro→failing-test→fix→green loop where testable:\n\n1. Stale per-part state after a part re-upload (service.rs).\n   A delayed UploadPart's state write (in-memory or .s4mpu/ record)\n   can land after a re-upload of the same part number; Complete then\n   trusted the stale original_md5 and could stamp a composite for\n   bytes the backend no longer holds — GET would serve bytes B with\n   ETag(A). Fix: cross-check every recorded entry against the\n   authoritative ListParts ETag and drop mismatches (warned); the part\n   degrades to the unrecorded fallback (Complete succeeds, no stamp).\n   Regression test proven failing without the fix, green with it.\n\n2. Metered-savings multi-replica overbilling (main.rs + docs).\n   Every replica running --marketplace-metered-savings meters the full\n   stock its ledger reports and AWS does not dedup MeterUsage across\n   callers — N replicas sharing a ledger = N× billing; the design\n   doc's \"multi-gateway additive\" claim also fails under cross-pod\n   DELETEs. v1.5 contract: SINGLE metering gateway only — flag help,\n   metering.md, and a boot-time WARN state it; the design doc claim is\n   formally withdrawn with the fleet-aggregation follow-up recorded.\n\nAlso: testing.md counts re-measured on the current tree (1,355 default\n+ 86 env-gated = 1,441 test functions via cargo test --workspace\n-- --list, 2026-07-06; nightly properties 38→39 reconciled) and the\nREADME trust bullet updated from the stale 714+ (v1.0-era) figure.\n\ns4-server: 745 passed / 0 failed; clippy 0 warnings; fmt clean.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-06T15:17:52+09:00",
+          "tree_id": "2ce114364ae0994e8e8e076103dd4df045dcee98",
+          "url": "https://github.com/abyo-software/s4/commit/ba89a785bce9e9fd6729fbab12afe264d988fba5"
+        },
+        "date": 1783319121520,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 56368,
+            "range": "± 3879",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 43591,
+            "range": "± 2953",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 390,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2181541,
+            "range": "± 40816",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 28541389,
+            "range": "± 80778",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 152052,
+            "range": "± 507",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 50453448,
+            "range": "± 1179216",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 505026150,
+            "range": "± 503362",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 2462440,
+            "range": "± 18659",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 24321,
+            "range": "± 1778",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 30366,
+            "range": "± 2698",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 393,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 525573,
+            "range": "± 5727",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1415493,
+            "range": "± 45345",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 152075,
+            "range": "± 418",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 14349056,
+            "range": "± 351625",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27327732,
+            "range": "± 294425",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 2460813,
+            "range": "± 13391",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1353739,
+            "range": "± 15831",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2222027,
+            "range": "± 25684",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 392770128,
+            "range": "± 5920767",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 119,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 5848,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 795,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 12350,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2164,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 16602,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 66199,
+            "range": "± 635",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 591,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 5293,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 22953,
+            "range": "± 52",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 30,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 30,
             "range": "± 0",
             "unit": "ns/iter"
           }
