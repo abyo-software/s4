@@ -6,7 +6,7 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "s4.fullname" . }}-ledger
+  name: {{ include "s4.ledgerPvcName" . }}
   labels:
     {{- include "s4.labels" . | nindent 4 }}
 spec:

@@ -1,11 +1,14 @@
 {{- if not .Values.backend.endpointUrl -}}
 {{- fail "backend.endpointUrl is required (e.g. --set backend.endpointUrl=https://s3.us-east-1.amazonaws.com)" -}}
 {{- end -}}
-{{- if and .Values.marketplace.meteredSavings.enabled (gt (int .Values.replicas) 1) -}}
+{{- if and .Values.marketplace.meteredSavings.enabled (ne (int .Values.replicas) 1) -}}
 {{- fail "marketplace.meteredSavings requires exactly ONE replica (every metering replica bills the full ledger stock and AWS does not dedup MeterUsage across callers) — set replicas=1" -}}
 {{- end -}}
 {{- if and .Values.marketplace.meteredSavings.enabled (not .Values.marketplace.usageDimension) -}}
 {{- fail "marketplace.meteredSavings requires marketplace.usageDimension (the GiB-saved-hour dimension key, e.g. GBSavedHours)" -}}
+{{- end -}}
+{{- if and .Values.marketplace.meteredSavings.enabled (not .Values.marketplace.productCode) -}}
+{{- fail "marketplace.meteredSavings requires marketplace.productCode (all metering flags render inside the productCode block — without it the pod would run unmetered while looking configured)" -}}
 {{- end -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -164,7 +167,7 @@ spec:
         - name: ledger
           {{- if .Values.marketplace.meteredSavings.persistence.enabled }}
           persistentVolumeClaim:
-            claimName: {{ include "s4.fullname" . }}-ledger
+            claimName: {{ include "s4.ledgerPvcName" . }}
           {{- else }}
           # No PVC: a pod restart resets the ledger and under-meters until
           # the counters rebuild (documented in docs/marketplace/metering.md).

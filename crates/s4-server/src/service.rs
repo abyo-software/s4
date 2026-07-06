@@ -9732,14 +9732,18 @@ impl<B: S3> S3 for S4Service<B> {
         self.enforce_rate_limit(&req, &dst_bucket)?;
         // v0.2 #6: byte-range aware copy when the source is S4-framed.
         //
-        // For a framed source (multipart upload OR single-PUT framed-v2),
-        // a naive byte-range passthrough would copy compressed bytes that
-        // don't align with S4 frame boundaries — silently corrupting the
-        // result. Instead we GET the source through S4 (which handles
-        // decompression + Range), re-compress + re-frame as a new part,
-        // and forward as upload_part. For non-framed sources (S4-untouched
-        // raw objects), passthrough is correct and we keep the original
-        // (cheaper) code path.
+        // EVERY source is copied via GET → compress → frame → pad →
+        // upload_part (2026-07-06 round-3 review High). `upload_part`
+        // always frames destination parts, so a server-side byte-for-byte
+        // copy of a RAW (non-S4) source smuggled unframed bytes into an
+        // `s4-multipart` frame sequence — Complete succeeded, then every
+        // GET failed the frame parse ("bad frame magic"), effectively
+        // bricking the object behind the gateway (a direct backend read
+        // still worked). A framed source had the analogous boundary
+        // problem. Routing both through the S4 GET (which returns logical
+        // bytes for framed AND raw sources alike) is the only shape that
+        // composes with per-part framing; the cost is data movement
+        // through the gateway instead of a backend-side copy.
         // v0.8.4 #74: propagate the optional `?versionId=<vid>` from the
         // copy-source header. Without this, a versioned source bucket
         // copy that pins a specific old version would silently fall
@@ -9756,78 +9760,6 @@ impl<B: S3> S3 for S4Service<B> {
         let src_bucket = src_bucket.to_string();
         let src_key = src_key.to_string();
         let src_version_id: Option<String> = src_version_id.as_deref().map(str::to_owned);
-
-        // Probe metadata to decide whether the source needs S4-aware copy.
-        let head_input = HeadObjectInput {
-            bucket: src_bucket.clone(),
-            key: src_key.clone(),
-            version_id: src_version_id.clone(),
-            ..Default::default()
-        };
-        let head_req = S3Request {
-            input: head_input,
-            method: http::Method::HEAD,
-            uri: req.uri.clone(),
-            headers: req.headers.clone(),
-            extensions: http::Extensions::new(),
-            credentials: req.credentials.clone(),
-            region: req.region.clone(),
-            service: req.service.clone(),
-            trailing_headers: None,
-        };
-        let needs_s4_copy = match self.backend.head_object(head_req).await {
-            Ok(h) => {
-                is_multipart_object(&h.output.metadata) || is_framed_v2_object(&h.output.metadata)
-            }
-            Err(_) => false,
-        };
-        if !needs_s4_copy {
-            // Fix A: a non-S4 (raw / passthrough-codec) source is server-side
-            // copied byte-for-byte, so the backend's part ETag already equals
-            // MD5(original) — record it (original_md5 == backend_etag) so the
-            // Complete composite reverse-maps + folds this copied part in, and
-            // return the backend ETag unchanged. The single (non-multipart)
-            // backend part ETag is a plain unquoted MD5 hex (`as_strong()`),
-            // exactly the 32-char lowercase the composite decoder expects.
-            // Only under `--logical-etag`; passthrough mode is bit-for-bit
-            // unchanged.
-            if self.logical_etag {
-                let part_number = req.input.part_number;
-                let copy_upload_id = req.input.upload_id.clone();
-                let resp = self.backend.upload_part_copy(req).await?;
-                if let Some(backend_etag) = resp
-                    .output
-                    .copy_part_result
-                    .as_ref()
-                    .and_then(|r| r.e_tag.as_ref())
-                    .and_then(|e| e.as_strong())
-                    .map(str::to_owned)
-                {
-                    self.multipart_state.record_part(
-                        copy_upload_id.as_str(),
-                        part_number,
-                        backend_etag.clone(),
-                        backend_etag.clone(),
-                    );
-                    // Durable multipart state: same persistence as
-                    // `upload_part` (original_md5 == backend_etag for a
-                    // byte-for-byte copied raw part).
-                    if self.durable_multipart_state {
-                        self.write_durable_part_record(
-                            &dst_bucket,
-                            &dst_key,
-                            copy_upload_id.as_str(),
-                            part_number,
-                            &backend_etag,
-                            &backend_etag,
-                        )
-                        .await;
-                    }
-                }
-                return Ok(resp);
-            }
-            return self.backend.upload_part_copy(req).await;
-        }
 
         // Resolve the optional source byte range to pass to GET.
         let source_range = req

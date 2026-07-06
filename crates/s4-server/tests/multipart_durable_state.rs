@@ -432,6 +432,46 @@ impl S3 for MemBackend {
         st.mpu_meta.remove(req.input.upload_id.as_str());
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
+
+    /// Server-side part copy: read the source object body from state and
+    /// store it verbatim as the destination part (what a real backend does
+    /// for a raw copy) — the gateway must never let raw bytes reach an
+    /// S4-framed destination upload through this call.
+    async fn upload_part_copy(
+        &self,
+        req: S3Request<UploadPartCopyInput>,
+    ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        let CopySource::Bucket {
+            ref bucket,
+            ref key,
+            ..
+        } = req.input.copy_source
+        else {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                "unsupported copy source",
+            ));
+        };
+        let mut st = self.state.lock().unwrap();
+        let body = st
+            .objects
+            .get(&(bucket.to_string(), key.to_string()))
+            .map(|o| o.body.clone())
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::NoSuchKey, "no source"))?;
+        let etag = md5_hex(&body);
+        let parts = st
+            .mpu_parts
+            .get_mut(req.input.upload_id.as_str())
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::NoSuchUpload, "no such upload"))?;
+        parts.insert(req.input.part_number, body);
+        Ok(S3Response::new(UploadPartCopyOutput {
+            copy_part_result: Some(CopyPartResult {
+                e_tag: Some(ETag::Strong(etag)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
 }
 
 // =========================================================================
@@ -1351,5 +1391,104 @@ async fn multipart_head_reports_original_content_length() {
         head.output.content_length,
         Some(original_total),
         "sidecar fallback must resolve the original size for unstamped multipart objects"
+    );
+}
+
+/// Round-3 review High: `UploadPartCopy` from a RAW (non-S4) source used
+/// to be server-side copied byte-for-byte into the destination upload —
+/// but `upload_part` always frames its parts, so the assembled object
+/// mixed raw bytes into an S4F2 frame sequence marked `s4-multipart`,
+/// and GET failed the frame parse (or worse). The gateway must instead
+/// route raw sources through the same GET→compress→frame path as framed
+/// ones.
+#[tokio::test]
+async fn upload_part_copy_from_raw_source_stays_decodable() {
+    let state = Arc::new(Mutex::new(InnerState::default()));
+    let (p1, _) = part_bodies();
+
+    // A raw object that never went through the gateway.
+    let raw = Bytes::from(vec![0x5A; 6 * 1024 * 1024]);
+    state.lock().unwrap().objects.insert(
+        ("b".to_owned(), "raw/source.bin".to_owned()),
+        StoredObject {
+            body: raw.clone(),
+            metadata: None,
+            content_type: None,
+        },
+    );
+
+    let svc = make_service(&state);
+    let create = svc
+        .create_multipart_upload(create_mpu_req("b", "mixed/copy.bin"))
+        .await
+        .expect("create");
+    let upload_id = create.output.upload_id.expect("upload id");
+
+    // Part 1: normal framed upload. Part 2: copy from the raw source.
+    let up1 = svc
+        .upload_part(upload_part_req(
+            "b",
+            "mixed/copy.bin",
+            &upload_id,
+            1,
+            p1.clone(),
+        ))
+        .await
+        .expect("part 1");
+    let etag1 = up1.output.e_tag.expect("etag1").into_value();
+    let mut copy_input = UploadPartCopyInput::builder();
+    copy_input.set_bucket("b".to_owned());
+    copy_input.set_key("mixed/copy.bin".to_owned());
+    copy_input.set_upload_id(upload_id.clone());
+    copy_input.set_part_number(2);
+    copy_input.set_copy_source(CopySource::Bucket {
+        bucket: "b".into(),
+        key: "raw/source.bin".into(),
+        version_id: None,
+    });
+    let copy_input = copy_input
+        .build()
+        .expect("UploadPartCopyInput builds with all required fields");
+    let copy = svc
+        .upload_part_copy(req(
+            copy_input,
+            http::Method::PUT,
+            &format!("/b/mixed/copy.bin?uploadId={upload_id}&partNumber=2"),
+        ))
+        .await
+        .expect("part copy");
+    let etag2 = copy
+        .output
+        .copy_part_result
+        .and_then(|r| r.e_tag)
+        .expect("copy etag")
+        .into_value();
+    // The advertised copy-part ETag must be MD5(original source bytes).
+    assert_eq!(etag2, md5_hex(&raw));
+
+    svc.complete_multipart_upload(complete_mpu_req(
+        "b",
+        "mixed/copy.bin",
+        &upload_id,
+        vec![(1, etag1.as_str()), (2, etag2.as_str())],
+    ))
+    .await
+    .expect("complete");
+
+    // GET must return the exact concatenation — a raw part smuggled into
+    // the frame sequence breaks the parse (or decodes wrong bytes).
+    let got = svc
+        .get_object(get_req("b", "mixed/copy.bin"))
+        .await
+        .expect("GET of the completed object must not fail");
+    let body = collect_blob(got.output.body.expect("body"), MAX_BODY)
+        .await
+        .expect("collect");
+    let mut expected = p1.to_vec();
+    expected.extend_from_slice(&raw);
+    assert_eq!(
+        md5_hex(&body),
+        md5_hex(&expected),
+        "GET must return part1 + raw source bytes exactly"
     );
 }

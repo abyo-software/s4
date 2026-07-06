@@ -107,3 +107,12 @@ True if a policy ConfigMap will be mounted.
 true
 {{- end -}}
 {{- end -}}
+
+{{/*
+Ledger PVC name — "-ledger" appended to a base truncated to 56 so the
+result never exceeds the 63-char DNS label limit even under
+fullnameOverride (s4.fullname itself truncates at 63).
+*/}}
+{{- define "s4.ledgerPvcName" -}}
+{{- printf "%s-ledger" (include "s4.fullname" . | trunc 56 | trimSuffix "-") -}}
+{{- end }}
