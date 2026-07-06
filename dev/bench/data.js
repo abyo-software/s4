@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783315416529,
+  "lastUpdate": 1783316569840,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -19902,6 +19902,232 @@ window.BENCHMARK_DATA = {
           {
             "name": "lookup_range_1024f/span_256MiB",
             "value": 28,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "82c5d13d00b64debc536a6b7faff4eca12f47d65",
+          "message": "fix(deps): drop legacy rustls 0.21 chain from aws-sdk deps (#91)\n\nThe rustls-webpki 0.101.7 CVE trio (RUSTSEC-2026-0098/0099/0104) rode in\non the aws-sdk crates' default `rustls` feature, which maps to\naws-smithy-runtime/tls-rustls — the legacy rustls 0.21 + hyper 0.14\nconnector. The SDK's actual TLS client is `default-https-client`\n(rustls 0.23), so the legacy stack was linked but replaceable.\n\nSet default-features = false (keeping the remaining defaults) on\naws-sdk-s3 (workspace + s3s-aws), aws-sdk-kms, aws-sdk-sns,\naws-sdk-sqs, aws-sdk-marketplacemetering. rustls 0.21.12,\nrustls-webpki 0.101.7, hyper-rustls 0.24.2 and tokio-rustls 0.24.1\nare gone from Cargo.lock; only the rustls 0.23 / webpki 0.103 chain\nremains. Remove the three CI audit ignores and update the security\ndocs (cargo-audit-ignores.md gains a Resolved section; threat-model\nresidual-risk #1 marked resolved).\n\ncargo audit exits 0 with only the RUSTSEC-2025-0134 ignore\n(rustls-pemfile unmaintained, documented accepted risk). Verified\ndefault + aws-kms,aws-events feature builds.\n\nCloses #91\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-06T14:34:53+09:00",
+          "tree_id": "2a2085ef40137817815735d94416a81c2e6cbeaf",
+          "url": "https://github.com/abyo-software/s4/commit/82c5d13d00b64debc536a6b7faff4eca12f47d65"
+        },
+        "date": 1783316568899,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 48715,
+            "range": "± 2003",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 55818,
+            "range": "± 3679",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 427,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2202577,
+            "range": "± 85775",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 50566317,
+            "range": "± 62273",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 201213,
+            "range": "± 462",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 50658531,
+            "range": "± 2027544",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 922933861,
+            "range": "± 2438552",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3224651,
+            "range": "± 34019",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 27891,
+            "range": "± 1000",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 32776,
+            "range": "± 2221",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 420,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 577059,
+            "range": "± 4503",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1637767,
+            "range": "± 21718",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 201081,
+            "range": "± 311",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12399921,
+            "range": "± 630023",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 28992244,
+            "range": "± 163989",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3222070,
+            "range": "± 42217",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1452103,
+            "range": "± 30638",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2276370,
+            "range": "± 57345",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 320123631,
+            "range": "± 2763419",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 136,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 8759,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 947,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 14459,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 2706,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 21002,
+            "range": "± 257",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 83798,
+            "range": "± 1244",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 597,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4742,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 18983,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 31,
             "range": "± 0",
             "unit": "ns/iter"
           }
