@@ -1492,3 +1492,155 @@ async fn upload_part_copy_from_raw_source_stays_decodable() {
         "GET must return part1 + raw source bytes exactly"
     );
 }
+
+/// Round-4 review High (2): `x-amz-copy-source-if-match` /
+/// `-if-none-match` must be evaluated against the SOURCE's logical ETag
+/// — the removed raw-source shortcut used to delegate this to the
+/// backend, and the GET path initially dropped it (a required 412 became
+/// a successful copy of current bytes).
+#[tokio::test]
+async fn upload_part_copy_honors_source_etag_preconditions() {
+    let state = Arc::new(Mutex::new(InnerState::default()));
+    let raw = Bytes::from(vec![0x42; 6 * 1024 * 1024]);
+    let raw_md5 = md5_hex(&raw);
+    state.lock().unwrap().objects.insert(
+        ("b".to_owned(), "raw/pre.bin".to_owned()),
+        StoredObject {
+            body: raw,
+            metadata: None,
+            content_type: None,
+        },
+    );
+
+    let svc = make_service(&state);
+    let create = svc
+        .create_multipart_upload(create_mpu_req("b", "pre/dst.bin"))
+        .await
+        .expect("create");
+    let upload_id = create.output.upload_id.expect("upload id");
+
+    let build = |if_match: Option<&str>, _sse: bool| {
+        let mut b = UploadPartCopyInput::builder();
+        b.set_bucket("b".to_owned());
+        b.set_key("pre/dst.bin".to_owned());
+        b.set_upload_id(upload_id.clone());
+        b.set_part_number(1);
+        b.set_copy_source(CopySource::Bucket {
+            bucket: "b".into(),
+            key: "raw/pre.bin".into(),
+            version_id: None,
+        });
+        b.set_copy_source_if_match(
+            if_match.map(|s| ETagCondition::ETag(ETag::Strong(s.to_owned()))),
+        );
+        b.build().expect("input builds")
+    };
+
+    // Wrong If-Match ⇒ 412 PreconditionFailed, nothing uploaded.
+    let err = svc
+        .upload_part_copy(req(
+            build(Some("00000000000000000000000000000000"), false),
+            http::Method::PUT,
+            &format!("/b/pre/dst.bin?uploadId={upload_id}&partNumber=1"),
+        ))
+        .await
+        .expect_err("wrong copy-source If-Match must fail");
+    assert_eq!(err.code().as_str(), "PreconditionFailed", "err: {err:?}");
+
+    // Correct If-Match ⇒ the copy proceeds.
+    svc.upload_part_copy(req(
+        build(Some(raw_md5.as_str()), false),
+        http::Method::PUT,
+        &format!("/b/pre/dst.bin?uploadId={upload_id}&partNumber=1"),
+    ))
+    .await
+    .expect("correct copy-source If-Match must proceed");
+
+    svc.abort_multipart_upload(abort_mpu_req("b", "pre/dst.bin", &upload_id))
+        .await
+        .expect("abort");
+
+    // Round-4 High (1), behavioral: an SSE-C-encrypted source is only
+    // copyable when the copy-source SSE-C header trio reaches the
+    // synthesized source GET (the gateway decrypts there; it never
+    // forwards customer keys to the backend). Without the mapping this
+    // GET — and therefore the copy — fails.
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let sse_key = [0x11u8; 32];
+    let plaintext = Bytes::from(vec![0x77u8; 6 * 1024 * 1024]);
+    let mut put = PutObjectInput::builder();
+    put.set_bucket("b".to_owned());
+    put.set_key("raw/ssec-src.bin".to_owned());
+    put.set_body(Some(bytes_to_blob(plaintext.clone())));
+    put.set_content_length(Some(plaintext.len() as i64));
+    put.set_sse_customer_algorithm(Some("AES256".to_owned()));
+    put.set_sse_customer_key(Some(b64.encode(sse_key)));
+    put.set_sse_customer_key_md5(Some(b64.encode(Md5::digest(sse_key))));
+    svc.put_object(req(
+        put.build().expect("put input"),
+        http::Method::PUT,
+        "/b/raw/ssec-src.bin",
+    ))
+    .await
+    .expect("SSE-C PUT through the gateway");
+
+    let create = svc
+        .create_multipart_upload(create_mpu_req("b", "pre/dst2.bin"))
+        .await
+        .expect("create 2");
+    let upload_id2 = create.output.upload_id.expect("upload id 2");
+    let mut b = UploadPartCopyInput::builder();
+    b.set_bucket("b".to_owned());
+    b.set_key("pre/dst2.bin".to_owned());
+    b.set_upload_id(upload_id2.clone());
+    b.set_part_number(1);
+    b.set_copy_source(CopySource::Bucket {
+        bucket: "b".into(),
+        key: "raw/ssec-src.bin".into(),
+        version_id: None,
+    });
+    b.set_copy_source_sse_customer_algorithm(Some("AES256".to_owned()));
+    b.set_copy_source_sse_customer_key(Some(b64.encode(sse_key)));
+    b.set_copy_source_sse_customer_key_md5(Some(b64.encode(Md5::digest(sse_key))));
+    let copy = svc
+        .upload_part_copy(req(
+            b.build().expect("copy input"),
+            http::Method::PUT,
+            &format!("/b/pre/dst2.bin?uploadId={upload_id2}&partNumber=1"),
+        ))
+        .await
+        .expect("SSE-C source copy must succeed when the key trio is mapped onto the GET");
+    let etag = copy
+        .output
+        .copy_part_result
+        .and_then(|r| r.e_tag)
+        .expect("copy etag")
+        .into_value();
+    assert_eq!(
+        etag,
+        md5_hex(&plaintext),
+        "copied-part logical ETag must be MD5(plaintext)"
+    );
+
+    svc.complete_multipart_upload(complete_mpu_req(
+        "b",
+        "pre/dst2.bin",
+        &upload_id2,
+        vec![(1, etag.as_str())],
+    ))
+    .await
+    .expect("complete 2");
+    let got = svc
+        .get_object(get_req("b", "pre/dst2.bin"))
+        .await
+        .expect("get 2");
+    let body = collect_blob(got.output.body.expect("body"), MAX_BODY)
+        .await
+        .expect("collect 2");
+    assert_eq!(
+        md5_hex(&body),
+        md5_hex(&plaintext),
+        "destination object must be the decrypted source plaintext"
+    );
+}

@@ -9761,6 +9761,34 @@ impl<B: S3> S3 for S4Service<B> {
         let src_key = src_key.to_string();
         let src_version_id: Option<String> = src_version_id.as_deref().map(str::to_owned);
 
+        // Round-4 review High (2): `x-amz-copy-source-if-[none-]match`
+        // must be honored — the old raw-source shortcut delegated them to
+        // the backend; the GET path has to evaluate them itself, mirroring
+        // `copy_object`'s handling (evaluate against the SOURCE's logical
+        // ETag — pinned to `versionId` when present — and fail the copy
+        // with 412 before any bytes move). A non-404 probe error fails
+        // the copy (never a wrong-200).
+        if req.input.copy_source_if_match.is_some() || req.input.copy_source_if_none_match.is_some()
+        {
+            let current = self
+                .current_logical_etag(&src_bucket, &src_key, src_version_id.as_deref())
+                .await?;
+            if !matches!(
+                evaluate_etag_preconditions(
+                    req.input.copy_source_if_match.as_ref(),
+                    req.input.copy_source_if_none_match.as_ref(),
+                    current.as_deref()
+                ),
+                EtagPrecondition::Proceed
+            ) {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::from_bytes(b"PreconditionFailed")
+                        .unwrap_or(S3ErrorCode::InvalidArgument),
+                    "At least one of the preconditions you specified did not hold",
+                ));
+            }
+        }
+
         // Resolve the optional source byte range to pass to GET.
         let source_range = req
             .input
@@ -9781,6 +9809,17 @@ impl<B: S3> S3 for S4Service<B> {
             ..Default::default()
         };
         get_input.range = source_range;
+        // Round-4 review High (1): an SSE-C source needs its customer key
+        // on the GET — map the copy-source SSE-C header trio onto the
+        // synthesized request (the backend / S4 SSE layer performs the
+        // usual all-or-none validation). Date preconditions ride along
+        // too: the source GET evaluates them; a failure surfaces as an
+        // error instead of copying stale bytes.
+        get_input.sse_customer_algorithm = req.input.copy_source_sse_customer_algorithm.clone();
+        get_input.sse_customer_key = req.input.copy_source_sse_customer_key.clone();
+        get_input.sse_customer_key_md5 = req.input.copy_source_sse_customer_key_md5.clone();
+        get_input.if_modified_since = req.input.copy_source_if_modified_since;
+        get_input.if_unmodified_since = req.input.copy_source_if_unmodified_since;
         let get_req = S3Request {
             input: get_input,
             method: http::Method::GET,
