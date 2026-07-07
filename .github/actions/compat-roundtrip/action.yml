@@ -83,20 +83,30 @@ runs:
         SKIP_BUCKET_CREATE: ${{ inputs.skip-bucket-create }}
       run: |
         set -euo pipefail
-        # Wait for the backend to respond to a ListBuckets — this is a
-        # cheap S3-spec sanity check that doesn't require the bucket
-        # to exist yet (works on MinIO / Garage / Ceph / B2 / R2 /
-        # Wasabi alike).
+        # Wait for the backend to respond. Two shapes (2026-07-08 fix —
+        # the first live R2 run failed here):
+        #  - skip-bucket-create=true (real-cloud rows): the bucket
+        #    pre-exists and the credentials are typically BUCKET-SCOPED
+        #    (e.g. Cloudflare R2 API tokens scoped to one bucket DENY
+        #    account-level ListBuckets) → probe with HeadBucket on the
+        #    test bucket instead.
+        #  - docker rows (admin creds, bucket may not exist yet):
+        #    ListBuckets stays the readiness probe.
+        if [ "$SKIP_BUCKET_CREATE" = "true" ]; then
+          PROBE=(s3api head-bucket --bucket "$TEST_BUCKET")
+        else
+          PROBE=(s3api list-buckets)
+        fi
         for _ in $(seq 1 60); do
           if aws --endpoint-url "$BACKEND_ENDPOINT" --region "$BACKEND_REGION" \
-              s3api list-buckets >/dev/null 2>&1; then
+              "${PROBE[@]}" >/dev/null 2>&1; then
             echo "backend ready"
             break
           fi
           sleep 2
         done
         aws --endpoint-url "$BACKEND_ENDPOINT" --region "$BACKEND_REGION" \
-          s3api list-buckets >/dev/null
+          "${PROBE[@]}" >/dev/null
 
         if [ "$SKIP_BUCKET_CREATE" != "true" ]; then
           # Tolerate BucketAlreadyOwnedByYou (re-running locally /
