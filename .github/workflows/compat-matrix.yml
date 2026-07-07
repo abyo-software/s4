@@ -40,6 +40,14 @@ name: Backend Compatibility Matrix
 #     - Wasabi           — vars: WASABI_BUCKET / WASABI_ENDPOINT / WASABI_REGION
 #                          secrets: WASABI_ACCESS_KEY_ID / WASABI_SECRET_ACCESS_KEY
 #
+#   The real-cloud rows additionally run a v1.5 (#143) multipart
+#   probe: a must-pass 4-part mixed-compressibility upload through
+#   an s4 instance running `--uniform-multipart-parts`, plus (R2
+#   only) a flag-off informational check of whether R2 still
+#   enforces its uniform-part-size rule. See the comment block
+#   above those steps in `realcloud-compat` for the rationale and
+#   the CRT chunk-size false-negative guard.
+#
 # Why a separate workflow vs adding to ci.yml:
 #   - cost: real-cloud backends bill per request + egress, so we
 #     keep these off PR runs and on a weekly schedule instead
@@ -99,6 +107,14 @@ env:
   # body would silent-pass on the single-frame elide path.
   TEST_SIZE_BYTES: "8388608"
   S4_PORT: "8014"
+  # v1.5 (#143) multipart probe (real-cloud rows only): run-scoped key
+  # prefix, same uniqueness rationale as TEST_KEY above. Namespaced
+  # under `compat-probe/` and — unlike TEST_KEY, which is deliberately
+  # left in place (see the compat-roundtrip action's note about not
+  # exercising DeleteObjects there) — torn down in an always() cleanup
+  # step: the probe bodies are 32 MiB each on operator-paid storage,
+  # so leaving them would accrete ~1.6+ GiB/yr per backend.
+  MP_PROBE_PREFIX: compat-probe/run-${{ github.run_id }}
 
 jobs:
   # ───────────────────────── shared build ─────────────────────────
@@ -436,7 +452,9 @@ jobs:
     name: ${{ matrix.label }} compat (real cloud)
     needs: build-s4
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 30 (was 20 pre-probe): the v1.5 multipart probe adds up to two
+    # 32 MiB uploads + one 32 MiB download of real-cloud transfer.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -525,3 +543,300 @@ jobs:
           # avoid clashing with whatever naming convention the
           # operator's cloud account already uses
           test-bucket: ${{ vars[matrix.bucket_var] }}
+
+      # ── v1.5 (#143) multipart uniform-parts probe ──────────────────
+      #
+      # Cloudflare R2 enforces "all non-trailing multipart parts must
+      # have the same length" at CompleteMultipartUpload. S4's
+      # compressed backend parts are content-dependent, so a ≥3-part
+      # upload with mixed-compressibility parts fails on R2 unless the
+      # server runs with `--uniform-multipart-parts` (v1.5 opt-in:
+      # pads every non-final backend part to a deterministic per-part
+      # size). Live-validated on R2 2026-07-06 — see
+      # docs/use-cases/s3-compatible-backends.md (R2 section) and
+      # closed issue #143. The 1 PUT + 1 GET smoke above never
+      # exercises multipart at all, so the real-cloud rows get this
+      # dedicated probe.
+      #
+      # Why ALL real-cloud rows (not just R2): the flag is
+      # backend-agnostic and must round-trip everywhere, not only
+      # where the uniform rule is enforced, and the matrix structure
+      # makes it a single step block. The docker rows are skipped
+      # deliberately: MinIO multipart is already CI-verified by the
+      # testcontainers multipart_e2e suites in
+      # crates/s4-server/tests/, and Garage / Ceph can't pass even the
+      # single-PUT smoke (wire drift — see their job comments), so a
+      # multipart probe there adds noise, not signal.
+      #
+      # FALSE-NEGATIVE GUARD (chunk-size forcing) — CRITICAL: modern
+      # aws-cli defaults to the CRT transfer client, which ignores
+      # `multipart_chunksize` and picks its own part size (observed
+      # 64 MiB during the 2026-07-06 live validation) → the 32 MiB
+      # body becomes ≤ 2 parts → R2's uniform rule is vacuous below
+      # 3 parts and the probe proves nothing while looking green.
+      # The probe therefore (a) pins
+      # `preferred_transfer_client = classic` +
+      # `multipart_threshold` / `multipart_chunksize = 8MB` in a
+      # scratch AWS_CONFIG_FILE (never the runner's default profile,
+      # so no other step's aws call is affected), and (b) hard-asserts
+      # the client-visible composite ETag ends in `-4` — proof the
+      # object really landed as 4 parts (3 non-trailing) — before
+      # trusting any other assertion.
+      - name: Multipart probe — --uniform-multipart-parts (must pass)
+        if: steps.check.outputs.configured == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets[matrix.access_key_secret] }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets[matrix.secret_key_secret] }}
+          AWS_REGION: ${{ vars[matrix.region_var] }}
+          BACKEND_ENDPOINT: ${{ vars[matrix.endpoint_var] }}
+          PROBE_BUCKET: ${{ vars[matrix.bucket_var] }}
+          RUST_LOG: info,aws_smithy_runtime=warn,aws_config=warn
+        run: |
+          set -euo pipefail
+          MP_KEY="${MP_PROBE_PREFIX}/uniform.bin"
+
+          # Second s4 instance: same relay config as the smoke
+          # round-trip (--codec cpu-zstd --dispatcher always) plus the
+          # flag under test. Port 8015 stays clear of the smoke
+          # instance (8014), which the composite action has already
+          # stopped by now.
+          ./bin/s4 \
+            --endpoint-url "$BACKEND_ENDPOINT" \
+            --host 127.0.0.1 \
+            --port 8015 \
+            --codec cpu-zstd \
+            --dispatcher always \
+            --uniform-multipart-parts \
+            > /tmp/s4-mp-uniform.log 2>&1 &
+          echo $! > /tmp/s4-mp-uniform.pid
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8015/ready >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -fsS http://127.0.0.1:8015/health >/dev/null; then
+            echo "::error::uniform-flag s4-server did not come up — log follows:"
+            cat /tmp/s4-mp-uniform.log
+            exit 1
+          fi
+
+          # 32 MiB body = 4 × 8 MiB parts alternating compressible
+          # text and incompressible random bytes, so the three
+          # non-trailing parts compress to wildly different sizes —
+          # exactly the shape #143 fails on without the flag.
+          # (python instead of `yes | head -c`: SIGPIPE from head
+          # would trip pipefail.)
+          python3 - <<'EOF'
+          import os
+          part = 8388608  # 8 MiB — must equal multipart_chunksize below
+          line = b's4 compat-matrix multipart probe: highly compressible filler line\n'
+          text = (line * (part // len(line) + 1))[:part]
+          rand = os.urandom(part)
+          with open('/tmp/mp-put.bin', 'wb') as f:
+              for block in (text, rand, text, rand):
+                  f.write(block)
+          EOF
+          BEFORE_SHA=$(sha256sum /tmp/mp-put.bin | awk '{print $1}')
+          echo "multipart PUT body sha256: $BEFORE_SHA"
+
+          # Scratch config file — see the FALSE-NEGATIVE GUARD comment
+          # above this step. Applied per-invocation via AWS_CONFIG_FILE
+          # so the runner's default profile is never mutated.
+          cat > /tmp/aws-mp-probe-config <<'EOF'
+          [default]
+          s3 =
+              multipart_threshold = 8MB
+              multipart_chunksize = 8MB
+              preferred_transfer_client = classic
+          EOF
+
+          AWS_CONFIG_FILE=/tmp/aws-mp-probe-config \
+            aws --endpoint-url http://127.0.0.1:8015 \
+            s3 cp /tmp/mp-put.bin "s3://${PROBE_BUCKET}/${MP_KEY}" \
+            --only-show-errors
+
+          # Part-count guard: the client-visible ETag must be a 4-part
+          # composite (s4 stamps the logical composite ETag itself, so
+          # this is independent of backend ETag quirks). If the
+          # transfer client ignored the chunk size the suffix differs
+          # (or is absent) → the probe is vacuous → hard fail. Also
+          # assert HEAD reports the logical (original) ContentLength —
+          # the #144 fix, live-validated on R2 2026-07-06.
+          ETAG=$(aws --endpoint-url http://127.0.0.1:8015 \
+            s3api head-object --bucket "$PROBE_BUCKET" --key "$MP_KEY" \
+            --query ETag --output text | tr -d '"')
+          CLEN=$(aws --endpoint-url http://127.0.0.1:8015 \
+            s3api head-object --bucket "$PROBE_BUCKET" --key "$MP_KEY" \
+            --query ContentLength --output text)
+          echo "client-visible ETag: $ETAG ContentLength: $CLEN"
+          case "$ETAG" in
+            *-4) echo "part-count guard OK (4 parts)" ;;
+            *)
+              echo "::error::multipart probe vacuous — ETag '$ETAG' is not a 4-part composite; the aws-cli transfer client ignored multipart_chunksize (CRT?). See the FALSE-NEGATIVE GUARD comment in compat-matrix.yml."
+              exit 1
+              ;;
+          esac
+          if [ "$CLEN" != "33554432" ]; then
+            echo "::error::multipart HEAD ContentLength $CLEN != logical 33554432 (client-transparency regression, cf. #144)"
+            exit 1
+          fi
+
+          # Full-body round-trip through s4.
+          AWS_CONFIG_FILE=/tmp/aws-mp-probe-config \
+            aws --endpoint-url http://127.0.0.1:8015 \
+            s3 cp "s3://${PROBE_BUCKET}/${MP_KEY}" /tmp/mp-get.bin \
+            --only-show-errors
+          AFTER_SHA=$(sha256sum /tmp/mp-get.bin | awk '{print $1}')
+          echo "multipart GET body sha256: $AFTER_SHA"
+          if [ "$BEFORE_SHA" != "$AFTER_SHA" ]; then
+            echo "::error::multipart round-trip mismatch: before=$BEFORE_SHA after=$AFTER_SHA"
+            exit 1
+          fi
+
+          # Range GET across the part-1|part-2 boundary (byte
+          # 8388608): 100 bytes either side, exercising the
+          # frame-index range path across a padded part seam.
+          # (dd instead of `tail | head`: SIGPIPE again.)
+          aws --endpoint-url http://127.0.0.1:8015 \
+            s3api get-object --bucket "$PROBE_BUCKET" --key "$MP_KEY" \
+            --range "bytes=8388508-8388707" /tmp/mp-range.bin >/dev/null
+          dd if=/tmp/mp-put.bin of=/tmp/mp-range-expect.bin \
+            bs=1 skip=8388508 count=200 status=none
+          if ! cmp -s /tmp/mp-range.bin /tmp/mp-range-expect.bin; then
+            echo "::error::range GET across the part boundary returned wrong bytes"
+            exit 1
+          fi
+          echo "multipart uniform-parts probe OK (4 parts, sha256 exact, boundary range exact)"
+
+          kill "$(cat /tmp/s4-mp-uniform.pid)" 2>/dev/null || true
+
+      # Flag-off observation (informational, never gates): the same
+      # upload WITHOUT --uniform-multipart-parts. On R2 this is
+      # expected to fail Complete with `InvalidPart: All non-trailing
+      # parts must have the same length` — the #143 shape. If it ever
+      # starts SUCCEEDING, R2 dropped the rule and the flag/doc
+      # guidance may be removable; either way we log loudly and exit
+      # 0. R2-only: B2 / Wasabi don't enforce the rule, so "flag off
+      # succeeds" there is the already-documented default posture and
+      # probing it would only spend paid requests to confirm a
+      # non-signal.
+      - name: Multipart flag-off observation — R2 uniform-part rule (#143, informational)
+        if: steps.check.outputs.configured == 'true' && matrix.backend == 'cloudflare-r2'
+        # Belt and suspenders: the script always exits 0, but even an
+        # unexpected script bug must not gate the job — this step is
+        # observational by design.
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets[matrix.access_key_secret] }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets[matrix.secret_key_secret] }}
+          AWS_REGION: ${{ vars[matrix.region_var] }}
+          BACKEND_ENDPOINT: ${{ vars[matrix.endpoint_var] }}
+          PROBE_BUCKET: ${{ vars[matrix.bucket_var] }}
+          RUST_LOG: info,aws_smithy_runtime=warn,aws_config=warn
+        run: |
+          set -uo pipefail
+          MP_KEY="${MP_PROBE_PREFIX}/flagoff.bin"
+
+          # Third s4 instance: identical relay config, NO flag.
+          ./bin/s4 \
+            --endpoint-url "$BACKEND_ENDPOINT" \
+            --host 127.0.0.1 \
+            --port 8016 \
+            --codec cpu-zstd \
+            --dispatcher always \
+            > /tmp/s4-mp-flagoff.log 2>&1 &
+          echo $! > /tmp/s4-mp-flagoff.pid
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8016/ready >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -fsS http://127.0.0.1:8016/health >/dev/null 2>&1; then
+            echo "::warning::flag-off observation skipped — s4-server (no flag) did not come up"
+            exit 0
+          fi
+
+          # Same 32 MiB mixed-compressibility body + same forced-8MB-
+          # chunking scratch config as the must-pass probe above (both
+          # files are still on disk from that step, which is a hard
+          # prerequisite of this one — this step is skipped whenever
+          # that one fails).
+          rc=0
+          AWS_CONFIG_FILE=/tmp/aws-mp-probe-config \
+            aws --endpoint-url http://127.0.0.1:8016 \
+            s3 cp /tmp/mp-put.bin "s3://${PROBE_BUCKET}/${MP_KEY}" \
+            --only-show-errors 2> /tmp/mp-flagoff-err.txt || rc=$?
+          kill "$(cat /tmp/s4-mp-flagoff.pid)" 2>/dev/null || true
+
+          if [ "$rc" -eq 0 ]; then
+            echo "::warning::R2 NO LONGER enforces uniform part sizes — the flag-off ≥3-part mixed-compressibility upload SUCCEEDED. The #143 --uniform-multipart-parts workaround may be removable; re-validate manually and update docs/use-cases/s3-compatible-backends.md + docs/compatibility.md."
+          elif grep -qiE "must have the same length|InvalidPart" /tmp/mp-flagoff-err.txt; then
+            echo "::notice::R2 still enforces uniform part sizes (flag-off upload failed with the expected #143 InvalidPart shape) — --uniform-multipart-parts remains required for ≥3-part mixed-compressibility multipart on R2."
+          else
+            echo "::warning::flag-off upload failed with an UNEXPECTED error (not the #143 InvalidPart shape) — aws-cli stderr follows:"
+            cat /tmp/mp-flagoff-err.txt || true
+          fi
+          exit 0
+
+      - name: Dump multipart-probe s4 logs on failure
+        if: failure() && steps.check.outputs.configured == 'true'
+        run: |
+          for f in /tmp/s4-mp-uniform.log /tmp/s4-mp-flagoff.log; do
+            if [ -f "$f" ]; then
+              echo "--- $f ---"
+              cat "$f"
+            fi
+          done
+
+      # Probe hygiene (see MP_PROBE_PREFIX comment in the workflow env
+      # block for why these ARE deleted while the smoke TEST_KEY is
+      # not). Everything is best-effort (`|| true`): cleanup failure
+      # must never mask or override the probe verdict.
+      - name: Cleanup multipart probe (kill servers + delete backend objects)
+        if: always() && steps.check.outputs.configured == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets[matrix.access_key_secret] }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets[matrix.secret_key_secret] }}
+          AWS_REGION: ${{ vars[matrix.region_var] }}
+          BACKEND_ENDPOINT: ${{ vars[matrix.endpoint_var] }}
+          BACKEND_REGION: ${{ vars[matrix.region_var] }}
+          PROBE_BUCKET: ${{ vars[matrix.bucket_var] }}
+        run: |
+          set -u
+          for pf in /tmp/s4-mp-uniform.pid /tmp/s4-mp-flagoff.pid; do
+            if [ -f "$pf" ]; then
+              kill "$(cat "$pf")" 2>/dev/null || true
+            fi
+          done
+          # Objects + sidecars for both probe keys (flagoff.bin only
+          # exists if R2 stopped enforcing the rule; deleting an
+          # absent key is a no-op, which is fine).
+          for k in \
+            "${MP_PROBE_PREFIX}/uniform.bin" \
+            "${MP_PROBE_PREFIX}/uniform.bin.s4index" \
+            "${MP_PROBE_PREFIX}/flagoff.bin" \
+            "${MP_PROBE_PREFIX}/flagoff.bin.s4index"; do
+            aws --endpoint-url "$BACKEND_ENDPOINT" --region "$BACKEND_REGION" \
+              s3api delete-object --bucket "$PROBE_BUCKET" --key "$k" \
+              >/dev/null 2>&1 || true
+          done
+          # Abort any incomplete MPU left under THIS run's probe
+          # prefix (the expected flag-off failure path relies on the
+          # aws-cli client aborting its upload; if that abort relay
+          # didn't land on the backend, the orphan would accrue
+          # storage until an operator lifecycle rule catches it).
+          # Scoped to this run's prefix so concurrent or historical
+          # runs are never touched.
+          aws --endpoint-url "$BACKEND_ENDPOINT" --region "$BACKEND_REGION" \
+            s3api list-multipart-uploads --bucket "$PROBE_BUCKET" \
+            --prefix "${MP_PROBE_PREFIX}/" \
+            --query 'Uploads[].[Key,UploadId]' --output text 2>/dev/null \
+          | while read -r key upload_id; do
+              if [ -n "${upload_id:-}" ] && [ "$key" != "None" ]; then
+                aws --endpoint-url "$BACKEND_ENDPOINT" --region "$BACKEND_REGION" \
+                  s3api abort-multipart-upload --bucket "$PROBE_BUCKET" \
+                  --key "$key" --upload-id "$upload_id" >/dev/null 2>&1 || true
+              fi
+            done || true
