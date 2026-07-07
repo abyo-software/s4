@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783327858279,
+  "lastUpdate": 1783442040746,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -23953,6 +23953,232 @@ window.BENCHMARK_DATA = {
             "name": "decode_index/4096f",
             "value": 18206,
             "range": "± 359",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "e645e5fe24f8c274d55ff7d4f342c68d47d41515",
+          "message": "fix(server): HEAD with Range/partNumber presents logical slice/part lengths (round-6 Minor)\n\nThe #144 ContentLength override was unconditional: HEAD with a Range or\npartNumber on an S4 object returned the FULL logical size instead of\nthe selected slice/part.\n\n- Range HEAD: resolved against the ORIGINAL size (416 InvalidRange on\n  unsatisfiable, matching GET) with a logical-domain ContentRange —\n  both the single-PUT manifest block and the multipart block.\n- partNumber HEAD on multipart objects: that part's original size from\n  the sidecar (data-frame entries map 1:1 to client parts — one frame\n  per part, padding skipped by the index builder) + PartsCount; out-of-\n  range partNumber is 416 InvalidPartNumber. Sidecar missing (pre-v1.5\n  SSE multipart) keeps the backend value — same honest fallback as the\n  full-size path. Stamped objects' backend already rejects partNumber>1\n  (the stamp self-copy collapses the backend object to single-part);\n  this fixes partNumber=1 and unstamped/multi-part-backend cases.\n- partNumber on single-PUT objects: part 1 is the whole object per AWS\n  non-multipart semantics (unchanged); larger numbers never reach the\n  override (backend rejects first).\n\nRegression test proven failing before the fix (full size leaked on\nranged HEAD); ordinary-HEAD behavior guarded. s4-server: 754 passed /\n0 failed; clippy 0 warnings; fmt clean.\n\nRefs #144\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-08T01:25:46+09:00",
+          "tree_id": "6c484b6a98069b59e36bf44040e3bde5489385f0",
+          "url": "https://github.com/abyo-software/s4/commit/e645e5fe24f8c274d55ff7d4f342c68d47d41515"
+        },
+        "date": 1783442039634,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 55133,
+            "range": "± 3945",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 53255,
+            "range": "± 4165",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 367,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2638821,
+            "range": "± 84378",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 42493599,
+            "range": "± 103084",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192372,
+            "range": "± 426",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 51486257,
+            "range": "± 906940",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 769943135,
+            "range": "± 1260258",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3088883,
+            "range": "± 26900",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 30653,
+            "range": "± 2421",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 37706,
+            "range": "± 2737",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 379,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 601775,
+            "range": "± 17932",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1586404,
+            "range": "± 36888",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192429,
+            "range": "± 1690",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 12993104,
+            "range": "± 375662",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27393205,
+            "range": "± 296826",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3082695,
+            "range": "± 15361",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1523632,
+            "range": "± 25836",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2575800,
+            "range": "± 89201",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 362799325,
+            "range": "± 14954914",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 196,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 7597,
+            "range": "± 181",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 828,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 13196,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 3090,
+            "range": "± 66",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 25265,
+            "range": "± 546",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 100140,
+            "range": "± 1159",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 605,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4544,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 18147,
+            "range": "± 33",
             "unit": "ns/iter"
           },
           {
