@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783442076804,
+  "lastUpdate": 1783442335509,
   "repoUrl": "https://github.com/abyo-software/s4",
   "entries": {
     "s4-codec criterion benches": [
@@ -24405,6 +24405,232 @@ window.BENCHMARK_DATA = {
             "name": "decode_index/4096f",
             "value": 18223,
             "range": "± 453",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/small_head",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/mid_16MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "lookup_range_1024f/span_256MiB",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "committer": {
+            "email": "abyo.software@gmail.com",
+            "name": "masumi-ryugo"
+          },
+          "distinct": true,
+          "id": "0a7ff392f5231b33f984ec72db4e79f643f48760",
+          "message": "ci(compat-matrix): multipart probe for real-cloud backends (#143 follow-up)\n\nWeekly real-cloud rows (R2/B2/Wasabi, when configured) gain a\nmust-pass multipart probe: 4 × 8 MiB alternating-compressibility parts\nthrough a --uniform-multipart-parts gateway — composite ETag part-count\nguard (-4), logical HEAD ContentLength, sha256 roundtrip, and a range\nGET across the part-1|part-2 boundary. A scratch AWS_CONFIG_FILE forces\nmultipart_chunksize=8MB + classic transfer client (CRITICAL: aws-cli\nCRT otherwise picks 64 MiB chunks → ≤2 parts → R2's uniform rule is\nvacuous and the probe proves nothing — the false negative hit during\nthe 2026-07-06 live validation).\n\nR2 additionally gets a non-gating flag-off observation step: loud\nnotice while R2 still enforces \"All non-trailing parts must have the\nsame length\", loud warning if the rule ever disappears (#143\nworkaround may then be removable).\n\nProbe objects/MPUs are run-scoped (compat-probe/run-<id>) and cleaned\nin an always() step. Docker rows unchanged (MinIO multipart is covered\nper-PR; Garage/Ceph can't pass the single-PUT smoke).\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-08T01:30:56+09:00",
+          "tree_id": "f82cda9ac36b1974305e6795f95363cdd13c9afc",
+          "url": "https://github.com/abyo-software/s4/commit/0a7ff392f5231b33f984ec72db4e79f643f48760"
+        },
+        "date": 1783442334277,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "compress/cpu_zstd_lvl3/1KiB",
+            "value": 54570,
+            "range": "± 3750",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1KiB",
+            "value": 56778,
+            "range": "± 3696",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1KiB",
+            "value": 364,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/1MiB",
+            "value": 2566631,
+            "range": "± 75132",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/1MiB",
+            "value": 42581081,
+            "range": "± 149035",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/1MiB",
+            "value": 192189,
+            "range": "± 447",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_zstd_lvl3/16MiB",
+            "value": 51319621,
+            "range": "± 1164373",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/cpu_gzip_lvl6/16MiB",
+            "value": 772237094,
+            "range": "± 1451647",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compress/passthrough/16MiB",
+            "value": 3066847,
+            "range": "± 11159",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1KiB",
+            "value": 32902,
+            "range": "± 2709",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1KiB",
+            "value": 39459,
+            "range": "± 2968",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1KiB",
+            "value": 377,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/1MiB",
+            "value": 617539,
+            "range": "± 14899",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/1MiB",
+            "value": 1553086,
+            "range": "± 9903",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/1MiB",
+            "value": 192103,
+            "range": "± 390",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_zstd_lvl3/16MiB",
+            "value": 13501971,
+            "range": "± 102607",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/cpu_gzip_lvl6/16MiB",
+            "value": 27081041,
+            "range": "± 118533",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompress/passthrough/16MiB",
+            "value": 3067036,
+            "range": "± 70045",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/1",
+            "value": 1569124,
+            "range": "± 65627",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/3",
+            "value": 2498241,
+            "range": "± 39724",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "cpu_zstd_levels_1MiB/compress/22",
+            "value": 339219193,
+            "range": "± 1821913",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/4KiB",
+            "value": 138,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_frame/single/256KiB",
+            "value": 6658,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/16f_64KiB",
+            "value": 818,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "frame_iter/256f_4KiB",
+            "value": 12976,
+            "range": "± 32",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/128f",
+            "value": 3086,
+            "range": "± 95",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/1024f",
+            "value": 24940,
+            "range": "± 536",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_index/4096f",
+            "value": 99699,
+            "range": "± 3199",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/128f",
+            "value": 599,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/1024f",
+            "value": 4951,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decode_index/4096f",
+            "value": 19489,
+            "range": "± 33",
             "unit": "ns/iter"
           },
           {
