@@ -58,7 +58,11 @@ sends one record per pod per hour (fail-open with ≤6 h backfill; see
 `s4_marketplace_meter_usage_total{result}` counter). The IAM policy
 needs `aws-marketplace:MeterUsage`.
 
-**Metered savings (v1.5, opt-in)** — `--marketplace-metered-savings`
+**Metered savings (v1.5, opt-in)** — the public
+["S4 Metered Savings" listing](https://aws.amazon.com/marketplace/pp/prodview-5aknpgmyjedc6)
+uses this mode with the `GBSavedHours` dimension at $0.00001/GB-saved-hour
+(≈ one third of the avoided S3 Standard storage cost).
+`--marketplace-metered-savings`
 switches the hourly quantity from the constant `1` pod-hour to the
 storage the gateway is currently avoiding on the backend, in integer
 GiB (`original_bytes − stored_bytes` from the savings ledger — the same

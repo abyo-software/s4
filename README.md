@@ -26,8 +26,9 @@ changes is the endpoint URL.
 - **No lock-in** — stop the gateway and the compressed objects + S4IX sidecars stay S3-native, decodable by the Apache-2.0 `s4-codec` CLI / library (`pip` / WASM / Rust). ([format](docs/wire-format.md))
 - **Range GET for framed objects** — sidecar-indexed byte ranges serve Parquet/ORC readers; some SSE / multipart-SSE modes use a buffered fallback.
 
-> ☁️ **Run it on AWS Marketplace — AWS-billed hourly, no app changes:**
-> **▶ [Container on EKS / ECS / Fargate](https://aws.amazon.com/marketplace/pp/prodview-kwpxxoeciis7e)** — runs on any small CPU node; the default path for most workloads.
+> ☁️ **Run it on AWS Marketplace — AWS-billed, no app changes:**
+> **▶ [Container on EKS / ECS / Fargate](https://aws.amazon.com/marketplace/pp/prodview-kwpxxoeciis7e)** — hourly per pod; runs on any small CPU node; the default path for most workloads.
+> &nbsp;·&nbsp; **[Metered Savings edition](https://aws.amazon.com/marketplace/pp/prodview-5aknpgmyjedc6)** — pay per GB actually saved instead of per pod-hour (~⅓ of the avoided S3 Standard cost; saving nothing costs nothing).
 > &nbsp;·&nbsp; **[GPU AMI on EC2 (g4dn / g5 / g6 / g6e)](https://aws.amazon.com/marketplace/pp/prodview-yvesl7lunql6i)** — for integer/columnar data at high throughput.
 >
 > The open-source build is free for local testing; Marketplace adds AWS procurement, billing, and the supported commercial path.
