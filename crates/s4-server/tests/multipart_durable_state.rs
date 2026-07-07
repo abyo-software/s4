@@ -1644,3 +1644,70 @@ async fn upload_part_copy_honors_source_etag_preconditions() {
         "destination object must be the decrypted source plaintext"
     );
 }
+
+/// #144 follow-up (round-6 Minor): HEAD with `Range` or `partNumber`
+/// must not present the FULL logical ContentLength — Range resolves
+/// against the original size (with a logical ContentRange), and
+/// partNumber returns that client part's original size (sidecar
+/// entries map 1:1 to parts — one data frame per part).
+#[tokio::test]
+async fn multipart_head_range_and_part_number_lengths() {
+    let state = Arc::new(Mutex::new(InnerState::default()));
+    let (p1, p2) = part_bodies();
+    let (p1_len, p2_len) = (p1.len() as i64, p2.len() as i64);
+    let total = p1_len + p2_len;
+
+    let svc = make_service(&state);
+    let (upload_id, etag1, etag2) =
+        create_and_upload_two_parts(&svc, "b", "hr/obj.bin", p1, p2).await;
+    svc.complete_multipart_upload(complete_mpu_req(
+        "b",
+        "hr/obj.bin",
+        &upload_id,
+        vec![(1, etag1.as_str()), (2, etag2.as_str())],
+    ))
+    .await
+    .expect("complete");
+
+    // Range HEAD: length of the requested slice, logical ContentRange.
+    let mut head = head_req("b", "hr/obj.bin");
+    head.input.range = Some(Range::Int {
+        first: 0,
+        last: Some(99),
+    });
+    let resp = svc.head_object(head).await.expect("range head");
+    assert_eq!(
+        resp.output.content_length,
+        Some(100),
+        "ranged HEAD must return the slice length, not the full object"
+    );
+    assert_eq!(
+        resp.output.content_range.as_deref(),
+        Some(format!("bytes 0-99/{total}").as_str()),
+        "ContentRange must be in the logical (original-bytes) domain"
+    );
+
+    // partNumber HEAD: that part's ORIGINAL length + parts count.
+    for (pn, want) in [(1, p1_len), (2, p2_len)] {
+        let mut head = head_req("b", "hr/obj.bin");
+        head.input.part_number = Some(pn);
+        let resp = svc.head_object(head).await.expect("part head");
+        assert_eq!(
+            resp.output.content_length,
+            Some(want),
+            "partNumber={pn} HEAD must return that part's original size"
+        );
+        assert_eq!(
+            resp.output.parts_count,
+            Some(2),
+            "partNumber HEAD must expose the client-visible parts count"
+        );
+    }
+
+    // Ordinary HEAD is unchanged (guard against regression of #144 core).
+    let resp = svc
+        .head_object(head_req("b", "hr/obj.bin"))
+        .await
+        .expect("plain head");
+    assert_eq!(resp.output.content_length, Some(total));
+}

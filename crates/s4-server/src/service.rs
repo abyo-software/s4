@@ -4417,6 +4417,31 @@ fn aws_to_tagset(tags: &[Tag]) -> Result<crate::tagging::TagSet, crate::tagging:
     crate::tagging::TagSet::from_pairs(pairs)
 }
 
+/// #144 follow-up: client-visible `(ContentLength, ContentRange)` for a
+/// HEAD of an S4 object whose logical (original) size is `original` —
+/// the resolved `Range` slice length in the logical domain when a range
+/// was requested, else the full original size. Range resolution
+/// failures surface as 416 `InvalidRange`, matching the GET path.
+fn head_logical_length(
+    original: u64,
+    head_range: Option<&s3s::dto::Range>,
+) -> S3Result<(i64, Option<String>)> {
+    match head_range {
+        Some(r) => {
+            let (start, end) = resolve_range(r, original)
+                .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, e))?;
+            Ok((
+                (end - start) as i64,
+                Some(format!(
+                    "bytes {start}-{}/{original}",
+                    end.saturating_sub(1)
+                )),
+            ))
+        }
+        None => Ok((original as i64, None)),
+    }
+}
+
 /// `Range` request を decompressed object サイズ `total` に適用して `(start, end_exclusive)`
 /// を返す。`Range::Int { first, last }` は `bytes=first-last` (last は inclusive)、
 /// `Range::Suffix { length }` は末尾 `length` byte。S3 仕様に準拠。
@@ -6785,6 +6810,12 @@ impl<B: S3> S3 for S4Service<B> {
         // client-facing `s4-*` strip via this request-extension marker, so the
         // raw `s4-encrypted` / `s4-sse-*` markers survive for classification.
         let keep_reserved_metadata = req.extensions.get::<InternalUnstrippedHead>().is_some();
+        // #144 follow-up (round-6 Minor): a HEAD with `Range` or
+        // `partNumber` must not be overridden to the FULL logical
+        // ContentLength below — capture both so the S4-object blocks can
+        // present the logical range / part length instead.
+        let head_range = req.input.range;
+        let head_part_number = req.input.part_number;
         let mut resp = self.backend.head_object(req).await?;
         // The backend's own ETag (real for passthrough / non-S4 objects);
         // captured before the framed block clears it below.
@@ -6797,7 +6828,17 @@ impl<B: S3> S3 for S4Service<B> {
             // 客側には decompress 後の意味のある content_length / checksum を返す。
             // backend が返す圧縮済 bytes の checksum / e_tag は意味が違うため除去
             // (S4 は manifest 内の crc32c で integrity を担保する)。
-            resp.output.content_length = Some(manifest.original_size as i64);
+            // #144 follow-up: range-aware — a ranged HEAD presents the
+            // logical slice length + ContentRange, not the full size.
+            // (`partNumber` on a single-PUT object: part 1 IS the whole
+            // object per AWS non-multipart semantics; larger part numbers
+            // never reach here — the backend rejects them first.)
+            let (head_len, head_content_range) =
+                head_logical_length(manifest.original_size, head_range.as_ref())?;
+            resp.output.content_length = Some(head_len);
+            if head_content_range.is_some() {
+                resp.output.content_range = head_content_range;
+            }
             resp.output.checksum_crc32 = None;
             resp.output.checksum_crc32c = None;
             resp.output.checksum_crc64nvme = None;
@@ -6884,15 +6925,48 @@ impl<B: S3> S3 for S4Service<B> {
                     .metadata
                     .as_ref()
                     .and_then(|m| m.get(META_ORIGINAL_SIZE))
-                    .and_then(|v| v.parse::<i64>().ok());
-                match stamped_size {
-                    Some(size) => resp.output.content_length = Some(size),
-                    None => {
-                        if let Some(idx) = self.read_sidecar(&head_bucket, &head_key).await
-                            && let Ok(size) = i64::try_from(idx.total_original_size())
+                    .and_then(|v| v.parse::<u64>().ok());
+                // #144 follow-up: a `partNumber` HEAD on a multipart object
+                // needs PER-PART original sizes, which only the sidecar
+                // carries (its data-frame entries map 1:1 to client parts —
+                // `upload_part` emits exactly one data frame per part, and
+                // the index builder skips padding frames).
+                let part_lookup =
+                    head_part_number.is_some() && is_multipart_object(&resp.output.metadata);
+                let sidecar = if part_lookup || stamped_size.is_none() {
+                    self.read_sidecar(&head_bucket, &head_key).await
+                } else {
+                    None
+                };
+                if let Some(pn) = head_part_number
+                    && part_lookup
+                {
+                    // Sidecar missing (pre-v1.5 SSE multipart etc.): leave
+                    // the backend's value — honest fallback, same posture
+                    // as the full-size case below.
+                    if let Some(ref idx) = sidecar {
+                        let n = idx.entries.len();
+                        if pn < 1 || pn as usize > n {
+                            return Err(S3Error::with_message(
+                                S3ErrorCode::from_bytes(b"InvalidPartNumber")
+                                    .unwrap_or(S3ErrorCode::InvalidRange),
+                                "The requested partnumber is not satisfiable",
+                            ));
+                        }
+                        if let Ok(size) = i64::try_from(idx.entries[pn as usize - 1].original_size)
                         {
                             resp.output.content_length = Some(size);
                         }
+                        resp.output.parts_count = i32::try_from(n).ok();
+                    }
+                } else if let Some(total) =
+                    stamped_size.or_else(|| sidecar.as_ref().map(|i| i.total_original_size()))
+                {
+                    let (head_len, head_content_range) =
+                        head_logical_length(total, head_range.as_ref())?;
+                    resp.output.content_length = Some(head_len);
+                    if head_content_range.is_some() {
+                        resp.output.content_range = head_content_range;
                     }
                 }
             }
