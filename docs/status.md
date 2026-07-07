@@ -1,5 +1,12 @@
 # Project status
 
+> **Current release: v1.5.0 (2026-07-06)** — HA multipart (durable
+> per-part state), the value-based Marketplace billing mode
+> (`GBSavedHours`, its own public listing), the standalone `s4-codec`
+> decoder CLI, `--uniform-multipart-parts` (Cloudflare R2 live-validated),
+> and the multipart-HEAD transparency fix. See
+> [CHANGELOG.md](../CHANGELOG.md) for the honest known-limitations list.
+
 > **Status: v1.0 — stable surface, no public production deployment
 > reference yet.** v1.0 is the SemVer-stable freeze of the wire formats,
 > library API surface, CLI subcommands, `s3s 0.13` HTTP trait set, and
