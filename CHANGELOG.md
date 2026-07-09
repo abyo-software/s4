@@ -7,6 +7,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-07-10
+
+Fix wave for the three defects the 2026-07-08 Metered Savings live E2E
+found in v1.5.0 (#148 Critical, #149/#150 High) plus the #151 docs /
+display items. #148 and #150 are latent in every release with the
+S4F2 multipart format (v0.2+); #149's whole-connection semantics date
+to the flag's introduction.
+
+### Fixed
+
+- **#148 (Critical, affects v0.2+): multipart / framed GET no longer
+  buffers the whole object.** GETs of multipart and framed-v2 objects
+  used to collect the full compressed body and decompress every frame
+  into a single buffer — one `aws s3 cp` of a 2 GiB object OOM-killed a
+  chart-default (2Gi) gateway pod, reproduced live 3/3. The framed GET
+  path (full, Range-with-sidecar via `partial_range_get`, and
+  Range-without-sidecar) now streams frame-by-frame: memory high-water
+  mark is one frame (each frame's declared sizes capped at
+  `--max-body-bytes`) plus a 2-frame channel, Range requests decode
+  only the covering frames, and a body that dies mid-stream or ends
+  short of the declared total surfaces as a loud stream error — never a
+  silently truncated 200. CompleteMultipartUpload's post-commit pass
+  similarly switched from a full-body fetch to a streaming frame scan
+  for the default deployment shape; SSE / versioning-Enabled /
+  replication-configured Completes still buffer (they rewrite the
+  bytes) and remain bounded by `--max-body-bytes`. Legacy objects with
+  no `s4-original-size` stamp and no sidecar keep a buffered fallback
+  for Range (and stream with chunked transfer-encoding for full GETs).
+- **#150 (High, affects v0.2+): interrupted CompleteMultipartUpload is
+  now idempotently retryable.** The gateway persists a completion
+  record (`.s4mpu/<hex(uploadId)>/completion`) immediately after a
+  successful backend Complete — its existence proves the commit — and
+  keeps ALL durable multipart records until the index / stamp / ledger
+  work has finished (previously they were destroyed right after the
+  backend commit). A retried Complete that hits
+  `NoSuchUpload` on a committed upload is verified — same key, same
+  manifest, every part ETag matching its durable part record — and then
+  answered idempotently: the gateway rebuilds the `.s4index` (streaming
+  scan), re-stamps the composite ETag, and returns success instead of
+  leaving an index-less phantom object at the client key (live E2E: 4/6
+  interrupted 2 GiB uploads left 160 MiB padding phantoms). Recovery
+  refuses (keeps returning `NoSuchUpload`, with a WARN naming the
+  repair path) when the interrupted attempt still owed work only the
+  crashed gateway could do: SSE re-encrypt, versioning shadow re-PUT,
+  or replication. `s4 maintain` (`action = "mpu-state-gc"`) now
+  classifies completion records first-class and reports
+  committed-but-unindexed phantoms (`phantom_committed_keys`) with an
+  `s4 repair-sidecar` pointer instead of deleting the evidence;
+  docs/ops/repair.md documents the scenario. The savings ledger is
+  deliberately not applied on the recovery path (under-counts,
+  customer-favor, disclosed) — metering accuracy semantics unchanged.
+  Residual windows (disclosed in docs/ops/repair.md): a crash while the
+  backend Complete call itself is in flight predates the completion
+  record, so that phantom stays unrecoverable-by-retry and invisible to
+  `mpu-state-gc` — manual repair applies, as before v1.5.1. A response
+  lost after ALL post-processing finished still answers the retry with
+  `NoSuchUpload`, but the object is fully coherent by then — identical
+  to AWS S3's own Complete semantics for a lost response (recovery
+  deliberately does not bless retries of fully-completed uploads).
+- **#149 (High): `--read-timeout-seconds` is now a progress-based idle
+  timeout, not a whole-connection wall clock.** The old implementation
+  wrapped the entire connection in one timeout, so any healthy transfer
+  needing more than 30 s (default) died mid-flight — plain `aws s3 cp`
+  of 2 GiB objects succeeded 2/6 live. The timer now resets on any read
+  or write progress (tracked underneath TLS on all three accept paths)
+  and only N seconds with zero I/O kills the connection — the slowloris
+  guard property is preserved and pinned by test. The TLS / ACME
+  handshake now runs inside the same watchdog (a stalled handshake used
+  to hold its connection slot unbounded — also true before this fix).
+  The flag doc's claim that the budget "resets on each request
+  boundary" was false and has been corrected. New:
+  `S4_READ_TIMEOUT_SECONDS` env override (CLI > env > default) and a
+  helm `extraArgs` list value (chart 0.4.0 → 0.5.0) so Marketplace
+  deployments are no longer pinned to the default. No secondary
+  absolute cap is imposed (deliberate; documented in
+  docs/configuration.md).
+- **#151: `s4 savings` columns are now honestly labeled and the default
+  multipart padding overhead is documented.** The live-E2E display
+  (`objects=0 / original=net / stored=sidecar-only / 100.0%`) was
+  reconstructed byte-exactly: a Complete that dies before its ledger
+  add leaves a marker-stamped-but-never-added object, and the client's
+  retried upload is then accounted as an overwrite swap — cumulative
+  net counters presented as if they were a bucket inventory. The report
+  gains an always-accurate `saved` bytes column (the exact
+  `--marketplace-metered-savings` quantity), `saved_bytes` /
+  `total_saved_bytes` JSON fields, a fixed note explaining the column
+  semantics, and a data-driven note naming buckets showing the
+  retried-multipart signature. Metering / accumulation semantics are
+  untouched (verified byte-accurate live). New docs/savings.md section
+  documents the always-on 5 MiB part-padding floor (aws-cli default
+  8 MiB parts ⇒ stored ≥62.5% of original regardless of
+  compressibility), recommends `multipart_chunksize` ≥64 MiB, and
+  corrects a docs claim that `s4 migrate` reclaims padding (only
+  `s4 recompact` does — migrate skips already-S4 objects).
+- Durable multipart record reads are now bounded at 1 MiB per record
+  (was `--max-body-bytes`): a corrupted or planted multi-GiB object at
+  a `.s4mpu/` record key can no longer pin gateway memory ×16
+  concurrent record GETs (QA-round finding).
+
 ## [1.5.0] - 2026-07-06
 
 **v1.5.0 — HA multipart, value-based Marketplace billing, the offline
@@ -92,6 +191,14 @@ found, worked around, and fixed via an opt-in mode).
 - `HeadObject` with `Range` or `partNumber` returns the full logical
   ContentLength for S4 objects rather than the selected range/part
   length (pre-existing pattern, round-6 review Minor).
+- **Found after release (2026-07-08 live E2E; fixed in the next
+  version):** #148 — multipart/framed GET and Complete buffer the whole
+  object in memory (2 GiB GET OOM-kills a chart-default 2Gi pod; latent
+  since v0.2); #149 — `--read-timeout-seconds` is a whole-connection
+  wall clock that kills healthy large transfers at 30 s, with no chart
+  override; #150 — an interrupted CompleteMultipartUpload is
+  non-idempotent: the retry gets `NoSuchUpload` and an index-less
+  phantom object is left at the client key (latent since v0.2).
 
 ## [1.4.1] - 2026-06-24
 

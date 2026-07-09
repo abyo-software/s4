@@ -1,10 +1,14 @@
 # Project status
 
-> **Current release: v1.5.0 (2026-07-06)** — HA multipart (durable
-> per-part state), the value-based Marketplace billing mode
-> (`GBSavedHours`, its own public listing), the standalone `s4-codec`
-> decoder CLI, `--uniform-multipart-parts` (Cloudflare R2 live-validated),
-> and the multipart-HEAD transparency fix. See
+> **Current release: v1.5.1 (2026-07-10)** — the live-E2E fix wave:
+> multipart / framed GET and Complete now stream frame-by-frame instead
+> of buffering whole objects (#148, a 2 GiB GET used to OOM-kill a
+> chart-default pod), interrupted CompleteMultipartUpload retries are
+> answered idempotently instead of leaving index-less phantoms (#150),
+> `--read-timeout-seconds` became a progress-based idle guard that no
+> longer kills healthy large transfers (#149, with an env var + helm
+> `extraArgs` override), and `s4 savings` columns are honestly labeled
+> with the 5 MiB multipart padding floor documented (#151). See
 > [CHANGELOG.md](../CHANGELOG.md) for the honest known-limitations list.
 
 > **Status: v1.0 — stable surface, no public production deployment
