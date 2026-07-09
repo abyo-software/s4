@@ -195,7 +195,8 @@ and minus a small operations delta:
   [enforces](https://developers.cloudflare.com/r2/objects/multipart-objects/)
   "all parts except the last must be the same size", and S4's backend
   parts are otherwise content-dependent (compressed per part, padded only
-  to the 5 MiB floor). Measured repro without the flag (11 × 8 MiB parts
+  to the 5 MiB floor — which itself caps default-mode multipart savings;
+  see [savings.md](../savings.md#multipart-uploads-the-5-mib-part-floor-caps-at-rest-savings)). Measured repro without the flag (11 × 8 MiB parts
   alternating text/random):
   `CompleteMultipartUpload → InvalidPart: All non-trailing parts must
   have the same length.` ([#143](https://github.com/abyo-software/s4/issues/143))
@@ -210,8 +211,9 @@ and minus a small operations delta:
   ContentLength. **The honest
   trade-off**: while the object stays in multipart form its at-rest
   savings are ~zero (each non-final part is stored at ≈ its original
-  size); a later `s4 recompact` / `s4 migrate` rewrite drops the padding
-  and reclaims the savings. Single-PUT objects are unaffected.
+  size); a later `s4 recompact` rewrite drops the padding and reclaims
+  the savings (`s4 migrate` does *not* — it skips objects already in
+  S4 format). Single-PUT objects are unaffected.
   **Without the flag**: raise the client's `multipart_threshold` /
   `multipart_chunksize` so uploads stay at ≤ 2 parts (the rule is
   vacuous below 3 parts), or avoid multipart for mixed-compressibility

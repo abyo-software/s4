@@ -86,6 +86,14 @@ configure larger multipart chunk sizes via the AWS SDK
 Range-GET granularity). The CSV captures end-to-end PUT/GET wall-clock
 including framing overhead.
 
+Separately from the ratio effect, every non-final compressible part is
+also **padded to the S3 5 MiB minimum part size** — with the aws-cli
+default 8 MiB `multipart_chunksize`, stored bytes are ≥62.5% of the
+original *regardless of compressibility* until an `s4 recompact`
+rewrite. Arithmetic, the `multipart_chunksize` mitigation, and the
+reclaim path are in
+[docs/savings.md](savings.md#multipart-uploads-the-5-mib-part-floor-caps-at-rest-savings).
+
 ### Performance regression tracking (criterion + GitHub Pages)
 
 The single-pass numbers above are captured manually on the maintainer's

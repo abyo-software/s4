@@ -61,6 +61,14 @@ with backend (no network RTT to amortise). TTFB excludes TLS handshake
 - **Multipart final-part padding trim** (v0.2): the final part of a multipart
   with a tiny highly-compressible tail skips `S4P1` padding (saves up to
   ~5 MiB per object on highly compressible workloads)
+- **Multipart non-final parts are padded to the S3 5 MiB minimum**: a
+  compressible part whose framed output lands under 5 MiB gets a zero-filled
+  `S4P1` padding frame back up to the floor (S3 rejects smaller non-final
+  parts with `EntityTooSmall`). At-rest multipart savings are therefore
+  floored at `5 MiB ÷ client part size` — 62.5% stored at the aws-cli
+  default 8 MiB `multipart_chunksize` — until an `s4 recompact` rewrite;
+  arithmetic and mitigation in
+  [docs/savings.md](savings.md#multipart-uploads-the-5-mib-part-floor-caps-at-rest-savings)
 - **Range GET via sidecar `<key>.s4index`**: only the needed compressed bytes
   are fetched from backend, decoded, and sliced. Falls back to full read when
   sidecar is absent

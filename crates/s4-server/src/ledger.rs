@@ -126,6 +126,20 @@ pub struct BucketTotals {
     pub objects: u64,
 }
 
+impl BucketTotals {
+    /// Net saved bytes: `original_bytes - stored_bytes`, floored at 0.
+    /// This is the byte-accurate figure — the same quantity the
+    /// `--marketplace-metered-savings` hourly meter bills as
+    /// GBSavedHours — and it stays exact even when the individual
+    /// counters diverge from a point-in-time bucket listing (#151: a
+    /// marker-gated overwrite swap subtracts equal amounts from both
+    /// sides, so the difference is preserved while the per-column
+    /// split is not).
+    pub fn saved_bytes(&self) -> u64 {
+        self.original_bytes.saturating_sub(self.stored_bytes)
+    }
+}
+
 /// On-disk snapshot shape (`--savings-ledger-state-file` JSON). Also
 /// what `s4 savings` deserializes — the CLI never needs the live
 /// gateway, only this file.
@@ -375,6 +389,12 @@ pub struct BucketSavings {
     pub objects: u64,
     pub original_bytes: u64,
     pub stored_bytes: u64,
+    /// #151: `original_bytes - stored_bytes` (floored at 0) — the net
+    /// saved bytes. Byte-accurate even when the per-column split is
+    /// distorted by a marker-gated overwrite swap (see the fixed
+    /// column-semantics report note); the same quantity
+    /// `--marketplace-metered-savings` bills as GBSavedHours.
+    pub saved_bytes: u64,
     /// `1 - stored/original` (0.0 when `original_bytes == 0`).
     /// v1.2 audit R1: floored at 0.0 — `stored > original` (counter
     /// drift or negative compression gain) renders as 0% saved with a
@@ -400,6 +420,12 @@ pub struct SavingsReport {
     pub total_objects: u64,
     pub total_original_bytes: u64,
     pub total_stored_bytes: u64,
+    /// #151: global `original - stored` (floored at 0) — the
+    /// byte-accurate net figure. Computed from the global totals, NOT
+    /// as the sum of the per-bucket floors, so it matches exactly how
+    /// the `--marketplace-metered-savings` quantity is derived (drift
+    /// in one bucket nets against savings in another).
+    pub total_saved_bytes: u64,
     /// `1 - total_stored/total_original` (0.0 when nothing recorded;
     /// floored at 0.0 on drift — see [`BucketSavings::savings_ratio`]).
     pub total_savings_ratio: f64,
@@ -441,6 +467,7 @@ pub fn build_savings_report(snapshot: &LedgerSnapshot, price_per_gb_month: f64) 
             objects: t.objects,
             original_bytes: t.original_bytes,
             stored_bytes: t.stored_bytes,
+            saved_bytes: t.saved_bytes(),
             savings_ratio: savings_ratio(t.original_bytes, t.stored_bytes),
             monthly_savings_usd: monthly_savings_usd(
                 t.original_bytes,
@@ -478,6 +505,19 @@ pub fn build_savings_report(snapshot: &LedgerSnapshot, price_per_gb_month: f64) 
         "storage bytes only: request, egress, and (on GPU deployments) compute costs \
          are unchanged by S4"
             .to_owned(),
+        // #151: the live Metered Savings E2E (2026-07-08) showed a
+        // bucket at objects=0 / original=net-delta / stored=sidecar-only
+        // after retried multipart Completes — the counters were correct
+        // as counters, but the columns read like an inventory listing.
+        "column semantics: `objects` / `original` / `stored` are cumulative \
+         accounted-write counters, not a point-in-time bucket inventory — an \
+         overwrite of an already-accounted object adds 0 objects and only the \
+         footprint delta, so after churn (notably retried multipart Completes) \
+         the per-column split can diverge from what a bucket listing shows. \
+         `saved` (= original - stored) is the byte-accurate net figure — the \
+         `--marketplace-metered-savings` billing quantity — and is the number \
+         to quote"
+            .to_owned(),
     ];
     if total_skipped > 0 {
         notes.push(format!(
@@ -506,11 +546,36 @@ pub fn build_savings_report(snapshot: &LedgerSnapshot, price_per_gb_month: f64) 
             drifted.join(", ")
         ));
     }
+    // #151: disclose buckets carrying bytes with zero accounted objects
+    // — the live signature of a multipart Complete that was interrupted
+    // after the backend commit (the `s4-ledger` marker is stamped at
+    // Create time; the counter add is owed at Complete) and then
+    // retried by the client: the retry is accounted as an overwrite of
+    // the uncounted first attempt, so `objects` gains 0, `stored` gains
+    // only the sidecar bytes, and `original` absorbs the difference.
+    // Net `saved` stays exact through the swap.
+    let zero_object_bytes: Vec<&str> = snapshot
+        .buckets
+        .iter()
+        .filter(|(_, t)| t.objects == 0 && (t.original_bytes > 0 || t.stored_bytes > 0))
+        .map(|(b, _)| b.as_str())
+        .collect();
+    if !zero_object_bytes.is_empty() {
+        notes.push(format!(
+            "bucket(s) {}: bytes recorded with 0 accounted objects — typically a \
+             multipart Complete interrupted after the backend commit (crash/OOM) \
+             and then retried by the client; the retry is accounted as an overwrite \
+             of the uncounted first attempt, so `objects`/`original`/`stored` do \
+             not reflect the live bucket for these bucket(s). `saved` is exact",
+            zero_object_bytes.join(", ")
+        ));
+    }
     SavingsReport {
         buckets,
         total_objects: g.objects,
         total_original_bytes: g.original_bytes,
         total_stored_bytes: g.stored_bytes,
+        total_saved_bytes: g.saved_bytes(),
         total_savings_ratio: savings_ratio(g.original_bytes, g.stored_bytes),
         price_per_gb_month,
         total_monthly_savings_usd: monthly_savings_usd(
@@ -589,19 +654,24 @@ pub fn render_savings_human(report: &SavingsReport) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "S4 measured savings (gateway-written objects)");
     let _ = writeln!(out);
+    // #151: `saved` (bytes) is the byte-accurate column (= the metered
+    // quantity); `objects` / `original` / `stored` are cumulative
+    // accounted-write counters and can diverge from a bucket listing
+    // after churn — the fixed column-semantics note below says so.
     let _ = writeln!(
         out,
-        "  {:<20} {:>8} {:>14} {:>14} {:>8} {:>12}",
-        "bucket", "objects", "original", "stored", "saved", "$/month",
+        "  {:<20} {:>8} {:>14} {:>14} {:>14} {:>7} {:>12}",
+        "bucket", "objects", "original", "stored", "saved", "saved%", "$/month",
     );
     for b in &report.buckets {
         let _ = writeln!(
             out,
-            "  {:<20} {:>8} {:>14} {:>14} {:>7.1}% {:>12.2}",
+            "  {:<20} {:>8} {:>14} {:>14} {:>14} {:>6.1}% {:>12.2}",
             b.bucket,
             b.objects,
             human_bytes(b.original_bytes),
             human_bytes(b.stored_bytes),
+            human_bytes(b.saved_bytes),
             b.savings_ratio * 100.0,
             b.monthly_savings_usd,
         );
@@ -993,6 +1063,130 @@ mod tests {
                 .any(|n| n.contains("floored at 0")),
             "no drift note expected for healthy counters"
         );
+    }
+
+    /// #151: live repro (2026-07-08, v1.5.0 Metered Savings E2E) — two
+    /// 2 GiB multipart uploads whose first Complete attempt died after
+    /// the backend commit (gateway OOM, #148) and were then retried by
+    /// the client. The retry is accounted as a marker-gated overwrite
+    /// of the uncounted first attempt, so the recorded counters are:
+    /// `objects` 0, `original` = the net swap delta
+    /// (2 × (2 GiB − 160 MiB padded)), `stored` = sidecar bytes only
+    /// (2 × 1,100). Net saved is byte-accurate; the per-column split is
+    /// not a bucket inventory. The report must (a) expose the accurate
+    /// `saved` figure as its own column/field, (b) carry a fixed
+    /// column-semantics note, and (c) call out the
+    /// bytes-with-zero-objects signature per bucket.
+    #[test]
+    fn multipart_retry_swap_report_discloses_column_semantics() {
+        const TWO_GIB: u64 = 2 * 1024 * 1024 * 1024; // 2,147,483,648
+        const PADDED: u64 = 160 * 1024 * 1024; // 167,772,160 (32 × 5 MiB parts)
+        const SIDECAR: u64 = 1_100;
+        let mut snap = LedgerSnapshot::default();
+        snap.buckets.insert(
+            "s4-meter-e2e".into(),
+            BucketTotals {
+                original_bytes: 2 * (TWO_GIB - PADDED), // 3,959,422,976
+                stored_bytes: 2 * SIDECAR,              // 2,200
+                objects: 0,
+            },
+        );
+        let report = build_savings_report(&snap, DEFAULT_PRICE_PER_GB_MONTH);
+        let saved = 2 * (TWO_GIB - PADDED - SIDECAR); // 3,959,420,776
+        let b = &report.buckets[0];
+        // The one always-accurate number (the GBSavedHours metering
+        // source, verified live to the byte).
+        assert_eq!(b.saved_bytes, saved);
+        assert_eq!(report.total_saved_bytes, saved);
+        // Fixed column-semantics note — always present, not just on
+        // pathological snapshots.
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("cumulative accounted-write counters")),
+            "column-semantics note missing: {:?}",
+            report.notes
+        );
+        // Targeted symptom note naming the bucket.
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("s4-meter-e2e") && n.contains("0 accounted objects")),
+            "zero-object symptom note missing: {:?}",
+            report.notes
+        );
+        // Human table: a `saved` bytes column (accurate) next to the
+        // ratio column, which is explicitly labelled as a percentage.
+        let txt = render_savings_human(&report);
+        assert!(
+            txt.contains("saved%"),
+            "ratio header must say saved%: {txt}"
+        );
+        assert!(
+            txt.contains("3.7 GiB"),
+            "saved column must render the net bytes: {txt}"
+        );
+        // JSON contract: additive fields.
+        let v = serde_json::to_value(&report).expect("serialize");
+        assert_eq!(v["buckets"][0]["saved_bytes"], saved);
+        assert_eq!(v["total_saved_bytes"], saved);
+    }
+
+    /// #151 guard rails: the zero-object symptom note fires only on
+    /// buckets that actually carry bytes with no accounted objects —
+    /// healthy buckets and genuinely-empty buckets stay note-free, and
+    /// drifted counters (stored > original) floor `saved_bytes` at 0.
+    #[test]
+    fn zero_object_note_scope_and_saved_bytes_floor() {
+        let mut snap = LedgerSnapshot::default();
+        snap.buckets.insert(
+            "healthy".into(),
+            BucketTotals {
+                original_bytes: 2048,
+                stored_bytes: 1024,
+                objects: 2,
+            },
+        );
+        snap.buckets.insert("empty".into(), BucketTotals::default());
+        snap.buckets.insert(
+            "drifty".into(),
+            BucketTotals {
+                original_bytes: 100,
+                stored_bytes: 250,
+                objects: 1,
+            },
+        );
+        let report = build_savings_report(&snap, DEFAULT_PRICE_PER_GB_MONTH);
+        assert!(
+            !report
+                .notes
+                .iter()
+                .any(|n| n.contains("0 accounted objects")),
+            "no zero-object note expected: {:?}",
+            report.notes
+        );
+        let healthy = report
+            .buckets
+            .iter()
+            .find(|b| b.bucket == "healthy")
+            .expect("healthy bucket");
+        assert_eq!(healthy.saved_bytes, 1024);
+        let drifty = report
+            .buckets
+            .iter()
+            .find(|b| b.bucket == "drifty")
+            .expect("drifty bucket");
+        assert_eq!(
+            drifty.saved_bytes, 0,
+            "saved_bytes must floor at 0 on drift"
+        );
+        // The total is `global original - global stored` (2148 - 1274),
+        // NOT the sum of per-bucket floors — mirroring exactly how the
+        // metered-savings quantity is computed from the global totals
+        // (drift in one bucket nets against savings in another).
+        assert_eq!(report.total_saved_bytes, 874);
     }
 
     /// `run_savings` on a corrupt file is a typed parse error (the CLI

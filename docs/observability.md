@@ -73,7 +73,14 @@ Cardinality is bounded by the bucket count. Savings ratio in PromQL:
 Scope honesty (same notes as the `s4 savings` report): the ledger
 observes gateway-traversing writes only — backend-direct writes,
 `s4 migrate` / `s4 recompact` (backend-direct), aborted-multipart part
-bytes, and replication replicas are not reflected.
+bytes, and replication replicas are not reflected. And the same column
+semantics (#151): these are cumulative accounted-write counters, not a
+bucket inventory — after churn (notably a multipart Complete retried
+past an interrupted first attempt) the individual gauges can diverge
+from a bucket listing, while the difference
+`s4_ledger_original_bytes - s4_ledger_stored_bytes` (= net saved
+bytes, the metering quantity) stays byte-accurate. See the
+column-semantics note in [savings.md](savings.md).
 
 A drop-in Grafana dashboard for these gauges (plus the always-on
 `s4_bytes_in_total` / `s4_bytes_out_total` PUT-path counters) ships at
