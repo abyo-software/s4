@@ -2436,38 +2436,25 @@ impl<B: S3> S4Service<B> {
                 "backend partial GET returned empty body",
             )
         })?;
-        let bytes = collect_blob(blob, self.max_body_bytes)
-            .await
-            .map_err(internal("collect partial body"))?;
-
-        // frame parse + decompress
-        let mut combined = BytesMut::new();
-        for frame in FrameIter::new(bytes) {
-            let (header, payload) = frame.map_err(|e| {
-                S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    format!("partial-range frame parse: {e}"),
-                )
-            })?;
-            let chunk_manifest = ChunkManifest {
-                codec: header.codec,
-                original_size: header.original_size,
-                compressed_size: header.compressed_size,
-                crc32c: header.crc32c,
-            };
-            let decompressed = self
-                .registry
-                .decompress(payload, &chunk_manifest)
-                .await
-                .map_err(internal("partial-range decompress"))?;
-            combined.extend_from_slice(&decompressed);
-        }
-        let combined = combined.freeze();
-        let sliced = combined
-            .slice(plan.slice_start_in_combined as usize..plan.slice_end_in_combined as usize);
+        // #148: the fetched covering frames used to be collected whole
+        // and decompressed into one BytesMut before slicing — a Range
+        // spanning most of a large object buffered nearly all of it.
+        // Stream instead: the fetched span starts at a frame boundary,
+        // so it is itself a valid frame sequence and the plan's slice
+        // offsets are exactly the walker's range coordinates. Memory
+        // high-water mark is one frame; a stale-but-binding-passing
+        // sidecar whose plan overruns the actual span surfaces as a
+        // loud mid-body stream error instead of a slice panic.
+        let body = crate::frame_stream::multipart_decompress_blob(
+            blob,
+            Arc::clone(&self.registry),
+            Some((plan.slice_start_in_combined, plan.slice_end_in_combined)),
+            None,
+            self.max_body_bytes,
+        );
 
         // response 組立て
-        let returned_size = sliced.len() as u64;
+        let returned_size = plan.slice_end_in_combined - plan.slice_start_in_combined;
         backend_resp.output.content_length = Some(returned_size as i64);
         backend_resp.output.content_range = Some(format!(
             "bytes {client_start}-{}/{total_original}",
@@ -2479,7 +2466,7 @@ impl<B: S3> S4Service<B> {
         backend_resp.output.checksum_sha1 = None;
         backend_resp.output.checksum_sha256 = None;
         backend_resp.output.e_tag = None;
-        backend_resp.output.body = Some(bytes_to_blob(sliced));
+        backend_resp.output.body = Some(body);
         backend_resp.status = Some(http::StatusCode::PARTIAL_CONTENT);
         // s3-compat fix #4 (fix #5): this Range fast-path `return`s before
         // the shared GET metadata strip, so it must (a) echo the object's
@@ -3152,72 +3139,13 @@ impl<B: S3> S4Service<B> {
         }
     }
 
-    /// Multipart object (frame 列) を解凍 → 元 bytes を再構築。
-    ///
-    /// **per-frame codec dispatch**: 各 frame header に codec_id が入っているので、
-    /// frame ごとに registry が違う codec を呼ぶことができる。同一 object 内で
-    /// 異なる codec が混在していても透過的に解凍可能 (parquet 風 mixed columns 等)。
-    async fn decompress_multipart(&self, bytes: bytes::Bytes) -> S3Result<bytes::Bytes> {
-        let mut out = BytesMut::new();
-        // v0.8.15 H-h: cap the *aggregate* decoded output. Each
-        // individual frame is already bounded by
-        // `validate_decompress_manifest` (default 5 GiB per frame),
-        // but a forged multi-frame body can declare many frames
-        // each near the limit — without an object-level ceiling, a
-        // single GET could pin tens of GiB of plaintext in
-        // `BytesMut::extend_from_slice`. Use the gateway's
-        // `max_body_bytes` (same cap that bounds PUT bodies) so a
-        // GET can never produce more plaintext than a PUT can ever
-        // legitimately have stored.
-        let aggregate_cap = self.max_body_bytes;
-        let mut produced: usize = 0;
-        for frame in FrameIter::new(bytes) {
-            let (header, payload) = frame.map_err(|e| {
-                S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    format!("multipart frame parse: {e}"),
-                )
-            })?;
-            let chunk_manifest = ChunkManifest {
-                codec: header.codec,
-                original_size: header.original_size,
-                compressed_size: header.compressed_size,
-                crc32c: header.crc32c,
-            };
-            // v0.8.15 H-h: pre-flight check on the declared
-            // `original_size` so a forged manifest claiming a frame
-            // that would push us past the cap is rejected before we
-            // start decoding. Defence-in-depth alongside the
-            // post-decode `produced` check below.
-            if (produced as u64).saturating_add(header.original_size) > aggregate_cap as u64 {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    format!(
-                        "multipart aggregate output exceeds cap: would reach \
-                         {produced_total} bytes after this frame, cap is {aggregate_cap}",
-                        produced_total = (produced as u64).saturating_add(header.original_size),
-                    ),
-                ));
-            }
-            let decompressed = self
-                .registry
-                .decompress(payload, &chunk_manifest)
-                .await
-                .map_err(internal("multipart frame decompress"))?;
-            produced = produced.saturating_add(decompressed.len());
-            if produced > aggregate_cap {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    format!(
-                        "multipart aggregate output exceeded cap: {produced} bytes \
-                         emitted, cap is {aggregate_cap}"
-                    ),
-                ));
-            }
-            out.extend_from_slice(&decompressed);
-        }
-        Ok(out.freeze())
-    }
+    // NOTE (#148): the buffered `decompress_multipart` helper that used
+    // to live here (per-frame codec dispatch into a single `BytesMut`,
+    // with the v0.8.15 H-h aggregate `max_body_bytes` cap) was replaced
+    // by the streaming walker in `crate::frame_stream` — the GET path
+    // now decompresses frame-by-frame with a per-frame cap instead of
+    // materializing the whole object (which OOM-killed the gateway on
+    // large multipart GETs, live repro 2026-07-08).
 
     // ===================================================================
     // v1.1 `--zstd-dict` helpers
@@ -3397,9 +3325,9 @@ impl<B: S3> S4Service<B> {
     }
 
     /// GET-side decompress for `s4-dict-id`-stamped objects. Same S4F2
-    /// frame walk as [`Self::decompress_multipart`] (incl. the aggregate
-    /// output cap), with `cpu-zstd-dict` frames decoded against `dict`
-    /// instead of going through the registry.
+    /// frame walk the multipart GET used before #148 went streaming
+    /// (incl. the aggregate output cap), with `cpu-zstd-dict` frames
+    /// decoded against `dict` instead of going through the registry.
     async fn decompress_framed_with_dict(
         &self,
         bytes: bytes::Bytes,
@@ -3720,6 +3648,11 @@ impl<B: S3> S4Service<B> {
         /// Concurrent record GETs per Complete — small objects, so the
         /// bound exists to protect the backend, not the gateway.
         const RECORD_GET_CONCURRENCY: usize = 16;
+        /// QA round-1 Medium: records are tiny JSON — bound each
+        /// collect so a corrupted / planted multi-GiB object at a
+        /// record key can't pin memory (×16 concurrent GETs) the way
+        /// the previous `max_body_bytes` bound allowed.
+        const MPU_RECORD_MAX_BYTES: usize = 1024 * 1024;
         let fetched: Vec<(i32, Option<crate::multipart_state::PartEtags>)> =
             futures::stream::iter(part_numbers.iter().copied())
                 .map(|pn| async move {
@@ -3744,7 +3677,7 @@ impl<B: S3> S4Service<B> {
                     };
                     let body = match self.backend.get_object(get_req).await {
                         Ok(resp) => match resp.output.body {
-                            Some(blob) => collect_blob(blob, self.max_body_bytes).await.ok(),
+                            Some(blob) => collect_blob(blob, MPU_RECORD_MAX_BYTES).await.ok(),
                             None => None,
                         },
                         Err(e) => {
@@ -3862,6 +3795,341 @@ impl<B: S3> S4Service<B> {
                 _ => return,
             }
         }
+    }
+
+    /// #150: persist the completion record
+    /// (`.s4mpu/<hex(uploadId)>/completion`) right AFTER a successful
+    /// backend Complete — its existence is what proves the upload id
+    /// was consumed by a commit. While it exists, a retried Complete
+    /// with the same manifest is answered idempotently by
+    /// [`Self::recover_committed_complete`] instead of `NoSuchUpload`.
+    /// Best-effort: a failed PUT is logged and the Complete proceeds —
+    /// the deployment merely loses crash-retryability for this upload
+    /// (the pre-#150 behaviour).
+    async fn write_completion_record(
+        &self,
+        bucket: &str,
+        record: &crate::mpu_durable::CompletionRecord,
+    ) {
+        let record_key = crate::mpu_durable::completion_key(&record.upload_id);
+        let bytes = record.encode();
+        let len = bytes.len() as i64;
+        let uri = match safe_object_uri(bucket, &record_key) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!(
+                    bucket,
+                    upload_id = %record.upload_id,
+                    "S4 durable multipart state: completion record key not \
+                     URI-encodable; an interrupted Complete will not be \
+                     retryable for this upload: {e}"
+                );
+                return;
+            }
+        };
+        let put_req = S3Request {
+            input: PutObjectInput {
+                bucket: bucket.into(),
+                key: record_key,
+                body: Some(bytes_to_blob(bytes.into())),
+                content_length: Some(len),
+                content_type: Some("application/json".into()),
+                ..Default::default()
+            },
+            method: http::Method::PUT,
+            uri,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        if let Err(e) = self.backend.put_object(put_req).await {
+            tracing::warn!(
+                bucket,
+                upload_id = %record.upload_id,
+                "S4 durable multipart state: completion record PUT failed; an \
+                 interrupted Complete will not be retryable for this upload \
+                 (pre-#150 behaviour — a mid-handler crash leaves an \
+                 index-less object and the retry gets NoSuchUpload): {e}"
+            );
+        }
+    }
+
+    /// #150: fetch + decode the completion record for
+    /// `upload_id`. `None` when absent / unreadable / not this upload's.
+    async fn read_completion_record(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+    ) -> Option<crate::mpu_durable::CompletionRecord> {
+        let record_key = crate::mpu_durable::completion_key(upload_id);
+        let uri = safe_object_uri(bucket, &record_key).ok()?;
+        let get_req = S3Request {
+            input: GetObjectInput {
+                bucket: bucket.to_owned(),
+                key: record_key,
+                ..Default::default()
+            },
+            method: http::Method::GET,
+            uri,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let resp = self.backend.get_object(get_req).await.ok()?;
+        let blob = resp.output.body?;
+        // Records are tiny JSON; the generous bound only guards a
+        // hostile oversized object planted at the reserved key.
+        let bytes = collect_blob(blob, 1024 * 1024).await.ok()?;
+        crate::mpu_durable::CompletionRecord::decode(&bytes, upload_id)
+    }
+
+    /// #150: idempotent recovery for a retried CompleteMultipartUpload
+    /// whose backend Complete answered `NoSuchUpload`. If the upload's
+    /// completion record exists and the retry manifest matches,
+    /// the backend Complete of a PREVIOUS attempt already committed the
+    /// base object and the crash window only lost the gateway's
+    /// post-processing — so finish it now (composite stamp + `.s4index`
+    /// sidecar) and answer success, exactly what the interrupted attempt
+    /// would have returned. Every mismatch falls back to the original
+    /// `NoSuchUpload` so this path can never bless a genuinely unknown
+    /// upload id.
+    ///
+    /// The savings ledger is deliberately NOT applied here: the doomed
+    /// pre-overwrite footprint was probed by the crashed attempt and is
+    /// unrecoverable now, so an add would over-state savings on
+    /// overwrite. Skipping keeps the disclosed under-count direction
+    /// (customer-favor) the ledger already documents for unaccounted
+    /// Completes.
+    async fn recover_committed_complete(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        client_manifest: &[(i32, String)],
+        original_err: S3Error,
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let Some(record) = self.read_completion_record(bucket, upload_id).await else {
+            return Err(original_err);
+        };
+        if record.key != key || !record.manifest_matches(client_manifest) {
+            tracing::warn!(
+                bucket,
+                key,
+                upload_id,
+                "S4 multipart Complete recovery: completion record exists but the \
+                 retry's key/manifest does not match the committed attempt; \
+                 refusing recovery (NoSuchUpload). If the base object at the \
+                 client key is unindexed garbage, repair or delete it \
+                 (see docs/ops/repair.md)"
+            );
+            return Err(original_err);
+        }
+        // The completion record is written only AFTER a successful
+        // backend Complete, so its existence proves the upload id was
+        // consumed by a commit (never by an Abort or a bogus id). The
+        // durable PART records add defense in depth: written at
+        // UploadPart time, reaped only after a fully-successful
+        // Complete, they bind the retry's manifest to the actual
+        // uploaded content. Require every manifest entry to match its
+        // part record's original-bytes MD5 — a tampered ETag, a missing
+        // record (already-reaped = the upload fully completed earlier,
+        // or a part that predates durable state), or an empty manifest
+        // all refuse recovery.
+        if client_manifest.is_empty() {
+            return Err(original_err);
+        }
+        let part_numbers: Vec<i32> = client_manifest.iter().map(|(pn, _)| *pn).collect();
+        let part_records = self
+            .read_durable_part_records(bucket, upload_id, &part_numbers)
+            .await;
+        for (pn, etag) in client_manifest {
+            let matches = part_records
+                .get(pn)
+                .is_some_and(|pe| pe.original_md5 == *etag);
+            if !matches {
+                tracing::warn!(
+                    bucket,
+                    key,
+                    upload_id,
+                    part_number = pn,
+                    "S4 multipart Complete recovery: manifest entry does not match \
+                     the durable part record (tampered/mismatched ETag, or the \
+                     record is gone because the upload already fully completed); \
+                     refusing recovery (NoSuchUpload)"
+                );
+                return Err(original_err);
+            }
+        }
+        if record.re_put_pending || self.replication.is_some() {
+            tracing::warn!(
+                bucket,
+                key,
+                upload_id,
+                re_put_pending = record.re_put_pending,
+                "S4 multipart Complete recovery: the interrupted attempt still \
+                 owed post-Complete work this gateway cannot reproduce (SSE \
+                 re-encrypt / versioning shadow re-PUT recipe lived in the \
+                 crashed gateway's memory, or replication is configured); \
+                 refusing recovery (NoSuchUpload). See docs/ops/repair.md"
+            );
+            return Err(original_err);
+        }
+        // The base object must exist — recovery re-derives everything
+        // else from it.
+        let head_uri = safe_object_uri(bucket, key)?;
+        let head_req = S3Request {
+            input: HeadObjectInput {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                ..Default::default()
+            },
+            method: http::Method::HEAD,
+            uri: head_uri,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        if self.backend.head_object(head_req).await.is_err() {
+            tracing::warn!(
+                bucket,
+                key,
+                upload_id,
+                "S4 multipart Complete recovery: completion record exists but \
+                 the committed base object is gone; refusing recovery"
+            );
+            return Err(original_err);
+        }
+        // Streaming frame scan of the committed object (same #148
+        // walker Complete's success path uses — no full-body buffering).
+        let get_uri = safe_object_uri(bucket, key)?;
+        let get_req = S3Request {
+            input: GetObjectInput {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                ..Default::default()
+            },
+            method: http::Method::GET,
+            uri: get_uri,
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let get_resp = self
+            .backend
+            .get_object(get_req)
+            .await
+            .map_err(internal("multipart Complete recovery: body fetch failed"))?;
+        let blob = get_resp.output.body.ok_or_else(|| {
+            S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "multipart Complete recovery: committed object returned no body",
+            )
+        })?;
+        let outcome = crate::frame_stream::scan_index_from_blob(blob)
+            .await
+            .map_err(|e| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("multipart Complete recovery: frame scan failed: {e}"),
+                )
+            })?;
+        let assembled_original = outcome
+            .index
+            .as_ref()
+            .map(|i| i.total_original_size())
+            .unwrap_or(outcome.consumed);
+        // Stamp the recorded composite BEFORE the sidecar build (the
+        // metadata self-copy changes the backend ETag the sidecar binds
+        // to) — same ordering as the success path.
+        let mut stamped = false;
+        if let Some(ref composite) = record.composite {
+            match self
+                .stamp_logical_etag_via_self_copy(bucket, key, composite, Some(assembled_original))
+                .await
+            {
+                Ok(true) => stamped = true,
+                Ok(false) => {}
+                Err(e) => {
+                    debug!(
+                        bucket = %bucket,
+                        key = %key,
+                        error = %e,
+                        "multipart Complete recovery: logical-ETag self-copy stamp \
+                         failed; HEAD/GET keep the backend composite ETag"
+                    );
+                }
+            }
+        }
+        if let Some(mut index) = outcome.index {
+            // Bind the sidecar to the (post-stamp) live object — same
+            // H-g binding the success path applies.
+            if let Ok(uri) = safe_object_uri(bucket, key) {
+                let head_req = S3Request {
+                    input: HeadObjectInput {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                        ..Default::default()
+                    },
+                    method: http::Method::HEAD,
+                    uri,
+                    headers: http::HeaderMap::new(),
+                    extensions: http::Extensions::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                    trailing_headers: None,
+                };
+                if let Ok(head) = self.backend.head_object(head_req).await {
+                    index.source_etag = head.output.e_tag.as_ref().map(|t| t.value().to_string());
+                    index.source_compressed_size = head
+                        .output
+                        .content_length
+                        .and_then(|n| u64::try_from(n).ok());
+                }
+            }
+            let _ = self.write_sidecar(bucket, key, &index).await;
+        }
+        info!(
+            op = "complete_multipart_upload",
+            bucket = %bucket,
+            key = %key,
+            upload_id = %upload_id,
+            "S4 multipart Complete recovery: upload was already committed by an \
+             interrupted attempt — post-processing finished idempotently \
+             (savings ledger deliberately not re-applied; see drift note)"
+        );
+        // All durable state (part records + completion record) is now
+        // dead weight.
+        self.cleanup_durable_mpu_records(bucket, upload_id).await;
+        self.multipart_state.drop_parts(upload_id);
+        self.multipart_state.remove(upload_id);
+        let e_tag = if self.logical_etag {
+            if stamped {
+                record.composite.map(ETag::Strong)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(S3Response::new(CompleteMultipartUploadOutput {
+            bucket: Some(bucket.to_owned()),
+            key: Some(key.to_owned()),
+            e_tag,
+            ..Default::default()
+        }))
     }
 }
 
@@ -6610,11 +6878,6 @@ impl<B: S3> S3 for S4Service<B> {
                 return Ok(resp);
             }
 
-            // ====== Buffered slow path (multipart frame parser, GPU codecs) ======
-            let bytes = collect_blob(blob, self.max_body_bytes)
-                .await
-                .map_err(internal("collect get body"))?;
-
             // v1.0.1 audit R1 P1: the dict branch is gated on the
             // *manifest* codec (`s4-codec: cpu-zstd-dict`), not on the
             // mere presence of `s4-dict-id` metadata. Pre-fix, any object
@@ -6631,91 +6894,251 @@ impl<B: S3> S3 for S4Service<B> {
                 .as_ref()
                 .map(|m| m.codec == CodecKind::CpuZstdDict)
                 .unwrap_or(false);
-            let decompressed = if let Some(ref dict_id) = dict_id_meta
-                && dict_codec_object
-            {
-                // v1.1 `--zstd-dict`: resolve the dictionary (preloaded →
-                // LRU → lazy backend fetch of `.s4dict/<id>`) and walk the
-                // S4F2 frames with the dict-aware decoder. Works even on a
-                // gateway booted without any `--zstd-dict` flag.
-                let dict = self.resolve_dict(&get_bucket, dict_id).await?;
-                self.decompress_framed_with_dict(bytes, dict).await?
-            } else if needs_frame_parse {
-                // multipart objects と framed-v2 single-PUT objects は同じ
-                // S4F2 frame 列なので decompress_multipart で統一処理
-                self.decompress_multipart(bytes).await?
-            } else {
-                let manifest = manifest_opt.as_ref().expect("non-multipart guarded above");
-                self.registry
-                    .decompress(bytes, manifest)
-                    .await
-                    .map_err(internal("registry decompress"))?
-            };
+            let dict_buffered = dict_id_meta.is_some() && dict_codec_object;
 
-            // Range request があれば slice。なければ full body を返す。
-            let total_size = decompressed.len() as u64;
-            let (final_bytes, status_override) = if let Some(r) = range_request.as_ref() {
-                let (start, end) = resolve_range(r, total_size)
-                    .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, e))?;
-                let sliced = decompressed.slice(start as usize..end as usize);
-                resp.output.content_range = Some(format!(
-                    "bytes {start}-{}/{total_size}",
-                    end.saturating_sub(1)
-                ));
-                (sliced, Some(http::StatusCode::PARTIAL_CONTENT))
-            } else {
-                (decompressed, None)
-            };
-            // 解凍後の真のサイズを返す (S3 client は content_length を信頼するので
-            // 圧縮 size のままだと downstream が body を途中で切ってしまう)
-            resp.output.content_length = Some(final_bytes.len() as i64);
-            // 圧縮済 bytes の checksum を返すと AWS SDK 側で StreamingError
-            // (ChecksumMismatch) になる。ETag も backend が返した「圧縮済 bytes の
-            // MD5/checksum」なので意味的にズレる — クリアして S4 自身の crc32c
-            // (manifest 内 / frame 内) で integrity を保証する設計にする。
-            resp.output.checksum_crc32 = None;
-            resp.output.checksum_crc32c = None;
-            resp.output.checksum_crc64nvme = None;
-            resp.output.checksum_sha1 = None;
-            resp.output.checksum_sha256 = None;
-            // `--logical-etag`: see the streaming path above — echo the
-            // original-payload MD5 stamp if present so GET matches PUT/HEAD.
-            // Fix C: gate on `self.logical_etag` so `--physical-passthrough`
-            // clears the ETag (no logical echo) for this framed / multipart
-            // object instead of returning a previously stamped logical value.
-            let logical_etag = if self.logical_etag {
-                resp.output
+            // ====== #148 streaming multipart / framed-v2 path ======
+            // Multipart objects and framed-v2 single-PUTs used to be
+            // collected whole (compressed) and decompressed into a single
+            // BytesMut — one 2 GiB GET OOM-killed a chart-default (2Gi)
+            // gateway pod (live repro 2026-07-08). Stream frame-by-frame
+            // instead: the memory high-water mark is one frame, bounded
+            // by the per-frame `max_body_bytes` cap inside the stream
+            // (per-frame successor of the v0.8.15 H-h aggregate cap —
+            // the aggregate output no longer accumulates in memory, so
+            // the DoS surface the aggregate cap closed is gone). Range
+            // requests decode only the covering frames. Dict-codec
+            // objects keep the buffered path below (their decoder needs
+            // the resolved dictionary and is not streaming-aware).
+            if needs_frame_parse && !dict_buffered {
+                // The logical total size, needed to resolve Range
+                // requests and to declare Content-Length: the
+                // `s4-original-size` stamp (Complete/self-copy writes
+                // it), else the sidecar's total, else unknown (legacy
+                // unstamped object — full GET falls back to chunked
+                // transfer-encoding, Range to a buffered slice).
+                //
+                // Only the STAMP feeds the walker's truncation guard
+                // (`expected_total`): it arrives in the same backend GET
+                // response as the body, so it cannot disagree with the
+                // bytes being streamed. The sidecar is a separate object
+                // — its total is used only when its version binding
+                // verifies against the live object (QA round-2 Medium: a
+                // stale or planted sidecar must not become the
+                // authoritative wire Content-Length), and even then a
+                // divergence degrades Content-Length accuracy at worst,
+                // never fails an otherwise-healthy full GET mid-stream.
+                let stamp_total: Option<u64> = resp
+                    .output
                     .metadata
                     .as_ref()
-                    .and_then(|mm| mm.get(META_LOGICAL_ETAG))
-                    .map(|hex| ETag::Strong(hex.clone()))
+                    .and_then(|m| m.get(META_ORIGINAL_SIZE))
+                    .and_then(|s| s.parse::<u64>().ok());
+                let total_known = match stamp_total {
+                    Some(t) => Some(t),
+                    None => match self.read_sidecar(&get_bucket, &get_key).await {
+                        Some(idx)
+                            if self
+                                .sidecar_version_binding_ok(&get_bucket, &get_key, &idx)
+                                .await =>
+                        {
+                            Some(idx.total_original_size())
+                        }
+                        _ => None,
+                    },
+                };
+                let mut bytes_out_hint: u64 = total_known.unwrap_or(0);
+                match (range_request.as_ref(), total_known) {
+                    (Some(r), Some(total)) => {
+                        let (start, end) = resolve_range(r, total)
+                            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, e))?;
+                        resp.output.content_range =
+                            Some(format!("bytes {start}-{}/{total}", end.saturating_sub(1)));
+                        resp.output.content_length = Some((end - start) as i64);
+                        resp.output.body = Some(crate::frame_stream::multipart_decompress_blob(
+                            blob,
+                            Arc::clone(&self.registry),
+                            Some((start, end)),
+                            None,
+                            self.max_body_bytes,
+                        ));
+                        resp.status = Some(http::StatusCode::PARTIAL_CONTENT);
+                        bytes_out_hint = end - start;
+                    }
+                    (Some(r), None) => {
+                        // Legacy object: no stamp, no sidecar — the range
+                        // can't be resolved without the total, so fall
+                        // back to the pre-#148 buffered behaviour
+                        // (bounded by max_body_bytes, as before).
+                        let stream = crate::frame_stream::multipart_decompress_blob(
+                            blob,
+                            Arc::clone(&self.registry),
+                            None,
+                            None,
+                            self.max_body_bytes,
+                        );
+                        let decompressed = collect_blob(stream, self.max_body_bytes)
+                            .await
+                            .map_err(internal("collect multipart get body"))?;
+                        let total = decompressed.len() as u64;
+                        let (start, end) = resolve_range(r, total)
+                            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, e))?;
+                        let sliced = decompressed.slice(start as usize..end as usize);
+                        resp.output.content_range =
+                            Some(format!("bytes {start}-{}/{total}", end.saturating_sub(1)));
+                        resp.output.content_length = Some(sliced.len() as i64);
+                        resp.output.body = Some(bytes_to_blob(sliced));
+                        resp.status = Some(http::StatusCode::PARTIAL_CONTENT);
+                        bytes_out_hint = end - start;
+                    }
+                    (None, total) => {
+                        // Full-object GET. When the total is unknown
+                        // (legacy unstamped, no sidecar) null the
+                        // Content-Length so the HTTP layer emits chunked
+                        // transfer-encoding rather than lying with the
+                        // stored (compressed) size.
+                        resp.output.content_length = total.map(|t| t as i64);
+                        resp.output.body = Some(crate::frame_stream::multipart_decompress_blob(
+                            blob,
+                            Arc::clone(&self.registry),
+                            None,
+                            stamp_total,
+                            self.max_body_bytes,
+                        ));
+                    }
+                }
+                // Backend checksums / ETag describe the stored compressed
+                // bytes; the logical ETag echo mirrors the buffered path
+                // (Fix C: gated on `self.logical_etag`).
+                resp.output.checksum_crc32 = None;
+                resp.output.checksum_crc32c = None;
+                resp.output.checksum_crc64nvme = None;
+                resp.output.checksum_sha1 = None;
+                resp.output.checksum_sha256 = None;
+                let logical_etag = if self.logical_etag {
+                    resp.output
+                        .metadata
+                        .as_ref()
+                        .and_then(|mm| mm.get(META_LOGICAL_ETAG))
+                        .map(|hex| ETag::Strong(hex.clone()))
+                } else {
+                    None
+                };
+                resp.output.e_tag = logical_etag;
+                let elapsed = get_start.elapsed();
+                crate::metrics::record_get(
+                    "multipart",
+                    0,
+                    bytes_out_hint,
+                    elapsed.as_secs_f64(),
+                    true,
+                );
+                info!(
+                    op = "get_object",
+                    bucket = %get_bucket,
+                    key = %get_key,
+                    codec = "multipart",
+                    total_object_size = total_known.unwrap_or(0),
+                    range = range_request.is_some(),
+                    path = "streaming-multipart",
+                    setup_latency_ms = elapsed.as_millis() as u64,
+                    "S4 get started (streaming multipart)"
+                );
+                // Fall through to the shared response tail (replication
+                // echo + v1.4.1 checksum strip + reserved-metadata strip).
             } else {
-                None
-            };
-            resp.output.e_tag = logical_etag;
-            let returned_size = final_bytes.len() as u64;
-            let codec_label = manifest_opt
-                .as_ref()
-                .map(|m| m.codec.as_str())
-                .unwrap_or("multipart");
-            resp.output.body = Some(bytes_to_blob(final_bytes));
-            if let Some(status) = status_override {
-                resp.status = Some(status);
+                // ====== Buffered slow path (dict objects, GPU codecs) ======
+                let bytes = collect_blob(blob, self.max_body_bytes)
+                    .await
+                    .map_err(internal("collect get body"))?;
+
+                let decompressed = if let Some(ref dict_id) = dict_id_meta
+                    && dict_codec_object
+                {
+                    // v1.1 `--zstd-dict`: resolve the dictionary (preloaded →
+                    // LRU → lazy backend fetch of `.s4dict/<id>`) and walk the
+                    // S4F2 frames with the dict-aware decoder. Works even on a
+                    // gateway booted without any `--zstd-dict` flag.
+                    let dict = self.resolve_dict(&get_bucket, dict_id).await?;
+                    self.decompress_framed_with_dict(bytes, dict).await?
+                } else {
+                    let manifest = manifest_opt.as_ref().expect("non-multipart guarded above");
+                    self.registry
+                        .decompress(bytes, manifest)
+                        .await
+                        .map_err(internal("registry decompress"))?
+                };
+
+                // Range request があれば slice。なければ full body を返す。
+                let total_size = decompressed.len() as u64;
+                let (final_bytes, status_override) = if let Some(r) = range_request.as_ref() {
+                    let (start, end) = resolve_range(r, total_size)
+                        .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, e))?;
+                    let sliced = decompressed.slice(start as usize..end as usize);
+                    resp.output.content_range = Some(format!(
+                        "bytes {start}-{}/{total_size}",
+                        end.saturating_sub(1)
+                    ));
+                    (sliced, Some(http::StatusCode::PARTIAL_CONTENT))
+                } else {
+                    (decompressed, None)
+                };
+                // 解凍後の真のサイズを返す (S3 client は content_length を信頼するので
+                // 圧縮 size のままだと downstream が body を途中で切ってしまう)
+                resp.output.content_length = Some(final_bytes.len() as i64);
+                // 圧縮済 bytes の checksum を返すと AWS SDK 側で StreamingError
+                // (ChecksumMismatch) になる。ETag も backend が返した「圧縮済 bytes の
+                // MD5/checksum」なので意味的にズレる — クリアして S4 自身の crc32c
+                // (manifest 内 / frame 内) で integrity を保証する設計にする。
+                resp.output.checksum_crc32 = None;
+                resp.output.checksum_crc32c = None;
+                resp.output.checksum_crc64nvme = None;
+                resp.output.checksum_sha1 = None;
+                resp.output.checksum_sha256 = None;
+                // `--logical-etag`: see the streaming path above — echo the
+                // original-payload MD5 stamp if present so GET matches PUT/HEAD.
+                // Fix C: gate on `self.logical_etag` so `--physical-passthrough`
+                // clears the ETag (no logical echo) for this framed / multipart
+                // object instead of returning a previously stamped logical value.
+                let logical_etag = if self.logical_etag {
+                    resp.output
+                        .metadata
+                        .as_ref()
+                        .and_then(|mm| mm.get(META_LOGICAL_ETAG))
+                        .map(|hex| ETag::Strong(hex.clone()))
+                } else {
+                    None
+                };
+                resp.output.e_tag = logical_etag;
+                let returned_size = final_bytes.len() as u64;
+                let codec_label = manifest_opt
+                    .as_ref()
+                    .map(|m| m.codec.as_str())
+                    .unwrap_or("multipart");
+                resp.output.body = Some(bytes_to_blob(final_bytes));
+                if let Some(status) = status_override {
+                    resp.status = Some(status);
+                }
+                let elapsed = get_start.elapsed();
+                crate::metrics::record_get(
+                    codec_label,
+                    0,
+                    returned_size,
+                    elapsed.as_secs_f64(),
+                    true,
+                );
+                info!(
+                    op = "get_object",
+                    bucket = %get_bucket,
+                    key = %get_key,
+                    codec = codec_label,
+                    bytes_out = returned_size,
+                    total_object_size = total_size,
+                    range = range_request.is_some(),
+                    path = "buffered",
+                    latency_ms = elapsed.as_millis() as u64,
+                    "S4 get completed (buffered)"
+                );
             }
-            let elapsed = get_start.elapsed();
-            crate::metrics::record_get(codec_label, 0, returned_size, elapsed.as_secs_f64(), true);
-            info!(
-                op = "get_object",
-                bucket = %get_bucket,
-                key = %get_key,
-                codec = codec_label,
-                bytes_out = returned_size,
-                total_object_size = total_size,
-                range = range_request.is_some(),
-                path = "buffered",
-                latency_ms = elapsed.as_millis() as u64,
-                "S4 get completed (buffered)"
-            );
         }
         // v0.6 #40: echo the recorded `x-amz-replication-status` so
         // consumers can poll progress (PENDING / COMPLETED / FAILED).
@@ -8274,7 +8697,7 @@ impl<B: S3> S3 for S4Service<B> {
         self.enforce_policy(&req, "s3:PutObject", &part_bucket, Some(&part_key))?;
         self.enforce_rate_limit(&req, &part_bucket)?;
         // 各 part を圧縮して frame header 付きで forward。GET 時に
-        // `decompress_multipart` が frame iter で順に解凍する。
+        // streaming frame walk (`crate::frame_stream`) が順に解凍する。
         // **per-part codec dispatch**: dispatcher が body 先頭 sample から
         // codec を選ぶので、parquet 風の mixed-content multipart で part ごとに
         // 最適 codec を使える (整数列 part → Bitcomp、text 列 part → zstd 等)。
@@ -8704,6 +9127,27 @@ impl<B: S3> S3 for S4Service<B> {
             }
             (map, _) => map,
         };
+        // #150: snapshot the manifest exactly as the CLIENT submitted it
+        // (part number + strong ETag), BEFORE the reverse-map below
+        // mutates the ETags to backend form. This is what the
+        // completion record stores, and what a retried Complete
+        // is verified against on the idempotent recovery path.
+        let client_manifest: Vec<(i32, String)> = req
+            .input
+            .multipart_upload
+            .as_ref()
+            .and_then(|mp| mp.parts.as_ref())
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|p| {
+                        let pn = p.part_number?;
+                        let etag = p.e_tag.as_ref().and_then(|e| e.as_strong())?;
+                        Some((pn, etag.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let logical_composite: Option<String> = if self.logical_etag {
             // Reverse-map the manifest in place + collect completed part
             // numbers for the composite.
@@ -8812,7 +9256,78 @@ impl<B: S3> S3 for S4Service<B> {
         } else {
             None
         };
-        let mut resp = self.backend.complete_multipart_upload(req).await?;
+        // v0.8.12 HIGH-10 (hoisted for #150): whether this Complete will
+        // SSE-encrypt + re-PUT the assembled body. `ctx.sse != None`
+        // covers all three SSE modes captured at Create time.
+        let mp_will_encrypt = ctx
+            .as_ref()
+            .map(|c| !matches!(c.sse, crate::multipart_state::MultipartSseMode::None))
+            .unwrap_or(false);
+        // v0.8.16 F-7 (hoisted for #150): versioning-Enabled buckets
+        // rewrite the assembled body under the shadow key after Complete.
+        let mp_versioning_enabled = self
+            .versioning
+            .as_ref()
+            .map(|mgr| mgr.state(&bucket))
+            .map(|state| state == crate::versioning::VersioningState::Enabled)
+            .unwrap_or(false);
+        // #150: whether the committed bytes still get rewritten after the
+        // backend Complete. Recovery cannot reproduce that work (the SSE
+        // recipe lives only in this gateway's memory), so the completion
+        // record carries the flag and recovery refuses when it is set.
+        let mp_re_put_pending = mp_will_encrypt || (ctx.is_some() && mp_versioning_enabled);
+        let mut resp = match self.backend.complete_multipart_upload(req).await {
+            Ok(resp) => resp,
+            // #150: `NoSuchUpload` on a manifest-matching retry of an
+            // already-committed upload is answered idempotently instead
+            // of leaving an index-less phantom at the client key.
+            Err(e)
+                if matches!(e.code(), &S3ErrorCode::NoSuchUpload)
+                    && self.logical_etag
+                    && self.durable_multipart_state =>
+            {
+                return self
+                    .recover_committed_complete(
+                        &bucket,
+                        &key,
+                        upload_id.as_str(),
+                        &client_manifest,
+                        e,
+                    )
+                    .await;
+            }
+            Err(e) => return Err(e),
+        };
+        // #150: persist the completion record IMMEDIATELY after the
+        // backend commit — its existence is the durable proof that this
+        // upload id was consumed by a SUCCESSFUL backend Complete. An
+        // aborted upload or a never-existed id can never produce one, so
+        // the recovery path can never bless those (QA round-1 High: a
+        // pre-commit write would let the retry attempt fabricate its own
+        // evidence). The record must be durable before the long
+        // post-processing window below opens; a crash inside the
+        // sub-millisecond gap between the backend Ok and this PUT (or a
+        // failed record PUT, WARNed inside the helper) degrades exactly
+        // to the pre-#150 behaviour for this one upload. Same gate as
+        // every other durable-state write; reaped with the part records
+        // at the end of this handler.
+        if self.logical_etag && self.durable_multipart_state {
+            let record = crate::mpu_durable::CompletionRecord {
+                v: crate::mpu_durable::CompletionRecord::VERSION,
+                upload_id: upload_id.to_string(),
+                key: key.clone(),
+                manifest: client_manifest
+                    .iter()
+                    .map(|(pn, etag)| crate::mpu_durable::CompletionManifestPart {
+                        part_number: *pn,
+                        etag: etag.clone(),
+                    })
+                    .collect(),
+                composite: logical_composite.clone(),
+                re_put_pending: mp_re_put_pending,
+            };
+            self.write_completion_record(&bucket, &record).await;
+        }
         // fix #4 P1 (retry-safety): the backend Complete succeeded, so the
         // per-part side-table is no longer needed for a retry — drop it now.
         // (We deliberately read it above via the non-draining `get_parts`
@@ -8820,28 +9335,30 @@ impl<B: S3> S3 for S4Service<B> {
         // intact for the client's retry.) The `remove(upload_id)` in the
         // ctx post-processing block below also clears it; this is the
         // explicit, ctx-independent success-path drop.
+        //
+        // #150: the durable `.s4mpu/` records are NOT reaped here any
+        // more — they (and the completion record) must survive until the
+        // post-Complete work below has finished, so an interrupted
+        // Complete stays recoverable. The cleanup moved to the end of
+        // this handler.
         self.multipart_state.drop_parts(upload_id.as_str());
-        // Durable multipart state: the upload is committed, so its
-        // `.s4mpu/` records are dead weight — best-effort delete (a
-        // failure is logged inside the helper and left for the
-        // `mpu-state-gc` maintain action). Deliberately AFTER the
-        // backend Complete `?` above: a failed Complete keeps the
-        // records so the client's retry can still merge them.
-        if self.logical_etag && self.durable_multipart_state {
-            self.cleanup_durable_mpu_records(&bucket, upload_id.as_str())
-                .await;
-        }
-        // CompleteMultipartUpload 成功 → 完成した object を full fetch して frame
+        // CompleteMultipartUpload 成功 → 完成した object を scan して frame
         // index を build、`<key>.s4index` sidecar として保存。これで Range GET の
         // partial fetch path が利用可能になる (Range request の帯域節約)。
-        // 注: 巨大 object の場合この pass は重いが、Range query は一度 sidecar が
-        // できれば爆速になるので 1 回の cost は payback される
         //
         // v0.8 #54 BUG-5..9: this same fetch is the choke-point for
         // the SSE encrypt re-PUT + versioning shadow-key rewrite +
-        // replication source-bytes capture, so we GET once and reuse
-        // the bytes for every post-processing step.
-        let assembled_body: Option<bytes::Bytes> = if let Ok(uri) = safe_object_uri(&bucket, &key) {
+        // replication source-bytes capture — those need the assembled
+        // BYTES in memory, so they keep the buffered collect (bounded by
+        // `max_body_bytes`). #148: every other deployment shape (the
+        // default) only needs the frame INDEX + lengths, which the
+        // streaming scan derives without materializing the body — a
+        // 2 GiB Complete no longer pins 2 GiB (+ decompressed) of RAM.
+        let must_buffer = mp_re_put_pending || (ctx.is_some() && self.replication.is_some());
+        let mut assembled_body: Option<bytes::Bytes> = None;
+        let mut assembled_scan: Option<FrameIndex> = None;
+        let mut assembled_stored_len: Option<u64> = None;
+        if let Ok(uri) = safe_object_uri(&bucket, &key) {
             let get_input = GetObjectInput {
                 bucket: bucket.clone(),
                 key: key.clone(),
@@ -8860,8 +9377,32 @@ impl<B: S3> S3 for S4Service<B> {
             };
             match self.backend.get_object(get_req).await {
                 Ok(get_resp) => match get_resp.output.body {
-                    Some(blob) => collect_blob(blob, self.max_body_bytes).await.ok(),
-                    None => None,
+                    Some(blob) if must_buffer => {
+                        if let Ok(body) = collect_blob(blob, self.max_body_bytes).await {
+                            assembled_scan = build_index_from_body(&body).ok();
+                            assembled_stored_len = Some(body.len() as u64);
+                            assembled_body = Some(body);
+                        }
+                    }
+                    Some(blob) => match crate::frame_stream::scan_index_from_blob(blob).await {
+                        Ok(outcome) => {
+                            assembled_stored_len = Some(outcome.consumed);
+                            assembled_scan = outcome.index;
+                        }
+                        Err(e) => {
+                            // Same contract as the pre-#148 collect
+                            // failure (`.ok()` → None): post-processing
+                            // is skipped with the loud ledger WARN below;
+                            // the retry now recovers idempotently.
+                            tracing::warn!(
+                                bucket = %bucket,
+                                key = %key,
+                                "multipart Complete: streaming frame scan of the \
+                                 assembled object failed; sidecar/stamp skipped: {e}"
+                            );
+                        }
+                    },
+                    None => {}
                 },
                 Err(e) => {
                     // v0.8.4 #71 (C-1 audit fix): a silent
@@ -8897,7 +9438,6 @@ impl<B: S3> S3 for S4Service<B> {
                             "multipart Complete: backend GET returned NoSuchKey; \
                              skipping post-processing (object likely raced with DeleteObject)"
                         );
-                        None
                     } else {
                         tracing::error!(
                             bucket = %bucket,
@@ -8905,80 +9445,55 @@ impl<B: S3> S3 for S4Service<B> {
                             error = %e,
                             "multipart Complete: backend GET failed; failing the Complete \
                              so the client retries (silent fall-through would skip SSE \
-                             re-encrypt and store plaintext)"
+                             re-encrypt and store plaintext; the retry is answered \
+                             idempotently via the #150 completion record)"
                         );
                         return Err(internal("multipart Complete: backend body fetch failed")(e));
                     }
                 }
             }
-        } else {
-            None
-        };
-        // v1.2 savings ledger: the assembled body is the ground truth
+        }
+        // v1.2 savings ledger: the assembled object is the ground truth
         // for the new object's footprint. `original` = sum of the
         // per-part frame headers' original sizes (exactly what the
         // client uploaded); a body the frame scanner can't parse
         // (passthrough-codec multipart = raw parts) falls back to the
-        // body length (original == stored, zero claimed savings).
+        // stored length (original == stored, zero claimed savings).
         // `stored` starts as the assembled length and is replaced by
         // the re-PUT length when SSE / versioning rewrites the bytes
-        // below. `None` body (NoSuchKey race) ⇒ the ledger skips this
-        // Complete with a WARN — never guess.
-        //
-        // v1.2 audit R1 P2 (CPU regression): the frame scan
-        // (`build_index_from_body`) is gated — deployments with BOTH the
-        // ledger and `--logical-etag` off must not pay a per-Complete
-        // header walk for values nobody reads. #144 widened the gate:
-        // the scan's `total_original_size` now also feeds the
-        // `s4-original-size` HEAD-ContentLength stamp, which exists
-        // whenever `--logical-etag` (the default) is on.
+        // below. `None` (NoSuchKey race / scan failure) ⇒ the ledger
+        // skips this Complete with a WARN — never guess.
+        // v1.2 audit R1 P2 gate preserved: with BOTH the ledger and
+        // `--logical-etag` off (physical passthrough), the original
+        // size is left uncomputed so the SSE/versioning re-PUT path
+        // doesn't newly stamp `s4-original-size` metadata that
+        // pre-#148 deployments never wrote.
         let ledger_on = self.savings_ledger.is_some();
         let assembled_original: Option<u64> = if ledger_on || self.logical_etag {
-            assembled_body.as_ref().map(|b| {
-                build_index_from_body(b)
+            assembled_stored_len.map(|stored| {
+                assembled_scan
+                    .as_ref()
                     .map(|idx| idx.total_original_size())
-                    .unwrap_or(b.len() as u64)
+                    .unwrap_or(stored)
             })
         } else {
             None
         };
         let ledger_new_original: Option<u64> = if ledger_on { assembled_original } else { None };
         let mut ledger_new_stored: Option<u64> = if ledger_on {
-            assembled_body.as_ref().map(|b| b.len() as u64)
+            assembled_stored_len
         } else {
             None
         };
         let mut ledger_sidecar_old: u64 = 0;
         let mut ledger_sidecar_new: u64 = 0;
-        // Sidecar build (existing behaviour, gated on assembled body).
-        //
-        // v0.8.12 HIGH-10 fix: skip the sidecar when the Complete is
-        // going to SSE-encrypt the assembled body before re-PUT (the
-        // single-PUT path applies the same suppression at L2271).
-        // Stale offsets into the pre-encrypt body would break Range
-        // GET on the encrypted on-disk bytes. `ctx.sse != None`
-        // covers all three SSE modes captured at Create time.
-        let mp_will_encrypt = ctx
-            .as_ref()
-            .map(|c| !matches!(c.sse, crate::multipart_state::MultipartSseMode::None))
-            .unwrap_or(false);
-        // v0.8.16 F-7: versioned multipart writes the assembled body
-        // under `versioned_shadow_key(&key, vid)` *after* this
-        // sidecar block, then deletes the original `<key>`. Stamping
-        // the sidecar against the to-be-deleted `<key>` (which is
-        // what H-g did) leaves an orphan `<key>.s4index` whose
-        // source-ETag binding can never match the live shadow body
-        // — the Range GET fast-path's stale-sidecar check then
-        // falls through to a full read on every request, silently
-        // disabling partial fetch. Skip the sidecar build entirely
-        // for versioned buckets; a follow-up issue tracks writing
-        // the sidecar under the shadow key with the shadow's ETag.
-        let mp_skip_sidecar_for_versioning = self
-            .versioning
-            .as_ref()
-            .map(|mgr| mgr.state(&bucket))
-            .map(|state| state == crate::versioning::VersioningState::Enabled)
-            .unwrap_or(false);
+        // Sidecar suppression (see the hoisted `mp_will_encrypt` /
+        // `mp_versioning_enabled` above): stale offsets into the
+        // pre-encrypt body would break Range GET on the encrypted
+        // on-disk bytes (v0.8.12 HIGH-10), and a versioning-Enabled
+        // bucket rewrites the body under the shadow key so a plain-key
+        // sidecar could never bind (v0.8.16 F-7).
+        let mp_skip_sidecar_for_versioning = mp_versioning_enabled;
         // fix #4 P1 (b): track whether the composite logical-ETag stamp was
         // actually PERSISTED onto the object (self-copy succeeded, OR the
         // SSE/versioning re-PUT below wrote it into `new_metadata`). The
@@ -9034,10 +9549,9 @@ impl<B: S3> S3 for S4Service<B> {
                 }
             }
         }
-        if let Some(ref body) = assembled_body
-            && !mp_will_encrypt
+        if !mp_will_encrypt
             && !mp_skip_sidecar_for_versioning
-            && let Ok(mut index) = build_index_from_body(body)
+            && let Some(mut index) = assembled_scan
         {
             // v0.8.15 H-g: stamp the source-ETag / source-compressed-size
             // binding on the multipart sidecar. The single-PUT path
@@ -9546,14 +10060,27 @@ impl<B: S3> S3 for S4Service<B> {
                         bucket = %bucket,
                         key = %key,
                         "S4 savings ledger: multipart Complete not accounted \
-                         (assembled body unavailable — backend GET failed or the body \
-                         exceeds --max-body-bytes); counters unchanged for this object. \
-                         NOTE: this object will carry the ledger marker without being \
-                         counted, so its later DELETE may subtract bytes that were never \
-                         added (clamped at zero, disclosed via the report drift note)"
+                         (assembled object unavailable — backend GET / frame scan \
+                         failed, or an SSE/versioned/replicated Complete's body \
+                         exceeds --max-body-bytes); counters unchanged for this \
+                         object. NOTE: this object will carry the ledger marker \
+                         without being counted, so its later DELETE may subtract \
+                         bytes that were never added (clamped at zero, disclosed \
+                         via the report drift note)"
                     );
                 }
             }
+        }
+        // #150: the post-Complete work (composite stamp, sidecar,
+        // ledger) is durable — NOW the upload's `.s4mpu/` records
+        // (parts + completion intent) are dead weight. Reaping them any
+        // earlier (pre-#150 they were dropped right after the backend
+        // Complete) destroyed the state that makes an interrupted
+        // Complete recoverable. Best-effort: failures are logged and
+        // left for `s4 maintain` (action = "mpu-state-gc").
+        if self.logical_etag && self.durable_multipart_state {
+            self.cleanup_durable_mpu_records(&bucket, upload_id.as_str())
+                .await;
         }
         // v0.8.1 #59 janitor: best-effort sweep of stale completion
         // locks while we are still on the critical path of a single

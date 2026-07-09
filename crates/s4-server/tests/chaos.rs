@@ -19,9 +19,12 @@
 //!
 //! 1. **Backend GET fails mid-stream** — `chaos_get_5xx_mid_stream`:
 //!    the backend's `GetObject` returns a `StreamingBlob` whose first
-//!    chunk is OK and second chunk is an `Err`. The gateway must
-//!    convert that into a 5xx response, **not** a truncated 200 with
-//!    a partial body.
+//!    chunk is OK and second chunk is an `Err`. Since #148 the framed
+//!    GET path streams frame-by-frame, so the gateway cannot know
+//!    about a later backend failure up-front — the invariant is that
+//!    the response BODY must fail loudly (an error mid-stream, which
+//!    aborts the HTTP response) and must NEVER complete as a silently
+//!    truncated 200 body.
 //!
 //! 2. **Backend HEAD latency** — `chaos_head_latency_timeout_fails_close`:
 //!    the backend's `HeadObject` parks on a `Notify` indefinitely. A
@@ -613,11 +616,12 @@ fn chaos_scaffold_smoke() {
 async fn chaos_get_5xx_mid_stream() {
     let handle = ChaosHandle::new();
     let backend = ChaosBackend::new(handle.clone());
-    // Default registry uses CpuZstd; the stored object will carry
-    // S4 codec metadata, so GET takes the buffered decompress path
-    // (collect_blob → frame parse → decompress). A mid-stream
-    // backend error surfaces during `collect_blob` and bubbles out
-    // of `get_object` as a typed S3Error.
+    // Default registry uses CpuZstd; the stored object carries S4
+    // codec metadata (framed), so GET takes the #148 streaming frame
+    // walk. A mid-stream backend error cannot surface before the
+    // response starts — the pinned invariant is that consuming the
+    // body yields a loud error (which aborts the HTTP response on the
+    // wire) and never a silently short success.
     let s4 = S4Service::new(backend, make_registry(), make_dispatcher());
 
     let payload = Bytes::from(vec![0xABu8; 64 * 1024]);
@@ -628,22 +632,45 @@ async fn chaos_get_5xx_mid_stream() {
     // Arm the fault: next GET emits ~1 KiB of body and then errors.
     handle.arm_get_fail_after(1024);
 
-    // The gateway MUST surface this as an Err directly. A streaming
-    // body that errors only on consumption would, on the wire, be a
-    // 200 + Content-Length lie followed by a truncated stream — the
-    // exact silent-truncation footgun the scenario is here to pin.
-    let err = s4.get_object(get_req("b", "scenario1")).await.expect_err(
-        "Scenario 1 invariant: a mid-stream backend GET failure on a buffered \
-             (S4 codec metadata-bearing) object MUST surface as `Err` from \
-             `S4Service::get_object` — returning Ok with a stream that errors only \
-             on later consumption is the silent-truncation regression we guard against",
-    );
-    let code = format!("{:?}", err.code());
-    assert!(
-        !code.contains("NoSuchKey"),
-        "wrong error code — got NoSuchKey, expected an InternalError-class \
-         surface for a mid-stream backend failure (code: {code})"
-    );
+    // Scenario 1 invariant (updated for #148 streaming): the GET may
+    // return Ok (headers already sent, streaming), but the BODY must
+    // terminate in an error — completing cleanly with fewer bytes than
+    // the object holds would be the silent-truncation footgun this
+    // scenario pins. (Pre-#148 the buffered path surfaced an up-front
+    // `Err`; both shapes abort the client-visible transfer.)
+    match s4.get_object(get_req("b", "scenario1")).await {
+        Err(err) => {
+            let code = format!("{:?}", err.code());
+            assert!(
+                !code.contains("NoSuchKey"),
+                "wrong error code — got NoSuchKey, expected an InternalError-class \
+                 surface for a mid-stream backend failure (code: {code})"
+            );
+        }
+        Ok(resp) => {
+            use futures::TryStreamExt as _;
+            let mut got: usize = 0;
+            let mut stream_err: Option<String> = None;
+            let mut body = std::pin::pin!(resp.output.body.expect("body"));
+            loop {
+                match body.try_next().await {
+                    Ok(Some(chunk)) => got += chunk.len(),
+                    Ok(None) => break,
+                    Err(e) => {
+                        stream_err = Some(e.to_string());
+                        break;
+                    }
+                }
+            }
+            assert!(
+                stream_err.is_some(),
+                "Scenario 1 invariant: the streamed body must FAIL when the \
+                 backend dies mid-stream — it completed 'cleanly' after \
+                 {got} of {} bytes (silent truncation)",
+                payload.len()
+            );
+        }
+    }
 
     // Sanity: the storage layer still has *something* at the key —
     // the failed GET must not have mutated backend state. We don't

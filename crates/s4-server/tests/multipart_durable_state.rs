@@ -795,11 +795,18 @@ async fn two_instances_split_parts_complete_with_validation() {
         .await
         .expect_err("wrong part-1 etag must fail");
     assert_eq!(*err.code(), S3ErrorCode::InvalidPart, "err: {err:?}");
-    // The failed Complete must keep the durable records for the retry.
+    // The failed Complete must keep the durable PART records for the
+    // retry. (#150: the attempt also leaves its completion-intent
+    // record — `.s4mpu/<hex>/completion` — which the retry overwrites
+    // and the successful Complete's cleanup reaps.)
+    let keys = mpu_record_keys(&state);
+    let part_records = keys
+        .iter()
+        .filter(|k| !mpu_durable::is_completion_key(k))
+        .count();
     assert_eq!(
-        mpu_record_keys(&state).len(),
-        2,
-        "failed Complete must not reap the records"
+        part_records, 2,
+        "failed Complete must not reap the part records: {keys:?}"
     );
 
     // Correct manifest completes on B with the full composite.

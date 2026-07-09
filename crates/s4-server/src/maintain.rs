@@ -1136,6 +1136,15 @@ pub struct MpuStateGcReport {
     /// Keys under `.s4mpu/` that do not parse as record keys — left in
     /// place and reported instead of deleted blindly.
     pub skipped_unparseable: u64,
+    /// #150: completion records seen (live + consumed).
+    pub completion_records: u64,
+    /// #150: client keys where a completion record proves an
+    /// interrupted Complete COMMITTED the base object, the object is
+    /// still there, and its `.s4index` sidecar is missing — i.e. the
+    /// phantom shape a crashed (and never-retried) Complete leaves.
+    /// These records are KEPT (they are the recovery/repair evidence);
+    /// the note recommends `s4 repair-sidecar` for each key.
+    pub phantom_committed_keys: Vec<String>,
     pub failed: u64,
     /// Per-key failure details, sorted by key.
     pub failures: Vec<MpuStateGcFailure>,
@@ -1153,6 +1162,12 @@ pub(crate) enum MpuGcDecision {
     TooRecent,
     /// Orphaned and old enough — delete.
     Orphaned,
+    /// #150 completion record of a still-live upload — keep.
+    LiveCompletion,
+    /// #150 completion record of a consumed upload, past the age
+    /// gate — needs the phantom check (base object without sidecar?)
+    /// before it can be reaped.
+    ConsumedCompletion,
 }
 
 /// Pure per-record decision. `live_upload_ids` is the
@@ -1167,6 +1182,15 @@ pub(crate) fn classify_mpu_record(
     last_modified_epoch_secs: Option<i64>,
     cutoff_epoch_secs: Option<i64>,
 ) -> MpuGcDecision {
+    if let Some(upload_id) = crate::mpu_durable::parse_completion_key(key) {
+        if live_upload_ids.contains(&upload_id) {
+            return MpuGcDecision::LiveCompletion;
+        }
+        if crate::recompact::is_too_recent(last_modified_epoch_secs, cutoff_epoch_secs) {
+            return MpuGcDecision::TooRecent;
+        }
+        return MpuGcDecision::ConsumedCompletion;
+    }
     let Some((upload_id, _part_number)) = crate::mpu_durable::parse_record_key(key) else {
         return MpuGcDecision::Unparseable;
     };
@@ -1177,6 +1201,56 @@ pub(crate) fn classify_mpu_record(
         return MpuGcDecision::TooRecent;
     }
     MpuGcDecision::Orphaned
+}
+
+/// #150 phantom check for a consumed upload's completion record:
+/// returns `Some(committed_key)` when the record decodes, the base
+/// object still exists at its key, and `<key>.s4index` is MISSING —
+/// the "interrupted Complete, never retried" phantom shape that needs
+/// operator attention (`s4 repair-sidecar`). Every other shape
+/// (unreadable record, object gone, sidecar present) returns `None` =
+/// the record is ordinary garbage.
+async fn completion_phantom_key(client: &Client, bucket: &str, record_key: &str) -> Option<String> {
+    let upload_id = crate::mpu_durable::parse_completion_key(record_key)?;
+    // QA round-2 Medium: bounded read. Records are tiny JSON — a
+    // corrupted / planted multi-GiB object at the reserved key must not
+    // OOM the maintenance process. The ranged GET caps the transfer; a
+    // record truncated by the cap fails `decode` below and is treated
+    // as ordinary garbage (orphan-reaped), same as any undecodable body.
+    const RECORD_CAP: u64 = 1024 * 1024;
+    let body = client
+        .get_object()
+        .bucket(bucket)
+        .key(record_key)
+        .range(format!("bytes=0-{}", RECORD_CAP - 1))
+        .send()
+        .await
+        .ok()?
+        .body
+        .collect()
+        .await
+        .ok()?
+        .into_bytes();
+    let record = crate::mpu_durable::CompletionRecord::decode(&body, &upload_id)?;
+    // Base object still there?
+    client
+        .head_object()
+        .bucket(bucket)
+        .key(&record.key)
+        .send()
+        .await
+        .ok()?;
+    // Sidecar missing = phantom.
+    match client
+        .head_object()
+        .bucket(bucket)
+        .key(sidecar_key(&record.key))
+        .send()
+        .await
+    {
+        Ok(_) => None,
+        Err(_) => Some(record.key),
+    }
 }
 
 /// One listed `.s4mpu/` record object.
@@ -1294,6 +1368,8 @@ pub(crate) async fn run_mpu_state_gc(
         deleted: 0,
         skipped_too_recent: 0,
         skipped_unparseable: 0,
+        completion_records: 0,
+        phantom_committed_keys: Vec::new(),
         failed: 0,
         failures: Vec::new(),
         notes: Vec::new(),
@@ -1304,6 +1380,49 @@ pub(crate) async fn run_mpu_state_gc(
             MpuGcDecision::Live => {}
             MpuGcDecision::TooRecent => report.skipped_too_recent += 1,
             MpuGcDecision::Unparseable => report.skipped_unparseable += 1,
+            MpuGcDecision::LiveCompletion => report.completion_records += 1,
+            MpuGcDecision::ConsumedCompletion => {
+                // #150: a completion record whose upload the
+                // backend no longer knows. Either (a) the Complete
+                // fully succeeded and this record just failed its
+                // cleanup — safe to reap — or (b) an interrupted
+                // Complete committed the base object, the client never
+                // retried, and this record is the ONLY evidence tying
+                // the index-less phantom at the client key to its
+                // upload. Distinguish by looking at the committed key:
+                // base object present WITHOUT its `.s4index` sidecar =
+                // phantom → report + KEEP the record (repair evidence);
+                // anything else → orphaned like a part record.
+                report.completion_records += 1;
+                match completion_phantom_key(client, bucket, &rec.key).await {
+                    Some(committed_key) => {
+                        report.phantom_committed_keys.push(committed_key);
+                    }
+                    None => {
+                        report.orphaned += 1;
+                        if !execute {
+                            continue;
+                        }
+                        match client
+                            .delete_object()
+                            .bucket(bucket)
+                            .key(&rec.key)
+                            .send()
+                            .await
+                        {
+                            Ok(_) => report.deleted += 1,
+                            Err(e) => {
+                                report.failed += 1;
+                                report.failures.push(MpuStateGcFailure {
+                                    key: rec.key.clone(),
+                                    op: "DeleteObject".to_owned(),
+                                    cause: format!("{e}"),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
             MpuGcDecision::Orphaned => {
                 report.orphaned += 1;
                 if !execute {
@@ -1329,6 +1448,7 @@ pub(crate) async fn run_mpu_state_gc(
             }
         }
     }
+    report.phantom_committed_keys.sort();
 
     report.failures.sort_by(|a, b| a.key.cmp(&b.key));
 
@@ -1358,6 +1478,21 @@ pub(crate) async fn run_mpu_state_gc(
             "{} key(s) under the reserved prefix did not parse as record keys and were left \
              in place — inspect them manually",
             report.skipped_unparseable,
+        ));
+    }
+    if !report.phantom_committed_keys.is_empty() {
+        report.notes.push(format!(
+            "{} committed-but-unindexed multipart object(s) detected (an interrupted \
+             CompleteMultipartUpload committed the base object but its post-processing \
+             never finished and the client never retried): {}. Rebuild each index with \
+             `s4 repair-sidecar <bucket>/<key>` (see docs/ops/repair.md) — the \
+             completion records were kept as evidence and will be reaped once the \
+             sidecar exists. CAUTION: if the upload was meant to be SSE-encrypted or \
+             versioned (the record's `re_put_pending` field is true), the committed \
+             bytes never received their re-encrypt / shadow re-PUT — delete the object \
+             instead of repairing it",
+            report.phantom_committed_keys.len(),
+            report.phantom_committed_keys.join(", "),
         ));
     }
     if report.failed > 0 {
@@ -2353,6 +2488,26 @@ concurrency = 8
         assert_eq!(
             classify_mpu_record(&orphan_key, &live, None, None),
             MpuGcDecision::Orphaned
+        );
+
+        // #150 completion records are first-class, never
+        // "unparseable": live upload ⇒ keep; consumed upload ⇒ the
+        // phantom check (base object without sidecar) decides between
+        // report-and-keep and ordinary reaping; the age gate holds
+        // young ones back like any orphan.
+        let live_completion = crate::mpu_durable::completion_key("upload-live");
+        let done_completion = crate::mpu_durable::completion_key("upload-done");
+        assert_eq!(
+            classify_mpu_record(&live_completion, &live, Some(0), Some(1_000)),
+            MpuGcDecision::LiveCompletion
+        );
+        assert_eq!(
+            classify_mpu_record(&done_completion, &live, Some(500), Some(1_000)),
+            MpuGcDecision::ConsumedCompletion
+        );
+        assert_eq!(
+            classify_mpu_record(&done_completion, &live, Some(2_000), Some(1_000)),
+            MpuGcDecision::TooRecent
         );
     }
 }

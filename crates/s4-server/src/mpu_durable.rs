@@ -115,6 +115,54 @@ pub fn record_key(upload_id: &str, part_number: i32) -> String {
     format!("{MPU_STATE_PREFIX}{}/{part_number}", hex_encode(upload_id))
 }
 
+/// #150: reserved final segment of one upload's completion record.
+/// Not a valid part number, so it can never collide with a part
+/// record key.
+pub const COMPLETION_SEGMENT: &str = "completion";
+
+/// `.s4mpu/<hex(upload_id)>/completion` — the completion record the
+/// gateway writes immediately AFTER a successful backend
+/// `CompleteMultipartUpload` (never before — its existence must prove
+/// the commit, so an aborted or never-existed upload id can never
+/// carry one). It is what makes an interrupted Complete retryable
+/// (#150): the backend consumes the upload id on its Complete, so a
+/// client retry after a mid-handler crash gets `NoSuchUpload` from
+/// the backend — the gateway then finds this record, verifies the retry
+/// manifest matches (and cross-checks it against the durable part
+/// records), and finishes the post-processing (index, stamp)
+/// idempotently instead of surfacing the phantom.
+#[must_use]
+pub fn completion_key(upload_id: &str) -> String {
+    format!(
+        "{MPU_STATE_PREFIX}{}/{COMPLETION_SEGMENT}",
+        hex_encode(upload_id)
+    )
+}
+
+/// `true` for the completion record key of ANY upload. Used by
+/// `mpu-state-gc` to classify these first-class instead of reporting
+/// them as unparseable strays.
+#[must_use]
+pub fn is_completion_key(key: &str) -> bool {
+    parse_completion_key(key).is_some()
+}
+
+/// Parse a completion-record key back into its `upload_id`. `None` for
+/// anything that is not a well-formed completion key.
+#[must_use]
+pub fn parse_completion_key(key: &str) -> Option<String> {
+    let rest = key.strip_prefix(MPU_STATE_PREFIX)?;
+    let (hex_id, segment) = rest.split_once('/')?;
+    if segment != COMPLETION_SEGMENT {
+        return None;
+    }
+    let upload_id = hex_decode(hex_id)?;
+    if upload_id.is_empty() {
+        return None;
+    }
+    Some(upload_id)
+}
+
 /// Parse a record key back into `(upload_id, part_number)`. `None` for
 /// anything that is not a well-formed record key (the `mpu-state-gc`
 /// maintain action reports those as `skipped-unparseable` instead of
@@ -192,6 +240,83 @@ impl DurablePartRecord {
             return None;
         }
         Some(rec)
+    }
+}
+
+/// One manifest entry as the CLIENT submitted it (part number + the
+/// client-visible part ETag, strong/unquoted form). Recorded verbatim in
+/// the completion record so a retried Complete can be verified to
+/// carry the SAME manifest before being answered idempotently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionManifestPart {
+    pub part_number: i32,
+    pub etag: String,
+}
+
+/// #150: the completion record body
+/// (`.s4mpu/<hex(upload_id)>/completion`). Written right after the
+/// backend Complete succeeds; deleted with the rest of the upload's
+/// records once the gateway's post-Complete work (index, stamp,
+/// ledger) has finished. While it exists for a consumed upload id, a
+/// retried Complete whose manifest matches is answered by re-running
+/// the post-processing against the already-committed base object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionRecord {
+    /// Format version. Readers reject anything but `1`.
+    pub v: u32,
+    pub upload_id: String,
+    /// Logical object key the Complete commits to.
+    pub key: String,
+    /// The client-submitted manifest, ascending part-number order.
+    pub manifest: Vec<CompletionManifestPart>,
+    /// The client-transparent composite ETag computed on the first
+    /// attempt (`None` when it couldn't be computed — recovery then
+    /// finishes without a stamp, like the >5 GiB path).
+    pub composite: Option<String>,
+    /// `true` when the first attempt was going to rewrite the committed
+    /// bytes after the backend Complete (SSE re-encrypt or versioning
+    /// shadow re-PUT). Recovery cannot reproduce that work — the SSE
+    /// recipe lives only in the crashed gateway's memory — so it
+    /// refuses instead of blessing a half-processed object.
+    pub re_put_pending: bool,
+}
+
+impl CompletionRecord {
+    /// Current on-backend format version.
+    pub const VERSION: u32 = 1;
+
+    /// JSON-encode for the record PUT body.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+
+    /// Decode + validate a record fetched from
+    /// [`completion_key`]`(upload_id)`. `None` when the body is not
+    /// valid JSON, a different version, or belongs to another upload.
+    #[must_use]
+    pub fn decode(bytes: &[u8], upload_id: &str) -> Option<Self> {
+        let rec: Self = serde_json::from_slice(bytes).ok()?;
+        if rec.v != Self::VERSION || rec.upload_id != upload_id || rec.key.is_empty() {
+            return None;
+        }
+        Some(rec)
+    }
+
+    /// `true` when `manifest` (as `(part_number, etag)` pairs, in
+    /// submitted order) is exactly the recorded manifest — SEQUENCE
+    /// equality, not set equality. AWS rejects out-of-order Complete
+    /// manifests (`InvalidPartOrder`) before any commit, so a retry
+    /// reordered relative to the committed attempt must not be blessed
+    /// either (QA round-2 Minor: order-insensitive matching was a
+    /// wire-semantics divergence).
+    #[must_use]
+    pub fn manifest_matches(&self, manifest: &[(i32, String)]) -> bool {
+        manifest.len() == self.manifest.len()
+            && manifest
+                .iter()
+                .zip(self.manifest.iter())
+                .all(|(&(pn, ref etag), rec)| pn == rec.part_number && *etag == rec.etag)
     }
 }
 
@@ -346,6 +471,87 @@ mod tests {
         ] {
             assert!(parse_record_key(k).is_none(), "must reject {k:?}");
         }
+    }
+
+    /// Completion-record key round-trip + classification: the
+    /// `completion` segment never parses as a part record, and hostile
+    /// upload ids round-trip through the hex encoding.
+    #[test]
+    fn completion_key_round_trips_and_never_collides_with_parts() {
+        for id in ["plain-id", "with/slash/es", "base64+ish/id=="] {
+            let key = completion_key(id);
+            assert!(is_mpu_state_key(&key));
+            assert!(is_completion_key(&key));
+            assert_eq!(parse_completion_key(&key).as_deref(), Some(id));
+            assert!(
+                parse_record_key(&key).is_none(),
+                "completion key must never parse as a part record"
+            );
+            assert!(
+                key.starts_with(&upload_prefix(id)),
+                "completion record must live under its upload's cleanup prefix"
+            );
+        }
+        assert!(!is_completion_key(".s4mpu/deadbeef/1"));
+        assert!(!is_completion_key(".s4mpu/zzzz/completion"));
+        assert!(!is_completion_key(".s4mpu//completion"));
+        assert!(!is_completion_key("user/completion"));
+    }
+
+    /// CompletionRecord decode fails closed and manifest matching is
+    /// exact (order-insensitive, no subset/superset).
+    #[test]
+    fn completion_record_decode_and_manifest_match() {
+        let rec = CompletionRecord {
+            v: CompletionRecord::VERSION,
+            upload_id: "u/1+x".to_owned(),
+            key: "some/obj.bin".to_owned(),
+            manifest: vec![
+                CompletionManifestPart {
+                    part_number: 1,
+                    etag: "a".repeat(32),
+                },
+                CompletionManifestPart {
+                    part_number: 2,
+                    etag: "b".repeat(32),
+                },
+            ],
+            composite: Some(format!("{}-2", "c".repeat(32))),
+            re_put_pending: false,
+        };
+        let bytes = rec.encode();
+        let back = CompletionRecord::decode(&bytes, "u/1+x").expect("round-trip");
+        assert_eq!(back, rec);
+        assert!(
+            CompletionRecord::decode(&bytes, "other").is_none(),
+            "upload-id mismatch must reject"
+        );
+        assert!(CompletionRecord::decode(b"not json", "u/1+x").is_none());
+        let mut wrong_v = rec.clone();
+        wrong_v.v = 2;
+        assert!(CompletionRecord::decode(&wrong_v.encode(), "u/1+x").is_none());
+
+        // Exact sequence match — same order matches, reordered does not
+        // (AWS rejects out-of-order manifests before commit, so a
+        // reordered retry must not be blessed either).
+        assert!(rec.manifest_matches(&[(1, "a".repeat(32)), (2, "b".repeat(32))]));
+        assert!(
+            !rec.manifest_matches(&[(2, "b".repeat(32)), (1, "a".repeat(32))]),
+            "reordered manifest must not match"
+        );
+        assert!(!rec.manifest_matches(&[(1, "a".repeat(32))]), "subset");
+        assert!(
+            !rec.manifest_matches(&[(1, "a".repeat(32)), (2, "x".repeat(32))]),
+            "tampered etag"
+        );
+        assert!(
+            !rec.manifest_matches(&[
+                (1, "a".repeat(32)),
+                (2, "b".repeat(32)),
+                (3, "d".repeat(32))
+            ]),
+            "superset"
+        );
     }
 
     /// Merge semantics: in-memory wins on collisions, durable fills the
