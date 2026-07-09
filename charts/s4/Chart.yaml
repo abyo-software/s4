@@ -59,9 +59,18 @@ type: application
 #        replicas > 1 or without marketplace.usageDimension). Minor bump
 #        because the values.yaml key set changed; the default rendering is
 #        byte-identical to 0.3.7 (verified with helm template diff).
-version: 0.4.0
+# 0.5.0: s4 #149 — additive `extraArgs` key (default []): extra CLI args
+#        appended verbatim after every chart-managed flag, the operator
+#        escape hatch for server flags the chart has no dedicated value
+#        for (the motivating case: --read-timeout-seconds, whose
+#        semantics were reworked in the same fix from a whole-connection
+#        wall-clock cap into an idle/progress timeout; the server also
+#        gained the S4_READ_TIMEOUT_SECONDS env var, reachable via
+#        extraEnv). Minor bump because the values.yaml key set changed;
+#        the default ([]) rendering is byte-identical to 0.4.0.
+version: 0.5.0
 # appVersion tracks the s4-server release shipped on crates.io / ghcr.io.
-appVersion: "1.5.0"
+appVersion: "1.5.1"
 kubeVersion: ">=1.24.0-0"
 home: https://github.com/abyo-software/s4
 sources:

@@ -240,6 +240,15 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
+# -- Extra CLI arguments appended verbatim after every chart-managed flag
+# (chart 0.5.0, s4 #149) — the operator escape hatch for server flags the
+# chart has no dedicated value for. Example:
+#   extraArgs:
+#     - --read-timeout-seconds=300
+# Appended last, but note the s4 binary rejects a flag passed twice
+# (clap), so don't repeat a chart-managed flag here — use the chart value.
+extraArgs: []
+
 # -- Extra environment variables (list of {name, value} or {name, valueFrom}).
 extraEnv: []
 

@@ -89,6 +89,9 @@ spec:
             {{- if include "s4.policyActive" . }}
             - --policy=/etc/s4/policy/policy.json
             {{- end }}
+            {{- with .Values.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           env:
             {{- if .Values.backend.region }}
             - name: AWS_REGION

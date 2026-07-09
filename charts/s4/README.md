@@ -232,9 +232,10 @@ checksum annotations roll the deployment when the policy text changes.
 | `ingress.enabled` | `false` | Render an `Ingress` object. |
 | `logFormat` | `json` | `pretty` or `json`. |
 | `otlpEndpoint` | `""` | OTLP gRPC endpoint for tracing. |
+| `extraArgs` | `[]` | Extra CLI args appended verbatim after every chart-managed flag — escape hatch for server flags without a dedicated value, e.g. `--set 'extraArgs={--read-timeout-seconds=300}'` to retune the idle timeout. Don't repeat a chart-managed flag here (the binary rejects duplicates). |
 
 See [`values.yaml`](values.yaml) for the complete schema (probes, security
-context, extraEnv, extraVolumes, etc).
+context, extraArgs, extraEnv, extraVolumes, etc).
 
 ## Tested on
 

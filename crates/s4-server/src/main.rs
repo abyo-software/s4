@@ -427,14 +427,20 @@ struct Opt {
     #[clap(long, value_name = "SECS", default_value_t = 900)]
     sigv4a_skew_tolerance_seconds: u32,
 
-    /// v0.8.5 #84 (audit H-5): per-connection wall-clock cap including
-    /// header + body reads. Slowloris guard. Default 30s — HTTP
-    /// keep-alive within this window is fine because the timeout
-    /// resets on each request boundary via hyper's read budget. Set
-    /// to 0 to disable (NOT recommended in production — slow clients
-    /// can then occupy a task / FD slot indefinitely).
-    #[clap(long, value_name = "SECS", default_value_t = 30)]
-    read_timeout_seconds: u64,
+    /// v0.8.5 #84 (audit H-5), reworked for #149: per-connection IDLE
+    /// timeout (slowloris guard). The timer resets whenever the
+    /// connection makes read OR write progress; only N consecutive
+    /// seconds with zero bytes moved in either direction kills the
+    /// connection. Healthy transfers that need a long connection
+    /// lifetime (multi-GiB `aws s3 cp`, high `--zstd-level` PUT
+    /// compression) are unaffected — before #149 this was a
+    /// whole-connection wall-clock cap that cut them off at N seconds
+    /// flat. Default 30. Set to 0 to disable (NOT recommended in
+    /// production — a stalled client can then occupy a task / FD slot
+    /// indefinitely). Also settable via the S4_READ_TIMEOUT_SECONDS
+    /// environment variable (the CLI flag wins when both are given).
+    #[clap(long, value_name = "SECS")]
+    read_timeout_seconds: Option<u64>,
 
     /// v0.8.5 #84 (audit H-5): hard cap on the number of in-flight
     /// HTTP connections the listener will hold open at once. New
@@ -510,8 +516,9 @@ struct Opt {
     /// compressibility uploads of ≥3 parts with InvalidPart otherwise).
     /// Trade-off: at-rest multipart savings are ~zero while the object stays
     /// in multipart form (each non-final part is stored at ≈ its original
-    /// size); a later `s4 recompact` / `s4 migrate` rewrite drops the padding
-    /// and reclaims the savings. Single-PUT objects are unaffected. Default
+    /// size); a later `s4 recompact` rewrite drops the padding and reclaims
+    /// the savings (`s4 migrate` does NOT — it skips objects that are
+    /// already S4-framed). Single-PUT objects are unaffected. Default
     /// off — backend part sizes then stay content-dependent (AWS S3 / MinIO
     /// accept that), bit-for-bit the pre-v1.5 behaviour.
     #[clap(long = "uniform-multipart-parts")]
@@ -1005,8 +1012,12 @@ enum Cmd {
     /// state file only: no `--endpoint-url`, no network, and the
     /// gateway can keep running (the ledger flushes the file on every
     /// write event). Reports per-bucket + total original vs stored
-    /// bytes, savings ratio, and a $/month figure at
-    /// `--price-per-gb-month`. The numbers cover gateway-traversing
+    /// bytes, net saved bytes (the byte-accurate figure — what
+    /// `--marketplace-metered-savings` bills), savings ratio, and a
+    /// $/month figure at `--price-per-gb-month`. `objects` / `original`
+    /// / `stored` are cumulative accounted-write counters, not a
+    /// bucket inventory (the report's column-semantics note explains
+    /// when they diverge — #151). The numbers cover gateway-traversing
     /// writes only (backend-direct writes, `s4 migrate` /
     /// `s4 recompact`, aborted-multipart part bytes, and replication
     /// replicas are not observed — the report's fixed notes say so).
@@ -4705,36 +4716,224 @@ fn install_sigterm_stream()
     })
 }
 
-/// v0.8.5 #84 (audit H-5): drive a hyper connection future with an
-/// optional wall-clock cap. When the cap is `None` the future runs to
-/// completion unchanged (back-compat with `--read-timeout-seconds 0`).
-/// When set, exceeding the cap aborts the connection — slow clients
-/// can no longer pin a task / FD slot indefinitely. The cap covers
-/// header reads, body reads, and the inner-service handler all in
-/// one budget (the simplest semantics that defends against slowloris
-/// without needing two timers); HTTP keep-alive within the window
-/// keeps working because each new request resets hyper's own read
-/// budget — only the outer wall-clock keeps ticking. The connection
-/// future's own error is logged at DEBUG (normal client disconnects
-/// surface here, so WARN would be too noisy).
-async fn run_with_optional_timeout<F, E>(fut: F, cap: Option<std::time::Duration>)
+/// #149: environment override for `--read-timeout-seconds`, so container
+/// operators (e.g. the helm chart's `extraEnv`) can retune the idle
+/// timeout without args surgery. Follows the repo's `S4_` env prefix.
+const READ_TIMEOUT_ENV_VAR: &str = "S4_READ_TIMEOUT_SECONDS";
+
+/// #149: resolve the effective idle-timeout seconds. Precedence:
+/// explicit CLI flag > `S4_READ_TIMEOUT_SECONDS` env var > default 30
+/// (the pre-#149 default, kept). An unparseable env value is a boot
+/// error, NOT a silent fallback — an operator who set the override
+/// expects it to be in effect. Takes the env value as a parameter
+/// (rather than reading it inline) so unit tests stay pure — edition
+/// 2024 makes `std::env::set_var` unsafe, and test-parallel env
+/// mutation races anyway.
+fn resolve_read_timeout_seconds(cli: Option<u64>, env: Option<&str>) -> Result<u64, String> {
+    if let Some(secs) = cli {
+        return Ok(secs);
+    }
+    match env {
+        Some(raw) => raw.trim().parse::<u64>().map_err(|e| {
+            format!(
+                "invalid {READ_TIMEOUT_ENV_VAR}={raw:?}: {e} (expected whole seconds, 0 = disabled)"
+            )
+        }),
+        None => Ok(30),
+    }
+}
+
+/// #149: shared last-I/O-progress stamp for one connection. The
+/// [`ActivityTracked`] stream wrapper stamps it on every read/write
+/// that moves bytes; the watchdog in [`run_with_optional_idle_timeout`]
+/// reads it to decide whether the connection is stalled or merely
+/// long-lived. Millis-since-`epoch` in a relaxed `AtomicU64` — the
+/// stamp is monotonic bookkeeping, not a synchronization point, and a
+/// stale read only delays the kill by one watchdog tick.
+struct ConnActivity {
+    epoch: std::time::Instant,
+    last_millis: std::sync::atomic::AtomicU64,
+}
+
+impl ConnActivity {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            epoch: std::time::Instant::now(),
+            last_millis: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Record "the connection just moved bytes". Truncating the u128
+    /// millis to u64 is safe for any conceivable connection lifetime
+    /// (u64 millis ≈ 585 million years).
+    fn stamp(&self) {
+        #[allow(clippy::cast_possible_truncation)]
+        self.last_millis.store(
+            self.epoch.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Time since the last read/write progress. Saturating: a stamp
+    /// racing between our `elapsed()` and the load can make the stored
+    /// value exceed the observed elapsed — that's "activity just now",
+    /// i.e. zero idle.
+    fn idle_for(&self) -> std::time::Duration {
+        let last = std::time::Duration::from_millis(
+            self.last_millis.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        self.epoch.elapsed().saturating_sub(last)
+    }
+}
+
+/// #149: `AsyncRead + AsyncWrite` adapter that stamps a [`ConnActivity`]
+/// whenever the wrapped stream makes real progress (≥ 1 byte read or
+/// written). Wrapped UNDER TLS at the accept sites so encrypted-record
+/// I/O counts as progress too — the watchdog never needs to understand
+/// the protocol above it. EOF and `Pending` deliberately do NOT stamp:
+/// a half-closed or wedged connection must keep aging toward the kill.
+struct ActivityTracked<S> {
+    inner: S,
+    activity: Arc<ConnActivity>,
+}
+
+impl<S> ActivityTracked<S> {
+    fn new(inner: S, activity: Arc<ConnActivity>) -> Self {
+        Self { inner, activity }
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ActivityTracked<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(poll, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.activity.stamp();
+        }
+        poll
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ActivityTracked<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if matches!(poll, std::task::Poll::Ready(Ok(n)) if n > 0) {
+            self.activity.stamp();
+        }
+        poll
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if matches!(poll, std::task::Poll::Ready(Ok(n)) if n > 0) {
+            self.activity.stamp();
+        }
+        poll
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Outcome of driving one connection under the idle-timeout watchdog.
+/// Returned for unit-test observability ([`read_timeout_tests`]); the
+/// spawn sites in `run_server` ignore it.
+#[derive(Debug, PartialEq, Eq)]
+enum ConnDriveOutcome {
+    /// Connection future ran to completion (success or its own error).
+    Completed,
+    /// Watchdog killed the connection after `cap` with zero progress.
+    IdleTimeout,
+}
+
+/// v0.8.5 #84 (audit H-5), reworked for #149: drive a hyper connection
+/// future with an optional IDLE timeout. When the cap is `None` the
+/// future runs to completion unchanged (back-compat with
+/// `--read-timeout-seconds 0`). When set, the watchdog kills the
+/// connection only after `cap` elapses with ZERO read/write progress
+/// on the underlying stream (as reported by the [`ActivityTracked`]
+/// wrapper installed at the accept site): slowloris clients still
+/// can't pin a task / FD slot beyond ~N seconds, but a healthy
+/// transfer that simply needs a long connection lifetime — a multi-GiB
+/// `aws s3 cp`, a high-`--zstd-level` PUT — is never cut mid-flight.
+/// (The pre-#149 implementation was one `tokio::time::timeout` over
+/// the whole connection future, which killed exactly those transfers
+/// at +N seconds flat.) The connection future's own error is logged at
+/// DEBUG (normal client disconnects surface here, so WARN would be too
+/// noisy).
+async fn run_with_optional_idle_timeout<F, E>(
+    fut: F,
+    cap: Option<std::time::Duration>,
+    activity: Arc<ConnActivity>,
+) -> ConnDriveOutcome
 where
     F: std::future::Future<Output = Result<(), E>>,
     E: std::fmt::Display,
 {
-    match cap {
-        Some(d) => match tokio::time::timeout(d, fut).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::debug!(error = %e, "serve_connection error"),
-            Err(_) => tracing::warn!(
-                timeout_secs = d.as_secs(),
-                "connection timeout (slowloris guard)"
-            ),
-        },
-        None => match fut.await {
-            Ok(()) => {}
-            Err(e) => tracing::debug!(error = %e, "serve_connection error"),
-        },
+    let log_done = |res: Result<(), E>| {
+        if let Err(e) = res {
+            tracing::debug!(error = %e, "serve_connection error");
+        }
+        ConnDriveOutcome::Completed
+    };
+    let Some(cap) = cap else {
+        return log_done(fut.await);
+    };
+    // Check cadence: fine-grained enough that the effective kill point
+    // stays within ~25% of the configured cap, coarse enough (≤ 1 s,
+    // ≥ 10 ms) that thousands of idle keep-alive connections don't
+    // busy-tick. Bounded overshoot: a connection dies at most one tick
+    // after its idle window elapses.
+    let period = (cap / 4).clamp(
+        std::time::Duration::from_millis(10),
+        std::time::Duration::from_secs(1),
+    );
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            res = &mut fut => return log_done(res),
+            _ = ticker.tick() => {
+                if activity.idle_for() >= cap {
+                    // Same WARN line as the pre-#149 guard so existing
+                    // log-based alerting keeps matching. Dropping `fut`
+                    // (on return) aborts the hyper connection.
+                    tracing::warn!(
+                        timeout_secs = cap.as_secs(),
+                        "connection timeout (slowloris guard)"
+                    );
+                    return ConnDriveOutcome::IdleTimeout;
+                }
+            }
+        }
     }
 }
 
@@ -4896,18 +5095,24 @@ where
     // the per-connection task and dropped on task exit so the slot is
     // released even on panic / early return.
     let conn_cap = Arc::new(tokio::sync::Semaphore::new(opt.max_concurrent_connections));
-    // v0.8.5 #84 (audit H-5): per-connection wall-clock cap. 0 means
-    // disabled (unbounded). Stored as `Option<Duration>` so the
-    // per-connection wrapper short-circuits without a `Duration::ZERO`
-    // sentinel comparison at every accept.
-    let read_timeout: Option<std::time::Duration> = if opt.read_timeout_seconds == 0 {
+    // v0.8.5 #84 (audit H-5), #149: per-connection IDLE timeout. 0 means
+    // disabled (unbounded). Resolved flag > env > default-30 here (boot
+    // fails loudly on an unparseable env value — a typo'd override must
+    // not silently fall back to 30), then stored as `Option<Duration>`
+    // so the per-connection wrapper short-circuits without a
+    // `Duration::ZERO` sentinel comparison at every accept.
+    let read_timeout_seconds = resolve_read_timeout_seconds(
+        opt.read_timeout_seconds,
+        std::env::var(READ_TIMEOUT_ENV_VAR).ok().as_deref(),
+    )?;
+    let read_timeout: Option<std::time::Duration> = if read_timeout_seconds == 0 {
         None
     } else {
-        Some(std::time::Duration::from_secs(opt.read_timeout_seconds))
+        Some(std::time::Duration::from_secs(read_timeout_seconds))
     };
     info!(
         max_concurrent_connections = opt.max_concurrent_connections,
-        read_timeout_seconds = opt.read_timeout_seconds,
+        read_timeout_seconds,
         max_header_bytes = opt.max_header_bytes,
         http2 = opt.http2,
         "S4 HTTP wire-hardening configured (v0.8.5 #84)"
@@ -5093,25 +5298,45 @@ where
         let svc = routed_service.clone();
         let server = http_server.clone();
         let watch_handle = graceful.watcher();
+        // #149: the activity stamp is wired UNDER TLS (the wrapper sits
+        // between the TCP socket and the TLS/HTTP layers) so handshake
+        // records and encrypted payload bytes all count as progress —
+        // the idle watchdog in `run_with_optional_idle_timeout` only
+        // fires on a connection that moved zero bytes for the window.
+        //
+        // QA round-1 High: the TLS / ACME handshake itself runs INSIDE
+        // the watchdog too — a client that connects and stalls
+        // mid-handshake used to await unbounded while holding its
+        // connection permit (also true of the pre-#149 wall clock,
+        // which only wrapped the post-handshake serve). Handshake bytes
+        // stamp the same activity cell, so a slow-but-progressing
+        // handshake is never killed; a silent one dies at the cap.
+        let activity = ConnActivity::new();
+        let socket = ActivityTracked::new(socket, Arc::clone(&activity));
         if let Some(acceptors) = acme_acceptors.as_ref() {
             // ACME path: every connection is inspected for TLS-ALPN-01
             // challenge first; real TLS traffic gets the current cert.
             let acceptors = Arc::clone(acceptors);
             tokio::spawn(async move {
                 let _permit = permit; // released at task end
-                match s4_server::acme::accept_one(socket, &acceptors).await {
-                    Ok(Some(tls_stream)) => {
-                        let conn = server.serve_connection(TokioIo::new(tls_stream), svc);
-                        let conn = watch_handle.watch(conn.into_owned());
-                        run_with_optional_timeout(conn, read_timeout).await;
+                let drive = async {
+                    match s4_server::acme::accept_one(socket, &acceptors).await {
+                        Ok(Some(tls_stream)) => {
+                            let conn = server.serve_connection(TokioIo::new(tls_stream), svc);
+                            let conn = watch_handle.watch(conn.into_owned());
+                            conn.await.map_err(|e| e.to_string())
+                        }
+                        Ok(None) => {
+                            // Challenge handled; nothing more to do.
+                            Ok(())
+                        }
+                        Err(err) => {
+                            tracing::warn!("acme handshake failed: {err}");
+                            Ok(())
+                        }
                     }
-                    Ok(None) => {
-                        // Challenge handled; nothing more to do.
-                    }
-                    Err(err) => {
-                        tracing::warn!("acme handshake failed: {err}");
-                    }
-                }
+                };
+                run_with_optional_idle_timeout(drive, read_timeout, activity).await;
             });
         } else if let Some(state) = tls_state.as_ref() {
             // Static TLS: per-connection acceptor picks up the latest
@@ -5120,23 +5345,26 @@ where
             let acceptor = state.acceptor();
             tokio::spawn(async move {
                 let _permit = permit;
-                let tls_stream = match acceptor.accept(socket).await {
-                    Ok(s) => s,
-                    Err(err) => {
-                        tracing::warn!("tls handshake failed: {err}");
-                        return;
-                    }
+                let drive = async {
+                    let tls_stream = match acceptor.accept(socket).await {
+                        Ok(s) => s,
+                        Err(err) => {
+                            tracing::warn!("tls handshake failed: {err}");
+                            return Ok(());
+                        }
+                    };
+                    let conn = server.serve_connection(TokioIo::new(tls_stream), svc);
+                    let conn = watch_handle.watch(conn.into_owned());
+                    conn.await.map_err(|e| e.to_string())
                 };
-                let conn = server.serve_connection(TokioIo::new(tls_stream), svc);
-                let conn = watch_handle.watch(conn.into_owned());
-                run_with_optional_timeout(conn, read_timeout).await;
+                run_with_optional_idle_timeout(drive, read_timeout, activity).await;
             });
         } else {
             let conn = server.serve_connection(TokioIo::new(socket), svc);
             let conn = watch_handle.watch(conn.into_owned());
             tokio::spawn(async move {
                 let _permit = permit;
-                run_with_optional_timeout(conn, read_timeout).await;
+                run_with_optional_idle_timeout(conn, read_timeout, activity).await;
             });
         }
     }
@@ -5586,5 +5814,232 @@ mod sigusr1_dump_tests {
             "--marketplace-metered-savings",
         ])
         .expect_err("--marketplace-metered-savings requires --savings-ledger-state-file");
+    }
+}
+
+#[cfg(test)]
+mod read_timeout_tests {
+    //! #149: `--read-timeout-seconds` must be a PROGRESS (idle) timeout,
+    //! not a whole-connection wall-clock cap. A healthy connection that
+    //! keeps moving bytes — however long it lives — must never be killed;
+    //! a connection with zero read/write progress for the configured
+    //! window must still die (the slowloris property the flag exists
+    //! for). Driven over in-memory duplex streams so the tests exercise
+    //! the exact per-connection driver `run_server` spawns, without a
+    //! sacrificial port or a real slow client.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{ActivityTracked, ConnActivity, ConnDriveOutcome, run_with_optional_idle_timeout};
+
+    const CHUNK: &[u8] = b"0123456789abcdef";
+
+    /// Build the server side of a duplex "connection" exactly the way
+    /// `run_server` wires production sockets: the raw stream wrapped in
+    /// [`ActivityTracked`], sharing a [`ConnActivity`] with the driver.
+    /// The returned future reads to EOF and flips `done` when the whole
+    /// expected payload arrived.
+    fn read_to_eof_conn(
+        server: tokio::io::DuplexStream,
+        activity: &Arc<ConnActivity>,
+        expected_total: usize,
+        done: &Arc<AtomicBool>,
+    ) -> impl std::future::Future<Output = Result<(), std::io::Error>> + use<> {
+        let mut server = ActivityTracked::new(server, Arc::clone(activity));
+        let done = Arc::clone(done);
+        async move {
+            let mut total = 0usize;
+            let mut buf = [0u8; 64];
+            loop {
+                let n = server.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            if total == expected_total {
+                done.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    /// #149 repro (live EKS E2E: plain `aws s3 cp` of 2 GiB objects hit
+    /// 2/6 success rate, WARN "connection timeout (slowloris guard)" at
+    /// exactly +30 s): a connection making slow-but-steady progress for
+    /// ~3× the configured timeout must complete. Before the fix the
+    /// driver wrapped the whole connection future in one
+    /// `tokio::time::timeout`, so this test's transfer was killed at the
+    /// 400 ms mark with two thirds of the payload still in flight.
+    #[tokio::test]
+    async fn slow_but_steady_transfer_survives_read_timeout() {
+        const CAP: Duration = Duration::from_millis(400);
+        const CHUNKS: usize = 12; // 12 × 100 ms = 1.2 s ≈ 3× CAP
+        const CHUNK_GAP: Duration = Duration::from_millis(100);
+
+        // Duplex buffer is larger than the whole payload so the writer
+        // never blocks on the reader — its pacing is purely the sleep.
+        let (mut client, server) = tokio::io::duplex(4096);
+        let done = Arc::new(AtomicBool::new(false));
+        let activity = ConnActivity::new();
+        let server_fut = read_to_eof_conn(server, &activity, CHUNKS * CHUNK.len(), &done);
+
+        let writer = tokio::spawn(async move {
+            for _ in 0..CHUNKS {
+                tokio::time::sleep(CHUNK_GAP).await;
+                client.write_all(CHUNK).await.expect("steady chunk write");
+            }
+            client.shutdown().await.expect("client EOF");
+        });
+
+        let outcome = run_with_optional_idle_timeout(server_fut, Some(CAP), activity).await;
+        writer.abort();
+        assert_eq!(
+            outcome,
+            ConnDriveOutcome::Completed,
+            "#149 repro: steady progress must never trip the guard"
+        );
+        assert!(
+            done.load(Ordering::SeqCst),
+            "#149 repro: a healthy connection moving bytes every 100 ms for ~3× the \
+             400 ms timeout must run to completion — killing it means the timeout is \
+             a whole-connection wall-clock cap, not a progress guard"
+        );
+    }
+
+    /// Slowloris property (must KEEP holding after the #149 rework): a
+    /// connection with zero read/write progress dies at ~N seconds.
+    #[tokio::test]
+    async fn idle_connection_still_killed_at_timeout() {
+        const CAP: Duration = Duration::from_millis(300);
+
+        // Hold the client end open without writing a byte — the server
+        // read pends forever, i.e. a classic slowloris slot pin.
+        let (_client, server) = tokio::io::duplex(4096);
+        let done = Arc::new(AtomicBool::new(false));
+        let activity = ConnActivity::new();
+        let server_fut = read_to_eof_conn(server, &activity, usize::MAX, &done);
+
+        let started = std::time::Instant::now();
+        let outcome = run_with_optional_idle_timeout(server_fut, Some(CAP), activity).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            outcome,
+            ConnDriveOutcome::IdleTimeout,
+            "fully idle connection must be killed, not completed"
+        );
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "killed connection must not have completed its read loop"
+        );
+        assert!(
+            elapsed >= CAP,
+            "guard fired before the configured window elapsed ({elapsed:?} < {CAP:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "idle connection must die at ~{CAP:?}, not linger ({elapsed:?})"
+        );
+    }
+
+    /// The reset semantics end-to-end: a connection that trickles for a
+    /// while and THEN stalls dies ~CAP after its LAST byte of progress,
+    /// not CAP after connection start. Guards against a regression that
+    /// stamps activity but never consults it (or vice versa).
+    #[tokio::test]
+    async fn trickle_then_stall_killed_after_last_progress() {
+        const CAP: Duration = Duration::from_millis(300);
+        const TRICKLES: usize = 3;
+        const CHUNK_GAP: Duration = Duration::from_millis(100);
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let done = Arc::new(AtomicBool::new(false));
+        let activity = ConnActivity::new();
+        let server_fut = read_to_eof_conn(server, &activity, usize::MAX, &done);
+
+        // Trickle a few chunks, then go silent WITHOUT closing — the
+        // guard (not EOF) must end the connection.
+        let writer = tokio::spawn(async move {
+            for _ in 0..TRICKLES {
+                tokio::time::sleep(CHUNK_GAP).await;
+                client.write_all(CHUNK).await.expect("trickle write");
+            }
+            std::future::pending::<()>().await;
+            drop(client); // unreachable; keeps `client` owned by the task
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = run_with_optional_idle_timeout(server_fut, Some(CAP), activity).await;
+        let elapsed = started.elapsed();
+        writer.abort();
+
+        assert_eq!(outcome, ConnDriveOutcome::IdleTimeout);
+        // Last progress lands at ~TRICKLES × CHUNK_GAP = 300 ms; the kill
+        // must therefore land no earlier than last-progress + CAP. (Upper
+        // bound left generous — CI runners stall — the load-bearing edge
+        // is "not before".)
+        let last_progress = CHUNK_GAP * TRICKLES as u32;
+        assert!(
+            elapsed >= last_progress + CAP,
+            "guard must reset on progress: killed {elapsed:?} after start, but the \
+             last byte moved at ~{last_progress:?} so the earliest legal kill is \
+             {:?}",
+            last_progress + CAP,
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "stalled connection must still die promptly ({elapsed:?})"
+        );
+    }
+
+    /// `--read-timeout-seconds 0` back-compat: no cap means the future
+    /// runs to completion untouched, no watchdog ticking.
+    #[tokio::test]
+    async fn no_cap_runs_to_completion() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let done = Arc::new(AtomicBool::new(false));
+        let activity = ConnActivity::new();
+        let server_fut = read_to_eof_conn(server, &activity, CHUNK.len(), &done);
+
+        client.write_all(CHUNK).await.expect("write");
+        client.shutdown().await.expect("EOF");
+
+        let outcome = run_with_optional_idle_timeout(server_fut, None, activity).await;
+        assert_eq!(outcome, ConnDriveOutcome::Completed);
+        assert!(done.load(Ordering::SeqCst));
+    }
+
+    /// #149: flag/env/default precedence for the timeout value. Pure
+    /// function — env is a parameter (see `resolve_read_timeout_seconds`
+    /// docs for why we don't mutate process env in tests).
+    #[test]
+    fn resolve_read_timeout_precedence() {
+        // CLI flag wins over everything, including an env override.
+        assert_eq!(
+            super::resolve_read_timeout_seconds(Some(120), Some("300")),
+            Ok(120)
+        );
+        // Env var used when the flag is absent (whitespace tolerated —
+        // k8s manifests / .env files pick up trailing spaces easily).
+        assert_eq!(
+            super::resolve_read_timeout_seconds(None, Some(" 300 ")),
+            Ok(300)
+        );
+        // Neither → the long-standing default.
+        assert_eq!(super::resolve_read_timeout_seconds(None, None), Ok(30));
+        // 0 stays a valid "disabled" sentinel through both routes.
+        assert_eq!(super::resolve_read_timeout_seconds(Some(0), None), Ok(0));
+        assert_eq!(super::resolve_read_timeout_seconds(None, Some("0")), Ok(0));
+        // Garbage env is a loud boot error, not a silent 30.
+        let err = super::resolve_read_timeout_seconds(None, Some("5m"))
+            .expect_err("non-numeric env value must fail the boot");
+        assert!(
+            err.contains("S4_READ_TIMEOUT_SECONDS"),
+            "error must name the env var so the operator can find it: {err}"
+        );
     }
 }

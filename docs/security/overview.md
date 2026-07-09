@@ -28,8 +28,9 @@ think about:
   for the supported subset.
 - **Body-size limits / request smuggling**: hyper limits enforced
   (`--max-header-bytes`, default 64 KiB; `--max-concurrent-connections`,
-  default 1024; `--read-timeout-seconds`, default 30s — see v0.8.5
-  #84). HTTP/2 is **off by default** (`--http2` to opt in); the S3 API
+  default 1024; `--read-timeout-seconds`, default 30s of zero
+  connection I/O progress — see v0.8.5 #84, idle semantics per #149).
+  HTTP/2 is **off by default** (`--http2` to opt in); the S3 API
   is HTTP/1.1 in practice and h2 adds DoS surface (stream-multiplexing
   abuse) that doesn't pay off for our workload.
 - **Tenant isolation**: S4 is **single-tenant by design** — one S4
