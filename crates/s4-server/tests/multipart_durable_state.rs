@@ -108,6 +108,24 @@ struct MemBackend {
     state: Arc<Mutex<InnerState>>,
 }
 
+/// Slice a stored body according to the request's Range — the frame-hop
+/// Complete scan depends on real ranged-GET semantics.
+fn apply_range(body: &Bytes, range: &Range) -> Bytes {
+    match range {
+        Range::Int { first, last } => {
+            let start = *first as usize;
+            let end = last
+                .map(|l| (l as usize + 1).min(body.len()))
+                .unwrap_or(body.len());
+            body.slice(start.min(body.len())..end.max(start.min(body.len())))
+        }
+        Range::Suffix { length } => {
+            let start = body.len().saturating_sub(*length as usize);
+            body.slice(start..)
+        }
+    }
+}
+
 impl MemBackend {
     fn from_shared(state: Arc<Mutex<InnerState>>) -> Self {
         Self { state }
@@ -165,10 +183,14 @@ impl S3 for MemBackend {
             st.objects.get(&key).cloned()
         };
         let stored = stored.ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey))?;
-        let len = stored.body.len() as i64;
         let etag = md5_hex(&stored.body);
+        let body = match req.input.range.as_ref() {
+            Some(r) => apply_range(&stored.body, r),
+            None => stored.body.clone(),
+        };
+        let len = body.len() as i64;
         Ok(S3Response::new(GetObjectOutput {
-            body: Some(bytes_to_blob(stored.body)),
+            body: Some(bytes_to_blob(body)),
             content_length: Some(len),
             metadata: stored.metadata,
             content_type: stored.content_type,

@@ -410,9 +410,24 @@ impl S3 for ChaosBackend {
             };
             return Ok(S3Response::new(out));
         }
-        let len = stored.body.len() as i64;
+        // Honor Range (the frame-hop Complete scan depends on it).
+        let body = match req.input.range.as_ref() {
+            Some(Range::Int { first, last }) => {
+                let start = (*first as usize).min(stored.body.len());
+                let end = last
+                    .map(|l| (l as usize + 1).min(stored.body.len()))
+                    .unwrap_or(stored.body.len());
+                stored.body.slice(start..end.max(start))
+            }
+            Some(Range::Suffix { length }) => {
+                let start = stored.body.len().saturating_sub(*length as usize);
+                stored.body.slice(start..)
+            }
+            None => stored.body.clone(),
+        };
+        let len = body.len() as i64;
         let out = GetObjectOutput {
-            body: Some(bytes_to_blob(stored.body)),
+            body: Some(bytes_to_blob(body)),
             content_length: Some(len),
             metadata: stored.metadata,
             content_type: stored.content_type,

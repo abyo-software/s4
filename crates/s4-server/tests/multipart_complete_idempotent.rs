@@ -94,6 +94,12 @@ struct InnerState {
 struct FaultBackend {
     state: Arc<Mutex<InnerState>>,
     hang_main_get: Arc<AtomicBool>,
+    /// QA delta-round: error every RANGED main-object GET — the
+    /// frame-hop scan's transport-failure case. Distinct from
+    /// `hang_main_get` so the transient-failure semantics (recovery
+    /// must fail closed with state intact, then succeed once the
+    /// backend heals) are testable deterministically.
+    fail_ranged_get: Arc<AtomicBool>,
 }
 
 impl FaultBackend {
@@ -101,12 +107,36 @@ impl FaultBackend {
         Self {
             state,
             hang_main_get,
+            fail_ranged_get: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn with_fail_ranged(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.fail_ranged_get = flag;
+        self
     }
 }
 
 fn is_internal_key(key: &str) -> bool {
     mpu_durable::is_mpu_state_key(key) || key.ends_with(".s4index")
+}
+
+/// Slice a stored body according to the request's Range — the frame-hop
+/// Complete scan depends on real ranged-GET semantics.
+fn apply_range(body: &Bytes, range: &Range) -> Bytes {
+    match range {
+        Range::Int { first, last } => {
+            let start = *first as usize;
+            let end = last
+                .map(|l| (l as usize + 1).min(body.len()))
+                .unwrap_or(body.len());
+            body.slice(start.min(body.len())..end.max(start.min(body.len())))
+        }
+        Range::Suffix { length } => {
+            let start = body.len().saturating_sub(*length as usize);
+            body.slice(start..)
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -147,16 +177,29 @@ impl S3 for FaultBackend {
             // about to be cancelled by the test.
             std::future::pending::<()>().await;
         }
+        if self.fail_ranged_get.load(Ordering::SeqCst)
+            && !is_internal_key(&req.input.key)
+            && req.input.range.is_some()
+        {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "injected transient ranged-GET failure",
+            ));
+        }
         let key = (req.input.bucket.clone(), req.input.key.clone());
         let stored = {
             let st = self.state.lock().unwrap();
             st.objects.get(&key).cloned()
         };
         let stored = stored.ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey))?;
-        let len = stored.body.len() as i64;
         let etag = md5_hex(&stored.body);
+        let body = match req.input.range.as_ref() {
+            Some(r) => apply_range(&stored.body, r),
+            None => stored.body.clone(),
+        };
+        let len = body.len() as i64;
         Ok(S3Response::new(GetObjectOutput {
-            body: Some(bytes_to_blob(stored.body)),
+            body: Some(bytes_to_blob(body)),
             content_length: Some(len),
             metadata: stored.metadata,
             content_type: stored.content_type,
@@ -419,6 +462,19 @@ impl S3 for FaultBackend {
 fn make_service(state: &Arc<Mutex<InnerState>>, hang: &Arc<AtomicBool>) -> S4Service<FaultBackend> {
     S4Service::new(
         FaultBackend::new(Arc::clone(state), Arc::clone(hang)),
+        make_registry(),
+        Arc::new(AlwaysDispatcher(CodecKind::CpuZstd)),
+    )
+}
+
+fn make_service_with_ranged_fail(
+    state: &Arc<Mutex<InnerState>>,
+    hang: &Arc<AtomicBool>,
+    fail_ranged: &Arc<AtomicBool>,
+) -> S4Service<FaultBackend> {
+    S4Service::new(
+        FaultBackend::new(Arc::clone(state), Arc::clone(hang))
+            .with_fail_ranged(Arc::clone(fail_ranged)),
         make_registry(),
         Arc::new(AlwaysDispatcher(CodecKind::CpuZstd)),
     )
@@ -772,4 +828,135 @@ async fn duplicate_complete_after_full_success_still_no_such_upload() {
         .await
         .expect_err("duplicate Complete after full success stays an error");
     assert_eq!(*err.code(), S3ErrorCode::NoSuchUpload, "err: {err:?}");
+}
+
+/// QA delta-round (frame-hop scan): a TRANSIENT ranged-GET failure
+/// during recovery must fail the retry with all durable state intact —
+/// finalizing would reap the completion record and stamp the stored
+/// (compressed) length as the original size. Once the backend heals,
+/// the next retry recovers fully.
+#[tokio::test]
+async fn recovery_survives_transient_ranged_get_failure() {
+    let state = Arc::new(Mutex::new(InnerState::default()));
+    let hang = Arc::new(AtomicBool::new(false));
+    let fail_ranged = Arc::new(AtomicBool::new(false));
+    let (p1, p2) = part_bodies();
+    let expected = expected_composite(&[&p1, &p2]);
+
+    let (upload_id, etag1, etag2) = interrupted_complete(&state, &hang, "b", "flaky/obj.bin").await;
+
+    // Retry through an instance whose ranged GETs fail (transient
+    // backend trouble): the recovery must ERROR, not fabricate success.
+    let svc_flaky = make_service_with_ranged_fail(&state, &hang, &fail_ranged);
+    fail_ranged.store(true, Ordering::SeqCst);
+    let err = svc_flaky
+        .complete_multipart_upload(complete_mpu_req(
+            "b",
+            "flaky/obj.bin",
+            &upload_id,
+            vec![(1, etag1.as_str()), (2, etag2.as_str())],
+        ))
+        .await
+        .expect_err("recovery with failing hop reads must not fabricate success");
+    assert_eq!(*err.code(), S3ErrorCode::InternalError, "err: {err:?}");
+    // State intact: completion record + part records survive, no
+    // sidecar, no premature stamp.
+    let keys = mpu_record_keys(&state);
+    assert_eq!(
+        keys.len(),
+        3,
+        "durable state must survive the failed recovery: {keys:?}"
+    );
+    assert!(
+        !sidecar_present(&state, "b", "flaky/obj.bin"),
+        "no sidecar may be written by a failed recovery"
+    );
+
+    // Backend heals → the next retry recovers fully.
+    fail_ranged.store(false, Ordering::SeqCst);
+    let resp = svc_flaky
+        .complete_multipart_upload(complete_mpu_req(
+            "b",
+            "flaky/obj.bin",
+            &upload_id,
+            vec![(1, etag1.as_str()), (2, etag2.as_str())],
+        ))
+        .await
+        .expect("retry after the backend heals must recover");
+    assert_eq!(resp.output.e_tag.expect("composite").into_value(), expected);
+    assert!(sidecar_present(&state, "b", "flaky/obj.bin"));
+    assert!(mpu_record_keys(&state).is_empty(), "state reaped");
+}
+
+/// QA round-6 Medium: when NO completion record can exist
+/// (`--no-durable-multipart-state`), a transient hop-scan failure must
+/// NOT fail the Complete — the retry could never be answered (backend
+/// NoSuchUpload, recovery disabled), stranding the client against a
+/// committed upload. The Complete degrades: 200 with post-processing
+/// skipped (no stamp, no sidecar).
+#[tokio::test]
+async fn no_durable_state_scan_failure_degrades_instead_of_stranding() {
+    let state = Arc::new(Mutex::new(InnerState::default()));
+    let hang = Arc::new(AtomicBool::new(false));
+    let fail_ranged = Arc::new(AtomicBool::new(true));
+    let (p1, p2) = part_bodies();
+
+    let svc = make_service_with_ranged_fail(&state, &hang, &fail_ranged)
+        .with_durable_multipart_state(false);
+    let create = svc
+        .create_multipart_upload(create_mpu_req("b", "degrade/obj.bin"))
+        .await
+        .expect("create");
+    let upload_id = create.output.upload_id.expect("upload id");
+    let etag1 = svc
+        .upload_part(upload_part_req("b", "degrade/obj.bin", &upload_id, 1, p1))
+        .await
+        .expect("part 1")
+        .output
+        .e_tag
+        .expect("etag1")
+        .into_value();
+    let etag2 = svc
+        .upload_part(upload_part_req("b", "degrade/obj.bin", &upload_id, 2, p2))
+        .await
+        .expect("part 2")
+        .output
+        .e_tag
+        .expect("etag2")
+        .into_value();
+
+    let resp = svc
+        .complete_multipart_upload(complete_mpu_req(
+            "b",
+            "degrade/obj.bin",
+            &upload_id,
+            vec![(1, etag1.as_str()), (2, etag2.as_str())],
+        ))
+        .await
+        .expect("scan failure without a completion record must degrade, not error");
+    // QA round-7: a Failed scan may BE the If-Match concurrent-
+    // overwrite signal, so the degrade path must not mutate the key at
+    // all — including the composite self-copy stamp (it re-HEADs
+    // whatever lives at the key NOW and would write the old upload's
+    // composite onto a new generation). Unstamped multipart presents
+    // no ETag (the documented >5 GiB shape).
+    assert!(
+        resp.output.e_tag.is_none(),
+        "degraded Complete must not stamp/echo a composite"
+    );
+    assert!(
+        !sidecar_present(&state, "b", "degrade/obj.bin"),
+        "degraded Complete must not write a sidecar"
+    );
+    // The committed object is intact and readable once the backend
+    // heals (GET streams; frame parse happens client-side of the scan).
+    fail_ranged.store(false, Ordering::SeqCst);
+    let got = svc
+        .get_object(get_req("b", "degrade/obj.bin"))
+        .await
+        .expect("committed object must be readable");
+    let body = collect_blob(got.output.body.expect("body"), MAX_BODY)
+        .await
+        .expect("collect");
+    assert_eq!(body.len(), 5 * 1024 * 1024 + 137 + 64 * 1024);
 }

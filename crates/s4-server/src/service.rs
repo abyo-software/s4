@@ -36,8 +36,8 @@ use s3s::dto::*;
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use s4_codec::index::{FrameIndex, build_index_from_body, decode_index, encode_index, sidecar_key};
 use s4_codec::multipart::{
-    FRAME_HEADER_BYTES, FrameHeader, FrameIter, PADDING_HEADER_BYTES, S3_MULTIPART_MIN_PART_BYTES,
-    pad_to_minimum, write_frame,
+    FRAME_HEADER_BYTES, FRAME_MAGIC, FrameHeader, FrameIter, PADDING_HEADER_BYTES, PADDING_MAGIC,
+    S3_MULTIPART_MIN_PART_BYTES, pad_to_minimum, write_frame,
 };
 use s4_codec::{ChunkManifest, CodecDispatcher, CodecKind, CodecRegistry, CompressTelemetry};
 use std::time::Instant;
@@ -3806,11 +3806,14 @@ impl<B: S3> S4Service<B> {
     /// Best-effort: a failed PUT is logged and the Complete proceeds —
     /// the deployment merely loses crash-retryability for this upload
     /// (the pre-#150 behaviour).
+    /// Returns `true` only when the record PUT durably succeeded — the
+    /// Complete's scan-failure handling branches on it (fail-for-retry
+    /// only when the retry can actually recover).
     async fn write_completion_record(
         &self,
         bucket: &str,
         record: &crate::mpu_durable::CompletionRecord,
-    ) {
+    ) -> bool {
         let record_key = crate::mpu_durable::completion_key(&record.upload_id);
         let bytes = record.encode();
         let len = bytes.len() as i64;
@@ -3824,7 +3827,7 @@ impl<B: S3> S4Service<B> {
                      URI-encodable; an interrupted Complete will not be \
                      retryable for this upload: {e}"
                 );
-                return;
+                return false;
             }
         };
         let put_req = S3Request {
@@ -3845,16 +3848,181 @@ impl<B: S3> S4Service<B> {
             service: None,
             trailing_headers: None,
         };
-        if let Err(e) = self.backend.put_object(put_req).await {
-            tracing::warn!(
-                bucket,
-                upload_id = %record.upload_id,
-                "S4 durable multipart state: completion record PUT failed; an \
-                 interrupted Complete will not be retryable for this upload \
-                 (pre-#150 behaviour — a mid-handler crash leaves an \
-                 index-less object and the retry gets NoSuchUpload): {e}"
-            );
+        match self.backend.put_object(put_req).await {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(
+                    bucket,
+                    upload_id = %record.upload_id,
+                    "S4 durable multipart state: completion record PUT failed; an \
+                     interrupted Complete will not be retryable for this upload \
+                     (pre-#150 behaviour — a mid-handler crash leaves an \
+                     index-less object and the retry gets NoSuchUpload): {e}"
+                );
+                false
+            }
         }
+    }
+
+    /// #148/#150 live-verify fix (2026-07-10 EKS): build the frame index
+    /// of a committed multipart object via FRAME-HOP ranged reads —
+    /// O(parts) small GETs — instead of a full-body transfer. The
+    /// post-commit scan runs while the CLIENT connection is silent, so
+    /// a transfer-time-scaled scan outlives the #149 idle guard on
+    /// large incompressible objects (the 2 GiB urandom repro took >30 s
+    /// to scan) and the Complete — and every retry's recovery, which
+    /// scans the same way — was killed at the cap: a livelock. Hops are
+    /// bounded well above the S3 10k-part ceiling and the cursor
+    /// strictly advances, so a forged chain terminates. Objects with
+    /// thousands of parts pay one backend round-trip per part
+    /// (documented limitation: at ~5-15 ms each, >~2000 parts can
+    /// still approach the idle window).
+    ///
+    /// The outcome is three-way (QA delta-round High): DATA-shaped
+    /// verdicts (`NotFramed` — bad magic, truncated header, geometry
+    /// overshoot, hop budget) legitimately fall back to raw-length
+    /// accounting, while TRANSPORT failures (`Failed` — ranged GET
+    /// error, missing body, collect error) must NOT be mistaken for
+    /// "raw multipart": stamping the stored length as the original
+    /// size would corrupt HEAD/Range/GET semantics for a compressed
+    /// object, so the callers fail the request and let the client
+    /// retry (idempotently, via the completion record).
+    ///
+    /// `source_etag` (from the same HEAD that supplied `stored_len`)
+    /// pins every hop with `If-Match`: the hops span multiple GETs, so
+    /// unlike a single-stream scan they are not atomic against a
+    /// concurrent overwrite — a 412 mid-walk surfaces as `Failed`
+    /// instead of stitching an index from two different objects.
+    async fn scan_index_via_frame_hops(
+        &self,
+        bucket: &str,
+        key: &str,
+        stored_len: u64,
+        source_etag: Option<&str>,
+    ) -> FrameHopScan {
+        // 10_000 parts (S3 ceiling) → one data frame + one padding
+        // frame each, plus slack.
+        const MAX_HOPS: u32 = 25_000;
+        // One hop fetches enough for either header shape (28-byte S4F2
+        // or 12-byte S4P1).
+        const HOP_BYTES: u64 = FRAME_HEADER_BYTES as u64;
+        let mut entries: Vec<s4_codec::index::FrameIndexEntry> = Vec::new();
+        let mut cursor: u64 = 0;
+        let mut original_off: u64 = 0;
+        let mut hops: u32 = 0;
+        while cursor < stored_len {
+            hops += 1;
+            if hops > MAX_HOPS {
+                tracing::warn!(
+                    bucket,
+                    key,
+                    stored_len,
+                    "multipart frame-hop scan exceeded the hop budget; treating the \
+                     body as unparseable (no sidecar, raw-length accounting)"
+                );
+                return FrameHopScan::NotFramed;
+            }
+            let end_exclusive = cursor.saturating_add(HOP_BYTES).min(stored_len);
+            let Ok(uri) = safe_object_uri(bucket, key) else {
+                return FrameHopScan::Failed;
+            };
+            let get_req = S3Request {
+                input: GetObjectInput {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    range: Some(s3s::dto::Range::Int {
+                        first: cursor,
+                        last: Some(end_exclusive - 1),
+                    }),
+                    if_match: source_etag.map(|e| ETagCondition::ETag(ETag::Strong(e.to_owned()))),
+                    ..Default::default()
+                },
+                method: http::Method::GET,
+                uri,
+                headers: http::HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            let resp = match self.backend.get_object(get_req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        bucket,
+                        key,
+                        offset = cursor,
+                        "multipart frame-hop scan ranged GET failed (transient error \
+                         or concurrent overwrite): {e}"
+                    );
+                    return FrameHopScan::Failed;
+                }
+            };
+            let Some(blob) = resp.output.body else {
+                return FrameHopScan::Failed;
+            };
+            // A hop is at most HOP_BYTES; the generous bound only guards
+            // a backend that ignores Range and returns the whole body.
+            let Ok(bytes) = collect_blob(blob, 64 * 1024).await else {
+                return FrameHopScan::Failed;
+            };
+            if bytes.len() >= 4 && bytes[..4] == *PADDING_MAGIC {
+                if bytes.len() < PADDING_HEADER_BYTES {
+                    return FrameHopScan::NotFramed;
+                }
+                let pad = match <[u8; 8]>::try_from(&bytes[4..PADDING_HEADER_BYTES])
+                    .map(u64::from_le_bytes)
+                {
+                    Ok(p) => p,
+                    Err(_) => return FrameHopScan::NotFramed,
+                };
+                cursor = match cursor
+                    .checked_add(PADDING_HEADER_BYTES as u64)
+                    .and_then(|c| c.checked_add(pad))
+                {
+                    Some(c) => c,
+                    None => return FrameHopScan::NotFramed,
+                };
+                continue;
+            }
+            if bytes.len() < FRAME_HEADER_BYTES || bytes[..4] != *FRAME_MAGIC {
+                return FrameHopScan::NotFramed;
+            }
+            let Ok(header) = crate::frame_stream::parse_header_bytes(&bytes[..FRAME_HEADER_BYTES])
+            else {
+                return FrameHopScan::NotFramed;
+            };
+            let Some(frame_total) = (FRAME_HEADER_BYTES as u64).checked_add(header.compressed_size)
+            else {
+                return FrameHopScan::NotFramed;
+            };
+            entries.push(s4_codec::index::FrameIndexEntry {
+                original_offset: original_off,
+                original_size: header.original_size,
+                compressed_offset: cursor,
+                compressed_size: frame_total,
+            });
+            original_off = match original_off.checked_add(header.original_size) {
+                Some(o) => o,
+                None => return FrameHopScan::NotFramed,
+            };
+            cursor = match cursor.checked_add(frame_total) {
+                Some(c) => c,
+                None => return FrameHopScan::NotFramed,
+            };
+        }
+        if cursor != stored_len {
+            // Overshoot = truncated / forged geometry — fail closed.
+            return FrameHopScan::NotFramed;
+        }
+        FrameHopScan::Index(FrameIndex {
+            total_padded_size: stored_len,
+            entries,
+            source_etag: None,
+            source_compressed_size: None,
+            sse_v3: None,
+        })
     }
 
     /// #150: fetch + decode the completion record for
@@ -3998,58 +4166,58 @@ impl<B: S3> S4Service<B> {
             service: None,
             trailing_headers: None,
         };
-        if self.backend.head_object(head_req).await.is_err() {
-            tracing::warn!(
-                bucket,
-                key,
-                upload_id,
-                "S4 multipart Complete recovery: completion record exists but \
-                 the committed base object is gone; refusing recovery"
-            );
-            return Err(original_err);
-        }
-        // Streaming frame scan of the committed object (same #148
-        // walker Complete's success path uses — no full-body buffering).
-        let get_uri = safe_object_uri(bucket, key)?;
-        let get_req = S3Request {
-            input: GetObjectInput {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                ..Default::default()
-            },
-            method: http::Method::GET,
-            uri: get_uri,
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
+        let (stored_len, recovery_head_etag) = match self.backend.head_object(head_req).await {
+            Ok(head) => (
+                head.output
+                    .content_length
+                    .and_then(|n| u64::try_from(n).ok()),
+                head.output.e_tag.as_ref().map(|t| t.value().to_string()),
+            ),
+            Err(_) => {
+                tracing::warn!(
+                    bucket,
+                    key,
+                    upload_id,
+                    "S4 multipart Complete recovery: completion record exists but \
+                     the committed base object is gone; refusing recovery"
+                );
+                return Err(original_err);
+            }
         };
-        let get_resp = self
-            .backend
-            .get_object(get_req)
-            .await
-            .map_err(internal("multipart Complete recovery: body fetch failed"))?;
-        let blob = get_resp.output.body.ok_or_else(|| {
-            S3Error::with_message(
+        let Some(stored_len) = stored_len else {
+            return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
-                "multipart Complete recovery: committed object returned no body",
-            )
-        })?;
-        let outcome = crate::frame_stream::scan_index_from_blob(blob)
+                "multipart Complete recovery: backend HEAD reported no length",
+            ));
+        };
+        // Frame-hop index scan (same as the Complete success path):
+        // O(parts) small ranged reads, NEVER a full-body transfer —
+        // recovery runs while the retry's client connection is silent,
+        // and a transfer-scaled scan would be killed by the #149 idle
+        // guard on large objects (the retry livelock the 2026-07-10
+        // EKS live verify found).
+        let hop_index = match self
+            .scan_index_via_frame_hops(bucket, key, stored_len, recovery_head_etag.as_deref())
             .await
-            .map_err(|e| {
-                S3Error::with_message(
+        {
+            FrameHopScan::Index(idx) => Some(idx),
+            FrameHopScan::NotFramed => None,
+            FrameHopScan::Failed => {
+                // QA delta-round Medium: a transient read failure must
+                // not finalize the recovery (that would reap the
+                // completion record and stamp a wrong original size).
+                // Fail the retry with state intact — a later retry
+                // recovers once the backend is healthy again.
+                return Err(S3Error::with_message(
                     S3ErrorCode::InternalError,
-                    format!("multipart Complete recovery: frame scan failed: {e}"),
-                )
-            })?;
-        let assembled_original = outcome
-            .index
+                    "multipart Complete recovery: frame-hop scan failed; retry later",
+                ));
+            }
+        };
+        let assembled_original = hop_index
             .as_ref()
             .map(|i| i.total_original_size())
-            .unwrap_or(outcome.consumed);
+            .unwrap_or(stored_len);
         // Stamp the recorded composite BEFORE the sidecar build (the
         // metadata self-copy changes the backend ETag the sidecar binds
         // to) — same ordering as the success path.
@@ -4072,7 +4240,7 @@ impl<B: S3> S4Service<B> {
                 }
             }
         }
-        if let Some(mut index) = outcome.index {
+        if let Some(mut index) = hop_index {
             // Bind the sidecar to the (post-stamp) live object — same
             // H-g binding the success path applies.
             if let Ok(uri) = safe_object_uri(bucket, key) {
@@ -4131,6 +4299,23 @@ impl<B: S3> S4Service<B> {
             ..Default::default()
         }))
     }
+}
+
+/// Outcome of [`S4Service::scan_index_via_frame_hops`] (QA delta-round
+/// High): DATA verdicts and TRANSPORT failures must not be conflated —
+/// only the former may fall back to raw-length accounting.
+enum FrameHopScan {
+    /// Well-formed S4F2 frame sequence — index built.
+    Index(FrameIndex),
+    /// Deterministically not a frame sequence (raw / passthrough
+    /// multipart body, or forged geometry). Raw-length fallback
+    /// (original = stored, no sidecar) is the correct accounting.
+    NotFramed,
+    /// A hop could not be READ (ranged GET error, missing body,
+    /// collect failure, concurrent-overwrite 412). The body's shape is
+    /// unknown — the caller must fail the request so the client
+    /// retries, never stamp stored-length as the original size.
+    Failed,
 }
 
 /// Parse a CopySourceRange header value (`bytes=N-M`, `bytes=N-`, `bytes=-N`)
@@ -9311,7 +9496,7 @@ impl<B: S3> S3 for S4Service<B> {
         // to the pre-#150 behaviour for this one upload. Same gate as
         // every other durable-state write; reaped with the part records
         // at the end of this handler.
-        if self.logical_etag && self.durable_multipart_state {
+        let completion_record_written = if self.logical_etag && self.durable_multipart_state {
             let record = crate::mpu_durable::CompletionRecord {
                 v: crate::mpu_durable::CompletionRecord::VERSION,
                 upload_id: upload_id.to_string(),
@@ -9326,8 +9511,10 @@ impl<B: S3> S3 for S4Service<B> {
                 composite: logical_composite.clone(),
                 re_put_pending: mp_re_put_pending,
             };
-            self.write_completion_record(&bucket, &record).await;
-        }
+            self.write_completion_record(&bucket, &record).await
+        } else {
+            false
+        };
         // fix #4 P1 (retry-safety): the backend Complete succeeded, so the
         // per-part side-table is no longer needed for a retry — drop it now.
         // (We deliberately read it above via the non-draining `get_parts`
@@ -9346,27 +9533,101 @@ impl<B: S3> S3 for S4Service<B> {
         // index を build、`<key>.s4index` sidecar として保存。これで Range GET の
         // partial fetch path が利用可能になる (Range request の帯域節約)。
         //
-        // v0.8 #54 BUG-5..9: this same fetch is the choke-point for
+        // v0.8 #54 BUG-5..9: the full-body fetch is the choke-point for
         // the SSE encrypt re-PUT + versioning shadow-key rewrite +
         // replication source-bytes capture — those need the assembled
         // BYTES in memory, so they keep the buffered collect (bounded by
         // `max_body_bytes`). #148: every other deployment shape (the
-        // default) only needs the frame INDEX + lengths, which the
-        // streaming scan derives without materializing the body — a
-        // 2 GiB Complete no longer pins 2 GiB (+ decompressed) of RAM.
+        // default) only needs the frame INDEX + lengths — derived via
+        // HEAD + frame-hop ranged reads (O(parts) small GETs), never a
+        // full-body transfer: the scan runs while the CLIENT connection
+        // is silent, so a transfer-scaled scan would outlive the #149
+        // idle guard on large objects (2026-07-10 EKS live verify:
+        // 2 GiB incompressible Completes and their recovery retries
+        // were killed at 30 s — a livelock).
         let must_buffer = mp_re_put_pending || (ctx.is_some() && self.replication.is_some());
         let mut assembled_body: Option<bytes::Bytes> = None;
         let mut assembled_scan: Option<FrameIndex> = None;
         let mut assembled_stored_len: Option<u64> = None;
-        if let Ok(uri) = safe_object_uri(&bucket, &key) {
-            let get_input = GetObjectInput {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                ..Default::default()
-            };
-            let get_req = S3Request {
-                input: get_input,
-                method: http::Method::GET,
+        // QA round-7 Medium: set when a no-record hop-scan failure
+        // degrades the Complete — every post-commit mutation of the key
+        // (incl. the composite self-copy stamp) must then be skipped,
+        // because the failure may BE the If-Match overwrite signal.
+        let mut mp_scan_failed_degrade = false;
+        if must_buffer {
+            if let Ok(uri) = safe_object_uri(&bucket, &key) {
+                let get_req = S3Request {
+                    input: GetObjectInput {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        ..Default::default()
+                    },
+                    method: http::Method::GET,
+                    uri,
+                    headers: http::HeaderMap::new(),
+                    extensions: http::Extensions::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                    trailing_headers: None,
+                };
+                match self.backend.get_object(get_req).await {
+                    Ok(get_resp) => {
+                        if let Some(blob) = get_resp.output.body
+                            && let Ok(body) = collect_blob(blob, self.max_body_bytes).await
+                        {
+                            assembled_scan = build_index_from_body(&body).ok();
+                            assembled_stored_len = Some(body.len() as u64);
+                            assembled_body = Some(body);
+                        }
+                    }
+                    Err(e) => {
+                        // v0.8.4 #71 (C-1 audit fix): a silent
+                        // `Err(_) => None` here is a SSE plaintext
+                        // leak. The post-processing block below only
+                        // runs the SSE re-encrypt branch when
+                        // `assembled_body.is_some()`, so swallowing a
+                        // backend error skipped the encrypt step and
+                        // left the multipart object on disk as
+                        // plaintext, even on SSE-S4 / SSE-C / SSE-KMS
+                        // configured buckets. NoSuchKey = the object
+                        // genuinely vanished post-Complete (raced a
+                        // DeleteObject) — nothing to re-encrypt, safe
+                        // to fall through; anything else must FAIL the
+                        // Complete so the client retries (idempotently,
+                        // via the #150 completion record).
+                        if matches!(e.code(), &S3ErrorCode::NoSuchKey) {
+                            tracing::warn!(
+                                bucket = %bucket,
+                                key = %key,
+                                "multipart Complete: backend GET returned NoSuchKey; \
+                                 skipping post-processing (object likely raced with \
+                                 DeleteObject)"
+                            );
+                        } else {
+                            tracing::error!(
+                                bucket = %bucket,
+                                key = %key,
+                                error = %e,
+                                "multipart Complete: backend GET failed; failing the \
+                                 Complete so the client retries (silent fall-through \
+                                 would skip SSE re-encrypt and store plaintext)"
+                            );
+                            return Err(internal("multipart Complete: backend body fetch failed")(
+                                e,
+                            ));
+                        }
+                    }
+                }
+            }
+        } else if let Ok(uri) = safe_object_uri(&bucket, &key) {
+            let head_req = S3Request {
+                input: HeadObjectInput {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    ..Default::default()
+                },
+                method: http::Method::HEAD,
                 uri,
                 headers: http::HeaderMap::new(),
                 extensions: http::Extensions::new(),
@@ -9375,80 +9636,100 @@ impl<B: S3> S3 for S4Service<B> {
                 service: None,
                 trailing_headers: None,
             };
-            match self.backend.get_object(get_req).await {
-                Ok(get_resp) => match get_resp.output.body {
-                    Some(blob) if must_buffer => {
-                        if let Ok(body) = collect_blob(blob, self.max_body_bytes).await {
-                            assembled_scan = build_index_from_body(&body).ok();
-                            assembled_stored_len = Some(body.len() as u64);
-                            assembled_body = Some(body);
+            match self.backend.head_object(head_req).await {
+                Ok(head) => {
+                    if let Some(len) = head
+                        .output
+                        .content_length
+                        .and_then(|n| u64::try_from(n).ok())
+                    {
+                        let head_etag = head.output.e_tag.as_ref().map(|t| t.value().to_string());
+                        match self
+                            .scan_index_via_frame_hops(&bucket, &key, len, head_etag.as_deref())
+                            .await
+                        {
+                            FrameHopScan::Index(idx) => {
+                                assembled_stored_len = Some(len);
+                                assembled_scan = Some(idx);
+                            }
+                            FrameHopScan::NotFramed => {
+                                // Raw / passthrough multipart: original =
+                                // stored is the honest accounting; no
+                                // sidecar (nothing frame-addressable).
+                                assembled_stored_len = Some(len);
+                            }
+                            FrameHopScan::Failed if completion_record_written => {
+                                // QA delta-round High: a read failure must
+                                // not masquerade as "raw multipart" — the
+                                // stamp would corrupt HEAD/Range semantics
+                                // for a compressed object. Fail the
+                                // Complete; the retry is answered
+                                // idempotently via the completion record.
+                                tracing::error!(
+                                    bucket = %bucket,
+                                    key = %key,
+                                    "multipart Complete: post-commit frame-hop scan failed; \
+                                     failing the Complete so the client retries"
+                                );
+                                return Err(S3Error::with_message(
+                                    S3ErrorCode::InternalError,
+                                    "multipart Complete: post-commit frame scan failed",
+                                ));
+                            }
+                            FrameHopScan::Failed => {
+                                // QA round-6 Medium: no completion record
+                                // (flag-off config or its PUT failed) means
+                                // a failed Complete could NEVER be answered
+                                // idempotently — erroring would strand the
+                                // client against a committed upload. Degrade
+                                // instead: 200 with post-processing skipped
+                                // (no stamp, no sidecar, loud ledger WARN
+                                // below) — the pre-#148 stream-error
+                                // semantics for these configurations.
+                                //
+                                // QA round-7 Medium: the SKIP includes the
+                                // composite self-copy stamp — a `Failed`
+                                // can be the If-Match pin detecting a
+                                // concurrent overwrite, and the stamp
+                                // re-HEADs whatever lives at the key NOW,
+                                // so it would write the old upload's
+                                // composite onto the new generation.
+                                tracing::warn!(
+                                    bucket = %bucket,
+                                    key = %key,
+                                    "multipart Complete: post-commit frame-hop scan failed and \
+                                     no completion record exists (retry could not recover); \
+                                     skipping stamp/sidecar/ledger for this object"
+                                );
+                                mp_scan_failed_degrade = true;
+                            }
                         }
                     }
-                    Some(blob) => match crate::frame_stream::scan_index_from_blob(blob).await {
-                        Ok(outcome) => {
-                            assembled_stored_len = Some(outcome.consumed);
-                            assembled_scan = outcome.index;
-                        }
-                        Err(e) => {
-                            // Same contract as the pre-#148 collect
-                            // failure (`.ok()` → None): post-processing
-                            // is skipped with the loud ledger WARN below;
-                            // the retry now recovers idempotently.
-                            tracing::warn!(
-                                bucket = %bucket,
-                                key = %key,
-                                "multipart Complete: streaming frame scan of the \
-                                 assembled object failed; sidecar/stamp skipped: {e}"
-                            );
-                        }
-                    },
-                    None => {}
-                },
+                }
                 Err(e) => {
-                    // v0.8.4 #71 (C-1 audit fix): a silent
-                    // `Err(_) => None` here is a SSE plaintext
-                    // leak. The post-processing block below only
-                    // runs the SSE re-encrypt branch when
-                    // `assembled_body.is_some()`, so swallowing a
-                    // backend error skipped the encrypt step and
-                    // left the multipart object on disk as
-                    // plaintext, even on SSE-S4 / SSE-C / SSE-KMS
-                    // configured buckets. Same root-cause family
-                    // as v0.8 BUG-5; this branch closes the
-                    // remaining read-side window.
-                    //
-                    // We distinguish two cases:
-                    //  - `NoSuchKey`: the object is genuinely
-                    //    missing post-Complete. This is rare and
-                    //    typically races with a concurrent
-                    //    DeleteObject; there is nothing to re-
-                    //    encrypt and no SSE markers to honour, so
-                    //    falling through to the legacy
-                    //    `assembled_body = None` path is safe.
-                    //  - everything else (5xx, network, auth,
-                    //    etc.): we must FAIL the Complete so the
-                    //    client can retry. Returning Ok with
-                    //    `assembled_body = None` would silently
-                    //    skip the SSE re-encrypt and leave the
-                    //    backend bytes plaintext.
+                    // Mirrors the buffered arm's error split: a vanished
+                    // object (DeleteObject race) skips post-processing
+                    // with the loud ledger WARN below; any other failure
+                    // fails the Complete so the client retries
+                    // (idempotently, via the #150 completion record).
                     if matches!(e.code(), &S3ErrorCode::NoSuchKey) {
                         tracing::warn!(
                             bucket = %bucket,
                             key = %key,
-                            "multipart Complete: backend GET returned NoSuchKey; \
-                             skipping post-processing (object likely raced with DeleteObject)"
+                            "multipart Complete: post-commit HEAD returned NoSuchKey; \
+                             skipping post-processing (object likely raced with \
+                             DeleteObject)"
                         );
                     } else {
                         tracing::error!(
                             bucket = %bucket,
                             key = %key,
                             error = %e,
-                            "multipart Complete: backend GET failed; failing the Complete \
-                             so the client retries (silent fall-through would skip SSE \
-                             re-encrypt and store plaintext; the retry is answered \
+                            "multipart Complete: post-commit HEAD failed; failing the \
+                             Complete so the client retries (the retry is answered \
                              idempotently via the #150 completion record)"
                         );
-                        return Err(internal("multipart Complete: backend body fetch failed")(e));
+                        return Err(internal("multipart Complete: post-commit HEAD failed")(e));
                     }
                 }
             }
@@ -9520,6 +9801,7 @@ impl<B: S3> S3 for S4Service<B> {
         // is skipped entirely.
         if !mp_will_encrypt
             && !mp_skip_sidecar_for_versioning
+            && !mp_scan_failed_degrade
             && let Some(ref composite) = logical_composite
         {
             // fix #4 P1 (a): the 5 GiB CopyObject guard + the stored length
@@ -9928,7 +10210,16 @@ impl<B: S3> S3 for S4Service<B> {
             // v0.8 #54 BUG-6 commit: register the new version with
             // the VersioningManager so list_object_versions /
             // GET ?versionId= see it.
-            if let (Some(mgr), Some(pv)) = (self.versioning.as_ref(), pending_version.as_ref()) {
+            //
+            // QA round-9 Medium: same degrade gate as the stamp /
+            // lock / tag state — on a Suspended/Unversioned bucket the
+            // null-version commit is per-key gateway state, and a
+            // Failed hop scan may be the If-Match overwrite signal, so
+            // the old upload's entry must not clobber the new
+            // generation's.
+            if !mp_scan_failed_degrade
+                && let (Some(mgr), Some(pv)) = (self.versioning.as_ref(), pending_version.as_ref())
+            {
                 let etag = resp
                     .output
                     .e_tag
@@ -9957,7 +10248,13 @@ impl<B: S3> S3 for S4Service<B> {
             // v0.8 #54 BUG-7 fix: persist any per-upload Object Lock
             // recipe + auto-apply the bucket default. Mirrors the
             // put_object L2057-L2074 block.
-            if let Some(mgr) = self.object_lock.as_ref() {
+            //
+            // QA round-8 Medium: gated on the degrade flag like the
+            // composite stamp — a Failed hop scan may be the If-Match
+            // pin detecting a concurrent overwrite, and attaching the
+            // OLD upload's lock/tag state to the key would decorate the
+            // NEW generation.
+            if !mp_scan_failed_degrade && let Some(mgr) = self.object_lock.as_ref() {
                 if ctx.object_lock_mode.is_some()
                     || ctx.object_lock_retain_until.is_some()
                     || ctx.object_lock_legal_hold
@@ -9977,8 +10274,11 @@ impl<B: S3> S3 for S4Service<B> {
                 mgr.apply_default_on_put(&bucket, &key, chrono::Utc::now());
             }
             // v0.8 #54 BUG-9 fix: persist the captured tags via the
-            // TagManager so GetObjectTagging returns them.
-            if let (Some(mgr), Some(tags)) = (self.tagging.as_ref(), ctx.tags.as_ref()) {
+            // TagManager so GetObjectTagging returns them. (Same
+            // round-8 degrade gate as the lock state above.)
+            if !mp_scan_failed_degrade
+                && let (Some(mgr), Some(tags)) = (self.tagging.as_ref(), ctx.tags.as_ref())
+            {
                 mgr.put_object_tags(&bucket, &key, tags.clone());
             }
             // SSE-C / SSE-KMS response echo. The

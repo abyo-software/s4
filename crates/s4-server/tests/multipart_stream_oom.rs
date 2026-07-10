@@ -90,6 +90,13 @@ struct InnerState {
     /// Ranged GETs served (lets tests assert the sidecar partial-fetch
     /// path was actually taken vs the full-body fallback).
     ranged_gets: u64,
+    /// Un-ranged GETs of non-internal (main) objects. The Complete
+    /// post-commit scan must NOT full-body-GET the assembled object —
+    /// on the live EKS verify (2026-07-10) that transfer ran longer
+    /// than the #149 idle window (the client connection is silent
+    /// while the gateway scans), so Complete/recovery were killed at
+    /// 30 s and large incompressible multipart objects livelocked.
+    full_main_gets: u64,
 }
 
 struct MemBackend {
@@ -165,7 +172,12 @@ impl S3 for MemBackend {
                 self.state.lock().unwrap().ranged_gets += 1;
                 apply_range(&stored.body, r)
             }
-            None => stored.body.clone(),
+            None => {
+                if !req.input.key.starts_with(".s4mpu/") && !req.input.key.ends_with(".s4index") {
+                    self.state.lock().unwrap().full_main_gets += 1;
+                }
+                stored.body.clone()
+            }
         };
         let len = body.len() as i64;
         Ok(S3Response::new(GetObjectOutput {
@@ -703,6 +715,55 @@ async fn multipart_complete_succeeds_beyond_max_body_bytes() {
         .expect("collect");
     let mut expected_slice = vec![b'a'; 50];
     expected_slice.extend_from_slice(&[b'b'; 50]);
+    assert_eq!(body.as_ref(), expected_slice.as_slice());
+}
+
+/// EKS live-verify follow-up (2026-07-10): the Complete post-commit
+/// index scan must be frame-hop ranged reads — O(parts) small GETs —
+/// never a full-body transfer. A full-body scan's duration scales with
+/// object size, and it runs while the CLIENT connection is idle, so on
+/// real backends it outlives the #149 idle window and the connection
+/// (and any retry's recovery, which scans the same way) is killed at
+/// the cap: large incompressible multipart objects livelock.
+#[tokio::test]
+async fn multipart_complete_scans_via_ranged_hops_not_full_get() {
+    let state = Arc::new(Mutex::new(InnerState::default()));
+    let parts = oversized_parts();
+    let svc = make_service(&state, TEST_COLLECT_MAX);
+    let (upload_id, etags) = upload_all(&svc, "b", "hop/scan.bin", &parts).await;
+    complete_all(&svc, "b", "hop/scan.bin", &upload_id, &etags)
+        .await
+        .expect("complete");
+    let (full, ranged) = {
+        let st = state.lock().unwrap();
+        (st.full_main_gets, st.ranged_gets)
+    };
+    assert_eq!(
+        full, 0,
+        "Complete must not full-body-GET the assembled object (scan must hop)"
+    );
+    assert!(
+        ranged >= parts.len() as u64,
+        "the hop scan issues one small ranged GET per frame (got {ranged})"
+    );
+    // The hop-built sidecar must be byte-accurate: cross part-boundary
+    // range through the partial-fetch path.
+    assert!(
+        sidecar_present(&state, "b", "hop/scan.bin"),
+        "sidecar written"
+    );
+    let boundary = 6 * 1024 * 1024;
+    let mut get = get_req("b", "hop/scan.bin");
+    get.input.range = Some(Range::Int {
+        first: (boundary - 10) as u64,
+        last: Some((boundary + 9) as u64),
+    });
+    let got = svc.get_object(get).await.expect("range GET via sidecar");
+    let body = collect_blob(got.output.body.expect("body"), TEST_COLLECT_MAX)
+        .await
+        .expect("collect");
+    let mut expected_slice = vec![b'a'; 10];
+    expected_slice.extend_from_slice(&[b'b'; 10]);
     assert_eq!(body.as_ref(), expected_slice.as_slice());
 }
 

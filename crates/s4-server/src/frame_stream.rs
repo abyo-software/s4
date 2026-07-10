@@ -7,18 +7,16 @@
 //! GET of a 2 GiB object OOM-killed a 2 Gi-limit gateway pod (live
 //! repro, 2026-07-08 Metered Savings E2E).
 //!
-//! Two consumers, one incremental reader:
-//!
-//! - [`scan_index_from_blob`]: walk the frame headers of a streaming
-//!   body and build the [`FrameIndex`] (sidecar) WITHOUT retaining
-//!   payloads — O(chunk) memory. Used by CompleteMultipartUpload (the
-//!   sidecar build no longer fetches-and-buffers the assembled object)
-//!   and by the idempotent-Complete recovery path (#150).
-//! - [`multipart_decompress_blob`]: decompress a framed body
-//!   frame-by-frame, emitting each frame's plaintext as soon as it is
-//!   decoded — O(one frame) memory. With a `range`, frames left of the
-//!   range are SKIPPED (payload bytes discarded, never decoded), frames
-//!   right of it terminate the stream early.
+//! The GET-side consumer here is [`multipart_decompress_blob`]:
+//! decompress a framed body frame-by-frame, emitting each frame's
+//! plaintext as soon as it is decoded — O(one frame) memory. With a
+//! `range`, frames left of the range are SKIPPED (payload bytes
+//! discarded, never decoded), frames right of it terminate the stream
+//! early. The Complete-side index scan lives in `service.rs`
+//! (`scan_index_via_frame_hops`): O(parts) small ranged reads, because
+//! a full-body streaming scan runs while the CLIENT connection is idle
+//! and would outlive the #149 idle guard on large objects (found on
+//! the 2026-07-10 EKS live verify). It reuses [`parse_header_bytes`].
 //!
 //! Per-frame integrity is unchanged: each frame's payload goes through
 //! `CodecRegistry::decompress` with the header's `ChunkManifest`, so the
@@ -29,7 +27,6 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use s3s::dto::StreamingBlob;
-use s4_codec::index::{FrameIndex, FrameIndexEntry};
 use s4_codec::multipart::{
     FRAME_HEADER_BYTES, FRAME_MAGIC, FrameHeader, PADDING_HEADER_BYTES, PADDING_MAGIC, read_frame,
 };
@@ -94,12 +91,8 @@ enum WalkStep {
     /// Clean EOF at a frame boundary.
     Eof,
     /// A data frame header. The payload has NOT been consumed yet —
-    /// `payload_offset` is the reader's current position.
-    Frame {
-        header: FrameHeader,
-        /// Offset of the frame's first byte (the `S4F2` magic).
-        frame_offset: u64,
-    },
+    /// the reader's cursor sits at the payload's first byte.
+    Frame { header: FrameHeader },
 }
 
 /// Advance past any padding frames and parse the next data-frame header
@@ -145,17 +138,15 @@ async fn next_data_frame<R: AsyncRead + Unpin>(
         // `read_frame` also wants the payload present to split it off —
         // feed it a zero-payload view and parse only the header fields.
         let header = parse_header_bytes(&full)?;
-        return Ok(WalkStep::Frame {
-            header,
-            frame_offset,
-        });
+        return Ok(WalkStep::Frame { header });
     }
 }
 
 /// Parse the 28 header bytes via the codec crate's `read_frame` (payload
 /// checks disabled by declaring the remainder empty is not possible, so
-/// parse fields with the same layout/validation semantics).
-fn parse_header_bytes(full: &[u8]) -> io::Result<FrameHeader> {
+/// parse fields with the same layout/validation semantics). Also used
+/// by the Complete-side frame-hop scanner in `service.rs`.
+pub(crate) fn parse_header_bytes(full: &[u8]) -> io::Result<FrameHeader> {
     debug_assert_eq!(full.len(), FRAME_HEADER_BYTES);
     // Delegate to `read_frame` with an empty-payload copy so the codec
     // crate stays the single source of truth for the header layout: a
@@ -179,89 +170,6 @@ fn parse_header_bytes(full: &[u8]) -> io::Result<FrameHeader> {
     })?;
     header.compressed_size = real_compressed;
     Ok(header)
-}
-
-/// Outcome of a streaming frame-index scan.
-pub(crate) struct ScanOutcome {
-    /// `Some` when the body parsed as a well-formed frame sequence.
-    /// `None` when it did not (e.g. passthrough-codec multipart = raw
-    /// parts) — mirrors `build_index_from_body` returning `Err` on the
-    /// buffered path.
-    pub index: Option<FrameIndex>,
-    /// Total bytes consumed from the stream (== the stored object size
-    /// when the scan drained it; the caller uses the backend
-    /// content-length as the authoritative stored size).
-    pub consumed: u64,
-}
-
-/// Walk a streaming body's frame headers and build a [`FrameIndex`]
-/// without retaining any payload bytes. On a malformed body the partial
-/// scan is discarded (`index: None`) and the rest of the stream is
-/// drained so `consumed` still reflects the full body length.
-pub(crate) async fn scan_index_from_blob(blob: StreamingBlob) -> io::Result<ScanOutcome> {
-    let mut reader = FrameReader::new(blob_to_async_read(blob));
-    let mut entries: Vec<FrameIndexEntry> = Vec::new();
-    let mut original_off: u64 = 0;
-    let parse_result: io::Result<()> = async {
-        loop {
-            match next_data_frame(&mut reader).await? {
-                WalkStep::Eof => return Ok(()),
-                WalkStep::Frame {
-                    header,
-                    frame_offset,
-                } => {
-                    reader.skip(header.compressed_size).await?;
-                    let frame_total = (FRAME_HEADER_BYTES as u64)
-                        .checked_add(header.compressed_size)
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "frame size overflow")
-                        })?;
-                    entries.push(FrameIndexEntry {
-                        original_offset: original_off,
-                        original_size: header.original_size,
-                        compressed_offset: frame_offset,
-                        compressed_size: frame_total,
-                    });
-                    original_off =
-                        original_off
-                            .checked_add(header.original_size)
-                            .ok_or_else(|| {
-                                io::Error::new(io::ErrorKind::InvalidData, "original size overflow")
-                            })?;
-                }
-            }
-        }
-    }
-    .await;
-    match parse_result {
-        Ok(()) => {
-            let consumed = reader.offset;
-            Ok(ScanOutcome {
-                index: Some(FrameIndex {
-                    total_padded_size: consumed,
-                    entries,
-                    source_etag: None,
-                    source_compressed_size: None,
-                    sse_v3: None,
-                }),
-                consumed,
-            })
-        }
-        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-            // Not a frame sequence (raw / passthrough multipart body).
-            // Drain so `consumed` reflects the full length, then report
-            // "no index" — the caller falls back to raw-length
-            // accounting, same as the buffered `build_index_from_body`
-            // error path did.
-            let mut sink = tokio::io::sink();
-            let drained = tokio::io::copy(&mut reader.inner, &mut sink).await?;
-            Ok(ScanOutcome {
-                index: None,
-                consumed: reader.offset + drained,
-            })
-        }
-        Err(e) => Err(e),
-    }
 }
 
 /// Frame-by-frame streaming decompression of a framed body.
@@ -332,7 +240,7 @@ async fn walk_and_send(
     let mut original_cursor: u64 = 0;
     loop {
         let step = next_data_frame(&mut reader).await?;
-        let WalkStep::Frame { header, .. } = step else {
+        let WalkStep::Frame { header } = step else {
             // Clean EOF. Running out of frames before the range end (or
             // the declared total) means the body is shorter than what
             // the request was resolved against — treat as corruption
@@ -524,41 +432,6 @@ mod tests {
             out.extend_from_slice(&chunk);
         }
         Ok(out)
-    }
-
-    #[tokio::test]
-    async fn scan_matches_buffered_index_builder_across_chunk_sizes() {
-        let (body, _original) = framed_body(
-            &[vec![b'x'; 100_000], vec![b'y'; 50_000], vec![b'z'; 1]],
-            64 * 1024,
-        )
-        .await;
-        let reference = s4_codec::index::build_index_from_body(&body).unwrap();
-        for chunk in [1, 7, 4096, body.len()] {
-            let outcome = scan_index_from_blob(chunked_blob(body.clone(), chunk))
-                .await
-                .unwrap();
-            let idx = outcome.index.expect("well-formed body must scan");
-            assert_eq!(outcome.consumed, body.len() as u64, "chunk={chunk}");
-            assert_eq!(idx.total_padded_size, reference.total_padded_size);
-            assert_eq!(idx.entries.len(), reference.entries.len());
-            for (a, b) in idx.entries.iter().zip(reference.entries.iter()) {
-                assert_eq!(a, b, "chunk={chunk}");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn scan_rejects_raw_body_but_reports_length() {
-        let raw = Bytes::from(vec![0x42u8; 10_000]);
-        let outcome = scan_index_from_blob(chunked_blob(raw.clone(), 512))
-            .await
-            .unwrap();
-        assert!(
-            outcome.index.is_none(),
-            "raw body must not produce an index"
-        );
-        assert_eq!(outcome.consumed, raw.len() as u64);
     }
 
     #[tokio::test]
