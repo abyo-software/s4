@@ -70,7 +70,7 @@ type: application
 #        the default ([]) rendering is byte-identical to 0.4.0.
 version: 0.5.0
 # appVersion tracks the s4-server release shipped on crates.io / ghcr.io.
-appVersion: "1.5.1"
+appVersion: "1.5.2"
 kubeVersion: ">=1.24.0-0"
 home: https://github.com/abyo-software/s4
 sources:

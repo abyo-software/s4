@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-07-10
+
+Same-day fast-follow: the v1.5.1 EKS live verification (2 GiB
+incompressible multipart) found that the #148/#150 fixes' post-commit
+index scan — a full-body streaming read — runs while the CLIENT
+connection is silent, so on large objects it outlived the new #149 idle
+guard: the Complete, and every retry's recovery (which scanned the same
+way), was killed at 30 s — a livelock. v1.5.1's crates.io / PyPI
+packages do not contain the server and are unaffected; the image and
+chart move to 1.5.2 (`s4-codec` / `s4-config` are republished as 1.5.2
+purely for workspace version alignment — no code change; PyPI stays at
+1.5.1).
+
+### Fixed
+
+- **CompleteMultipartUpload post-commit index scan is now frame-hop
+  ranged reads** — O(parts) small GETs (28-byte headers, hopping by
+  declared frame sizes) instead of a full-body transfer, on both the
+  Complete success path and the #150 recovery path. Scan time no longer
+  scales with object size, so it stays far inside the idle window (the
+  2 GiB / 4-part live repro dropped from >30 s to sub-second) and
+  Completes no longer transfer the whole object per upload. Every hop
+  is pinned with `If-Match` to the ETag of the HEAD that sized the
+  walk — a concurrent overwrite surfaces as a clean failure instead of
+  an index stitched from two objects. Transport failures (ranged GET
+  error, missing body) are strictly distinguished from "not a frame
+  sequence": the former fail the request so the client retries
+  (idempotently, via the completion record — durable state intact),
+  the latter fall back to raw-length accounting exactly as before
+  (QA delta-round High/Medium, both regression-tested).
+
+### Known limitations
+
+- Objects with thousands of parts pay one backend round-trip per part
+  in the post-commit scan (~5–15 ms each); >~2000 parts can approach
+  the 30 s idle window — raise `--read-timeout-seconds` (env
+  `S4_READ_TIMEOUT_SECONDS` / chart `extraArgs`) for such workloads.
+- A backend that ignores `Range` on GET cannot complete multipart
+  uploads through the gateway any more (the hop scan fails closed
+  rather than mis-accounting). Every backend in the compat matrix
+  (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Wasabi) honors Range.
+- SSE / versioning-Enabled / replication Completes still buffer the
+  assembled body and can exceed the idle window on large objects —
+  raise the timeout for those deployments (pre-existing, disclosed in
+  v1.5.1).
+
 ## [1.5.1] - 2026-07-10
 
 Fix wave for the three defects the 2026-07-08 Metered Savings live E2E
